@@ -1,0 +1,31 @@
+services:
+  signal:
+    build: .
+    restart: unless-stopped
+    env_file: .env
+    volumes:
+      - ./runtime:/app/runtime
+      - ./strategy.json:/app/strategy.json
+      - ./reversion_strategy.json:/app/reversion_strategy.json
+    environment:
+      DATABASE_PATH: /app/runtime/btc15.db
+  optimizer:
+    build: .
+    restart: unless-stopped
+    volumes:
+      - ./runtime:/app/runtime
+      - ./strategy.json:/app/strategy.json
+      - ./reversion_strategy.json:/app/reversion_strategy.json
+    command:
+      - sh
+      - -c
+      - >-
+        while true; do
+        btc15-kalshi-backtest --days 30
+        --output /app/runtime/flexible-backtest.json
+        --strategy-output /app/strategy.json;
+        btc15-reversion-backtest --days 30
+        --output /app/runtime/reversion-backtest.json
+        --strategy-output /app/reversion_strategy.json;
+        sleep 86400;
+        done

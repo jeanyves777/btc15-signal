@@ -1,0 +1,32 @@
+[project]
+name = "btc15-signal"
+version = "0.1.0"
+description = "Paper-first BTC 15-minute non-return signal using public Binance data"
+requires-python = ">=3.11"
+dependencies = [
+  "cryptography>=43,<47",
+  "httpx[socks]>=0.27,<1",
+  "pydantic-settings>=2.4,<3",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8,<9", "ruff>=0.6,<1"]
+
+[project.scripts]
+btc15-signal = "btc15_signal.main:run"
+btc15-backtest = "btc15_signal.backtest:run"
+btc15-kalshi-backtest = "btc15_signal.kalshi_backtest:run"
+btc15-reversion-backtest = "btc15_signal.reversion_backtest:run"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+
+[tool.ruff]
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]

@@ -1,0 +1,13 @@
+{
+  "enabled": false,
+  "min_remaining_minutes": 10,
+  "max_remaining_minutes": 12,
+  "min_entry_price": 0.3,
+  "max_entry_price": 0.35,
+  "min_spike_bps": 8.0,
+  "min_rejection_bps": 1.0,
+  "max_rejection_bps": 12.0,
+  "max_distance_bps": 35.0,
+  "take_profit_price": 0.5,
+  "fee_buffer": 0.02
+}
