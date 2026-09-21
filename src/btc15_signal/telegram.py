@@ -1,4 +1,21 @@
+import sys
+
 import httpx
+
+
+def safe_print(text: str) -> None:
+    """Print without letting an emoji kill the service.
+
+    Dry-run mode echoes every message to stdout, and a Windows console defaults
+    to cp1252, which cannot encode the emoji these messages use. An unguarded
+    print raises UnicodeEncodeError and takes the polling loop down with it.
+    """
+    stream = sys.stdout
+    try:
+        print(text, flush=True)
+    except UnicodeEncodeError:
+        encoding = getattr(stream, "encoding", None) or "ascii"
+        print(text.encode(encoding, errors="replace").decode(encoding), flush=True)
 
 
 class Telegram:
@@ -10,9 +27,16 @@ class Telegram:
 
     async def send(self, text: str, buttons: list[tuple[str, str]] | None = None) -> int | None:
         if self.dry_run or not self.token or not self.chat_id:
-            print(text, flush=True)
+            safe_print(text)
             return None
-        payload = {"chat_id": self.chat_id, "text": text}
+        payload = {
+            "chat_id": self.chat_id,
+            "text": text,
+            # Telegram offers no text colour; the messages carry emoji chips for
+            # that and use this HTML subset for weight and monospace alignment.
+            "parse_mode": "HTML",
+            "link_preview_options": {"is_disabled": True},
+        }
         if buttons:
             payload["reply_markup"] = {
                 "inline_keyboard": [

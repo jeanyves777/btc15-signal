@@ -1,5 +1,10 @@
 # BTC15 Strategy Backtest
 
+> **Superseded.** This report gates on win rate after a flat fee buffer. Win rate is
+> not a validation criterion for a binary contract: an 84% win rate bought at 90c
+> loses money. `reports/VALIDATION_REPORT.md` measures gross edge (outcome minus
+> entry price) over 68 days with fees excluded, and supersedes the numbers here.
+
 Generated: 2026-09-20T21:04:13.861578+00:00
 Period: 2026-03-24 to 2026-09-20 UTC
 Selected raw-probability threshold: **50%**

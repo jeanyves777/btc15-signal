@@ -1,0 +1,143 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>BTC15 Performance</title>
+<style>
+  :root {
+    color-scheme: light;
+    --surface: #fcfcfb; --panel: #ffffff; --line: #e4e3df;
+    --ink: #0b0b0b; --ink-2: #52514e; --ink-3: #7a7873;
+    --pos: #2a78d6; --neg: #e34948;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      color-scheme: dark;
+      --surface: #1a1a19; --panel: #232322; --line: #383835;
+      --ink: #ffffff; --ink-2: #c3c2b7; --ink-3: #8f8e86;
+      --pos: #3987e5; --neg: #e66767;
+    }
+  }
+  :root[data-theme="dark"] {
+    color-scheme: dark;
+    --surface: #1a1a19; --panel: #232322; --line: #383835;
+    --ink: #ffffff; --ink-2: #c3c2b7; --ink-3: #8f8e86;
+    --pos: #3987e5; --neg: #e66767;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--surface); color: var(--ink);
+    font: 14px/1.5 ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+    padding: 24px 16px 48px; }
+  .wrap { max-width: 860px; margin: 0 auto; }
+  h1 { font-size: 20px; margin: 0 0 2px; letter-spacing: -0.01em; }
+  .sub { color: var(--ink-3); margin: 0 0 20px; font-size: 13px; }
+  h2 { font-size: 13px; text-transform: uppercase; letter-spacing: 0.06em;
+    color: var(--ink-3); margin: 0 0 10px; font-weight: 600; }
+  section { background: var(--panel); border: 1px solid var(--line);
+    border-radius: 12px; padding: 16px; margin-bottom: 14px; }
+  .tiles { display: grid; gap: 10px; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+    margin-bottom: 14px; }
+  .tile { background: var(--panel); border: 1px solid var(--line);
+    border-radius: 12px; padding: 14px 16px; }
+  .tile .k { font-size: 12px; color: var(--ink-3); margin-bottom: 4px; }
+  .tile .v { font-size: 26px; font-weight: 600; letter-spacing: -0.02em;
+    font-variant-numeric: tabular-nums; }
+  .tile .n { font-size: 12px; color: var(--ink-3); margin-top: 2px; }
+  .pos { color: var(--pos); } .neg { color: var(--neg); }
+  .dim { color: var(--ink-3); }
+  .warn { border: 1px solid var(--line); border-left: 3px solid var(--neg);
+    background: var(--panel); border-radius: 8px; padding: 12px 14px;
+    color: var(--ink-2); font-size: 13px; margin-bottom: 14px; }
+  table { width: 100%; border-collapse: collapse; font-size: 13px;
+    font-variant-numeric: tabular-nums; }
+  th { text-align: left; color: var(--ink-3); font-weight: 600; font-size: 12px;
+    padding: 6px 8px; border-bottom: 1px solid var(--line); }
+  td { padding: 6px 8px; border-bottom: 1px solid var(--line); color: var(--ink-2); }
+  tbody tr:last-child td { border-bottom: 0; }
+  .num { text-align: right; }
+  svg { width: 100%; height: auto; display: block; }
+  .zero { stroke: var(--line); stroke-width: 1; }
+  .empty { color: var(--ink-3); font-size: 13px; margin: 0; }
+  .scroll { overflow-x: auto; }
+  footer { color: var(--ink-3); font-size: 12px; margin-top: 18px; }
+</style></head><body>
+<div class="wrap">
+  <h1>BTC15 Performance</h1>
+  <p class="sub">Generated 2026-09-21 03:45 UTC</p>
+
+  <div class="warn">
+  <strong>17 settled signals.</strong> At an average entry of
+  0.81 a fair market wins about
+  81% of the time anyway, so a streak here
+  proves nothing. Roughly <strong>5,816</strong> settled
+  signals are needed before a 1%-per-trade edge separates from zero.
+</div>
+
+  <h2>Account</h2>
+  <p class="sub">Orders that actually filled — the size filled, the price paid,
+     the fee charged.</p>
+  <div class="tiles">
+    <div class="tile"><div class="k">Realised P&amp;L</div>
+      <div class="v neg">-0.85</div>
+      <div class="n">on $0.84 actually spent</div></div>
+    <div class="tile"><div class="k">Trades placed</div>
+      <div class="v">0&hairsp;/&hairsp;1</div>
+      <div class="n">16 signals not traded</div></div>
+    <div class="tile"><div class="k">Return on spend</div>
+      <div class="v neg">-101.13%</div>
+      <div class="n">realised, after fees</div></div>
+  </div>
+
+  <h2>Signals (paper)</h2>
+  <p class="sub">Every settled signal priced at $1.00 per signal,
+     whether or not an order was placed. Not money.</p>
+  <div class="tiles">
+    <div class="tile"><div class="k">Paper P&amp;L</div>
+      <div class="v neg">-0.24</div>
+      <div class="n">on $10.00 notional · 10 priced</div></div>
+    <div class="tile"><div class="k">Record</div>
+      <div class="v">13&hairsp;/&hairsp;17</div>
+      <div class="n">76% · floor 53% · 7 unpriced, excluded from P&amp;L</div></div>
+    <div class="tile"><div class="k">Return on notional</div>
+      <div class="v neg">-2.40%</div>
+      <div class="n">avg entry 0.81</div></div>
+    <div class="tile"><div class="k">Max drawdown</div>
+      <div class="v">$0.85</div>
+      <div class="n">paper, at $1.00/signal</div></div>
+  </div>
+
+  <section><h2>Cumulative P&amp;L</h2><svg viewBox="0 0 640 160" role="img"
+   aria-label="Cumulative profit and loss across 10 settled signals"
+   preserveAspectRatio="none" class="spark">
+  <line x1="8" x2="632" y1="76.1" y2="76.1" class="zero"/>
+  <polyline points="8.0,53.5 77.3,152.0 146.7,133.7 216.0,130.9 285.3,106.8 354.7,87.1 424.0,74.5 493.3,8.0 562.7,135.6 632.0,111.5" fill="none" stroke="#e34948" stroke-width="2"
+     stroke-linejoin="round" stroke-linecap="round"/>
+</svg></section>
+  <section><h2>P&amp;L by day</h2><svg viewBox="0 0 640 140" role="img"
+   aria-label="Profit and loss for each of 1 settled days" class="bars">
+  <line x1="8" x2="632" y1="70.0" y2="70.0" class="zero"/>
+  <rect x="306.0" y="70.0" width="28.0" height="62.0" rx="4" fill="#e34948"><title>2026-09-21: -0.24</title></rect>
+</svg></section>
+
+  <section><h2>By side</h2><table>
+<thead><tr><th>side</th><th class="num">n</th><th class="num">wins</th>
+<th class="num">win rate</th><th class="num">net</th></tr></thead>
+<tbody><tr><td>UP</td><td class='num'>13</td><td class='num'>9</td><td class='num'>69%</td><td class='num neg'>-0.46</td></tr><tr><td>DOWN</td><td class='num'>4</td><td class='num'>4</td><td class='num'>100%</td><td class='num pos'>+0.22</td></tr></tbody></table></section>
+  <section><h2>By entry price</h2><table>
+<thead><tr><th>band</th><th class="num">n</th><th class="num">wins</th>
+<th class="num">win rate</th><th class="num">net</th></tr></thead>
+<tbody><tr><td>0.85-1.00</td><td class='num'>4</td><td class='num'>4</td><td class='num'>100%</td><td class='num pos'>+0.36</td></tr><tr><td>0.50-0.85</td><td class='num'>6</td><td class='num'>4</td><td class='num'>67%</td><td class='num neg'>-0.59</td></tr></tbody></table></section>
+  <section><h2>Rule qualified vs paper</h2><table>
+<thead><tr><th>source</th><th class="num">n</th><th class="num">wins</th>
+<th class="num">win rate</th><th class="num">net</th></tr></thead>
+<tbody><tr><td>rule qualified</td><td class='num'>4</td><td class='num'>3</td><td class='num'>75%</td><td class='num neg'>-0.62</td></tr><tr><td>paper only</td><td class='num'>13</td><td class='num'>10</td><td class='num'>77%</td><td class='num pos'>+0.39</td></tr></tbody></table></section>
+
+  <section><h2>Recent settled signals</h2><div class="scroll"><table>
+  <thead><tr><th>window (UTC)</th><th>side</th><th class="num">entry</th>
+  <th>result</th><th class="num">P&amp;L</th><th>source</th></tr></thead>
+  <tbody><tr><td>2026-09-21 03:15</td><td>UP</td><td class='num'>83%</td><td>WIN</td><td class='num pos'>+0.16</td><td>paper</td></tr><tr><td>2026-09-21 03:00</td><td>UP</td><td class='num'>84%</td><td>LOSS</td><td class='num neg'>-0.85</td><td>rule</td></tr><tr><td>2026-09-21 02:45</td><td>UP</td><td class='num'>54%</td><td>WIN</td><td class='num pos'>+0.44</td><td>paper</td></tr><tr><td>2026-09-21 02:30</td><td>DOWN</td><td class='num'>91%</td><td>WIN</td><td class='num pos'>+0.08</td><td>rule</td></tr><tr><td>2026-09-21 02:15</td><td>UP</td><td class='num'>86%</td><td>WIN</td><td class='num pos'>+0.13</td><td>paper</td></tr><tr><td>2026-09-21 02:00</td><td>UP</td><td class='num'>83%</td><td>WIN</td><td class='num pos'>+0.16</td><td>paper</td></tr><tr><td>2026-09-21 01:45</td><td>DOWN</td><td class='num'>98%</td><td>WIN</td><td class='num pos'>+0.02</td><td>rule</td></tr><tr><td>2026-09-21 01:30</td><td>DOWN</td><td class='num'>87%</td><td>WIN</td><td class='num pos'>+0.12</td><td>rule</td></tr><tr><td>2026-09-21 01:15</td><td>UP</td><td class='num'>64%</td><td>LOSS</td><td class='num neg'>-0.66</td><td>paper</td></tr><tr><td>2026-09-21 01:00</td><td>UP</td><td class='num'>84%</td><td>WIN</td><td class='num pos'>+0.15</td><td>paper</td></tr><tr><td>2026-09-21 00:45</td><td>UP</td><td class='num'>&mdash;</td><td>WIN</td><td class='num dim'>&mdash;</td><td>paper</td></tr><tr><td>2026-09-21 00:15</td><td>UP</td><td class='num'>&mdash;</td><td>WIN</td><td class='num dim'>&mdash;</td><td>paper</td></tr><tr><td>2026-09-21 00:00</td><td>UP</td><td class='num'>&mdash;</td><td>WIN</td><td class='num dim'>&mdash;</td><td>paper</td></tr><tr><td>2026-09-20 23:45</td><td>DOWN</td><td class='num'>&mdash;</td><td>WIN</td><td class='num dim'>&mdash;</td><td>paper</td></tr><tr><td>2026-09-20 23:30</td><td>UP</td><td class='num'>&mdash;</td><td>WIN</td><td class='num dim'>&mdash;</td><td>paper</td></tr><tr><td>2026-09-20 23:15</td><td>UP</td><td class='num'>&mdash;</td><td>LOSS</td><td class='num dim'>&mdash;</td><td>paper</td></tr><tr><td>2026-09-20 23:00</td><td>UP</td><td class='num'>&mdash;</td><td>LOSS</td><td class='num dim'>&mdash;</td><td>paper</td></tr></tbody>
+  </table></div></section>
+
+  <footer>1 signal(s) awaiting settlement.
+  P&amp;L assumes $1 per signal at the quoted ask, net of Kalshi's
+  per-order fee. Win/loss is stated in text, never by colour alone.</footer>
+</div></body></html>

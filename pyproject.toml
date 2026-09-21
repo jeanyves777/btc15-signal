@@ -17,6 +17,11 @@ btc15-signal = "btc15_signal.main:run"
 btc15-backtest = "btc15_signal.backtest:run"
 btc15-kalshi-backtest = "btc15_signal.kalshi_backtest:run"
 btc15-reversion-backtest = "btc15_signal.reversion_backtest:run"
+btc15-validate = "btc15_signal.intelligence:run"
+btc15-intel = "btc15_signal.intel_query:run"
+btc15-profit-test = "btc15_signal.profittest:run"
+btc15-dashboard = "btc15_signal.dashboard:run"
+btc15-record = "btc15_signal.recorder:run"
 
 [build-system]
 requires = ["hatchling"]

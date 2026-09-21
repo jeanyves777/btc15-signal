@@ -5,27 +5,41 @@ services:
     env_file: .env
     volumes:
       - ./runtime:/app/runtime
+      - ./data:/app/data
+      - ./reports:/app/reports
       - ./strategy.json:/app/strategy.json
       - ./reversion_strategy.json:/app/reversion_strategy.json
     environment:
       DATABASE_PATH: /app/runtime/btc15.db
-  optimizer:
+
+  # Refreshes the data cache and re-runs validation daily. It deliberately does
+  # NOT write strategy.json any more. The old job ran a 3,680-rule grid search
+  # and wrote the winner straight into the live rule file; a permutation test
+  # scores that search at p = 0.99, i.e. it finds bigger "edges" in shuffled
+  # data than in real data. It was overwriting the deployed rule with noise
+  # every night. Validation now reports, and a human changes the rule.
+  validator:
     build: .
     restart: unless-stopped
     volumes:
       - ./runtime:/app/runtime
-      - ./strategy.json:/app/strategy.json
-      - ./reversion_strategy.json:/app/reversion_strategy.json
+      - ./data:/app/data
+      - ./reports:/app/reports
+      - ./strategy.json:/app/strategy.json:ro
+      - ./reversion_strategy.json:/app/reversion_strategy.json:ro
     command:
       - sh
       - -c
       - >-
         while true; do
-        btc15-kalshi-backtest --days 30
-        --output /app/runtime/flexible-backtest.json
-        --strategy-output /app/strategy.json;
-        btc15-reversion-backtest --days 30
-        --output /app/runtime/reversion-backtest.json
-        --strategy-output /app/reversion_strategy.json;
+        python /app/scripts/sync_data.py --days 70 --cache /app/data/market_data.db;
+        btc15-validate --cache /app/data/market_data.db
+        --ledger /app/data/intelligence.db
+        --output /app/reports/validation.json
+        --markdown /app/reports/VALIDATION_REPORT.md;
+        btc15-profit-test --cache /app/data/market_data.db
+        --output /app/reports/profit-test.json;
+        btc15-dashboard --db /app/runtime/btc15.db
+        --output /app/reports/dashboard.html;
         sleep 86400;
         done
