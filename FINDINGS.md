@@ -1829,3 +1829,121 @@ the maker question above cannot be narrowed further by analysis. It would need
 a live experiment - rest one contract at the bid, record fill rate, fill price
 and outcome - and the live path now carries Kalshi's authoritative bid
 (section 24) to do it with.
+
+---
+
+## 32. Loss recovery, and where the edge actually lives on the distance gate (2026-09-21)
+
+### The martingale recovery overlay: measured, and not adopted
+
+The operator's proposal: after a loss, arm a recovery leg that fires on the
+next window meeting every normal gate at 0.90-0.93 with about two minutes left,
+stakes ten contracts to cover the loss, then disarms.
+
+`scripts/measure_recovery.py`, 6,435 settled markets:
+
+```
+normal system   n=5088  +30.54   (1025 losses)
+recovery        n=488   +2.84    (92.0% won, 39 losses, worst -9.35)
+per trade       +0.0058  95% CI [-0.2394, +0.2418]
+max drawdown    -76.17   against -26.91 without the overlay
+```
+
+It wins 92.0% of the time and makes nothing. The break-even is the price:
+
+```
+at 0.90: win +0.94, lose -9.06 -> needs 90.6%
+at 0.92: win +0.75, lose -9.25 -> needs 92.5%
+at 0.93: win +0.65, lose -9.35 -> needs 93.5%
+```
+
+One loss erases eleven wins, and the overlay bought an indistinguishable-from-
+zero gain for **three times the drawdown**.
+
+**The live record agrees, and more sharply.** Replaying the deployed
+configuration over the live signals: 7 fires, 3 losses, **-24.07**. Seven fires
+settle nothing on their own, but the sign matches the drawdown.
+
+### The sweep found a "sweet spot" that is really "stop trading late"
+
+`scripts/optimize_recovery.py` over 108 configurations. Per contract, with size
+removed - size is leverage, not skill, and 20 contracts earns exactly twice the
+10-contract edge:
+
+```
+1-2 min  n=628  93.9%  -0.0057/contract
+1-3 min  n=792  95.1%  +0.0069
+2-4 min  n=841  95.0%  +0.0102
+3-5 min  n=834  94.8%  +0.0110
+4-6 min  n=798  95.2%  +0.0170
+```
+
+Monotone. The optimiser wants to move the recovery leg AWAY from two minutes
+and back toward the normal entry window - section 31 again, where the edge
+declines into the close as volume rises. **The recovery idea's whole premium is
+on late entry, and late entry is the worst part of the window.**
+
+Only 3 of 108 cells clear zero against ~2.7 expected by chance. A shuffle
+control put the best real cell beyond the null (p~0.005), but that null is
+i.i.d. and so destroys loss CLUSTERING - and the overlay fires after losses, so
+clustered losses beat an i.i.d. null for reasons that have nothing to do with
+the parameters. Not adopted.
+
+**A control that was wrong first time.** The initial null drew `won =
+random() < ask` - each trade winning at its own price. This strategy exists
+because these markets win MORE than their price (section 1), so the real data
+beat that null regardless of parameters: it tested "is there any edge at all",
+not "did the search find one". Replacing it with a price-conditional empirical
+rate moved the null's median from +106 to +175. Most of the apparent signal was
+the base edge.
+
+### The distance gate is a BAND, not a floor - and the confidence score had it backwards
+
+Measured on 3,841 deployed entries (settle 60s), momentum aligned:
+
+| distance | n | won | net/contract |
+|---|---|---|---|
+| 1.5-2x | 292 | 80.5% | -0.0012 |
+| **2-3x** | 679 | 84.8% | **+0.0360** |
+| 3-5x | 1143 | 84.1% | +0.0195 |
+| 5x+ | 1727 | 83.3% | +0.0064 |
+
+**The edge peaks at 2-4x and decays above it.** A strike far enough away to be
+safe is already priced for the safety it offers, so paying up for distance buys
+nothing. `regime.py`'s confidence score awarded its distance point for
+`>= 3.0x` - "more is better" - which scored a 13x setup as confidently as a 3x
+one and scored the best bucket of all as no better than the floor. Corrected to
+the measured `2.0 <= x < 4.0` band in `decision.py` and in the alert.
+
+**One condition separates on its own**, and it is not distance:
+
+```
+momentum aligned   n=3638  84.2%  +0.0197  [+0.0078, +0.0315]
+momentum against   n=203   71.4%  -0.0701  [-0.1329, -0.0074]
+```
+
+### What was adopted: confidence sizing
+
+Flat $2 was measured first and scales exactly: +115.03 against +57.42, and
+-37.05 drawdown against -18.53. Same trades, same win rate, twice of both.
+Recovery time is unchanged and is worth knowing - **median 11 trades to repay a
+loss, p90 101, worst 1,086**.
+
+Deployed instead is size conditioned on the measured band:
+
+```
+all entries        +0.0149/ct  [+0.0032, +0.0260]
+2.0-4.0x aligned   +0.0359/ct  [+0.0166, +0.0541]   n=1282, 33% of entries
+everything else    +0.0157/ct  [+0.0023, +0.0286]
+```
+
+Two contracts inside the band, one everywhere else - 2.4x the edge on a third
+of trades, and no extra size on the setups that do not support it. The
+difference against the rest does NOT clear zero on its own
+(+0.0226 [-0.0068, +0.0523]); what carries this is that the band's own interval
+excludes zero and is more than twice the pooled edge.
+
+`auto_daily_loss_limit` raised 10 -> 20 alongside it: a 2-contract loss is
+about $1.87 against $0.93, so the old floor tripped after half as many bad
+trades. A floor that stops a normal losing run early is a silent stop, not a
+safety control.

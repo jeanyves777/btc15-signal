@@ -41,7 +41,13 @@ def facts(*, btc, target, volatility_5m_bps, momentum_5m_bps=-12.3):
     )
 
 
+# 1.91x - under the band, and the live setup that was called 5/5 HIGH.
 THIN = dict(btc=85_831.73, target=85_917.19, volatility_5m_bps=5.2)
+# ~3.0x - inside the measured 2-4x edge band.
+MID = dict(btc=85_783.00, target=85_917.19, volatility_5m_bps=5.2)
+# ~13.8x - far ABOVE the band. Not "extra safe": measured at +0.0064/contract
+# against +0.0359 inside the band, because a strike that far away is already
+# priced for the safety it offers.
 WIDE = dict(btc=85_300.00, target=85_917.19, volatility_5m_bps=5.2)
 
 
@@ -55,11 +61,23 @@ def test_the_live_setup_is_no_longer_called_high_confidence():
     assert f["verdict"]["signals_total"] == 4
 
 
-def test_a_genuinely_wide_gap_still_reads_high():
+def test_a_gap_inside_the_measured_band_reads_high():
     """The fix must tighten the count, not disable it."""
-    f = facts(**WIDE)
-    assert f["price"]["distance_vol_units"] >= 3.0
+    f = facts(**MID)
+    assert 2.0 <= f["price"]["distance_vol_units"] < 4.0
     assert f["verdict"]["confidence"] == "HIGH"
+
+
+def test_a_gap_far_beyond_the_band_does_not_score_the_distance_point():
+    """"More distance is better" was wrong. Over 3,841 deployed entries the
+    edge peaks at 2-4x (+0.0359/contract) and decays above it (5x+ measures
+    +0.0064) - a strike far enough away to be safe is already priced for it.
+    The old >=3x rule scored a 13x setup as confidently as a 3x one."""
+    f = facts(**WIDE)
+    assert f["price"]["distance_vol_units"] >= 4.0
+    wide = f["verdict"]["signals_agreeing"]
+    mid = facts(**MID)["verdict"]["signals_agreeing"]
+    assert wide < mid, "a gap outside the band must score below one inside it"
 
 
 def test_no_signal_in_the_count_is_true_by_construction():
@@ -84,8 +102,8 @@ def test_no_signal_in_the_count_is_true_by_construction():
 def test_the_number_and_the_prose_agree_about_the_gap():
     """The old thresholds let "5/5 signals agree" sit directly above a line
     calling the same gap moderate. They now share the 3x boundary."""
-    thin, wide = facts(**THIN), facts(**WIDE)
+    thin, mid = facts(**THIN), facts(**MID)
     assert any("moderate" in e for e in thin["summary"]["evidence"])
-    assert any("comfortable" in e for e in wide["summary"]["evidence"])
+    assert any("comfortable" in e for e in mid["summary"]["evidence"])
     assert thin["verdict"]["confidence"] != "HIGH"
-    assert wide["verdict"]["confidence"] == "HIGH"
+    assert mid["verdict"]["confidence"] == "HIGH"

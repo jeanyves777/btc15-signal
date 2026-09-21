@@ -249,10 +249,33 @@ class Settings(BaseSettings):
     # hard stop, not a preference. All are overridable from Telegram EXCEPT the
     # kill switch, which can only ever be turned off from there, never on.
     auto_trade_enabled: bool = False
-    auto_daily_loss_limit: float = 10.0   # stop for the day once down this much
+    # Stop for the day once down this much. Raised 10 -> 20 alongside
+    # confidence sizing: a 2-contract loss is about $1.87 against $0.93 at one
+    # contract, so the old floor tripped after roughly half as many bad trades
+    # and would have stopped a day that the strategy was merely having a normal
+    # losing run in. A floor that stops trading early is not a safe floor, it
+    # is a silent stop - the failure mode that has already cost this system
+    # four hours once. The measured max drawdown at 2 contracts is -37.05 over
+    # 68 days, so this is a day limit, not a strategy limit.
+    auto_daily_loss_limit: float = 20.0
     auto_max_trades_per_day: int = 40
     auto_max_trades_per_hour: int = 6
     auto_min_seconds_between: int = 120
     max_budget: float = 100.0  # ceiling for /size, a guard against a fat finger
     trade_contract_count: int = 1
+    # CONFIDENCE SIZING. The edge is not flat across the distance gate: it
+    # peaks between 2x and 4x volatility and decays above, because a very
+    # distant strike is already priced for the safety it offers.
+    #
+    # Measured on 3,841 deployed entries over 68 days, momentum aligned:
+    #   all entries          +0.0149/ct [+0.0032, +0.0260]
+    #   distance 2.0-4.0x    +0.0359/ct [+0.0166, +0.0541]   n=1282, 33%
+    #   everything else      +0.0157/ct [+0.0023, +0.0286]
+    #
+    # So size up where the edge is 2.4x, and only there. Above 4x the edge
+    # fades (5x+ measures +0.0064), which is why this is a BAND and not a
+    # floor - the old ">= 3x is better" reading had it backwards.
+    high_confidence_contracts: int = 2
+    high_confidence_distance_min: float = 2.0
+    high_confidence_distance_max: float = 4.0
     dry_run: bool = True

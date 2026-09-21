@@ -190,13 +190,16 @@ def decision_facts(
     # the market had flipped to 68% the other way. A margin that thin is not
     # five signals agreeing.
     #
-    # So the distance term now requires a REAL margin - the same 3x the
-    # evidence line calls "comfortable", so the number and the prose can no
-    # longer contradict each other - and the free term is gone.
+    # The distance term is a BAND, not a floor. "More distance is better" was
+    # wrong: measured over 3,841 deployed entries the edge peaks at 2-4x
+    # volatility (+0.0359/contract) and decays above it (5x+ returns +0.0064),
+    # because a strike far enough away to be safe is already priced for it.
+    # The earlier >=3x rule scored a 6x setup as confidently as a 3x one and
+    # scored the best bucket of all - 2-3x - as no better than the floor.
     agreeing = sum(
         [
             bool(rule_match),
-            vol_units >= 3.0,
+            2.0 <= vol_units < 4.0,
             book_for_us == "BOOK_FAVOURS_US",
             (momentum_5m_bps > 0) == (side == "UP"),
         ]
