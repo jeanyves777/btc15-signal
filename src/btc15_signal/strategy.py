@@ -37,6 +37,14 @@ class EntryRule:
     # It does NOT rescue cheaper bands - at 0.80-0.85 the same >=10 bps filter
     # measures -$0.0096 - and 4-hour trend alignment is worse than no filter.
     min_momentum_bps: float = 0.0
+    # Require a confirmed level standing in the way of the move that beats us
+    # (see `levels.py`). Measured over 71 days: the setups WITH one are
+    # +0.0198 [+0.0049, +0.0341], those without +0.0059 [-0.0093, +0.0202] -
+    # but the DIFFERENCE is +0.0140 [-0.0067, +0.0344], p=0.090, which does not
+    # establish that filtering beats not filtering. Enabled by operator
+    # decision on 2026-09-21; defaults OFF so the code's own default stays the
+    # measured rule. It also refuses about half of qualifying setups.
+    require_blocking_level: bool = False
     fee_buffer: float = 0.02
 
     @classmethod
@@ -47,7 +55,13 @@ class EntryRule:
         return cls(**_known_fields(cls, json.loads(source.read_text())))
 
     def matches(
-        self, prediction: Prediction, snapshot: MarketSnapshot, ask: float
+        self,
+        prediction: Prediction,
+        snapshot: MarketSnapshot,
+        ask: float,
+        *,
+        blocking_level: float | None = None,
+        levels_ready: bool = True,
     ) -> tuple[bool, str]:
         normalized_distance = prediction.distance_bps / max(snapshot.volatility_5m_bps, 1.0)
         direction = 1 if prediction.side == "UP" else -1
@@ -62,12 +76,29 @@ class EntryRule:
                 "momentum alignment",
             ),
             (signed_momentum >= self.min_momentum_bps, "momentum strength"),
+            # Unknown levels are a REFUSAL, not a pass. The guard discipline in
+            # autotrade.py is that a check which cannot be evaluated answers
+            # no; letting a stale cache wave trades through would make the gate
+            # silently optional exactly when Binance is unwell. It is reported
+            # as its own reason so a level outage can never look like an
+            # ordinary rule rejection.
+            (
+                not self.require_blocking_level
+                or (levels_ready and blocking_level is not None),
+                "support/resistance" if levels_ready else "levels unavailable",
+            ),
         ]
         failed = [label for passed, label in checks if not passed]
         return not failed, ", ".join(failed)
 
     def check_detail(
-        self, prediction: Prediction, snapshot: MarketSnapshot, ask: float
+        self,
+        prediction: Prediction,
+        snapshot: MarketSnapshot,
+        ask: float,
+        *,
+        blocking_level: float | None = None,
+        levels_ready: bool = True,
     ) -> list[tuple[str, bool, str]]:
         """Every gate with its verdict and the actual numbers, for display.
 
@@ -77,7 +108,7 @@ class EntryRule:
         distance = prediction.distance_bps / max(snapshot.volatility_5m_bps, 1.0)
         direction = 1 if prediction.side == "UP" else -1
         momentum = direction * snapshot.momentum_5m_bps
-        return [
+        checks = [
             (
                 "price band",
                 self.min_ask <= ask <= self.max_ask,
@@ -100,6 +131,26 @@ class EntryRule:
                 f"{prediction.raw_probability:.0%} vs >={self.min_raw_probability:.0%}",
             ),
         ]
+        # Only a GATE belongs in Checks. When the level is not required it is a
+        # confidence contributor and lives in Context with its points, where a
+        # green tick cannot imply it had a say in whether this trade is allowed.
+        if self.require_blocking_level:
+            checks.append((
+                "level",
+                levels_ready and blocking_level is not None,
+                self._level_detail(blocking_level, levels_ready),
+            ))
+        return checks
+
+    def _level_detail(self, blocking_level: float | None, levels_ready: bool) -> str:
+        if not levels_ready:
+            return "unavailable - refusing while unknown"
+        if blocking_level is None:
+            return (
+                "none between price and target"
+                + ("" if self.require_blocking_level else " (not required)")
+            )
+        return f"${blocking_level:,.0f} in the way"
 
 
 @dataclass(frozen=True)

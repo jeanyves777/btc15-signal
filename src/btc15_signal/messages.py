@@ -87,6 +87,27 @@ def _distance_bps(price: float, target: float) -> str:
     return f"{bps:+.0f} bps"
 
 
+def _calibration(model: float, observed: float, samples: int) -> str:
+    """Model probability beside the observed rate, with the sample count.
+
+    An observed rate is suppressed below a handful of samples: "observed 100%
+    (1 samples)" reads as corroboration when it is one coin flip, and it once
+    sat directly beneath a model reading of 71%.
+
+    The model probability is NOT calibrated - two of the earliest live losses
+    came at 99.2% and 100.0% - so it is labelled as a score, never as odds.
+    """
+    if samples < 10:
+        return (
+            f"🧮 Model score {model:.0%} · "
+            f"<i>too few settled signals ({samples}) to compare against</i>"
+        )
+    return (
+        f"🧮 Model score {model:.0%} · observed {observed:.0%} "
+        f"({samples} samples)"
+    )
+
+
 def entry_alert(
     *,
     head: str,
@@ -105,6 +126,9 @@ def entry_alert(
     rule_reason: str = "",
     missing: str = "",
     checks: list[tuple[str, bool, str]] | None = None,
+    auto_blocked: str = "",
+    context: list[tuple[str, str]] | None = None,
+    similar: str = "",
 ) -> str:
     """An entry the operator can act on.
 
@@ -127,7 +151,7 @@ def entry_alert(
         f"\U0001f3af Target <code>${target:,.2f}</code> · now "
         f"<code>${price:,.2f}</code> ({_distance_bps(price, target)})",
         f"⏱ <b>{remaining // 60}m {remaining % 60:02d}s</b> to settle",
-        f"\U0001f9ee Model {model:.0%} · observed {observed:.0%} ({samples} samples)",
+        _calibration(model, observed, samples),
     ]
     if checks:
         # Every gate with its numbers. "rule says no: contract price band" hides
@@ -139,7 +163,27 @@ def entry_alert(
         lines.append("✅ <i>Rule: qualifies</i>")
     else:
         lines.append(f"\U0001f6ab <i>Rule says no: {escape(rule_reason or 'disabled')}</i>")
-    if not live:
+    if context:
+        # The numbers the Checks block does NOT carry. The settle timer in
+        # particular decided almost every refusal on 2026-09-21 and appeared
+        # nowhere: a setup could show five green ticks while a clock the
+        # message never mentioned was the only thing standing in the way.
+        lines.append("<b>Context</b>")
+        for label, value in context:
+            lines.append(f"  \u00b7 {escape(label)}: <code>{escape(value)}</code>")
+    if live and auto_blocked:
+        # The rule said yes and the bot still did not trade. On 2026-09-21 the
+        # 14:45 window showed five green ticks and "ENTRY READY" while the
+        # settle timer was refusing it - and could only ever refuse it, since
+        # the price reached the band with 422s left and 120s of hold would not
+        # complete before the 360s cutoff. Without this line there is no way to
+        # tell that from the message.
+        lines.append(
+            f"\U0001f916 <b>Automation did NOT take this</b> — "
+            f"<i>{escape(auto_blocked)}</i>"
+        )
+        lines.append("\U0001f446 <i>Your press is the only thing that will.</i>")
+    elif not live:
         lines.append("\U0001f446 <i>Not auto-validated — your press is the decision.</i>")
     if missing:
         # Name only what is actually missing. Listing settings that are already
@@ -149,6 +193,12 @@ def entry_alert(
         )
     if note:
         lines.append(f"⚠️ <i>{escape(note)}</i>")
+    if similar:
+        # Appended LAST and labelled shadow, so it can never be mistaken
+        # for the verdict that governs this alert. The deterministic rule
+        # above decides; this is a second opinion kept honest in public.
+        lines.append(RULE)
+        lines.append(similar)
     return "\n".join(lines)
 
 
@@ -175,7 +225,7 @@ def no_entry_alert(
             f"\U0001f3af Target <code>${target:,.2f}</code> · now "
             f"<code>${price:,.2f}</code> ({_distance_bps(price, target)})",
             f"\U0001f6ab <i>{escape(reason)}</i>",
-            f"\U0001f9ee Model {model:.0%} · observed {observed:.0%} ({samples} samples)",
+            _calibration(model, observed, samples),
         ]
     )
 
@@ -446,6 +496,7 @@ def auto_filled(
     limit: float | None = None,
     fee: float | None = None,
     exact: bool = True,
+    why: list[tuple[str, str]] | None = None,
 ) -> str:
     """An order automation placed and filled.
 
@@ -482,6 +533,15 @@ def auto_filled(
             "Check the Kalshi ticket for the real cost.</i>"
         )
     lines.append(f"<i>{escape(note)}</i>")
+    if why:
+        # WHY this trade, attached to the trade itself. Scattered across four
+        # tables afterwards, the answer to "what supported this order" was a
+        # reconstruction joined on drifting timestamps. Here it travels with
+        # the fill.
+        lines.append(RULE)
+        lines.append("\U0001f4cb <b>WHY THIS TRADE</b>")
+        for label, value in why:
+            lines.append(f"  \u00b7 {escape(label)}: <code>{escape(value)}</code>")
     lines.append("<i>No press was required. /auto off stops this immediately.</i>")
     return "\n".join(lines)
 
@@ -561,10 +621,26 @@ def cash_out(
         f"{chip} <b>{title}</b> · {escape(ticker)}",
         f"\U0001f4e6 Held <b>{side}</b> · bought {paid:.0%}, "
         f"{'sold' if sold else 'bid'} {bid:.0%}",
-        f"\U0001f3af Banked <b>{profit:+,.2f}</b> · "
-        f"{captured:.0%} of the most this trade could make",
-        f"\U0001f4b8 Gave up the last <code>${(1.0 - bid) * count:,.2f}</code> "
-        f"rather than risk <code>${bid * count:,.2f}</code> on it",
+    ]
+    if sold:
+        lines += [
+            f"\U0001f3af Banked <b>{profit:+,.2f}</b> · "
+            f"{captured:.0%} of the most this trade could make",
+            f"\U0001f4b8 Gave up the last <code>${(1.0 - bid) * count:,.2f}</code> "
+            f"rather than risk <code>${bid * count:,.2f}</code> on it",
+        ]
+    else:
+        # NOTHING moved. The failed cash-out on KXBTC15M-26SEP211400-00 still
+        # printed "Banked +0.20 - 91% of the most this trade could make"
+        # directly under "STILL HOLDING", which describes a sale that did not
+        # happen and contradicts its own headline. A miss must read as a miss.
+        lines += [
+            f"\U0001f4a4 Nothing sold · <b>{profit:+,.2f}</b> is what it "
+            f"WOULD have banked at {bid:.0%}",
+            "\U0001f4b5 <i>Still fully exposed · the position rides to "
+            "settlement</i>",
+        ]
+    lines += [
         f"⏱ {remaining // 60}m {remaining % 60:02d}s still to run",
         f"<i>{escape(note)}</i>",
     ]

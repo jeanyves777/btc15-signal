@@ -1,8 +1,11 @@
 import asyncio
+import hashlib
+import json
 import time
 from dataclasses import replace
 from datetime import UTC, datetime
 from html import escape
+from pathlib import Path
 from uuid import NAMESPACE_URL, uuid4, uuid5
 
 import httpx
@@ -14,8 +17,16 @@ from .config import Settings
 from .decision import decision_facts
 from .execution import KalshiExecutionClient
 from .features import _session
+from .hourly_shadow import HourlyShadow
 from .kalshi import KalshiClient, KalshiMarket
+from .levels import LevelTracker
+from .levels import confidence_points as level_points
 from .model import predict
+from .regime import base_points as regime_base_points
+from .regime import confidence_points as regime_confidence_points
+from .regime import label_for as regime_label
+from .regime import weight_at, weight_for_hour
+from .similar import Cohorts, Fingerprint
 from .store import Store, TradeProposal
 from .store import position_pnl as store_position_pnl
 from .strategy import EntryRule, ReversionRule, ReversionSetup
@@ -60,6 +71,25 @@ def report_sizing(settings: Settings) -> tuple[dict, str]:
 # +0.0166, 95% CI [+0.0084, +0.0247] over 22,560 clustered entries. Used to
 # say what a trade is worth AFTER costs, rather than letting the model guess.
 MEASURED_BAND_EDGE = 0.0166
+
+# Per-price net-of-fee edge, from the bucket study. Outside these ranges we have
+# NOT measured an edge, and saying "+0.0006 expected edge" about a 65c contract
+# - as the commentary did on 2026-09-21 - invents a number for a price nobody
+# studied. `None` means exactly that: unknown, not zero.
+MEASURED_BUCKETS = (
+    (0.85, 0.90, 0.0177),   # CI [+0.0048, +0.0298] - the only bucket excluding zero
+    (0.90, 0.93, 0.0114),   # CI [-0.0015, +0.0236] - marginal
+)
+
+
+def measured_edge_at(price: float) -> float | None:
+    """Gross edge measured for this price, or None where none was measured."""
+    for low, high, edge in MEASURED_BUCKETS:
+        if low <= price < high:
+            return edge
+    return None
+
+COHORTS = Cohorts()
 
 MEASURED_SESSION_EDGE = {
     "asia": 0.0093,
@@ -431,7 +461,17 @@ async def process_telegram(
             # As in the unattended path: only the order call may mark this
             # failed. Once it returns, money has moved, and a Telegram error
             # must not rewrite a real position out of the loss floor.
-            result = await trader.execute_with_take_profit(claimed, settings.entry_slippage)
+            submitted_ms = int(time.time() * 1000)
+            result = await trader.execute_with_take_profit(
+                        claimed, settings.entry_slippage,
+                        ceiling=settings.max_entry_price,
+                    )
+            log_execution(
+                store, claimed=claimed, result=result,
+                decision_ask=claimed.entry_limit,
+                submitted_ms=submitted_ms, acked_ms=int(time.time() * 1000),
+                attempt=1, entry_slippage=settings.entry_slippage,
+            )
             store.finish_proposal(
                 claimed.id,
                 result.status,
@@ -474,6 +514,83 @@ async def process_telegram(
             store.finish_proposal(proposal.id, "failed", f"{type(exc).__name__}: {exc}")
             await telegram.answer_callback(callback_id, "Order failed; see local logs")
             print(f"execution error: {type(exc).__name__}: {exc}", flush=True)
+
+
+def log_execution(
+    store: Store,
+    *,
+    claimed,
+    result,
+    decision_ask: float | None,
+    submitted_ms: int,
+    acked_ms: int,
+    attempt: int,
+    entry_slippage: float = 0.0,
+) -> None:
+    """Write down what one submitted order actually got. NEVER raises.
+
+    A backtest credits a fill at the price it saw; live, 9 of 21 orders filled.
+    Historical candles cannot close that gap - they record what the market did,
+    not what our order got - so every attempt has to be written down as it
+    happens, filled or not.
+
+    No book is read here. Reading before submitting would add a round trip to
+    the critical path and worsen the staleness being measured;
+    `decision_to_submit_ms` is the free version of it. Reading after would use
+    the recorder's `orderbook_fp` mapping, which FINDINGS records as unresolved
+    and must not be built on. The price after a miss is already captured
+    reliably by the next poll's observation row and is joined at analysis time.
+
+    Catches BaseException-minus-the-unignorable on purpose: this is pure
+    bookkeeping running immediately after money has moved, and nothing it does
+    may be allowed to propagate into the order path.
+    """
+    try:
+        filled = bool(result is not None and result.filled_count > 0)
+        # Looked up here, not passed in. `TradeProposal` has no `created_at`,
+        # and reading a missing attribute in an ARGUMENT expression raises at
+        # the call site - outside this try, in the order path, straight past
+        # `finish_proposal`. Anything that can fail belongs inside this block.
+        decision_ms = store.proposal_created_at(claimed.id)
+        store.record_execution({
+            "proposal_id": claimed.id,
+            "signal_id": signal_id_for(claimed.ticker),
+            "session_id": SESSION_ID,
+            "ticker": claimed.ticker,
+            "side": claimed.side,
+            "window_open": claimed.window_open,
+            "attempt": attempt,
+            "decision_ask": decision_ask,
+            # The limit that actually went to Kalshi, which is the proposal's
+            # limit PLUS the slippage allowance (`execute_with_take_profit`
+            # caps the sum at 0.99). Recording `entry_limit` here logged 0.85
+            # for three orders that were really submitted at 0.86 - and the
+            # slippage allowance is exactly the quantity that decides whether
+            # a fill happens, so the column that exists to explain misses was
+            # hiding the variable under test.
+            "limit_submitted": min(
+                claimed.entry_limit + max(0.0, entry_slippage), 0.99
+            ),
+            "decision_ms": decision_ms,
+            "submitted_ms": submitted_ms,
+            "acked_ms": acked_ms,
+            "decision_to_submit_ms": (
+                submitted_ms - decision_ms if decision_ms else None
+            ),
+            "round_trip_ms": acked_ms - submitted_ms,
+            "timing": timing_breakdown(),
+            "filled": filled,
+            # ExecutionResult has no fill price - it is read back separately
+            # by `record_fill_detail` and lands on `trade_proposals.fill_price`,
+            # which is joined at analysis time. Do not invent one here.
+            "fill_price": None,
+            "fill_count": result.filled_count if result is not None else 0.0,
+            "ask_after": None,
+        })
+    except Exception as exc:  # noqa: BLE001 - bookkeeping after money moved
+        # Deliberately broad. This runs immediately after an order has been
+        # placed; there is no failure here worth losing a filled position over.
+        print(f"execution log failed: {type(exc).__name__}: {exc}", flush=True)
 
 
 async def record_fill_detail(
@@ -681,6 +798,12 @@ def archive_observation(
             if status == "exited":
                 exit_reason = note
 
+        _hour = datetime.fromtimestamp(opened / 1000, UTC).hour
+        # Archived, never enforced: the regime lean is recorded on every
+        # observation so the hour question accumulates evidence. It moves
+        # the confidence EXPLANATION only - it cannot skip a market, stop
+        # polling, block an order or silence an alert.
+        _regime = weight_for_hour(_hour)
         row = {
             "session_id": SESSION_ID,
             "market_id": contract.ticker,
@@ -714,17 +837,386 @@ def archive_observation(
             "elapsed_minutes": snapshot.elapsed_minutes,
             "rule_match": int(rule_match), "failed_gates": failed or None,
             "session": _session(opened), "weekday": _weekday(opened),
-            "hour_utc": datetime.fromtimestamp(opened / 1000, UTC).hour,
+            "hour_utc": _hour,
             "vol_regime": (
                 "low" if snapshot.volatility_5m_bps < 8
                 else ("high" if snapshot.volatility_5m_bps > 20 else "mid")
             ),
+            "regime_weight": _regime.weight,
+            "confidence_adjustment": regime_confidence_points(_regime),
             "holding": holding, "entry_paid": paid, "unrealised": unrealised,
         }
         row.update(book_metrics(settings, contract.ticker))
         store.observe_full(row)
     except Exception as exc:  # noqa: BLE001 - archiving must never stop trading
         print(f"archive failed: {type(exc).__name__}: {exc}", flush=True)
+
+
+def entry_context(
+    settings: Settings,
+    snapshot: MarketSnapshot,
+    prediction,
+    ask: float,
+    priced_edge: float | None,
+    settled_s: float,
+    opened: int,
+    rule_match: bool = False,
+    blocking_level: float | None = None,
+    model_ok: bool = False,
+) -> list[tuple[str, str]]:
+    """The numbers the Checks block does not carry, in the order they matter.
+
+    Settle first, because it is the gate that actually decides: on 2026-09-21
+    it refused ten of thirteen qualifying windows and its countdown appeared in
+    no message. Edge second, because "the rule qualifies" says nothing about
+    whether the price is worth paying. The rest is the context needed to judge
+    an override by hand.
+    """
+    rows: list[tuple[str, str]] = []
+    normalized = prediction.distance_bps / max(snapshot.volatility_5m_bps, 1.0)
+    direction = 1 if prediction.side == "UP" else -1
+    momentum_aligned = direction * snapshot.momentum_5m_bps > 0
+    need = settings.entry_band_settle_s
+    rows.append((
+        "band settle",
+        f"held {settled_s:.0f}s of {need}s"
+        + ("  READY" if settled_s >= need else "  waiting"),
+    ))
+    if priced_edge is not None:
+        fee = kalshi_fee_charged(ask, 1)
+        net = priced_edge - fee
+        rows.append((
+            "measured edge",
+            f"{net:+.4f}/ct after a {fee:.4f} fee"
+            + ("" if net > 0.005 else "  (thin)"),
+        ))
+    else:
+        rows.append(("measured edge", "unknown - no study at this price"))
+    rows.append((
+        "distance",
+        f"${abs(snapshot.price - snapshot.target):,.0f} from target",
+    ))
+    rows.append((
+        "volatility",
+        f"{snapshot.volatility_5m_bps:.1f} bps / 5m",
+    ))
+    rows.append(("spread", f"{snapshot.spread_bps:.1f} bps"))
+    # Session AND the hour. Regime is archived on every observation
+    # (`session`, `hour_utc`, `weekday`, `vol_regime`) and registered in
+    # `scripts/forward_test.py`, but it does NOT gate: measured over 71 days,
+    # 17-20 UTC against every other hour is +0.0010/ct [-0.0272, +0.0305],
+    # p=0.542, and section 4 found every session interval overlapping every
+    # other. Shown so a live pattern can be seen and checked against the
+    # record, not so it can be traded on a hunch.
+    hour = datetime.fromtimestamp(opened / 1000, UTC).hour
+    rows.append(("session", f"{_session(opened)} · {hour:02d}:00 UTC"))
+    weight = weight_at(opened)
+    rows.append(("regime weight", weight.describe()))
+
+    # Confidence as arithmetic: base, then each contributor, then the result.
+    # Neither the clock nor the level may gate - both were tried as gates and
+    # both were wrong - so they appear here, priced in points, where their
+    # size can be seen and argued with.
+    signals = [
+        bool(rule_match),
+        normalized >= 3.0,
+        momentum_aligned,
+        model_ok,
+    ]
+    base = regime_base_points(sum(signals))
+    clock = regime_confidence_points(weight)
+    level = level_points(blocking_level is not None)
+    adjusted = max(0, min(100, base + clock + level))
+    rows.append((
+        "protective level",
+        (f"${blocking_level:,.0f} shields the target"
+         if blocking_level is not None
+         else "nothing shielding the target") + f"  ({level:+d})",
+    ))
+    rows.append((
+        "confidence",
+        f"base {regime_label(base)} ({sum(signals)}/4) \u00b7 clock {clock:+d} "
+        f"\u00b7 shield {level:+d} \u00b7 adjusted {regime_label(adjusted)}",
+    ))
+    return rows
+
+
+# Where the poll cycle spends its time. `now_ms` is stamped at the top of the
+# loop and an order goes out much later, and the gap between them - measured at
+# ~1,930-2,180ms against a 200ms round trip to Kalshi - is the single largest
+# known cause of missed fills. Moving the hourly recorder off the path did not
+# shift it, so this stops guessing and records the breakdown on the execution
+# row itself.
+#
+# A dict of integers touched a handful of times per poll. It cannot fail and it
+# cannot slow anything down, which is the only acceptable cost for something
+# sitting this close to an order.
+POLL_MARKS: dict[str, int] = {}
+
+
+def mark(name: str) -> None:
+    POLL_MARKS[name] = int(time.time() * 1000)
+
+
+def timing_breakdown() -> str:
+    """Milliseconds per phase since the poll began, as JSON. Never raises."""
+    try:
+        start = POLL_MARKS.get("poll")
+        if start is None:
+            return ""
+        ordered = sorted(POLL_MARKS.items(), key=lambda kv: kv[1])
+        out, previous = {}, start
+        for name, stamp in ordered:
+            if name == "poll":
+                continue
+            out[name] = stamp - previous
+            previous = stamp
+        out["_total"] = previous - start
+        return json.dumps(out)
+    except Exception:  # noqa: BLE001 - instrumentation is never fatal
+        return ""
+
+
+def strategy_version(settings: Settings) -> str:
+    """A short digest of the rule in force, so a record says which rule made it.
+
+    Without it the archive mixes decisions taken under different rules and a
+    later comparison silently averages across them - which on 2026-09-21 alone
+    would have pooled four different bands and two settle timers.
+    """
+    try:
+        rule = Path(settings.strategy_path).read_text(encoding="utf-8")
+    except OSError:
+        rule = "?"
+    payload = (
+        rule
+        + f"|settle={settings.entry_band_settle_s}"
+        + f"|window={settings.entry_to_seconds}-{settings.entry_from_seconds}"
+        + f"|slip={settings.entry_slippage}"
+    )
+    return hashlib.sha1(payload.encode("utf-8")).hexdigest()[:10]
+
+
+def decision_record(
+    store: Store,
+    settings: Settings,
+    claimed,
+    contract: KalshiMarket,
+    snapshot: MarketSnapshot,
+    prediction,
+    ask: float,
+    opened: int,
+    remaining: int,
+    now_ms: int,
+    settled_s: float,
+    blocking_level: float | None,
+    paid: float,
+    fee: float | None,
+    action: str = "ENTERED",
+    blocked_reason: str | None = None,
+) -> list[tuple[str, str]]:
+    """Everything that supported this order, recorded AND returned for display.
+
+    Afterwards these facts sit in four different tables joined on timestamps
+    that drift, so "why was this trade taken" was a reconstruction rather than
+    a record. Written once, at the moment the money moved.
+
+    Never raises: this runs immediately after a fill, and no bookkeeping may
+    propagate into the path that just spent money.
+    """
+    rows: list[tuple[str, str]] = []
+    try:
+        rule = EntryRule.load(settings.strategy_path)
+        hour = datetime.fromtimestamp(opened / 1000, UTC).hour
+        weight = weight_for_hour(hour)
+        edge = measured_edge_at(ask)
+        fee_charged = fee if fee is not None else kalshi_fee_charged(paid, 1)
+        net = (edge - fee_charged) if edge is not None else None
+        distance = abs(snapshot.price - snapshot.target)
+        normalized = prediction.distance_bps / max(snapshot.volatility_5m_bps, 1.0)
+        gates = rule.check_detail(
+            prediction, snapshot, ask,
+            blocking_level=blocking_level, levels_ready=True,
+        )
+        read = None
+        if COHORTS.ok:
+            read = COHORTS.read(
+                Fingerprint(
+                    remaining_s=remaining, ask=ask,
+                    normalized_distance=normalized,
+                    volatility_bps=snapshot.volatility_5m_bps,
+                    momentum_bps=snapshot.momentum_5m_bps,
+                    session=_session(opened),
+                    vol_regime=(
+                        "low" if snapshot.volatility_5m_bps < 8
+                        else "high" if snapshot.volatility_5m_bps > 20 else "mid"
+                    ),
+                    side_is_up=prediction.side == "UP",
+                ),
+                fill_rate=store.execution_report().get("fill_rate"),
+                as_of_ms=now_ms,
+            )
+
+        rows.append(("gates", ", ".join(f"{name} {value}" for name, ok, value
+                                        in gates if ok)))
+        rows.append(("band settle", f"held {settled_s:.0f}s of "
+                                    f"{settings.entry_band_settle_s}s"))
+        rows.append((
+            "measured edge",
+            f"{net:+.4f}/ct after a {fee_charged:.4f} fee"
+            if net is not None else "unknown at this price",
+        ))
+        rows.append(("distance", f"${distance:,.0f} = {normalized:.1f}x vol"))
+        rows.append(("volatility", f"{snapshot.volatility_5m_bps:.1f} bps / 5m"))
+        rows.append(("momentum", f"{snapshot.momentum_5m_bps:+.1f} bps"))
+        rows.append(("spread", f"{snapshot.spread_bps:.1f} bps"))
+        if blocking_level is not None:
+            rows.append(("protective level", f"${blocking_level:,.0f}"))
+        rows.append((
+            "regime",
+            f"{_session(opened)} {hour:02d}:00 UTC \u00b7 confidence "
+            f"{regime_confidence_points(weight):+d}",
+        ))
+        rows.append(("fill", f"paid {paid:.2f} against a {ask:.2f} ask"))
+        if read is not None:
+            rows.append((
+                "similar markets",
+                f"{read.n} comparable \u00b7 p(win) "
+                f"{read.win_probability:.0%} \u00b7 says {read.action}",
+            ))
+            rows.append(("similar says", read.reason))
+
+        store.record_decision_record({
+            "observation_id": f"{opened}:{remaining}",
+            "signal_id": signal_id_for(contract.ticker),
+            "market_id": contract.ticker,
+            "proposal_id": claimed.id if claimed is not None else None,
+            "strategy_version": strategy_version(settings),
+            "action": action,
+            "blocked_reason": blocked_reason,
+            "level_adjustment": level_points(blocking_level is not None),
+            "cohort_win_low": read.win_low if read else None,
+            "cohort_win_high": read.win_high if read else None,
+            "window_open": opened,
+            "created_at": now_ms, "ticker": contract.ticker,
+            "side": prediction.side, "remaining_s": remaining, "ask": ask,
+            "limit_submitted": (
+                min(claimed.entry_limit + settings.entry_slippage, 0.99)
+                if claimed is not None else None
+            ),
+            "count": claimed.count if claimed is not None else None,
+            "gates": "; ".join(f"{name}={value}" for name, _ok, value in gates),
+            "settled_s": settled_s, "measured_edge": edge, "fee": fee_charged,
+            "net_edge": net, "distance_dollars": distance,
+            "normalized_distance": normalized,
+            "volatility_bps": snapshot.volatility_5m_bps,
+            "momentum_bps": snapshot.momentum_5m_bps,
+            "spread_bps": snapshot.spread_bps,
+            "session": _session(opened), "hour_utc": hour,
+            "vol_regime": (
+                "low" if snapshot.volatility_5m_bps < 8
+                else "high" if snapshot.volatility_5m_bps > 20 else "mid"
+            ),
+            "regime_weight": weight.weight,
+            "confidence_adjustment": regime_confidence_points(weight),
+            "protective_level": blocking_level,
+            "cohort_n": read.n if read else None,
+            "cohort_win_probability": read.win_probability if read else None,
+            "cohort_action": read.action if read else None,
+            "cohort_reason": read.reason if read else None,
+            "fill_price": paid if claimed is not None else None,
+            "filled": 1 if claimed is not None else 0, "won": None,
+        })
+    except Exception as exc:  # noqa: BLE001 - bookkeeping after money moved
+        print(f"decision record failed {type(exc).__name__}: {exc}", flush=True)
+    return rows
+
+
+def shadow_read(
+    store: Store,
+    settings: Settings,
+    contract: KalshiMarket,
+    snapshot: MarketSnapshot,
+    prediction,
+    ask: float,
+    opened: int,
+    remaining: int,
+    now_ms: int,
+    rule_match: bool,
+    traded: bool = False,
+) -> str:
+    """Retrieve comparable markets and compare the actions. SHADOW ONLY.
+
+    Called from two places, and both of them are after the trading decision
+    they describe: where the entry alert is built, and immediately after an
+    order has gone to the exchange - so a 95ms corpus query can never delay a
+    fill. The second call site exists because this only ever ran with the
+    alert, while the auto path returns before the alert is built: every window
+    the bot actually TRADED was therefore absent from `shadow_decisions`, and
+    the head-to-head in scripts/score_shadow.py had nothing to compare.
+
+    `rule_match` and `traded` are recorded as of THIS call, which is what makes
+    the row honest - `rule_qualified` is the rule's verdict at this poll, not
+    at the alert poll, and the rule can flip between the two.
+
+    Returns the message text, or "" when the corpus is missing or the cohort is
+    too thin to have an opinion. It NEVER trades, gates, or changes a size.
+    """
+    if not COHORTS.ok:
+        return ""
+    try:
+        fingerprint = Fingerprint(
+            remaining_s=remaining,
+            ask=ask,
+            normalized_distance=(
+                prediction.distance_bps / max(snapshot.volatility_5m_bps, 1.0)
+            ),
+            volatility_bps=snapshot.volatility_5m_bps,
+            momentum_bps=snapshot.momentum_5m_bps,
+            session=_session(opened),
+            vol_regime=(
+                "low" if snapshot.volatility_5m_bps < 8
+                else "high" if snapshot.volatility_5m_bps > 20 else "mid"
+            ),
+            side_is_up=prediction.side == "UP",
+        )
+        fills = store.execution_report()
+        # as_of_ms enforces walk-forward: only markets that had already
+        # settled may inform this decision.
+        read = COHORTS.read(
+            fingerprint, fill_rate=fills.get("fill_rate"), as_of_ms=now_ms
+        )
+        if read is None:
+            return ""
+        store.record_shadow_decision({
+            "window_open": opened, "created_at": now_ms,
+            "ticker": contract.ticker, "side": prediction.side,
+            "remaining_s": remaining, "ask": ask, "cohort_n": read.n,
+            "win_probability": read.win_probability,
+            "raw_win_rate": read.raw_win_rate,
+            "net_edge_now": read.net_edge_now,
+            "enter_now_net": read.enter_now_net,
+            "wait_limit_net": read.wait_limit_net,
+            "wait_real_net": read.wait_real_net,
+            "dip_price": read.dip_price, "dip_rate": read.dip_rate,
+            "dip_n": read.dip_n, "win_low": read.win_low,
+            "win_high": read.win_high, "edge_low": read.edge_low,
+            "prior": read.prior, "wait_limit_low": read.wait_limit_low,
+            "mean_drift": read.mean_drift,
+            "ran_away_rate": read.ran_away_rate,
+            "session": fingerprint.session, "vol_regime": fingerprint.vol_regime,
+            "action": read.action, "reason": read.reason,
+            # Both as of this call. `traded` was hard-coded 0 here and
+            # updated nowhere. `record_fill` now stamps the whole window when
+            # the fill is read back; this covers the order's own row even when
+            # that read-back fails and never happens.
+            "rule_qualified": int(rule_match), "traded": int(traded),
+            "won": None,
+        })
+        return read.as_message()
+    except Exception as exc:  # noqa: BLE001 - shadow work is never fatal
+        print(f"shadow read failed {type(exc).__name__}: {exc}", flush=True)
+        return ""
 
 
 async def primary_signal(
@@ -737,8 +1229,16 @@ async def primary_signal(
     remaining: int,
     now_ms: int,
     trader: KalshiExecutionClient | None = None,
+    levels: LevelTracker | None = None,
 ) -> None:
     rule = EntryRule.load(settings.strategy_path)
+    # Read from the cache only. The tracker refreshes on its own slow clock
+    # after the trading path, because levels need ~25h of bars and that second
+    # Binance call on the order path is exactly the latency that cost three
+    # fills on 2026-09-21 (FINDINGS section 22).
+    pivot = levels.blocking(now_ms, snapshot.price, snapshot.target) if levels else None
+    blocking_level = pivot.price if pivot else None
+    levels_ready = bool(levels and levels.pivots)
     # Scan the whole window rather than a single minute: take the first minute
     # where the rule qualifies, and fall back to one paper summary at the end if
     # none ever does. Firing only at rule.remaining_minutes meant the service
@@ -750,7 +1250,10 @@ async def primary_signal(
     prediction = predict(snapshot)
     calibration = store.calibration(prediction.bucket)
     contract_ask = contract.ask(prediction.side)
-    rule_match, failed_checks = rule.matches(prediction, snapshot, contract_ask)
+    rule_match, failed_checks = rule.matches(
+        prediction, snapshot, contract_ask,
+        blocking_level=blocking_level, levels_ready=levels_ready,
+    )
     qualified = rule.enabled and rule_match and settings.entry_alerts_enabled
 
     # Three states, not two. The rule's verdict informs the decision without
@@ -784,19 +1287,35 @@ async def primary_signal(
     # can make is 8c while 92c is at risk, and the Kalshi fee peaks mid-book, so
     # a setup that still "matches" can easily be worth less than it costs. Every
     # retry must clear expected value after the fee, not just the price band.
-    retry_edge = MEASURED_BAND_EDGE - kalshi_fee_charged(contract_ask, 1)
-    # Drift is measured against the last attempt that actually REACHED the
-    # exchange, not the first proposal of the window - which may be a manual
-    # button offered far below the band and would make every drift look huge.
-    drift = contract_ask - (
+    priced_edge = measured_edge_at(contract_ask)
+    retry_edge = (
+        priced_edge - kalshi_fee_charged(contract_ask, 1)
+        if priced_edge is not None
+        else -1.0  # no measurement at this price: never a reason to retry
+    )
+    # Drift from the FIRST order of the window - the price we originally decided
+    # to pay - not the last. Measured against the last attempt it is measured
+    # incrementally, so a steady climb never trips the cap: on 2026-09-21 the
+    # 10:00 window walked 0.85 -> 0.926 -> 0.963 in one-cent-ish steps and every
+    # single step looked small while the total was 11 cents.
+    #
+    # Excludes proposals that never reached the exchange, so a manual button
+    # offered far below the band is not the baseline.
+    last_order_ms = (
         store.db.execute(
-            "SELECT entry_limit FROM trade_proposals WHERE window_open=? "
-            "AND strategy='primary' AND entry_order_id IS NOT NULL "
-            "ORDER BY attempt DESC LIMIT 1",
+            "SELECT MAX(created_at) FROM trade_proposals WHERE window_open=? "
+            "AND strategy='primary' AND entry_order_id IS NOT NULL",
             (opened,),
         ).fetchone()
-        or (contract_ask,)
+        or (None,)
     )[0]
+    first_order = store.db.execute(
+        "SELECT entry_limit FROM trade_proposals WHERE window_open=? "
+        "AND strategy='primary' AND entry_order_id IS NOT NULL "
+        "ORDER BY attempt ASC LIMIT 1",
+        (opened,),
+    ).fetchone()
+    drift = contract_ask - (first_order[0] if first_order else contract_ask)
     may_retry = (
         # terminal, and terminal in the one way that means nothing was bought:
         # an immediate-or-cancel leaves no resting order behind it
@@ -887,7 +1406,10 @@ async def primary_signal(
             # The numbers, not just the label: "target distance" alone hides
             # whether it missed by a hair or by a mile, and overnight that is
             # the difference between a rule to tune and a rule that is working.
-            detail = rule.check_detail(prediction, snapshot, contract_ask)
+            detail = rule.check_detail(
+                prediction, snapshot, contract_ask,
+                blocking_level=blocking_level, levels_ready=levels_ready,
+            )
             verdict = "rule: " + "; ".join(
                 f"{name}({value})" for name, passed, value in detail if not passed
             )
@@ -898,16 +1420,83 @@ async def primary_signal(
             f"{remaining}s]: {verdict}",
             flush=True,
         )
+    # Why automation did NOT take a setup the rule qualified. The alert and the
+    # auto path enforce DIFFERENT gates - the Checks block shows the rule, while
+    # the settle timer, the attempt caps and the safety limits live only in the
+    # auto path - so a message could show five green ticks and "ENTRY READY"
+    # while the bot was refusing to trade it, with the reason nowhere on screen.
+    # Computed here rather than inside the auto block so the ALERT can show it.
+    # It is one indexed read of at most 60 rows, and it is the single number
+    # that explained most refusals on 2026-09-21 while being invisible.
+    settled_s = store.band_streak_seconds(opened, rule.min_ask, rule.max_ask, now_ms)
+
+    auto_blocked = ""
+    declined_reason: str | None = None
+    if rule.enabled and rule_match and qualified:
+        if not auto_on:
+            auto_blocked = "automation is off (/auto on)"
+        elif trader is None:
+            auto_blocked = "no execution client configured"
     if rule.enabled and rule_match and auto_on and trader is not None:
+        # The attempt and drift caps are enforced HERE, not only in `may_retry`.
+        # Separating alerting from trading gave `trading_open` its own way into
+        # this block, which bypassed both: the 10:00 window on 2026-09-21 placed
+        # SIX orders against a limit of three and chased 0.85 to 0.963 against a
+        # cap of 0.08. A limit that only one of several paths respects is not a
+        # limit.
+        # ORDER MATTERS. Position ownership and the daily floor are the real
+        # safety controls and must speak first: after a fill, the honest reason
+        # to refuse is "a position is already open", not "too many attempts".
+        # The attempt cap is a chase control, not a safety one, and letting it
+        # answer first hid whether the position guard was even working.
         limits = auto_limits(store, settings)
         counts = store.auto_state(now_ms)
         state = autotrade.AutoState(*counts)
         blocked = autotrade.auto_block_reason(
             limits, state, contract_ask, enabled=execution_configured(settings)
         )
+        # The price must have SETTLED in the band, not merely touched it. This
+        # is the single largest improvement measured: entering on the first
+        # qualifying minute does not clear zero, entering after two minutes in
+        # the band nearly triples the edge.
+        if not blocked and settled_s < settings.entry_band_settle_s:
+            blocked = (
+                f"price has only held the band {settled_s:.0f}s, "
+                f"waiting for {settings.entry_band_settle_s}s"
+            )
+        if not blocked and attempts >= settings.auto_retry_limit:
+            blocked = (
+                f"{attempts} order(s) already this window, limit "
+                f"{settings.auto_retry_limit}"
+            )
+        # No chasing. Observing is free and there are minutes left, so a retry
+        # may not pay more than the first order did - if the price ran away,
+        # wait and see whether it comes back.
+        if not blocked and attempts and drift > settings.auto_retry_max_drift:
+            blocked = (
+                f"price is {drift:+.2f} worse than the first order at "
+                f"{contract_ask - drift:.2f}; waiting for it to come back"
+            )
+        if not blocked and attempts and last_order_ms is not None:
+            waited = (now_ms - last_order_ms) / 1000
+            if waited < settings.auto_retry_cooldown_s:
+                blocked = (
+                    f"only {waited:.0f}s since the last order, letting the book "
+                    f"settle for {settings.auto_retry_cooldown_s}s"
+                )
         if blocked:
+            auto_blocked = blocked
+            # Only the reason is kept here. The record itself is written below,
+            # clear of this block - see the comment at that call.
+            declined_reason = blocked
             print(f"auto: declined {contract.ticker} - {blocked}", flush=True)
         else:
+            # SIZE IS THE OPERATOR'S, AND ONLY THE OPERATOR'S. The regime
+            # weight was briefly wired into this budget on 2026-09-21; it was
+            # never asked for and is reverted. Regime is intelligence - it is
+            # shown in the alert and archived for measurement - and it must not
+            # scale, throttle or otherwise touch what gets ordered. The budget
+            # comes from settings and nothing else.
             count = contracts_for_budget(limits.budget, contract_ask)
             proposal = create_proposal(
                 store, "primary", opened, contract, prediction.side,
@@ -922,14 +1511,46 @@ async def primary_signal(
                 # to 'failed', erasing it from the daily loss floor and freeing
                 # the one-position guard while the contracts were still live.
                 result = None
+                submitted_ms = int(time.time() * 1000)
                 try:
-                    result = await trader.execute_with_take_profit(claimed, settings.entry_slippage)
+                    result = await trader.execute_with_take_profit(
+                        claimed, settings.entry_slippage,
+                        ceiling=settings.max_entry_price,
+                    )
                 except (httpx.HTTPError, OSError, RuntimeError, ValueError) as exc:
                     store.finish_proposal(
                         claimed.id, "failed", f"{type(exc).__name__}: {exc}"
                     )
                     print(f"auto: order failed {type(exc).__name__}", flush=True)
 
+                # Logged whether or not the order threw: a miss is exactly
+                # the case the execution archive exists to capture, and the
+                # failures are the rows that would otherwise never be written.
+                log_execution(
+                    store, claimed=claimed, result=result,
+                    decision_ask=contract_ask,
+                    submitted_ms=submitted_ms, acked_ms=int(time.time() * 1000),
+                    attempt=attempts + 1,
+                    entry_slippage=settings.entry_slippage,
+                )
+                # The shadow row for a window we actually TRADED. `shadow_read`
+                # ran only where the entry alert is built, and this branch
+                # returns long before that, so `shadow_decisions` held rows for
+                # the windows the bot passed on and nothing at all for the ones
+                # it took - precisely the half the head-to-head needs. Here for
+                # the same reason `log_execution` is here: the order is already
+                # at the exchange, so the corpus query cannot cost a fill. And
+                # BEFORE `record_fill_detail`, so the `traded` stamp in
+                # `record_fill` has a row to land on.
+                #
+                # `getattr` rather than `result.filled_count`: an argument
+                # expression is evaluated outside the callee's try, in the
+                # order path - the same trap `log_execution` documents.
+                shadow_read(
+                    store, settings, contract, snapshot, prediction,
+                    contract_ask, opened, remaining, now_ms, rule_match,
+                    traded=getattr(result, "filled_count", 0) > 0,
+                )
                 if result is not None:
                     store.finish_proposal(
                         claimed.id, result.status, result.note,
@@ -958,6 +1579,12 @@ async def primary_signal(
                                     limit=contract_ask,
                                     fee=fee,
                                     exact=exact,
+                                    why=decision_record(
+                                        store, settings, claimed, contract,
+                                        snapshot, prediction, contract_ask,
+                                        opened, remaining, now_ms, settled_s,
+                                        blocking_level, paid, fee,
+                                    ),
                                 )
                             )
                         else:
@@ -981,6 +1608,23 @@ async def primary_signal(
                 rule_match, failed_checks, contract_ask, remaining, opened, now_ms,
             )
             return
+    # A refusal is evidence too, and it has no proposal: recording only the
+    # fills left the archive holding one side of every decision the system ever
+    # made. But `decision_record` runs a COHORTS.read plus an execution_report
+    # - the same ~95ms archive-only corpus query `shadow_read` carries - and it
+    # was doing that INSIDE the block that places the order, on the declined
+    # path, where the next thing that can happen in this window is a retry
+    # attempt at the very next poll. Same row, same data, written here instead:
+    # after every branch that can send an order, and still above the
+    # `not alerting` return, because most refusals happen on polls that have
+    # already alerted.
+    if declined_reason is not None:
+        decision_record(
+            store, settings, None, contract, snapshot, prediction,
+            contract_ask, opened, remaining, now_ms, settled_s,
+            blocking_level, contract_ask, None, action="DECLINED",
+            blocked_reason=declined_reason,
+        )
     if not alerting:
         # Already alerted this window. Trading was evaluated above; there is
         # nothing further to say until something happens.
@@ -1017,8 +1661,22 @@ async def primary_signal(
             samples=calibration.samples,
             rule_ok=rule_match,
             rule_reason=failed_checks,
-            checks=rule.check_detail(prediction, snapshot, contract_ask),
+            checks=rule.check_detail(
+                prediction, snapshot, contract_ask,
+                blocking_level=blocking_level, levels_ready=levels_ready,
+            ),
             missing=missing_for_execution(settings),
+            auto_blocked=auto_blocked,
+            similar=shadow_read(
+                store, settings, contract, snapshot, prediction, contract_ask,
+                opened, remaining, now_ms, rule_match,
+            ),
+            context=entry_context(
+                settings, snapshot, prediction, contract_ask,
+                priced_edge, settled_s, opened,
+                rule_match=rule_match, blocking_level=blocking_level,
+                model_ok=prediction.raw_probability >= 0.9,
+            ),
         )
         buttons = messages.execute_buttons(
             proposal.count, proposal.id, override=not rule_match
@@ -1116,8 +1774,11 @@ def schedule_commentary(
         entry_paid=position[1] if position else None,
         unrealised=round((exit_bid - position[1]) * position[2], 4) if position else None,
         model_probability=prediction.raw_probability,
-        measured_edge=MEASURED_BAND_EDGE,
+        measured_edge=measured_edge_at(contract_ask),
         slippage=settings.entry_slippage,
+        # Time-of-day adjusts the confidence EXPLANATION only. It never
+        # reaches polling, evaluation, the order path, alerts or archiving.
+        hour_utc=datetime.fromtimestamp(opened / 1000, UTC).hour,
     )
     engine = brain_mod.Brain(
         brain_mod.BrainConfig(
@@ -1126,7 +1787,13 @@ def schedule_commentary(
             timeout_s=settings.brain_timeout_s,
         )
     )
-    asyncio.create_task(brain_mod.decision_commentary(engine, facts, telegram.send))
+    if settings.brain_commentary_enabled:
+        # Off by default since 2026-09-21: the entry alert now carries the
+        # checks, the context, the confidence arithmetic and the similar-regime
+        # read, so a second message restated all of it in prose.
+        asyncio.create_task(
+            brain_mod.decision_commentary(engine, facts, telegram.send)
+        )
 
 
 async def report_settlement(
@@ -1254,7 +1921,16 @@ async def cash_out_exit(
         return
     side, paid, count, ticker, proposal_id = position
 
-    bid = 1 - contract.ask("DOWN" if side == "UP" else "UP")
+    # The quoted bid, then the price we would actually accept. Judging the
+    # trade on the quote and then selling at the quote is what failed on
+    # 2026-09-21: an IOC at a 0.979 top-of-book filled nothing while the app
+    # offered 0.93. Everything below - the gate AND the order - uses the
+    # discounted price, so a quote that is not really there declines instead
+    # of firing.
+    quoted = contract.bid(side)
+    if quoted <= 0.0:  # older payloads carried no bid at all
+        quoted = 1 - contract.ask("DOWN" if side == "UP" else "UP")
+    bid = round(quoted - settings.exit_slippage, 4)
     if not 0.0 < bid < 1.0 or bid < settings.cash_out_min_bid:
         return
     available = 1.0 - paid  # the most this position can still make
@@ -1265,7 +1941,9 @@ async def cash_out_exit(
 
     captured = (bid - paid) / available
     try:
-        result = await trader.close_position(ticker, side, count, bid)
+        result = await trader.close_position(
+            ticker, side, count, bid, floor=settings.min_exit_price
+        )
         if result.filled_count > 0:
             store.mark_exited(proposal_id, bid, result.filled_count, result.note)
             try:
@@ -1343,7 +2021,9 @@ async def reversal_exit(
     sellable = 0.0 < bid < 1.0
     if auto_is_on(store, settings) and trader is not None and sellable:
         try:
-            result = await trader.close_position(ticker, side, count, bid)
+            result = await trader.close_position(
+            ticker, side, count, bid, floor=settings.min_exit_price
+        )
             if result.filled_count > 0:
                 # Record the sale before refining its price. If the fill lookup
                 # then fails, the position is still correctly marked closed -
@@ -1482,13 +2162,21 @@ async def service() -> None:
             )
         except (OSError, ValueError) as exc:
             print(f"Kalshi execution disabled: {exc}", flush=True)
+    hourly = HourlyShadow(settings) if settings.hourly_enabled else None
+    levels = LevelTracker()
+    if hourly:
+        print(f"hourly ladder recording (shadow) -> {settings.hourly_database_path}",
+              flush=True)
     print("BTC15 signal started; execution requires Telegram approval", flush=True)
     last_ticker = None
     try:
         while True:
             now_ms = int(time.time() * 1000)
+            POLL_MARKS.clear()
+            POLL_MARKS["poll"] = now_ms
             try:
                 await process_telegram(telegram, store, kalshi, trader, settings)
+                mark("telegram")
 
                 # Settle first. A closed market's result does not depend on
                 # another market being open, and running this after the lookup
@@ -1502,16 +2190,30 @@ async def service() -> None:
                         # two can never drift out of step. `won` is from OUR
                         # side's point of view, matching predictions.won.
                         winning_side = "UP" if result == "yes" else "DOWN"
+                        # row[5] is the STRIKE. Passing it as `final_price`
+                        # wrote the target into every settled row and left the
+                        # settlement price recorded nowhere. The last observed
+                        # BTC print of the window is the settlement price we
+                        # actually saw.
+                        settled_at = store.last_observed_btc(row[0]) or 0.0
                         store.settle_observations(
-                            row[0], row[1] == winning_side, row[5] or 0.0
+                            row[0], winning_side, settled_at
                         )
+                        # Score the shadow layer against what actually
+                        # happened. Without the outcome attached, a record of
+                        # what it WOULD have decided can never be graded, and
+                        # an ungradeable shadow can never be promoted.
+                        store.settle_shadow(row[0], winning_side)
+                        store.settle_decision_records(row[0], winning_side)
                         sizing, basis = report_sizing(settings)
                         await report_settlement(
                             store, telegram, row, result, settings, sizing, basis
                         )
 
+                mark("settlements")
                 try:
                     contract = await kalshi.active_market(now_ms)
+                    mark("active_market")
                 except RuntimeError:
                     # Kalshi takes a few seconds to flip the next window to
                     # open. That is the normal shape of the boundary, not a
@@ -1519,24 +2221,47 @@ async def service() -> None:
                     if last_ticker is not None:
                         print("between windows; waiting for the next market", flush=True)
                         last_ticker = None
+                    # The shadow archive still runs between windows - that is
+                    # why this block used to sit ahead of the lookup. It now
+                    # runs on BOTH paths instead, so the gap is still covered
+                    # without the recorder standing in front of a live order.
+                    if hourly:
+                        await hourly.poll(now_ms, market)
+                        await hourly.settle(now_ms)
                     await asyncio.sleep(settings.poll_seconds)
                     continue
                 opened = contract.open_ms
                 remaining = (contract.close_ms - now_ms) // 1000
                 snapshot = replace(await market.snapshot(opened), target=contract.target)
+                mark("binance_snapshot")
                 if contract.ticker != last_ticker:
                     print(f"Live market data connected: {contract.ticker}", flush=True)
                     last_ticker = contract.ticker
                 archive_observation(
                     settings, store, contract, snapshot, opened, remaining, now_ms
                 )
+                mark("archive")
                 await primary_signal(
                     settings, store, telegram, contract, snapshot, opened, remaining,
-                    now_ms, trader,
+                    now_ms, trader, levels,
                 )
                 await reversion_signal(
                     settings, store, telegram, contract, snapshot, opened, remaining, now_ms
                 )
+                # Shadow recording for the hourly ladder, AFTER the trading
+                # path. It records and never trades, so it must never sit in
+                # front of an order: on 2026-09-21 three auto orders missed
+                # with decision_to_submit around 2,000ms against a 200ms
+                # round trip to Kalshi, and this block - 188 rungs of quotes -
+                # ran before every one of them. Both calls swallow their own
+                # errors, so a slow ladder cannot break the trading loop.
+                if hourly:
+                    await hourly.poll(now_ms, market)
+                    await hourly.settle(now_ms)
+                # Same reasoning as the hourly shadow: a second Binance request
+                # for a day of bars must never sit in front of an order. It
+                # self-throttles and swallows its own errors.
+                await levels.maybe_refresh(market, now_ms)
                 await reversal_exit(
                     settings, store, telegram, contract, snapshot, opened, remaining,
                     now_ms, trader,
@@ -1551,6 +2276,8 @@ async def service() -> None:
     finally:
         await market.close()
         await kalshi.close()
+        if hourly:
+            await hourly.close()
         if trader:
             await trader.close()
 

@@ -21,8 +21,17 @@ class Settings(BaseSettings):
     # The non-return edge is concentrated well before the old 5-minute trigger:
     # measured over 68 days it is negative at 3 minutes left and positive from
     # about 6. Scan the whole window and take the first minute that qualifies.
-    entry_from_seconds: int = 630  # start looking with ~10.5 minutes left
-    entry_to_seconds: int = 330  # stop looking at ~5.5 minutes left
+    #
+    # These MUST match the window every measurement uses, which is
+    # `6 <= remaining <= 11` in `scripts/compare_series.py`. Backtest snapshots
+    # sit on exact minute boundaries (`remaining = 15 - elapsed`), so that is
+    # 360-660 seconds. They were 630/330 - half a minute adrift at both ends -
+    # so the bot was not running the rule that was measured: it acted in a
+    # 330-359s band nothing had ever been tested in, and stopped 30s before the
+    # tested range ended. Measured 6-11: +0.0220 [+0.0077, +0.0360] on 1,359
+    # entries. If these change, re-measure; do not let them drift again.
+    entry_from_seconds: int = 660  # start looking with 11 minutes left
+    entry_to_seconds: int = 360  # stop looking at 6 minutes left
     # OFF, and it should stay off. Measured on 5,753 paired historical trades
     # (same entries, exit vs hold): exiting costs -$0.0162/contract, 95% CI
     # [-0.0233, -0.0089]. It fired on 50% of trades and was WORSE than holding
@@ -65,16 +74,75 @@ class Settings(BaseSettings):
     # fills if the resting size survives the round trip. A limit still fills at
     # the best available price, so this is a ceiling, not a cost: it is paid
     # only when the book moved, in cases that were otherwise no trade at all.
-    entry_slippage: float = 0.01
+    # The price must have held inside the band this long before we buy.
+    #
+    # Measured over 3,394 markets: entering on the FIRST qualifying minute gives
+    # +0.0080/contract, 95% CI [-0.0019, +0.0180] - it does not clear zero. The
+    # same rule after two minutes in the band gives +0.0219 [+0.0090, +0.0347].
+    # It halves the number of markets and nearly triples the edge, which is the
+    # better trade: 1,674 x 0.0219 beats 3,394 x 0.0080 in total as well as per
+    # trade. Three and four minutes score higher still but on far fewer markets.
+    #
+    # The mechanism is plain in the live alerts: the price walks up from the 60s,
+    # clips the band, and we buy into a market that has not agreed on a price -
+    # which is also why those orders so often fail to fill.
+    # 60, not 120. The entry window is 660-360s - a 300-second span - so a
+    # 120s hold could only ever complete for a price already in the band by
+    # 480s remaining, leaving the last two minutes of every window dead.
+    # KXBTC15M-26SEP211445-45 on 2026-09-21 reached the band at 422s, held,
+    # showed five green ticks and was refused to the cutoff.
+    #
+    # Measured together over 71 days (`scripts/measure_window_settle.py`),
+    # paired on markets, which is the test section 16 says to run:
+    #   settle 60s   n=3841  +0.0149/ct [+0.0032, +0.0260]  total +57.42
+    #   settle 120s  n=2681  +0.0147/ct [+0.0012, +0.0278]  total +39.53
+    #   difference   +0.0002/ct [-0.0082, +0.0084], p=0.479
+    # Indistinguishable per contract, +43% trades, 1,160 fewer dead setups.
+    # Dropping the settle entirely does NOT clear zero at any window bound,
+    # so the rule stays - it is only half as long.
+    entry_band_settle_s: int = 60
+    # The separate LLM commentary message. Off since 2026-09-21: the entry
+    # alert now carries the checks, the context, the confidence arithmetic
+    # and the similar-regime read, so the second message repeated it.
+    brain_commentary_enabled: bool = False
+    # How far above the quoted ask the entry limit is set. An IOC limit fills
+    # at the BEST AVAILABLE price, never at the limit - our own fills prove it
+    # (limit 0.87 filled 0.84, limit 0.80 filled 0.75, limit 0.81 filled 0.76)
+    # - so a wider allowance costs nothing on an order that would have filled
+    # anyway. It only spends when the book actually moved, which is precisely
+    # when the old 1c allowance bought nothing at all.
+    #
+    # Measured over the signed ask drift across the ~1.93s submit lag, at
+    # qualifying polls: 1c covered 89.1%, 3c covered 99.1%, 5c covered 100.0%
+    # of every move recorded (max observed drift 4.13c).
+    entry_slippage: float = 0.05
+    # And a hard ceiling, because "take whatever price" has a floor of sanity:
+    # above 0.93 every measured bucket's interval includes zero, and on
+    # 2026-09-21 a retry chain chased 0.85 to 0.963. The limit may cross the
+    # book; it may not cross out of the region where an edge was ever shown.
+    max_entry_price: float = 0.95
     # How many entry orders one window may attempt. An immediate-or-cancel that
     # does not fill costs nothing, so a single miss should not end an
     # opportunity that is still valid - but each retry re-runs every gate at the
     # new price, and this caps how far a running market can be followed.
     auto_retry_limit: int = 3
-    # How far the price may run away before a retry is abandoned. Chasing a
-    # gapping book is how you end up paying 92c for something you wanted at 76c,
-    # where the most it can make is 8c against 92c at risk.
-    auto_retry_max_drift: float = 0.08
+    # ZERO. A retry may never pay more than the first order did.
+    #
+    # This was an 8c "chase allowance" and that was the wrong idea. Observing
+    # costs nothing and a window has ten minutes in it, so there is no reason to
+    # pay up: if the price runs away, wait to see whether it comes back, and
+    # accept that some markets leave without us. Missing a winner is better than
+    # risking 96c to make 4c.
+    #
+    #   85c  first order, unfilled
+    #   92c  observe, no order
+    #   98c  observe, no order
+    #   89c  still worse than 85c, wait
+    #   84c  at or below the first price -> second attempt allowed
+    auto_retry_max_drift: float = 0.0
+    # Time to let the book settle after a failed order. Firing again on the very
+    # next poll re-reads the same disturbed book and misses for the same reason.
+    auto_retry_cooldown_s: int = 30
     # Basis for the P&L shown in alerts and the dashboard.
     #
     # Kalshi sizes a position by MAX PAYOUT, not by cash spent: a "$10 position"
@@ -113,6 +181,27 @@ class Settings(BaseSettings):
     cash_out_enabled: bool = True
     cash_out_capture: float = 0.90  # fraction of the available profit to bank
     cash_out_min_bid: float = 0.90  # and never sell into a thin, low bid
+    # How far BELOW the quoted bid a cash-out is priced and judged. Entries
+    # have `entry_slippage` because an immediate-or-cancel order at exactly the
+    # touch only fills if that quote is real and still there - on 2026-09-21
+    # three entries missed that way. Exits had no equivalent, so the cash-out
+    # on KXBTC15M-26SEP211400-00 was submitted AT a quoted 0.979 bid, filled
+    # nothing, and the Kalshi app was offering 0.93 at that moment. Discounting
+    # first makes the order marketable AND stops the capture test firing on a
+    # price that is not there: at paid=0.76 the gate needs 0.976, and
+    # 0.979 - 0.01 = 0.969 correctly declines.
+    exit_slippage: float = 0.01
+    # The mirror of `max_entry_price`. A sell IOC fills at the BEST AVAILABLE
+    # bid, not at its limit, so pricing the exit AT the quoted bid meant a
+    # stale or thin top-of-book killed it - exactly the entry defect, in
+    # reverse. KXBTC15M-26SEP211700-00 held UP bought at 0.72, the quote said
+    # 0.98, the order went out at 0.98 and filled nothing.
+    #
+    # The exit now crosses DOWN to this floor and takes whatever real bid is
+    # there above it. `cash_out_min_bid` (0.90) already refuses to even try
+    # below this level, so the floor cannot sell into a collapse - it only
+    # stops the order being priced at a number nobody is actually bidding.
+    min_exit_price: float = 0.90
     min_calibration_samples: int = 100
     min_win_probability: float = 0.80
     min_raw_probability: float = 0.50
@@ -127,6 +216,23 @@ class Settings(BaseSettings):
     reversion_strategy_path: str = "reversion_strategy.json"
     max_spread_bps: float = 2.0
     database_path: str = "btc15.db"
+    # --- hourly strike ladder (KXBTCD), SHADOW ONLY ----------------------
+    # The hourly series is a ladder of ~188 "or above" thresholds sharing one
+    # settlement time, not a single contract. It has never been measured, so it
+    # records and does not trade. `hourly_trading_enabled` is read by nothing:
+    # it exists so that turning hourly trading on is a code change someone has
+    # to make deliberately, not a config flag someone can flip by accident.
+    hourly_enabled: bool = True
+    hourly_trading_enabled: bool = False
+    hourly_series: str = "KXBTCD"
+    hourly_database_path: str = "runtime/hourly.db"
+    # Slower than the 15-minute poll: an hour-long window does not need 12s
+    # resolution, and each poll writes ~50 rows instead of one.
+    hourly_poll_seconds: float = 60.0
+    # Archive rungs within this many dollars of spot. At $100 spacing that is
+    # ~51 rungs. The far tails are pinned at 0.00/0.01 and carry no
+    # information; the chain row records how many were left out.
+    hourly_archive_window: float = 2500.0
     telegram_bot_token: str = ""
     telegram_chat_id: str = ""
     telegram_authorized_user_id: int = 0

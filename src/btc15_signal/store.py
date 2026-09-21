@@ -112,6 +112,35 @@ class Store:
         # distance gate or the momentum gate was the one that cost you.
         if "failed_gates" not in columns:
             self.db.execute("ALTER TABLE predictions ADD COLUMN failed_gates TEXT")
+        # What the similarity layer WOULD have decided, recorded and never
+        # acted on. Promotion to an execution policy requires this table to
+        # show its calls beating the deployed rule on realised P&L - which is
+        # the only way to find out whether retrieval adds anything or merely
+        # sounds clever.
+        #
+        # Two of these columns are easy to misread, so: `rule_qualified` is the
+        # rule's verdict AT THIS ROW'S POLL, not the window's - the rule can
+        # say no at the alert and yes two minutes later at the price we
+        # actually bought, and one row cannot hold both. `traded` is the
+        # opposite: a WINDOW-level fact, stamped on every row of the window by
+        # `record_fill` once a real position exists. Group by window_open
+        # before counting a head-to-head, or a traded window is counted twice.
+        self.db.execute("""
+            CREATE TABLE IF NOT EXISTS shadow_decisions (
+                window_open INTEGER NOT NULL, created_at INTEGER NOT NULL,
+                ticker TEXT, side TEXT, remaining_s INTEGER,
+                ask REAL, cohort_n INTEGER, win_probability REAL,
+                raw_win_rate REAL, net_edge_now REAL,
+                enter_now_net REAL, wait_limit_net REAL, wait_real_net REAL,
+                dip_price REAL, dip_rate REAL, dip_n INTEGER, mean_drift REAL,
+                win_low REAL, win_high REAL, edge_low REAL, prior REAL,
+                wait_limit_low REAL,
+                ran_away_rate REAL, session TEXT, vol_regime TEXT,
+                action TEXT, reason TEXT,
+                rule_qualified INTEGER, traded INTEGER, won INTEGER,
+                PRIMARY KEY (window_open, remaining_s)
+            )
+        """)
         self.db.execute("""
             CREATE TABLE IF NOT EXISTS strategy_alerts (
                 strategy TEXT NOT NULL, window_open INTEGER NOT NULL,
@@ -192,6 +221,17 @@ class Store:
         # a future rule can be fitted and walk-forward tested on live data
         # rather than only on the historical dump.
         self.db.execute("""
+            CREATE TABLE IF NOT EXISTS executions (
+                proposal_id TEXT PRIMARY KEY,
+                signal_id TEXT, session_id TEXT,
+                ticker TEXT, side TEXT, window_open INTEGER, attempt INTEGER,
+                decision_ask REAL, limit_submitted REAL,
+                decision_ms INTEGER, submitted_ms INTEGER, acked_ms INTEGER,
+                decision_to_submit_ms INTEGER, round_trip_ms INTEGER,
+                filled INTEGER, fill_price REAL, fill_count REAL,
+                ask_after REAL, timing TEXT
+            )""")
+        self.db.execute("""
             CREATE TABLE IF NOT EXISTS observations (
                 window_open INTEGER NOT NULL, remaining_s INTEGER NOT NULL,
                 observed_ms INTEGER NOT NULL, ticker TEXT,
@@ -245,9 +285,35 @@ class Store:
             ("exit_price", "REAL"),
             ("exit_reason", "TEXT"),
             ("realised_pnl", "REAL"),
+            # --- regime, archived so the hour question keeps being measured
+            # rather than re-argued from single days. Recorded, never enforced:
+            # time-of-day moves the confidence EXPLANATION and nothing else.
+            ("regime_weight", "REAL"),
+            ("confidence_adjustment", "INTEGER"),
         ):
             if column not in observation_columns:
                 self.db.execute(f"ALTER TABLE observations ADD COLUMN {column} {kind}")
+
+        # Where the time between reading a price and sending the order went.
+        # Two guesses at that gap have already been wrong; this records it
+        # instead of reasoning about it.
+        execution_columns = {
+            row[1] for row in self.db.execute("PRAGMA table_info(executions)")
+        }
+        if "timing" not in execution_columns:
+            self.db.execute("ALTER TABLE executions ADD COLUMN timing TEXT")
+
+        shadow_columns = {
+            row[1] for row in self.db.execute("PRAGMA table_info(shadow_decisions)")
+        }
+        for column, kind in (
+            ("dip_n", "INTEGER"), ("win_low", "REAL"), ("win_high", "REAL"),
+            ("edge_low", "REAL"), ("prior", "REAL"), ("wait_limit_low", "REAL"),
+        ):
+            if shadow_columns and column not in shadow_columns:
+                self.db.execute(
+                    f"ALTER TABLE shadow_decisions ADD COLUMN {column} {kind}"
+                )
 
         proposal_columns = {
             row[1] for row in self.db.execute("PRAGMA table_info(trade_proposals)")
@@ -266,6 +332,66 @@ class Store:
         if "fee_paid" not in proposal_columns:
             self.db.execute("ALTER TABLE trade_proposals ADD COLUMN fee_paid REAL")
         self.db.commit()
+
+    def proposal_created_at(self, proposal_id: str) -> int | None:
+        """When the proposal was written, i.e. when the price was judged.
+
+        Read from the row rather than the dataclass: `TradeProposal` does not
+        carry `created_at`, and reaching for it raises in the order path.
+        """
+        row = self.db.execute(
+            "SELECT created_at FROM trade_proposals WHERE id=?", (proposal_id,)
+        ).fetchone()
+        return row[0] if row else None
+
+    def record_execution(self, row: dict) -> None:
+        """One submitted order, with everything needed to judge execution.
+
+        A backtest credits a fill at the price it saw. Live, 9 of 21 orders
+        filled. Nothing measured from historical quotes can say which - the
+        candles record what the market did, not what OUR order got - so the
+        only way to learn the difference is to write down every attempt as it
+        happens. That is what this is for.
+
+        Deliberately does NOT read the book immediately before submitting.
+        That would add a network round trip to the critical path and make the
+        staleness it is trying to measure worse. `decision_to_submit_ms` -
+        how long the price sat between being judged and being ordered on - is
+        the free version of the same measurement. The post-failure book read
+        IS taken, because by then the order has already missed and the read
+        costs nothing.
+        """
+        self.db.execute(
+            "INSERT OR REPLACE INTO executions VALUES ("
+            + ",".join("?" * 19) + ")",
+            (
+                row.get("proposal_id"), row.get("signal_id"), row.get("session_id"),
+                row.get("ticker"), row.get("side"), row.get("window_open"),
+                row.get("attempt"),
+                row.get("decision_ask"), row.get("limit_submitted"),
+                row.get("decision_ms"), row.get("submitted_ms"), row.get("acked_ms"),
+                row.get("decision_to_submit_ms"), row.get("round_trip_ms"),
+                1 if row.get("filled") else 0,
+                row.get("fill_price"), row.get("fill_count"),
+                row.get("ask_after"), row.get("timing"),
+            ),
+        )
+        self.db.commit()
+
+    def execution_report(self) -> dict:
+        """Fill rate and timing, which is the honest denominator for any edge."""
+        row = self.db.execute(
+            "SELECT COUNT(*) n, SUM(filled) filled, "
+            "AVG(decision_to_submit_ms) avg_decide, AVG(round_trip_ms) avg_trip "
+            "FROM executions"
+        ).fetchone()
+        return {
+            "orders": row[0] or 0,
+            "filled": row[1] or 0,
+            "fill_rate": (row[1] / row[0]) if row[0] else None,
+            "avg_decision_to_submit_ms": row[2],
+            "avg_round_trip_ms": row[3],
+        }
 
     def record(self, values: tuple) -> bool:
         # `failed_gates` was added later, so a caller may still pass the older
@@ -355,6 +481,37 @@ class Store:
             "exited": status == "exited" and exit_price is not None,
         }
 
+    def band_streak_seconds(
+        self, window_open: int, low: float, high: float, now_ms: int
+    ) -> float:
+        """How long the price has sat CONTINUOUSLY inside the band, in seconds.
+
+        Measured from the archive rather than held in memory, so a restart does
+        not reset it and hand a fresh entry to a price that has not settled.
+
+        Entering on the first qualifying minute measured +0.0080/contract with a
+        95% CI of [-0.0019, +0.0180] - indistinguishable from zero. Waiting for
+        two minutes in the band measured +0.0219 [+0.0090, +0.0347]. The first
+        qualifying minute is the worst moment to buy: the price is still moving,
+        which is why it is both hard to fill and worth little.
+        """
+        rows = self.db.execute(
+            "SELECT observed_ms, our_ask FROM observations "
+            "WHERE window_open=? AND our_ask IS NOT NULL "
+            "ORDER BY observed_ms DESC LIMIT 60",
+            (window_open,),
+        ).fetchall()
+        if not rows:
+            return 0.0
+        earliest = None
+        for observed_ms, ask in rows:
+            if not low <= ask <= high:
+                break  # the streak ended here
+            earliest = observed_ms
+        if earliest is None:
+            return 0.0
+        return max(0.0, (now_ms - earliest) / 1000)
+
     def lifecycle_by_signal(self, signal_id: str) -> list[dict]:
         """One opportunity's whole path, oldest first, however many runs it spans.
 
@@ -420,26 +577,79 @@ class Store:
         )
         self.db.commit()
 
-    def settle_observations(self, window_open: int, won: bool, final_price: float) -> int:
+    def last_observed_btc(self, window_open: int) -> float | None:
+        """The last BTC print seen in a window - the settlement price we saw.
+
+        `final_price` was being fed the STRIKE, so all 2,383 settled rows
+        recorded the target and the actual settlement price existed nowhere in
+        the database.
+        """
+        row = self.db.execute(
+            "SELECT btc FROM observations WHERE window_open=? AND btc IS NOT NULL "
+            "ORDER BY remaining_s ASC LIMIT 1",
+            (window_open,),
+        ).fetchone()
+        return float(row[0]) if row and row[0] is not None else None
+
+    def settle_observations(
+        self, window_open: int, winning_side: str, final_price: float
+    ) -> int:
         """Stamp every observation of a window with what actually happened.
 
-        Done in one statement per window rather than per row, so the research
-        archive settles at the same moment the trade does and can never drift
-        out of step with `predictions`.
+        PER ROW, on that row's OWN side. The model's side flips whenever BTC
+        crosses the strike mid-window, so a single window holds both UP and
+        DOWN rows. Stamping one boolean across all of them wrote the
+        PREDICTION's outcome onto rows that had bet the other way: 432 of
+        2,527 settled rows - 17.1% of the archive - carried an inverted `won`.
+        Every live-tape study that read this column inherited that error.
+
+        Takes the winning SIDE rather than a boolean for exactly that reason:
+        a boolean cannot be correct for two different sides at once.
         """
         realised = None
         trade = self.trade_for_window(window_open)
         if trade:
+            # The realised figure belongs to the position we actually held, so
+            # it is scored on the TRADED side, not on each observation's side.
             realised = position_pnl(
                 paid=trade["paid"], count=trade["count"], entry_fee=trade["fee"],
-                exit_price=trade["exit_price"], exit_count=trade["exit_count"], won=won,
+                exit_price=trade["exit_price"], exit_count=trade["exit_count"],
+                won=trade["side"] == winning_side,
             )
-        cursor = self.db.execute(
-            "UPDATE observations SET won=?, final_price=?, realised_pnl=? "
-            "WHERE window_open=? AND won IS NULL",
-            (1 if won else 0, final_price, realised, window_open),
-        )
-        self.db.commit()
+        try:
+            cursor = self.db.execute(
+                "UPDATE observations SET won=CASE WHEN side=? THEN 1 ELSE 0 END, "
+                "final_price=?, realised_pnl=? "
+                "WHERE window_open=? AND won IS NULL",
+                (winning_side, final_price, realised, window_open),
+            )
+            self.db.commit()
+        except sqlite3.Error as exc:
+            # This is ONE-SHOT: `won IS NULL` means a window that fails here is
+            # never offered again, so the outcome is lost for good. It could
+            # also take the service down with it - the cycle handler in main.py
+            # catches httpx/RuntimeError/ValueError/OSError and NOT
+            # sqlite3.Error - so the stamp now survives its own failure and
+            # says which window it lost, rather than losing it in silence.
+            print(
+                f"settle: observations for window {window_open} were NOT "
+                f"stamped: {type(exc).__name__}: {exc}",
+                flush=True,
+            )
+            return 0
+        # Stamped nothing although the window has rows: they already carry an
+        # outcome, so this result went on the floor and, being one-shot, will
+        # never be applied. That silence is how 432 inverted rows sat in the
+        # archive unnoticed until someone went looking for them.
+        if cursor.rowcount == 0 and self.db.execute(
+            "SELECT 1 FROM observations WHERE window_open=? LIMIT 1",
+            (window_open,),
+        ).fetchone():
+            print(
+                f"settle: window {window_open} already carried an outcome; "
+                f"the {winning_side} result was applied to no row",
+                flush=True,
+            )
         return cursor.rowcount
 
     # Rows written before the linkage columns existed carry no signal_id. They
@@ -832,6 +1042,153 @@ class Store:
         ).fetchall()
         return len(rows), (rows[0][0] if rows else None)
 
+    def record_decision_record(self, row: dict) -> None:
+        """Everything that supported ONE decision, proposal or not.
+
+        Keyed on the OBSERVATION, not the proposal. A PASS, a WAIT, a rejected
+        setup and an order that never filled are all training data - arguably
+        the most valuable, since they are the counterfactuals - and none of
+        them has a proposal id. Keying on `proposal_id` meant the archive only
+        ever contained the trades that worked out well enough to exist.
+
+        Linked by signal_id (one opportunity, stable across restarts),
+        market_id (the Kalshi ticker), observation_id (the exact poll) and
+        strategy_version (what the rule was at the time), with proposal_id
+        optional.
+
+        NEVER raises: bookkeeping may not propagate into the path that trades.
+        """
+        try:
+            self.db.execute("""
+                CREATE TABLE IF NOT EXISTS decision_records (
+                    observation_id TEXT PRIMARY KEY,
+                    signal_id TEXT, market_id TEXT, proposal_id TEXT,
+                    strategy_version TEXT,
+                    window_open INTEGER, created_at INTEGER,
+                    ticker TEXT, side TEXT, remaining_s INTEGER,
+                    action TEXT, blocked_reason TEXT,
+                    ask REAL, limit_submitted REAL, count REAL,
+                    gates TEXT, settled_s REAL,
+                    measured_edge REAL, fee REAL, net_edge REAL,
+                    distance_dollars REAL, normalized_distance REAL,
+                    volatility_bps REAL, momentum_bps REAL, spread_bps REAL,
+                    session TEXT, hour_utc INTEGER, vol_regime TEXT,
+                    regime_weight REAL, confidence_adjustment INTEGER,
+                    protective_level REAL, level_adjustment INTEGER,
+                    cohort_n INTEGER, cohort_win_probability REAL,
+                    cohort_win_low REAL, cohort_win_high REAL,
+                    cohort_action TEXT, cohort_reason TEXT,
+                    fill_price REAL, filled INTEGER, won INTEGER
+                )
+            """)
+            columns = [
+                "observation_id", "signal_id", "market_id", "proposal_id",
+                "strategy_version", "window_open", "created_at", "ticker",
+                "side", "remaining_s", "action", "blocked_reason", "ask",
+                "limit_submitted", "count", "gates", "settled_s",
+                "measured_edge", "fee", "net_edge", "distance_dollars",
+                "normalized_distance", "volatility_bps", "momentum_bps",
+                "spread_bps", "session", "hour_utc", "vol_regime",
+                "regime_weight", "confidence_adjustment", "protective_level",
+                "level_adjustment", "cohort_n", "cohort_win_probability",
+                "cohort_win_low", "cohort_win_high", "cohort_action",
+                "cohort_reason", "fill_price", "filled", "won",
+            ]
+            self.db.execute(
+                "INSERT OR REPLACE INTO decision_records VALUES ("
+                + ",".join("?" * len(columns)) + ")",
+                tuple(row.get(key) for key in columns),
+            )
+            self.db.commit()
+        except sqlite3.Error:
+            pass
+
+    def settle_decision_records(self, window_open: int, winning_side: str) -> None:
+        """Per row, on that row's own side - see `settle_observations`."""
+        try:
+            self.db.execute(
+                "UPDATE decision_records "
+                "SET won = CASE WHEN side=? THEN 1 ELSE 0 END "
+                "WHERE window_open=?",
+                (winning_side, window_open),
+            )
+            self.db.commit()
+        except sqlite3.Error as exc:
+            # See `settle_shadow`: a silent failure here leaves every DECLINED
+            # and ENTERED record ungraded, so "what did refusing cost us" has
+            # no answer and nothing reports that it has no answer.
+            print(
+                f"settle: decision records for window {window_open} were NOT "
+                f"graded: {type(exc).__name__}: {exc}",
+                flush=True,
+            )
+
+    def record_shadow_decision(self, row: dict) -> None:
+        """Write down one similarity read. NEVER raises, never trades.
+
+        Pure bookkeeping for a layer that is not allowed to act, so nothing it
+        does may propagate into the loop that is.
+        """
+        try:
+            self.db.execute(
+                "INSERT OR REPLACE INTO shadow_decisions VALUES ("
+                + ",".join("?" * 30) + ")",
+                (
+                    row.get("window_open"), row.get("created_at"),
+                    row.get("ticker"), row.get("side"), row.get("remaining_s"),
+                    row.get("ask"), row.get("cohort_n"),
+                    row.get("win_probability"), row.get("raw_win_rate"),
+                    row.get("net_edge_now"), row.get("enter_now_net"),
+                    row.get("wait_limit_net"), row.get("wait_real_net"),
+                    row.get("dip_price"), row.get("dip_rate"), row.get("dip_n"),
+                    row.get("mean_drift"),
+                    row.get("win_low"), row.get("win_high"),
+                    row.get("edge_low"), row.get("prior"),
+                    row.get("wait_limit_low"),
+                    row.get("ran_away_rate"),
+                    row.get("session"), row.get("vol_regime"),
+                    row.get("action"), row.get("reason"),
+                    row.get("rule_qualified"), row.get("traded"), row.get("won"),
+                ),
+            )
+            self.db.commit()
+        except sqlite3.Error as exc:
+            # Still never raises - but no longer invisible. A row dropped here
+            # is a window missing from the head-to-head, which is exactly the
+            # failure that made the comparison look merely thin instead of
+            # broken.
+            print(
+                f"shadow decision not recorded for "
+                f"{row.get('window_open')}: {type(exc).__name__}: {exc}",
+                flush=True,
+            )
+
+    def settle_shadow(self, window_open: int, winning_side: str) -> None:
+        """Attach the outcome, scored on each ROW's own side.
+
+        Same defect as `settle_observations`: a window holds rows on both
+        sides once the model flips, and one boolean cannot be right for both.
+        Safe today only because there happens to be one shadow row per window.
+        """
+        try:
+            self.db.execute(
+                "UPDATE shadow_decisions "
+                "SET won = CASE WHEN side=? THEN 1 ELSE 0 END "
+                "WHERE window_open=?",
+                (winning_side, window_open),
+            )
+            self.db.commit()
+        except sqlite3.Error as exc:
+            # An unsettled shadow row can never be graded, and a shadow layer
+            # that cannot be graded can never be promoted. Swallowing the error
+            # meant the corpus could stop settling entirely without one line
+            # anywhere saying so. Still never raises into the trading loop.
+            print(
+                f"settle: shadow rows for window {window_open} were NOT "
+                f"graded: {type(exc).__name__}: {exc}",
+                flush=True,
+            )
+
     def record_alert(self, strategy: str, window_open: int, created_at: int) -> bool:
         cursor = self.db.execute(
             "INSERT OR IGNORE INTO strategy_alerts(strategy,window_open,created_at) VALUES(?,?,?)",
@@ -946,6 +1303,25 @@ class Store:
                 "UPDATE predictions SET contract_price=? WHERE window_open=?",
                 (float(price), window_open),
             )
+            # `shadow_decisions.traded` was written as a literal 0 by its only
+            # writer and updated by nobody, so "the rule traded it and the
+            # shadow said don't" could not return a row however long the
+            # service ran. This is the one point that proves a real position
+            # exists, so it is where the window gets stamped. Its own
+            # try/except: sqlite3.Error is not caught by the post-order handler
+            # in primary_signal, and bookkeeping may not reach the loop after
+            # money has moved.
+            try:
+                self.db.execute(
+                    "UPDATE shadow_decisions SET traded=1 WHERE window_open=?",
+                    (window_open,),
+                )
+            except sqlite3.Error as exc:
+                print(
+                    f"shadow traded stamp failed for window {window_open}: "
+                    f"{type(exc).__name__}: {exc}",
+                    flush=True,
+                )
         self.db.commit()
 
     def mark_exited(self, proposal_id: str, price: float, count: float, note: str) -> None:

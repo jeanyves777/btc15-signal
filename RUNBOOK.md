@@ -212,6 +212,80 @@ whole reply.
 Commentary is once per window, fire-and-forget, and can never gate or delay a
 trade.
 
+## The hourly ladder (KXBTCD) — shadow only
+
+A second instrument, recording since 2026-09-21. **It does not trade and there
+is no code path by which it can.** `hourly_trading_enabled` is read by nothing;
+it exists so that turning hourly trading on has to be a deliberate code change,
+not a config flag someone flips at 2am.
+
+### What it is
+
+`KXBTCD` is **not daily** — the D is misleading. Its events are hourly:
+`KXBTCD-26SEP2112` opens 15:00 UTC and closes 16:00 UTC. One event is a ladder
+of ~188 "or above" thresholds $100 apart, all settling on the same BRTI print.
+Typically ~24 of the 188 are quotable at once; the rest sit pinned at 0.00/0.01
+or 0.99/1.00 and are the exchange saying the outcome is already decided.
+
+`KXBTC` is the *same* expiry expressed as ~186 mutually exclusive $100
+brackets. Different instrument. Not handled.
+
+Liquidity is far better than the 15-minute market: the rung nearest spot showed
+93,083 contracts of volume against a few hundred on a typical 15-minute
+contract.
+
+### Where it lives
+
+| Thing | Where |
+|---|---|
+| chain parse + integrity | `src/btc15_signal/hourly.py` |
+| archive | `src/btc15_signal/hourly_store.py` |
+| shadow recorder | `src/btc15_signal/hourly_shadow.py` |
+| database | `runtime/hourly.db` — **separate file on purpose** |
+| history fetcher | `scripts/fetch_hourly.py` |
+
+The database is separate from `btc15.db` so a research experiment can never
+hold a write lock on, or corrupt, the database that knows what money is at
+risk. Nothing on the 15-minute trading path imports any of these modules.
+
+The recorder is called before the 15-minute market lookup, because that block
+`continue`s between windows and would otherwise stop the archive for the length
+of every gap. Both its entry points swallow their own exceptions: a failed
+research write must never interrupt settlement reporting or order placement.
+
+### Reading the archive
+
+```powershell
+.venv\Scripts\python.exe -c "import sqlite3; d=sqlite3.connect('runtime/hourly.db'); d.row_factory=sqlite3.Row; print(dict(d.execute('SELECT COUNT(*) n, COUNT(DISTINCT chain_id) chains, SUM(integrity_ok) clean FROM hourly_chains').fetchone()))"
+```
+
+`hourly_chains` is one row per poll, `hourly_strikes` one row per rung per poll
+(only rungs within `hourly_archive_window` of spot — `n_strikes` vs
+`n_archived` on the chain row says how many were left out, so the trimming is
+never silent), `hourly_settlements` one row per event.
+
+**Every row carries `mode='shadow'`.** If hourly ever trades, live rows must
+stay distinguishable from shadow rows forever after. This is the same boundary
+lesson as the legacy null `signal_id` rows — do not infer across it.
+
+### Two traps already paid for
+
+**`updated_time` is not a quote clock.** All 188 rungs carry one of three
+timestamps stamped at chain open, and they never move. Measured: 13 rungs
+changed their quotes inside 20 seconds while not one timestamp changed. Using
+it for freshness marks *every* snapshot stale. Staleness is measured across
+polls instead — how long since any quotable rung's quote last moved — which is
+why `check_integrity` takes `quotes_age_s` from the caller rather than working
+it out itself.
+
+**Do not pick the strike with the best edge.** The ladder offers ~24 quotable,
+heavily correlated estimates at once, and taking the maximum over them selects
+wherever the model is most wrong, not wherever the edge is most real. This is
+the grid-search failure in FINDINGS.md §7 with a new face: the best of 11,365
+searched rules scored below the *median* best rule on shuffled data. Strike
+selection must be a pre-registered rule measured in advance — "the rung nearest
+N volatility units from spot", say — and never an argmax over the live chain.
+
 ## Known limits
 
 - **`bid_imbalance` is hard-coded to 0.0** in backtests. It has never been

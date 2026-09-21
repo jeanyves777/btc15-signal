@@ -2,11 +2,10 @@
   "enabled": true,
   "remaining_minutes": 7,
   "min_raw_probability": 0.5,
-  "min_ask": 0.7,
+  "min_ask": 0.85,
   "max_ask": 0.93,
   "min_normalized_distance": 1.5,
   "require_momentum_alignment": false,
   "min_momentum_bps": 0.0,
-  "fee_buffer": 0.0,
-  "require_blocking_level": false
+  "fee_buffer": 0.0
 }

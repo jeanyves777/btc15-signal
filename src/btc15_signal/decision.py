@@ -22,6 +22,10 @@ because a decision needs it.
 
 from dataclasses import dataclass
 
+from .regime import adjust as regime_adjust
+from .regime import base_points as regime_base_points
+from .regime import label_for as regime_label
+from .regime import weight_for_hour
 from .validation import kalshi_fee_charged
 
 
@@ -110,9 +114,10 @@ def decision_facts(
     entry_paid: float | None,
     unrealised: float | None,
     model_probability: float,
-    measured_edge: float,
+    measured_edge: float | None,
     slippage: float,
     count: float = 1.0,
+    hour_utc: int | None = None,
 ) -> dict:
     """Finished conclusions for one decision point. No raw comparisons escape.
 
@@ -147,8 +152,13 @@ def decision_facts(
     # a ceiling that costs nothing unless the book moves, so charging it on
     # every trade understates the edge and would refuse trades that are fine.
     # Both are reported, and the verdict uses the certain one.
+    # A MEANINGFUL margin, not merely a positive number. The old test was
+    # `> 0`, so +0.0006 - six hundredths of a cent, indistinguishable from zero -
+    # was announced as "worth having". And `measured_edge` is None at prices
+    # nobody studied, where the honest answer is "unknown", not a figure.
+    WORTH_HAVING = 0.005
     edge_after_costs = worst_case_edge = fee_per = None
-    if implied is not None:
+    if implied is not None and measured_edge is not None:
         fee_per = round(kalshi_fee_charged(implied, count) / count, 4)
         edge_after_costs = round(measured_edge - fee_per, 4)
         worst_case_edge = round(edge_after_costs - slippage, 4)
@@ -160,18 +170,53 @@ def decision_facts(
     else:
         action = "BUY"
 
-    # Confidence is about the strength of agreement between independent
+    # Confidence is about the strength of agreement between INDEPENDENT
     # signals, never about the model's own certainty - which is not calibrated.
+    # Two of the original five were not independent, and the count was inflated
+    # on every setup as a result:
+    #
+    #   `signed > 0` could not fail on an entry. `model.predict` chooses the
+    #   side FROM the sign of the distance, so `signed` is non-negative by
+    #   construction and this was a free point on every alert ever sent.
+    #
+    #   `vol_units >= 1.5` restated `min_normalized_distance`, which
+    #   `rule_match` had already counted, and it ticked identically at 1.9x and
+    #   at 6x - so a setup scraping over the floor scored the same as one with
+    #   four times the room.
+    #
+    # On 2026-09-21 the 14:45 window was announced "BUY - confidence high (5/5
+    # signals agree)" on a 1.9x gap that the evidence line immediately below
+    # called "moderate"; one minute later BTC was 83 cents from the target and
+    # the market had flipped to 68% the other way. A margin that thin is not
+    # five signals agreeing.
+    #
+    # So the distance term now requires a REAL margin - the same 3x the
+    # evidence line calls "comfortable", so the number and the prose can no
+    # longer contradict each other - and the free term is gone.
     agreeing = sum(
         [
             bool(rule_match),
-            signed > 0,
-            vol_units >= 1.5,
+            vol_units >= 3.0,
             book_for_us == "BOOK_FAVOURS_US",
             (momentum_5m_bps > 0) == (side == "UP"),
         ]
     )
-    confidence = ("LOW", "LOW", "MEDIUM", "MEDIUM", "HIGH", "HIGH")[agreeing]
+    # Time-of-day adjusts the CONFIDENCE EXPLANATION and nothing else. It may
+    # never skip a market, stop a poll, prevent evaluation, block a qualified
+    # order or silence an alert - the 15-minute system runs 24/7 regardless of
+    # what the clock says about the regime. Stated as points so the move is
+    # visible: base HIGH, adjustment -25, adjusted MEDIUM.
+    regime_weight = weight_for_hour(hour_utc) if hour_utc is not None else None
+    if regime_weight is not None:
+        scored = regime_adjust(agreeing, regime_weight)
+    else:
+        base = regime_base_points(agreeing)
+        scored = {
+            "base_points": base, "base_label": regime_label(base),
+            "regime_points": 0, "regime_reason": "unknown hour",
+            "adjusted_points": base, "adjusted_label": regime_label(base),
+        }
+    confidence = scored["adjusted_label"]
 
     # The level at which this trade is simply wrong, stated as a price.
     invalidation = round(target, 2)
@@ -217,10 +262,23 @@ def decision_facts(
             f"we already hold this at {entry_paid:.0%} and it is "
             f"{'up' if unrealised >= 0 else 'down'} {abs(unrealised):.2f} right now"
         )
-    if edge_after_costs is not None:
+    if measured_edge is None:
         evidence.append(
-            f"after the fee the expected edge is {edge_after_costs:+.4f} per contract, "
-            + ("which is worth having" if edge_after_costs > 0 else "which is not worth having")
+            f"no edge has ever been measured at {implied:.0%}, so there is nothing "
+            "to expect from this price either way"
+            if implied is not None
+            else "no edge has been measured at this price"
+        )
+    elif edge_after_costs is not None:
+        if edge_after_costs >= WORTH_HAVING:
+            verdict_words = "which is worth having"
+        elif edge_after_costs > 0:
+            verdict_words = "which is too thin to be worth having"
+        else:
+            verdict_words = "which is not worth having"
+        evidence.append(
+            f"after the fee the expected edge is {edge_after_costs:+.4f} per "
+            f"contract, {verdict_words}"
         )
 
     return {
@@ -287,6 +345,7 @@ def decision_facts(
         },
         "economics": {
             "measured_edge_per_contract": measured_edge,
+            "price_was_measured": measured_edge is not None,
             "fee_per_contract": fee_per,
             "edge_after_fees": edge_after_costs,
             "slippage_allowance": slippage,
@@ -296,7 +355,9 @@ def decision_facts(
                 "smallest at the extremes - the cheap end of the band is the "
                 "expensive end after fees"
             ),
-            "worth_doing": edge_after_costs is not None and edge_after_costs > 0,
+            "worth_doing": (
+                edge_after_costs is not None and edge_after_costs >= WORTH_HAVING
+            ),
         },
         "position": {
             "holding": holding,
@@ -321,7 +382,11 @@ def decision_facts(
             "action": action,
             "confidence": confidence,
             "signals_agreeing": agreeing,
-            "signals_total": 5,
+            "signals_total": 4,
+            "base_confidence": scored["base_label"],
+            "regime_adjustment": scored["regime_points"],
+            "regime_hour": scored["regime_reason"],
+            "adjusted_confidence": scored["adjusted_label"],
             "rule_match": rule_match,
             "failed_gates": failed_gates or "none",
             "invalidation_price": invalidation,

@@ -80,14 +80,16 @@ def test_deployed_rule_targets_the_measured_band():
     from btc15_signal.strategy import EntryRule
 
     rule = EntryRule.load("strategy.json")
-    # 0.80-0.99. Widened to 0.70 on GROSS edge, then corrected: the Kalshi fee
-    # is 0.07*P*(1-P), largest mid-book, so the cheap end of the band is the
-    # expensive end after fees. Net of fees, 0.70-0.99 measures +0.0072 with a
-    # 95% CI of [-0.0009, +0.0154] - it straddles zero. 0.80-0.99 is +0.0094
-    # [+0.0009, +0.0177], keeping 40% more trades than 0.85 with a lower bound
-    # still above zero.
-    assert rule.min_ask == 0.80
-    assert rule.max_ask == 0.99
+    # 0.85-0.93, set from the per-bucket net-of-fee measurement rather than the
+    # aggregate. Only 0.85-0.90 has a CI excluding zero; 0.90-0.93 is marginal
+    # and everything above it straddles zero. A 0.96 entry needs a demonstrated
+    # 96.3% win rate to break even and the data cannot show one.
+    # Net for this band: +0.0149, CI [+0.0047, +0.0255], n=6,721.
+    # Floor lowered to 0.70 on 2026-09-21 by operator decision, knowingly
+    # against the above (FINDINGS section 21). Measured forward by
+    # `scripts/forward_test.py`; the ceiling is unchanged.
+    assert rule.min_ask == 0.70
+    assert rule.max_ask == 0.93
     # The rule is the master switch for unattended trading. Turning it off here
     # stops automation outright, independently of the /auto flag - which is
     # exactly what silently happened for four hours on 2026-09-21.
@@ -333,3 +335,21 @@ def test_auto_limits_take_a_telegram_override_over_the_env(tmp_path):
     assert auto_limits(store, Settings()).max_trades_per_hour == 6
     store.set_setting("auto_max_trades_per_hour", 2.0, 1_000)
     assert auto_limits(store, Settings()).max_trades_per_hour == 2
+
+
+def test_the_entry_window_matches_the_window_every_study_measures():
+    """Guard against the live rule drifting away from the measured one again.
+
+    Every measurement in FINDINGS uses `6 <= remaining <= 11` (see
+    `scripts/compare_series.py`). Backtest snapshots sit on exact minute
+    boundaries - `remaining = 15 - elapsed` - so the tested range is 360-660
+    seconds. The deployed config was 330-630 for some time, which meant the bot
+    traded a 330-359s band no study had covered and skipped 630-660s that every
+    study included. If this test fails, either re-measure or revert; do not
+    just update the numbers.
+    """
+    from btc15_signal.config import Settings
+
+    settings = Settings()
+    assert settings.entry_to_seconds == 6 * 60
+    assert settings.entry_from_seconds == 11 * 60

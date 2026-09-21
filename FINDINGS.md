@@ -190,3 +190,1502 @@ older backtests stay comparable with each other.
 - **Grid search cannot find this edge.** The best of 11,365 searched rules
   scored below the *median* best rule on shuffled data (p=0.99). Only
   pre-specified rules recover it. Do not trust a rule that a search found.
+
+---
+
+## 8. Session and volatility (2026-09-21) — tested, and NOT adopted
+
+Prompted by the live observation that the New York session looked unusually
+volatile. Measured on the full BTC history, one entry per market, deployed rule
+(0.85-0.93, distance >= 1.5x vol, 6-11 minutes left, 2-minute band settle).
+1,453 entries. Volatility is the Binance-kline 5-minute realised figure;
+quartile cuts 1.5 / 2.6 / 4.4 bps.
+
+| slice | n | NET edge | 95% CI |
+|---|---|---|---|
+| all | 1453 | +0.0248 | [+0.0114, +0.0380] |
+| calm BTC (bottom quartile) | 363 | +0.0228 | [-0.0045, +0.0488] |
+| normal BTC (middle half) | 726 | +0.0328 | [+0.0146, +0.0504] |
+| VOLATILE BTC (top quartile) | 364 | +0.0110 | [-0.0187, +0.0385] |
+| US session only | 525 | +0.0281 | [+0.0054, +0.0480] |
+| US session AND volatile | 181 | -0.0111 | [-0.0595, +0.0316] |
+
+**No gate was added.** Three reasons:
+
+1. **The gap is not a finding.** Reading the table as "volatile is worse" is the
+   overlapping-CI error. Bootstrapping the *difference* directly, clustered by
+   market: volatile minus rest = **-0.0185, 95% CI [-0.0526, +0.0130], p=0.262**.
+   That is noise. The two lines that exclude zero are the ones with the most
+   samples, which is what sample size does, not what volatility does.
+2. **The rule is already volatility-normalised.** `min_normalized_distance`
+   gates on `distance_bps / volatility_5m_bps >= 1.5`. When volatility doubles,
+   the strike must be twice as far away in dollars to qualify. A volatility
+   ceiling would be a second, cruder copy of a control that already exists.
+3. **The New York session is not special.** US-only is +0.0281 against
+   all-sessions +0.0248 — the same edge with fewer samples. Volatility during
+   the New York session is a true observation about the *price*; it is not a
+   true observation about the *edge*.
+
+Note on units: an earlier cut of this used `contract_candles.price_close`, which
+is the **contract** price, not BTC. It produced "volatility" of 1000-2700 bps per
+minute, which should have been the tell. If a BTC per-minute figure is not in
+single-digit-to-low-tens bps, it is not BTC.
+
+`volatility_5m_bps`, `session` and `vol_regime` are archived on every
+observation, so the live record accumulates the data to re-test this later
+without a re-fetch. Re-test as a single pre-registered comparison; do not
+re-slice.
+
+---
+
+## 9. The hourly ladder (2026-09-21) — structure measured, edge NOT measured
+
+A second instrument was added in **shadow mode**: `KXBTCD`, the hourly "or
+above" ladder. Nothing below is a result about profitability. There is no
+hourly entry rule and no hourly trade.
+
+**Structure, measured from the live API:**
+
+- `KXBTCD` is hourly, not daily. `KXBTCD-26SEP2112` opens 15:00 UTC, closes
+  16:00 UTC. The `D` in the ticker is misleading.
+- One event = ~188 threshold contracts, $100 apart, one shared BRTI print.
+  ~24 are quotable at any instant; the other ~164 sit pinned at 0.00/0.01 or
+  0.99/1.00.
+- `KXBTC` is the same expiry as ~186 mutually exclusive brackets. A different
+  instrument.
+- **Liquidity is much deeper than the 15-minute market.** The rung nearest spot
+  carried 93,083 contracts of volume against a few hundred on a typical
+  15-minute contract. Whatever else is true, fill quality should be better.
+- One `expiration_value` decides all 188 rungs, so every outcome in an event is
+  derivable from one number. No per-contract result fetch is ever needed.
+
+**`updated_time` is not a quote clock.** All 188 rungs carry one of three
+timestamps stamped at chain open. Measured over 20 seconds: **13 rungs changed
+their quotes, zero timestamps changed.** Any freshness check built on that
+field marks 100% of live snapshots stale. Staleness has to be measured across
+polls - time since any quotable rung's quote last moved.
+
+**The selection trap, stated before it can be fallen into.** A ladder offers
+~24 correlated estimates at once. Taking the best net edge across them is a
+maximum over correlated noise: it selects the rung where the model is most
+wrong, not the one where the edge is most real. This is FINDINGS.md 7 wearing a
+different hat - the best of 11,365 grid-searched rules scored below the
+*median* best rule on shuffled data (p=0.99). The strike-selection rule must be
+pre-registered and measured in advance, never an argmax over the live chain.
+The correct question is not "which rung looks best now" but "does the rung at a
+pre-specified distance from spot have an edge, measured over many hours".
+
+**The 15-minute band must not be transplanted.** 0.85-0.93 was measured on
+1,453 fifteen-minute windows. The hourly instrument has a different horizon, a
+different fee burden at the same price, and a strike choice the 15-minute
+market does not have. Reusing the band would be assuming the answer. Hourly
+gets its own measurement, its own calibration, and its own session results, or
+it does not trade.
+
+---
+
+## 10. The hourly ladder, measured (2026-09-21) — NO demonstrated edge
+
+21 days: **490 settled hourly events, 90,008 rungs, 661,151 minute candles**
+(`scripts/fetch_hourly.py`, `scripts/measure_hourly.py`).
+
+Rules pre-registered before looking. The rung is chosen by a quantity
+observable at entry - target PRICE or distance from spot - never by estimated
+edge, because an argmax over ~24 correlated rungs manufactures an edge from
+noise. One entry per event. Net of fees. Clustered by day.
+
+**Control — the rung nearest spot** (a coin flip near 0.50, where the Kalshi
+fee peaks). Pooled over 470 entries: **-0.0284 [-0.0844, +0.0251]**, 57.7% win.
+Negative, as it must be. The control behaving correctly is what licenses
+reading the treatment.
+
+**Treatment — the rung whose dearer side is priced nearest 0.89**, entered at
+five fixed times. Five pre-registered points, Benjamini-Hochberg corrected:
+
+| entry | n | win | NET edge | 95% CI | raw p | BH p |
+|---|---|---|---|---|---|---|
+| 50 min left | 470 | 89.8% | -0.0012 | [-0.0298, +0.0265] | 0.527 | 0.527 |
+| 40 min left | 470 | 90.2% | +0.0002 | [-0.0280, +0.0281] | 0.483 | 0.527 |
+| 30 min left | 470 | 90.6% | +0.0041 | [-0.0238, +0.0287] | 0.375 | 0.527 |
+| 20 min left | 470 | 92.6% | +0.0212 | [-0.0081, +0.0485] | 0.076 | 0.380 |
+| 10 min left | 468 | 92.5% | +0.0116 | [-0.0147, +0.0353] | 0.178 | 0.446 |
+
+**Nothing is demonstrated. The hourly ladder must not be traded.**
+
+What the table does NOT say: it does not say hourly has no edge. The estimate at
+20 minutes left (+0.0212) is close to the deployed 15-minute figure (+0.0197),
+and the edge rises as entry moves later, which is the same shape the 15-minute
+rule has. It is simply not resolvable here. With a CI half-width near 0.028,
+this sample can only detect an edge above roughly **2.8c**, and the effect being
+looked for is about **2c** - underpowered by about a factor of two. Roughly
+2,000 events (~85 days) would be needed. A 90-day fetch is running.
+
+**A mistake worth recording.** The first version of this measurement scanned
+from 50 minutes left and took the first qualifying minute, exactly as the
+15-minute rule does. Because a rung near 0.89 almost always exists, it fired at
+50 minutes every single time - `minutes remaining: min 50, median 50, max 50`.
+It was reported as "entry 10-50 minutes" when it measured one instant, 17% into
+the window, against the 15-minute rule's 40-73%. "First qualifying minute" is
+only a meaningful rule when qualifying is actually rare. Check the realised
+distribution of any gate before believing the label on it.
+
+Also note: in the descriptive breakdown by the ask that was actually paid, the
+0.85 bucket showed +0.0473 on n=86. **That is not a finding.** It is where a
+rule chosen for other reasons happened to land, which is the selection trap in
+section 9 arriving by the back door.
+
+---
+
+## 11. Re-verification after the hourly flaw (2026-09-21)
+
+Section 10 records a measurement that claimed "entry 10-50 minutes" while
+firing at 50 minutes every time. The obvious question is whether the deployed
+15-minute rule was measured the same way. **It was not.** Realised entry times,
+deployed rule, 1,453 entries:
+
+| minutes left | 10 | 9 | 8 | 7 | 6 |
+|---|---|---|---|---|---|
+| share of entries | 19.8% | 17.2% | 20.5% | 21.1% | 21.5% |
+
+Near-uniform. The failure is specific to a strike LADDER: with 188 rungs a
+contract near any target price always exists, so "first qualifying minute"
+collapses to "first minute scanned". With the single strike of a 15-minute
+market, qualifying is genuinely rare and the distribution spreads out. Two
+internal checks also pass - without the settle rule entries appear at 11
+minutes left, and with it 11 correctly vanishes, since two consecutive
+qualifying minutes make 10 the earliest possible entry.
+
+**Sample size corrected.** The deployed rule yields **1,453** entries, not the
+1,674 quoted earlier in places. The larger figure came from a run whose scan
+loop used `break` where it should have continued, and is superseded everywhere.
+
+**The band-settle rule was re-derived**, because `entry_band_settle_s = 120` is
+live config whose justification came from that same superseded run. Paired on
+the 1,453 markets that qualify under both rules, the delay itself is harmful:
+entering at the first qualifying minute returns +0.0423 [+0.0286, +0.0556]
+against +0.0248 [+0.0114, +0.0378] after waiting, a difference of **-0.0175
+[-0.0189, -0.0161]**.
+
+That is not a reason to remove the rule, and reading it as one would be a
+lookahead error. The settle rule both DELAYS entry and EXCLUDES the markets that
+never hold the band, and those excluded markets are bad: **-0.0164
+[-0.0333, +0.0004]** on 1,513 entries. You cannot keep the good markets and
+enter them early, because at minute one you do not know which ones will hold.
+Comparing only the two implementable rules:
+
+| rule | n | NET edge | 95% CI | total |
+|---|---|---|---|---|
+| enter at 1st qualifying minute | 2966 | +0.0124 | [+0.0011, +0.0228] | +$36.70 |
+| **wait 2 minutes in band (deployed)** | 1453 | **+0.0248** | [+0.0114, +0.0378] | +$36.09 |
+
+Twice the edge per contract for half the trades and half the capital at risk,
+at the same total. **Keep `entry_band_settle_s = 120`.** The earlier chat
+figures (+0.0219 vs +0.0080) are superseded by +0.0248 vs +0.0124; the
+direction was right, the magnitudes were not.
+
+**The open opportunity.** The delay costs 1.75c and the filter is worth more
+than that. Anything observable AT MINUTE ONE that predicts whether the band
+will hold would let entry happen early on the markets worth keeping. The
+archive records the full per-minute path, so this is answerable. It may also
+bear on the live fill problem: on 2026-09-21 two of three auto orders did not
+fill, and in both cases the order was placed well above the price at which the
+signal first appeared (signal 65% -> order 86%; signal 81% -> order 91%). The
+mechanism is NOT established - that is an inference from three orders, not a
+measurement. What IS certain is that the backtest above credits a fill at the
+delayed price, and live trading got one fill in three. Whatever the cause, a
+measured edge that assumes execution overstates what is collectable.
+
+---
+
+## 12. The clock, not the band (2026-09-21)
+
+A manual entry at 0.72 on `KXBTC15M-26SEP211145-45` settled at $1.00 while the
+bot placed no order. The archive says why, and it is not the price band.
+
+| remaining | ask | failed gates |
+|---|---|---|
+| 316s | 0.84 | contract price band |
+| 291s | 0.84 | contract price band |
+| **279s** | **0.921** | **None** |
+| **267s** | **0.921** | **None** |
+| 255s | 0.83 | contract price band |
+
+The setup qualified **completely**. `entry_to_seconds = 330` stopped
+`primary_signal` before it looked: at 279s the function returns at its first
+line, which is why the service log holds exactly one entry for the whole
+window. Had it looked, `entry_band_settle_s = 120` would have blocked it
+anyway - the 0.921 streak lasted 24 seconds.
+
+**Two gates are invisible to `failed_gates`.** That column records the ENTRY
+RULE only. The entry-time window and the band-settle are applied afterwards, in
+the trading path. A row reading "gates: None" therefore does NOT mean an order
+was placed, and any study that counts clean rows as trades will overcount. Of
+256 fully-clean polls in the live archive, **97 fall outside the entry window**,
+and 3 markets qualified ONLY outside it.
+
+**A live-versus-measured discrepancy.** Every backtest here uses 6-11 minutes
+remaining (360-660s). The deployed config is `entry_from_seconds = 630`,
+`entry_to_seconds = 330`. The measured rule and the running rule are shifted 30
+seconds apart at both ends. Not yet quantified.
+
+**The manual trade is archived** in `manual_trades` (`scripts/record_manual_trade.py`)
+so research can separate signal price from fill price from what was actually
+reachable: signal 0.67, filled 0.72 (acting late cost 5c), settled 1.00, net
+**+0.2658**; cashing out at the available 0.94 would have returned +0.2058.
+Holding the last two minutes earned **+0.06 more while the whole position stayed
+exposed**. One observation. The measured verdict on cash-out remains -0.0006
+(noise) from 5,753 paired trades; this does not move it.
+
+---
+
+## 13. The side-convention trap (2026-09-21)
+
+**Every band table in this file above section 12, and `scripts/compare_series.py`,
+pick the side as the DEARER contract:**
+
+```python
+up, dn = yes_ask, 1 - yes_bid
+ask = max(up, dn)
+```
+
+**The live service does not.** `model.py:18` sets
+`side = "UP" if signed_distance >= 0 else "DOWN"` - by where BTC sits relative
+to the strike - and `main.py` then reads *that* side's ask. The two agree where
+the contract is dear and diverge exactly at the cheap end:
+
+| favourite ask | side disagreement | mean gap |
+|---|---|---|
+| 0.95-0.99 | 2.3% | 0.021 |
+| 0.85-0.89 | 13.4% | 0.097 |
+| 0.70-0.74 | 25.0% | 0.108 |
+| 0.60-0.64 | 33.0% | 0.076 |
+
+So the published tables fairly describe the deployed rule at 0.85+, and **do not
+describe it below**. On the live convention the deployed band measures
+**+0.0220 [+0.0081, +0.0360]** against the published +0.0248 - same verdict,
+slightly smaller. Any future study of the cheap end that uses the published
+convention is measuring a rule the bot does not run.
+
+## 14. Below the band: measured, and the answer is no (2026-09-21)
+
+Full per-bucket study on 6,435 settled markets / 68 days, live side convention,
+BH-corrected over nine 0.05 buckets.
+
+| band run AS the band | n | NET | 95% CI | BH p |
+|---|---|---|---|---|
+| 0.70-0.74 | 336 | +0.0325 | [-0.0132, +0.0758] | 0.185 |
+| 0.75-0.79 | 409 | +0.0036 | [-0.0374, +0.0430] | 0.485 |
+| **0.80-0.84** | 428 | **-0.0012** | [-0.0368, +0.0332] | 0.527 |
+| 0.85-0.89 | 511 | +0.0289 | [+0.0034, +0.0527] | 0.070 |
+| 0.90-0.94 | 647 | +0.0170 | [-0.0013, +0.0342] | 0.097 |
+
+The bucket immediately below the floor is the flattest line in the table. The
+two pre-specified hypotheses, each tested once, with the difference bootstrapped
+directly:
+
+- `min_ask 0.80` - deployed = **-0.0055 [-0.0166, +0.0047]**, p=0.30
+- `min_ask 0.70` - deployed = **-0.0100 [-0.0240, +0.0035]**, p=0.15
+
+Both negative, neither significant. The trades a lower bound would ADD measure
++0.0076 and +0.0091 with intervals through zero. Total dollars rise on the point
+estimate (2.5x the trades at half the edge) but the wider rule's interval
+includes zero, and 50 entries/day collides with `auto_max_trades_per_hour = 6`
+anyway. **Do not lower the bound.**
+
+**The trend confound is settled**: the operator's exact regime - momentum
+aligned, 4h trend >= 50bp - measures **-0.0019 [-0.0457, +0.0404]** on the
+pooled 0.70-0.84. There is no trend artifact masquerading as an edge because
+there is no edge to attribute.
+
+**One positive sub-band result, deliberately NOT adopted.** 0.65-0.69 as its own
+band: +0.0709 [+0.0209, +0.1203], n=284, BH p=0.038 in the 9-bucket family but
+**0.079 across all 35 buckets tested**. It survives bucket-edge jitter, all four
+quarters of history, and a negative control. It dies on two things: it collapses
+without the settle rule (settle=1 gives **-0.0061**), and an open 0.55-0.99 band
+- what a widened rule would actually trade - captures the same region at only
++0.0126 [-0.0251, +0.0487] and measures +0.0024 overall. **It is a grid-found
+rule**, and section 7 says what those are worth. Recorded as a pre-registered
+hypothesis to measure FORWARD, never as a band change.
+
+**What the data cannot resolve**: the difference test resolves +-1.5c. A genuine
+1c/contract gain from lowering the bound is invisible here; the history would
+need to roughly triple. 0.80-0.84 alone has an MDE of 5c.
+
+**Also found, not acted on**: 0.85-0.93 does BETTER when the 4h trend runs
+AGAINST the bet (+0.0416 [+0.0248, +0.0577]) than with it (+0.0008
+[-0.0222, +0.0228]), difference p=0.0045 - the opposite sign to intuition. A
+single slice of an already-sliced sample. Hypothesis, not a gate.
+
+---
+
+## 15. The hourly ladder, settled (2026-09-21) — no edge, and the promising cell was noise
+
+Section 10 measured 490 events over 21 days, found nothing significant, and
+said the sample was underpowered by about a factor of two. The history was
+extended to everything Kalshi holds for the series: **1,584 settled hourly
+events over 72.8 days, 46,250 rungs, 2,148,976 minute candles.** Same five
+pre-registered entry times, same rung-selection rule, same BH family. Nothing
+was re-chosen.
+
+| entry | n | win | NET edge | 95% CI | BH p |
+|---|---|---|---|---|---|
+| 50 min left | 1508 | 91.0% | +0.0077 | [-0.0069, +0.0215] | 0.705 |
+| 40 min left | 1508 | 89.3% | -0.0116 | [-0.0294, +0.0053] | 0.916 |
+| 30 min left | 1507 | 89.7% | -0.0100 | [-0.0241, +0.0038] | 0.916 |
+| 20 min left | 1501 | 91.5% | **+0.0047** | [-0.0129, +0.0224] | 0.716 |
+| 10 min left | 1497 | 91.6% | +0.0011 | [-0.0120, +0.0141] | 0.716 |
+
+Control (rung nearest spot, 20 min left): -0.0110 [-0.0305, +0.0098].
+
+**The 20-minute cell went from +0.0212 to +0.0047.** On 21 days it was the best
+line in the table, raw p=0.076, and section 10 noted it sat close to the
+deployed 15-minute figure of +0.0197 and rose as entry moved later. Tripling the
+data collapsed it to a fifth of its size. That is what the most promising cell
+in an underpowered table does, and it is the cleanest example in this file of
+why a raw p near 0.08 on a small sample is not a finding waiting for
+confirmation.
+
+**This is no longer an underpowered null.** CI half-widths are now 0.7c to 1.8c
+against 2.8c before. An edge the size of the deployed 15-minute rule (+0.0197)
+would have shown at four of the five entry times. It did not.
+
+**Verdict: the hourly ladder has no tradeable edge and the question is closed**
+unless something other than price-targeted rung selection is proposed. Shadow
+recording continues, because the live archive captures depth, spreads and the
+full chain path that this candle study cannot see - but no hourly rule should
+be written against this instrument on the strength of historical quotes.
+
+The 15-minute strategy is unaffected: different instrument, different horizon,
+measured separately, still +0.0220 [+0.0081, +0.0360] on the live side
+convention.
+
+---
+
+## 16. "They keep winning and we are just watching" — tested (2026-09-21)
+
+The operator repeatedly saw declined setups settle as winners: a 72c manual
+entry that paid $1.00, and a DOWN contract at 94.1% with 4:53 left that the bot
+ignored. Both fell outside the entry window. The window had never been tested,
+so it was tested. LIVE side convention (see section 13), 68 days, everything
+else deployed.
+
+| entry window (minutes left) | n | NET | 95% CI | total |
+|---|---|---|---|---|
+| **6-10 (DEPLOYED)** | 1243 | **+0.0218** | [+0.0078, +0.0357] | +$27.05 |
+| 5-11 | 1594 | +0.0173 | [+0.0038, +0.0303] | +$27.61 |
+| 4-12 | 1860 | +0.0180 | [+0.0053, +0.0298] | +$33.41 |
+| 3-13 | 1991 | +0.0149 | [+0.0027, +0.0267] | +$29.76 |
+| 2-14 | 2058 | +0.0127 | [+0.0004, +0.0244] | +$26.14 |
+| 0-15 (whole window) | 2072 | +0.0122 | [+0.0007, +0.0235] | +$25.32 |
+| 6-10, ceiling raised to 0.97 | 1974 | +0.0172 | [+0.0065, +0.0276] | +$33.90 |
+| 1-14, no settle rule | 3947 | **-0.0006** | [-0.0102, +0.0094] | -$2.23 |
+
+**The deployed window is the best per contract of everything tested**, and the
+degradation is monotone as it widens. Widening buys volume at the cost of
+quality. Paired difference tests against the deployed rule, bootstrapped
+directly over markets:
+
+| alternative | per contract | total dollars |
+|---|---|---|
+| window 4-12 | -0.0038 [-0.0129, +0.0050] | +$6.36 [-$8.26, +$20.16] |
+| ceiling 0.97 | -0.0046 [-0.0122, +0.0030] | +$6.85 [-$4.05, +$16.91] |
+| **both together** | **-0.0113 [-0.0222, -0.0007]** | +$2.62 [-$17.03, +$21.20] |
+
+Loosening either gate alone is a wash - no significant gain or loss either way.
+Loosening **both** is significantly WORSE per contract and gains nothing in
+total. Removing the settle rule while widening the window destroys the edge
+outright (-0.0006).
+
+**Answer: the bot is not leaving money on the table.** Declined setups do win
+often, because they are priced to win - a contract at 94% wins about 94% of the
+time, and the break-even at 94c after fee is about 94.4%. Trading them does not
+measurably improve the result.
+
+**The honest residual.** Every total-dollar point estimate is positive (+$6.36,
++$6.85, +$2.62) with intervals through zero, so slightly more total profit may
+exist and this data cannot resolve it. At $1/contract that is about **9 cents a
+day** over 68 days, against `auto_max_trades_per_hour = 6` and a
+one-position-at-a-time guard that would block much of the extra volume anyway.
+Not worth trading quality for.
+
+**Caveat on this study**: seven window choices and three band variants were
+scanned before the difference tests were run. The differences themselves were
+tested directly and paired, which is the right test, but "4-12" was chosen as a
+comparator after seeing the table. Treat the magnitudes as indicative; the
+verdict - no significant improvement available - does not depend on which
+comparator was picked, since the deployed rule is top of the table on the
+measure that matters.
+
+---
+
+## 17. The deployed window did not match the measured one (2026-09-21) — FIXED
+
+Every study in this file uses `6 <= remaining <= 11` (`scripts/compare_series.py`).
+Backtest snapshots sit on exact minute boundaries - `remaining = 15 - elapsed`
+in `features.py` - so the measured range is **360-660 seconds**.
+
+The live config was `entry_from_seconds = 630`, `entry_to_seconds = 330`. Half a
+minute adrift at **both** ends. The bot was therefore:
+
+- trading a **330-359s** band that no study has ever covered, and
+- ignoring **630-660s**, which every study includes.
+
+Changed to 660 / 360. Measured 6-11 under the live side convention (section 13):
+**+0.0220 [+0.0077, +0.0360] on 1,359 entries, +$29.96** over 68 days - which
+independently reproduces the subagent's figure for the same window to four
+decimal places. Against the 6-10 window used in some of this session's tests the
+difference is +0.0003 [-0.0044, +0.0043], not distinguishable, but 6-11 captures
+116 more entries.
+
+`tests/test_service_window.py` now asserts the config equals 6 and 11 minutes so
+this cannot drift again silently.
+
+**This is not a loosening, and it does not chase the recent misses.** It tightens
+the late end. `KXBTC15M-26SEP211215-15` was eligible at 348s on 2026-09-21,
+inside the old window and OUTSIDE the new one - though the 120-second settle
+blocked it anyway, so no trade either way. The change was made because the
+deployed rule should be the rule that was measured, not because it captures any
+particular observation.
+
+**What was rejected at the same time.** Sections 14 and 16 measured every
+loosening the live record suggested. All have negative point estimates per
+contract; none is significantly better on total dollars; window-plus-ceiling
+together is significantly worse (-0.0113). The settle curve is monotone -
++0.0113 / +0.0218 / +0.0297 / +0.0364 at 1/2/3/4 minutes - so waiting longer
+produces better trades, and shortening the settle to catch fast movers runs
+against the gradient. No gate was loosened.
+
+---
+
+## 18. Live evidence is the real evidence (2026-09-21)
+
+The operator's objection: results and live-collected data are the evidence,
+not backtests on past data. That is substantially correct, and it is now a
+report - `scripts/live_evidence.py` - which uses only what actually happened
+and touches no historical candle.
+
+It separates three things that one P&L figure hides:
+
+| | what it measures | can a backtest see it? |
+|---|---|---|
+| RULE | did the gates pick winners, traded or not | yes |
+| EXECUTION | what getting the trade ON cost | **no** |
+| REALISED | the account: rule + execution + variance | no |
+
+**The execution section is the part no historical study can produce**, and it
+is the operator's point made concrete: **21 orders submitted, 9 filled (43%),
+12 missed.** A backtest credits all 21.
+
+Live, as of 17.2 hours of settled signals:
+
+```
+RULE       all signals (paper)     n=61  +0.0961/ct  [+0.0120, +0.1725]
+           inside 0.85-0.93 band   n=14  +0.1198/ct  NO INTERVAL - 0 losses
+EXECUTION  fill rate 43%; fills land -0.0151 vs the decision price
+REALISED   n=9  -0.1034/trade  total -$0.9306
+GAP        realised - paper on the same trades = +0.0369/ct
+```
+
+**Two numbers this report produced first time round were wrong, and the
+mistakes are worth keeping.**
+
+1. It printed a bootstrap CI of [+0.1076, +0.1308] for the banded signals. That
+   sample is **14 wins and 0 losses**. A bootstrap can only resample what it was
+   given, so it never draws a loss; the interval describes price variation among
+   winners, not uncertainty about the mean. It now REFUSES an interval below 3
+   losses and prints "NO INTERVAL" instead.
+2. It claimed the banded sample needed "~5 more samples" to resolve a 2.2c edge,
+   because it estimated the standard deviation from that same all-wins run.
+   Sample size now uses the THEORETICAL payoff variance q(1-q) with q taken from
+   the price, which gives **~1,586 trades, about 79 days**.
+
+The correct reading of the live record: 14 of 14 banded signals won, the 95%
+lower bound on that win rate is **78.5%**, and break-even at 0.89 after fee is
+**89.7%**. The lower bound does not clear break-even. The live data is
+**consistent with the measured edge and does not establish it** - and cannot,
+for roughly another 80 trading days.
+
+**So both objections are right at once.** Backtests cannot see execution and
+overstate what is collectable; live data is the only thing that can settle it
+and is nowhere near able to yet. The response is not to pick one, but to record
+execution from now on (section 12, the `executions` table) so that when the live
+sample matures it can answer the question the candles never could.
+
+---
+
+## 19. Backtesting on the live tape instead of candles (2026-09-21)
+
+Section 18 answered "live results beat backtests" by reporting the live record.
+This goes one step further and does the **backtest itself on live-collected
+data**: `scripts/replay_live.py` replays the `observations` table - the quotes
+the running service actually saw, at the cadence it actually polled, with the
+settlement it actually observed - through the deployed gate stack. No candle is
+read and no price is reconstructed.
+
+Three things the tape has that a minute candle cannot:
+
+1. **The real ask on our side** at the instant of decision, not a mid or close.
+2. **The real cadence.** The service sees the book about every 12s and can only
+   act at those instants. A minute-candle study is simultaneously too coarse to
+   see a 24-second band touch and too generous about when it may act.
+3. **The 120s settle gate.** `entry_band_settle_s` is a rule about the *path*
+   the price took, not a price level. It needs sub-minute quotes and **cannot be
+   evaluated on minute candles at all** - and it is the gate currently deciding
+   whether this system trades.
+
+**Two corrections the build forced, both worth keeping.**
+
+- The stored `rule_match` column is **not trustworthy across the tape**.
+  `strategy.json` was edited mid-record (0.80-0.99 -> 0.85-0.93 at 14:00 UTC),
+  so earlier rows carry a verdict from a rule no longer deployed. Every gate is
+  recomputed from raw features against the rule on disk.
+- The first run reported the 12:15 window as having "held the band 121s" and
+  been skipped anyway, which looked like a gate bug. It was a reporting bug:
+  that streak was reached with **120s left on the clock**, two minutes past the
+  entry window and failing three other gates. Taking the maximum streak over
+  the whole window describes a moment the gate could never have acted on. It now
+  reports the longest streak reached at a poll that passed every other gate.
+
+**The funnel, on 22 windows / 1,463 live quotes / 5.2 hours:**
+
+```
+windows on the tape                      22
+...whose ask entered the band            19
+...eligible on ALL gates at some poll    13
+...and held the band   0s -> TRADE       13
+...and held the band  60s -> TRADE        5
+...and held the band 120s -> TRADE        3
+```
+
+**The settle gate is the binding constraint, by a wide margin.** Thirteen
+windows qualified on price, distance, model and momentum; three survived the
+wait. The other ten topped out at 24-85 seconds in band before the ask moved or
+the entry window ran out. This is the mechanical explanation for the live
+service placing **no order between 14:52 and 16:46 UTC** while logging
+"eligible" repeatedly.
+
+**Why none of that says the gate is wrong.** The tape contains almost no
+downside inside the band:
+
+```
+quotes in band, WINNING windows          203
+quotes in band, LOSING  windows            3
+```
+
+Both losing windows (11:45, 15:45) were excluded by the band almost
+mechanically - one put three quotes in the band, the other none. So every win
+rate in the report is near 100% **by construction**, and the headline that the
+120s wait "declined +1.2166 of P&L at the touch ask" is not a cost measurement:
+on a tape whose band holds no losers, *any* filter can only look expensive.
+This is the same shape as the section 18 bootstrap failure - the downside is
+absent from the sample - and it is why the report prints section 2b above
+section 3 rather than below it.
+
+**Execution, carried over and applied rather than assumed:** 21 orders
+submitted, 9 filled (43%), fills landing -0.0151 against the decision price (7
+better, 2 worse). Applied to the replay, the haircut goes on the **count, not
+the price** - a missed order is a trade that never happened, not a loss. The
+three deployed-gate trades are +0.3104 assuming fills and +0.1330 at the live
+fill rate.
+
+**What this settles and what it does not.** It settles the *mechanics*: which
+gate stops which window, and what the ask did while the clock ran. It settles
+nothing about edge - 3 trades against the ~1,600 of section 7 is a rounding
+error, and the 95% lower bound on the deployed gate's win rate is 43.8% against
+a break-even of 89.7%.
+
+**The change NOT made.** The obvious move from this report is to loosen
+`entry_band_settle_s`, since it is refusing ten of thirteen qualifying windows
+that all won. That is exactly the inference the tape cannot support, and the
+120s value came from a measurement that did clear zero where entering on the
+first qualifying minute did not (`store.band_streak_seconds`). The gate stays
+until a tape with in-band losses in it can price the trade-off.
+
+**Open, unverified:** the `executions` table is still empty. It is covered by
+`tests/test_execution_log.py`, but the instrumentation landed at ~15:52 UTC and
+the last live order was 14:52 UTC, so **it has never yet written a production
+row**. The first order placed after a settle-gate clearance is what proves it.
+
+---
+
+## 20. The forward test section 14 asked for, and the day-effect trap (2026-09-21)
+
+The live feed for 2026-09-21 shows a long run of declined sub-band setups
+settling as winners: signals at 63-81% refused on the price band, then "✅
+right", over and over, while paper climbed to +6.16 and live sat at -0.93. The
+natural reading is that the band is too tight.
+
+Sections 14 and 16 already tested that reading on 68 days and said no. What
+neither had was the thing section 14 explicitly asked for: 0.65-0.69 was
+recorded "as a pre-registered hypothesis to measure FORWARD, never as a band
+change", and **nothing measured it forward.** `scripts/forward_test.py` does.
+
+The historical study ends at the last kline, 2026-09-20 23:20; the live signal
+record begins 2026-09-20 23:09. The eleven-minute overlap is immaterial, so the
+live record is genuinely out of sample.
+
+**The statistic is excess over the market's own price**, not win rate:
+
+```
+excess = wins - sum(contract_price)
+```
+
+A contract at 0.70 that wins 70% of the time has zero excess and, after fee, is
+a losing trade. Win rate flatters any band full of high-probability bets; the
+price already charged for those. This is why the feed's "89% win rate" and the
+band-qualified "24/27 (89%)" being identical is the interesting number, not the
+89% itself.
+
+**The control, which has to be read first.**
+
+```
+settled live signals    63
+wins                    56
+wins the PRICES implied 48.9
+excess                  +7.1  (+0.112/signal)
+z against fair pricing  +2.21
+```
+
+**The whole tape beat its prices, not one band.** On a day like this every band
+beats its own price at once and whichever band is under suspicion looks
+vindicated. A band is only interesting if it beat its prices by MORE than the
+rest of the tape did.
+
+**Measured that way, no band separates from the day:**
+
+| hypothesis | forward | z | vs rest of tape |
+|---|---|---|---|
+| 0.65-0.69 (registered) | 9/11 @ 0.67 | +1.05 | +0.043 — no interval, 2 losses |
+| **0.70-0.84** (lower the floor) | 26/30 @ 0.79 | +1.07 | **-0.064 [-0.222, +0.088]** |
+| 0.85-0.93 (deployed) | 14/14 @ 0.87 | +1.43 | +0.020 — no interval, 0 losses |
+
+Every individual z is below 1.96 while the tape's is above it. **The band the
+feed is full of - 0.70-0.84 - measured WORSE than the rest of the tape on the
+point estimate**, which is the opposite of the "money left on the table"
+reading, though its interval spans zero and settles nothing either way.
+
+**So the answer to the feed is: today was a good day at every price.** The
+declined signals won because almost everything won - including, at the same
+time, the 14/14 inside the deployed band. Attributing that to the band boundary
+requires the boundary to have done something, and on this tape it did not.
+
+**Nothing adopted, nothing changed.** Each hypothesis is 90x to 326x short of
+the sample it needs to resolve a 2.2c effect. The value of this section is the
+method: the control line makes a day-wide mispricing visible as a day-wide
+mispricing, which is the specific way a short live record misleads. It is the
+same failure as the section 18 bootstrap and the section 19 all-wins band, in a
+third costume.
+
+Re-run `python scripts/forward_test.py` daily. It becomes evidence only with
+time, and the registered hypotheses are now written down where a later result
+cannot be quietly reinterpreted.
+
+---
+
+## 21. The band floor lowered to 0.70 (2026-09-21) — operator decision, logged as a live experiment
+
+**Changed:** `strategy.json` `min_ask` 0.85 -> 0.70. `max_ask` stays 0.93,
+`entry_band_settle_s` stays 120. Previous file kept at `strategy.json.bak.band85`.
+
+**This is an operator decision taken against the measured evidence**, made with
+that evidence in front of it, and it is recorded here as such rather than
+rewritten into a justification. Sections 14, 16 and 20 all measured this region
+and none of them found a reason to widen:
+
+- s14, 68 days: `min_ask 0.70` - deployed = **-0.0100 [-0.0240, +0.0035]**,
+  p=0.15. Negative point estimate, not significant. The bucket immediately
+  below the floor (0.80-0.84) is the flattest line in the whole table.
+- s16: declined setups win because they are **priced** to win; trading them did
+  not measurably improve the result.
+- s20, forward: on the live tape the 0.70-0.84 region measured **-0.064/signal
+  against the rest of the same tape** [-0.222, +0.088]. Opposite sign to the
+  intuition, interval through zero, settles nothing.
+
+**What the change was chosen on.** Trade count, from the live-tape sweep:
+
+| floor | trades today | won | avg ask | net/ct | in-band quotes from LOSING windows |
+|---|---|---|---|---|---|
+| 0.85 | 3 | 3 | 0.890 | +0.1035 | 3 |
+| 0.80 | 7 | 7 | 0.861 | +0.1305 | 9 |
+| **0.70** | **13** | **13** | **0.835** | **+0.1550** | **23** |
+| 0.65 | 14 | 14 | 0.806 | +0.1834 | 52 |
+
+Lowering the floor helps twice: it admits cheaper contracts AND makes the 120s
+settle gate far easier to clear, because a wider band is one the price stays
+inside for longer. That is why the count moves 3 -> 13 rather than marginally.
+
+**The 14/14 and 13/13 in that table are not evidence.** 2026-09-21 beat its own
+prices across every price level at once (s20, z=+2.21). The loser-exposure
+column is the honest read of the risk: a 0.70 floor puts the band across ~8x
+more of the losing windows' price action than 0.85 did, and today's clean sweep
+dodged all of it on a sample of two losing windows. **Expect losses this band
+would have taken.**
+
+**Guardrails that now actually bind** (`autotrade.auto_block_reason`, all hard
+stops read from durable state before every order): daily loss floor $10,
+one open position at a time, 6 trades/hour, per-day cap, minimum spacing. At
+~13 trades/day at ~$0.84 the daily loss floor is the one that matters - it is
+roughly one bad day away, by design.
+
+**Applied without a restart.** `EntryRule.load` runs every poll, so the file is
+hot-reloaded; it was written atomically (temp file + `os.replace`) because
+`load` has no guard around `json.loads` and a half-written file read mid-poll
+raises inside the loop. Confirmed live at 17:11:27 UTC: a 0.81 ask evaluated
+`rule_match=1, failed_gates=None`, where a 0.84 ask three minutes earlier had
+failed `contract price band`.
+
+**What decides whether this stays.** Re-run `scripts/forward_test.py` daily. The
+question is not "did it win" - on a trending day everything wins - but whether
+0.70-0.84 beats **the rest of the same tape**, which is the only comparison
+that separates the band from the day. s14 says ~2,700 signals to resolve 2.2c.
+**Revert with `cp strategy.json.bak.band85 strategy.json`** - it takes effect on
+the next poll, no restart.
+
+---
+
+## 22. Why the auto orders missed, and what support/resistance is worth (2026-09-21)
+
+Lowering the floor to 0.70 (section 21) worked immediately: the 13:30 window
+qualified within four minutes. Then **all three orders missed**, and the
+operator took the trade by hand at 0.81. It settled DOWN, a winner:
+**+$0.1792 net**, recorded in `manual_trades`.
+
+**The `executions` table wrote its first production rows** - section 19 listed
+it as never having done so - and they diagnose the miss immediately:
+
+```
+17:19:29  att=1  decision_ask=0.85  filled=0  decision_to_submit=2176ms  round_trip=178ms
+17:21:20  att=2  decision_ask=0.85  filled=0  decision_to_submit=2018ms  round_trip=225ms
+17:21:59  att=3  decision_ask=0.81  filled=0  decision_to_submit=2026ms  round_trip=235ms
+```
+
+**The network is not the problem.** Kalshi answers in ~200ms. The order goes out
+~2,000ms after the decision it was priced from, and the orders are
+`immediate_or_cancel` - they fill against resting size or die. An IOC at a
+two-second-old touch with one cent of allowance cancels.
+
+**Where the two seconds went.** `now_ms` is stamped at the TOP of the poll
+cycle, and before the order the loop ran: pending settlements (`kalshi.result`
+per row, plus a Telegram settlement report), **the hourly ladder's shadow poll -
+188 rungs** - then `active_market`, the Binance snapshot, and the observation
+write. A recorder that by design never trades was standing in front of real
+money.
+
+**Fixed:** the hourly shadow block now runs AFTER `primary_signal` /
+`reversion_signal`. Its original comment explained it sat early so the archive
+kept running between windows, where the loop `continue`s - so it is now called
+on BOTH paths rather than merely moved, and the gap is still covered. Deployed
+by restart at 13:32 local.
+
+**Also fixed, an instrumentation bug that hid the variable under test.**
+`executions.limit_submitted` recorded `claimed.entry_limit`, not the limit
+actually sent, which is `entry_limit + entry_slippage` capped at 0.99. Three
+orders logged as 0.85 were really submitted at 0.86 - and the slippage
+allowance is precisely what decides whether a fill happens. The column that
+exists to explain misses was recording the wrong number.
+
+**NOT YET VERIFIED.** No order has been placed since the restart, so the
+latency fix is deployed and **unmeasured**. The next `executions` row is the
+test: `decision_to_submit_ms` should fall well below 2,000ms. If it does not,
+the remaining cost is the Binance snapshot and `active_market`, which sit
+between the ask being read and the order going out.
+
+### "Keep checking a refused signal so it can still qualify"
+
+Already true, and the archive proves it. Every poll re-evaluates every gate
+from scratch - `observations.failed_gates` is written fresh about every 12
+seconds, and a setup refused at 69% is re-checked 12 seconds later:
+
+```
+17:36:03  ask=0.69 -> contract price band
+17:36:16  ask=0.69 -> contract price band
+17:36:42  ask=0.62 -> contract price band
+```
+
+Nothing is latched or dropped. What fires only once per window is the TELEGRAM
+ALERT (`strategy_alerts`, one row per strategy+window - section 3's alert lock).
+The trading path is not gated by it. So a refused signal that later enters the
+band **will** be taken; it simply will not produce a second "ENTRY READY"
+message. The thing to change, if anything, is the notification - not the rule.
+
+### Support and resistance: measured, and NOT established
+
+The operator is right that it is missing: `key_level` exists only in the
+reversion strategy, set to the current window's high or low. The primary rule
+has no notion of a level. `scripts/measure_levels.py` tests ONE pre-specified
+hypothesis over 71 days - if a level stands in the way of the move that beats
+us, it has to break first, so those setups should settle better:
+
+```
+                                   n       won     net       95% CI              p
+ALL qualifying setups           15369    83.7%  +0.0126  [+0.0025, +0.0223]   0.009
+a level BLOCKS the adverse move  7370    84.8%  +0.0198  [+0.0049, +0.0341]   0.003
+no level in the way              7999    82.6%  +0.0059  [-0.0093, +0.0202]   0.212
+```
+
+Read alone, that looks decisive: one arm's interval excludes zero and the
+other's does not. **It is not the test.** Section 16 makes exactly this point,
+and the difference has to be bootstrapped directly - on shared clusters, since
+one market contributes minutes to both arms:
+
+```
+blocked - clear   +0.0140/contract  [-0.0067, +0.0344]  p=0.090
+```
+
+**The interval includes zero.** The point estimate is the largest single-feature
+effect measured in this file and it still is not established at n=15,369. No
+gate is added. `CONFIRM=30` and the 24h level lifetime were picked once, before
+running, and not tuned - tuning them would turn this into the grid search
+section 7 warns about.
+
+**No lookahead:** a pivot is timestamped at CONFIRMATION, not formation. A swing
+high is only known 30 minutes after the bar that made it, and using the
+formation time would identify the level with the very bars that prove it held.
+
+---
+
+## 23. The support/resistance gate, deployed (2026-09-21) — operator decision
+
+Section 22 measured levels and did not adopt them: the difference between
+filtering and not filtering was +0.0140 [-0.0067, +0.0344], p=0.090. The
+operator's decision was to apply it anyway. Logged here as taken against the
+measurement, with the evidence beside it rather than rewritten to suit.
+
+**What the evidence actually supports.** The gated arm on its own is
++0.0198 [+0.0049, +0.0341], n=7,370, an interval excluding zero. So trading
+only the setups with a level in the way is defensible on its own terms. What is
+NOT established is that it beats not filtering. Both readings are true at once
+and the second is the one this gate is betting on.
+
+**The cost, stated up front: it refuses about half.** 7,999 of 15,369
+qualifying setups had no level in the way. On top of the 0.70-0.93 band and the
+120s settle gate, expect a materially lower trade rate.
+
+**Design.**
+
+- `levels.py` holds ONE definition of a pivot and of "the level in the way",
+  imported by both `scripts/measure_levels.py` and the live path. A level shown
+  in Telegram computed differently from the level that was measured would be
+  worse than showing nothing - it would read as confirmation of a result that
+  was never about it. The study was re-run after the refactor and reproduces
+  every figure exactly (n=15,369 / 7,370 / 7,999, same intervals).
+- **No lookahead.** A pivot is stamped at CONFIRMATION, `CONFIRM=30` minutes
+  after the bar that formed it. Using formation time would identify a level
+  with the very bars that prove it held. `test_a_pivot_is_not_knowable_until_it_is_confirmed`
+  pins this.
+- **Off the order path.** Levels need ~25h of one-minute bars; the live
+  snapshot fetches 16. That second Binance call is exactly the latency that
+  cost three fills in section 22, so `LevelTracker` refreshes on its own
+  300-second clock AFTER the trading path, and the rule only ever reads the
+  cache.
+- **Unknown levels REFUSE.** An empty or failed cache reports
+  `levels unavailable`, distinct from an ordinary `support/resistance`
+  rejection, and blocks. Following `autotrade.auto_block_reason`: a check that
+  cannot be evaluated answers no. The distinct wording exists because a silent
+  stop is the failure mode that has already cost this system four hours once.
+- **Default OFF in code** (`require_blocking_level: bool = False`) so the
+  package's own default remains the measured rule; it is ON only in the
+  deployed `strategy.json`. Previous file at `strategy.json.bak.nolevels`.
+
+**Confirmed live** at 17:55:25 UTC after restart: a 0.972 ask recorded
+`failed_gates = "contract price band, support/resistance"`. That it names the
+gate rather than `levels unavailable` proves the tracker had loaded.
+
+**A guard that worked.** Between writing `strategy.json` and restarting, the
+running process logged `EntryRule: ignoring unknown setting(s)
+['require_blocking_level']` on every poll instead of dying - `_known_fields`
+doing precisely the job it was added for after an earlier unknown key took the
+service down mid-loop.
+
+**How this gets settled.** `scripts/forward_test.py` for the band and
+`scripts/measure_levels.py` for the level. The honest test is not whether gated
+trades win - at these prices they mostly will - but whether they beat the
+setups the gate refused. That comparison needs the refused ones to keep being
+recorded, which they are: every poll writes `failed_gates`.
+
+**Revert:** `cp strategy.json.bak.nolevels strategy.json`, effective next poll,
+no restart needed.
+
+---
+
+## 24. The cash-out sold into a price that was not there (2026-09-21)
+
+First auto fill since the band change: KXBTC15M-26SEP211400-00, DOWN at 0.76
+against a limit of 0.82, **filled 5c better than the limit**, settled a winner
+at +$0.23. Live moved -0.93 -> -0.70 over 10 trades.
+
+**The latency fix from section 22 did NOT work, and the fill does not prove it
+did.** The filled order measured `decision_to_submit_ms = 2171`, statistically
+identical to the three misses (2176 / 2018 / 2026). Moving the hourly shadow
+recorder off the pre-order path changed nothing measurable, so the ~2s lives
+elsewhere - the Binance snapshot and `active_market` both sit between `now_ms`
+and the order. This one filled because the book moved IN OUR FAVOUR (5c
+better), not because it was faster. The `limit_submitted` fix does work: it
+recorded 0.82 = 0.81 + slippage, where the old code would have logged 0.81.
+
+**Then the cash-out fired and filled nothing.** Four minutes later:
+
+```
+17:56:54   yes_ask 0.021  ->  inferred bid 0.979  ->  IOC sell at 98%  ->  NO FILL
+Kalshi app at the same moment:                        Cash out = $0.93
+```
+
+**Root cause, and it is not arithmetic.** `KalshiMarket` carried asks ONLY -
+there were no bids in the model at all - so the exit inferred one:
+
+```python
+bid = 1 - contract.ask("DOWN" if side == "UP" else "UP")
+```
+
+On Kalshi `no_bid = 1 - yes_ask` holds exactly, so the number was right as
+arithmetic and wrong as a price: it is a top-of-book quote, and the executable
+price was ~5c worse. That is the 1-10c book-to-quote offset section 7 records
+as unresolved, showing up for the first time somewhere that spends money.
+
+**The order was also submitted AT that quote.** Entries have `entry_slippage`
+because an immediate-or-cancel order at the touch only fills if the quote is
+real and still there - three entries missed that way hours earlier. Exits had
+no equivalent at all.
+
+**Why it mattered more than the miss.** The capture gate was evaluated on the
+same phantom:
+
+```
+paid 0.76, cash_out_capture 0.90  ->  needs a bid of 0.976
+quoted 0.979                      ->  fired, by 0.003
+achievable ~0.93                  ->  should never have fired
+```
+
+So the no-fill was the system being SAVED by immediate-or-cancel, not a
+malfunction. The defect is that it attempted at all.
+
+**Fixed.**
+
+- `KalshiMarket` now carries the real `yes_bid` / `no_bid` from
+  `yes_bid_dollars` / `no_bid_dollars`, which the API published all along and
+  the client never requested, plus a `bid(side)` accessor. A fabricated number
+  can no longer masquerade as a quote.
+- New `exit_slippage = 0.01`, the mirror of `entry_slippage`. The cash-out now
+  judges itself on AND submits at `quoted_bid - exit_slippage`, so the order is
+  marketable and a quote that is not really there declines instead of firing.
+  At the live numbers 0.979 - 0.01 = 0.969 < 0.976: correctly declined.
+- The message lied. Under the headline "CASH-OUT FAILED · STILL HOLDING" it
+  printed "Banked +0.20 · 91% of the most this trade could make" - describing a
+  sale that did not happen. A miss now reads "Nothing sold · +0.20 is what it
+  WOULD have banked" and says the position is still fully exposed.
+
+`tests/test_cash_out_bid.py` pins the exact live case: undiscounted it clears
+the gate, discounted it declines, a genuinely rich bid still cashes out, and a
+failed cash-out may not use the word "Banked".
+
+**Still open.** The 2-second decision-to-submit gap is unexplained and
+unfixed - the hourly move was the wrong suspect. The next thing to measure is
+where the time actually goes between `now_ms` and the order, which means
+timing `active_market` and `market.snapshot` directly rather than guessing
+again.
+
+---
+
+## 25. Two gate sets, one message — and an inflated confidence count (2026-09-21)
+
+KXBTC15M-26SEP211445-45 showed **five green ticks and "ENTRY READY"** and was
+not traded. Both halves of that were defects.
+
+### The alert and the auto path enforce different gates
+
+The Checks block shows the RULE. The settle timer, the attempt caps and the
+safety limits live only in the auto path, and nothing in the message said so:
+
+```
+14:37:59  auto[... DOWN@0.79 422s]: eligible
+14:37:59  auto: declined - price has only held the band 0s, waiting for 120s
+14:38:12  auto: declined - price has only held the band 13s, waiting for 120s
+```
+
+**It could never have fired.** The ask sat at 0.40-0.61 all window and entered
+the band at **422s** remaining. 120s of hold completes at 302s; the entry
+window closes at **360s**. Short by 58 seconds.
+
+This is section 19's tension stated exactly: the entry window is 660-360s, a
+300-second span, so **a price entering the band later than 480s remaining can
+never satisfy a 120s settle**. That is a 2-minute dead zone at the end of every
+entry window, and it is structural, not a tuning accident.
+
+**Fixed (visibility only, no trading change):** the auto verdict is captured
+and shown. A qualified setup automation refused now reads "Automation did NOT
+take this - price has only held the band 0s, waiting for 120s" followed by
+"Your press is the only thing that will." The button was always correct - the
+manual stage exists to take what automation will not - but the reason for the
+press was nowhere on screen.
+
+### Confidence counted signals that could not disagree
+
+The same message said **"BUY · confidence high (5/5 signals agree)"** on a
+distance of **1.9x** the 5-minute move against a 1.5x floor - while the
+evidence line directly beneath it called that gap **"moderate"**. A minute
+later BTC was **83 cents** from the target and the market had flipped to 68%
+the other way.
+
+Two of the five were not independent:
+
+| term | problem |
+|---|---|
+| `signed > 0` | **True by construction.** `model.predict` picks the side FROM the sign of the distance, so this scored on every entry ever alerted. |
+| `vol_units >= 1.5` | Restated `min_normalized_distance`, already counted inside `rule_match`, and ticked identically at 1.9x and at 6x. |
+
+So "5/5" was really about two independent signals - book and momentum - with
+three points that were close to automatic. The count now holds four terms, the
+free one is gone, and the distance term requires **3.0x**, the same boundary at
+which the prose says "comfortable", so the number and the sentence under it can
+no longer contradict each other.
+
+Re-run on the exact live inputs: **MEDIUM, 3/4**, evidence "the gap is
+moderate". Previously HIGH, 5/5. A setup wrong on book and momentum now scores
+1/4 LOW, where the old count floored at 3/5 MEDIUM.
+
+`decision_facts` feeds narration only - `action` is computed from `rule_match`
+and the edge, not from `agreeing` - so this changes what the bot SAYS, not what
+it trades. That is the right blast radius for a change made on one example.
+
+**What is not fixed.** The dead zone above is a real constraint and the options
+are all trading changes: widen the entry window past 360s, shorten the settle,
+or accept that late band entries are manual-only. None is taken here, because
+picking one off a single window is how the rules in section 14 got there in the
+first place. What has changed is that the operator can now SEE which gate
+refused, which is the prerequisite for measuring how often each one bites.
+
+---
+
+## 26. The dead zone fixed, the alert filled in, and hour-of-day re-tested (2026-09-21)
+
+### The engine fix: settle 120s -> 60s
+
+Section 25 named the dead zone and did not fix it. Fixed now, and chosen by
+measurement rather than by picking one of three options.
+
+`scripts/measure_window_settle.py` measures the entry window and the settle
+timer TOGETHER, which neither section 16 (window alone) nor the
+`band_streak_seconds` study (settle alone) had done. 71 days, one entry per
+market, deployed gates, paired on markets:
+
+```
+ settle  lower      n  dead    won    net/ct                  95% CI     total
+      0    360   5088     0  79.9%   +0.0060  [-0.0050, +0.0168]    +30.54
+      1    360   3841  1247  83.6%   +0.0149  [+0.0032, +0.0260]    +57.42
+      2    360   2681  2407  85.5%   +0.0147  [+0.0012, +0.0278]    +39.53  <- was deployed
+```
+
+And the test that decides it - the difference, bootstrapped directly:
+
+```
+settle 60s vs 120s   +0.0002/ct  [-0.0082, +0.0084]  p=0.479
+trades gained        +1160 (+43%)
+dead-zone setups     1160 fewer
+```
+
+**Indistinguishable per contract, 43% more trades, half the dead zone.** The
+shorter settle buys volume without paying for it in quality. Dropping the
+settle entirely (`settle=0`) fails to clear zero at every window bound, so the
+rule stays - it is only half as long. **Widening the WINDOW instead is worse**
+at every settle (300s / 240s / 180s all degrade), which is section 16 holding.
+So the window did not move; only the timer did.
+
+The live case that prompted it - KXBTC15M-26SEP211445-45, band entry at 422s -
+now qualifies at ~362s, just inside the 360s cutoff.
+
+### The alert now carries the numbers it was missing
+
+A Context block sits under Checks:
+
+```
+Context
+  · band settle: held 13s of 60s  waiting
+  · measured edge: +0.0087/ct after a 0.0166 fee
+  · distance: $85 from target
+  · volatility: 5.2 bps / 5m
+  · spread: 1.0 bps
+  · session: us · 18:00 UTC
+```
+
+Settle is first because it decided almost every refusal on 2026-09-21 while
+appearing in no message. The streak is now computed once, above the auto path,
+so the alert and the refusal read the same number; `test_the_settle_requirement_is_enforced_before_an_order`
+was updated to assert the ENFORCEMENT rather than where the call sits.
+
+### Hour of day: re-tested as ONE pre-registered comparison, and still no
+
+The operator's observation: the New York morning won on everything, and from
+about 1pm local the losses started. 1pm local (UTC-4) is **17:00 UTC** - exactly
+where section 4's weakest block begins, `US pm 17-20`, +0.0116 [-0.0096,
++0.0334]. Section 8 closed by asking for a single pre-registered re-test rather
+than another re-slice. `scripts/measure_hour.py` is it:
+
+```
+17-20 UTC        n=852    +0.0069/ct
+all other hours  n=4236   +0.0058/ct
+DIFFERENCE       +0.0010/ct  [-0.0272, +0.0305]  p=0.542
+```
+
+**The afternoon is not worse.** It is marginally better on the point estimate
+and the interval is wide through zero. In the 24-hour table exactly one hour
+excludes zero - hour 10, -0.0661 [-0.1274, -0.0065] - which is what 24
+independent tests produce by chance, and is not the hour anyone predicted.
+
+**No gate added; the section 4 guard test stands.** What was done instead:
+
+- **Tracking already existed** and was verified: `session`, `hour_utc`,
+  `weekday` and `vol_regime` are written on every observation (2,075 of 2,087
+  rows; the 12 nulls predate the instrumentation).
+- **Registered forward** in `scripts/forward_test.py`, so the live record keeps
+  measuring it. As of 2026-09-21: 17-20 UTC is 5/7, excess -0.1, z=-0.12; every
+  other hour is 56/63, excess +7.1, z=+2.21. The pattern IS there today, on
+  seven signals, which is why it is registered rather than traded.
+- **Shown in the alert**, so a live regime can be seen and checked against the
+  record instead of being inferred from a single afternoon.
+
+The honest summary: today looks exactly as the operator describes, and 71 days
+say it is not a property of the clock. Those are not in conflict - one day of
+seven afternoon signals cannot distinguish a regime from a run, and the
+registered test is the only thing that will.
+
+---
+
+## 27. Regime as a weight, not a gate (2026-09-21)
+
+The operator's correction to section 26: hour-of-day should "add or reduce
+weight, nor a blocker gate". That is a materially better proposal than the
+filter section 4 forbade, and the reason is not diplomatic:
+
+**A filter removes trades; a bounded multiplier cannot.** A filter fitted to
+noise destroys real opportunity permanently and irreversibly. A weight floored
+at 0.6 can only size some trades slightly wrong. Section 4's ban was reasoning
+about removal, so it does not carry over to weighting - and the guard test has
+been rewritten to assert the property that actually matters (**session can
+never produce a refusal**) instead of the property it was asserting (session is
+never mentioned near the order path).
+
+**Weighting on noise is still a cost**, though - it adds variance with no
+expected return - so the estimates are shrunk empirical-Bayes style:
+
+```
+shrink = tau^2 / (tau^2 + se_h^2)
+tau^2  = var(observed hourly means) - mean(sampling variance),  floored at 0
+```
+
+Measured: **baseline +0.00601/ct, tau = 0.0140** against a typical hourly
+**se = 0.0260**. So shrink lands around **0.21** and roughly **79% of every
+hour's deviation is discarded as sampling error.** Raw hour 10 is -0.0661 and
+shrinks to -0.0063; raw hour 14 is +0.0457 and shrinks to +0.0163.
+
+Resulting weights span **x0.75 to x1.21**, none clamped:
+
+| | |
+|---|---|
+| lowest | hour 10 UTC, **x0.75** - the only hour whose interval excludes zero |
+| highest | hour 14 UTC, **x1.21** |
+| operator's afternoon (17-20) | 1.03 / 0.96 / 1.16 / 0.89, averaging ~1.00 |
+
+That last row is the check that matters: the pre-registered test of 17-20 UTC
+found **+0.0010/ct [-0.0272, +0.0305], p=0.542**, and the weighting does not
+quietly reintroduce the effect the test failed to find. It is pinned by
+`test_the_operators_afternoon_is_not_singled_out`.
+
+**The safety property is arithmetic, not opinion.** If every hour differs only
+because each is noisily measured, the `tau^2` subtraction floors at zero, every
+shrink factor is zero and every weight is exactly 1.0. Nothing has to be
+switched off by hand. `test_an_hour_that_is_pure_noise_weighs_exactly_one`
+pins it with a synthetic flat table.
+
+**Stated plainly, because it would otherwise be oversold: at
+`trade_contract_count = 1` this changes nothing.** Kalshi trades whole
+contracts, so 1 x 0.75 and 1 x 1.21 both round to one contract, and
+`contracts_for_budget` keeps its floor of one regardless. The weight scales the
+BUDGET, so it becomes live in dollars only above roughly two contracts. It is
+wired, visible in the alert's Context block, and measured - and it is currently
+a no-op in money. `test_weighting_is_a_no_op_at_one_contract` records that so
+the claim cannot drift.
+
+**Not done, deliberately:** the weight is applied to the unattended path only.
+The manual button still sizes from the operator's own budget, because the
+press is their decision and silently resizing it would be a surprise.
+
+---
+
+## 28. THE PERMANENT RULE: time-of-day moves confidence, never the system (2026-09-21)
+
+> Time-of-day may increase or reduce intelligence confidence, but it can never
+> stop the 15-minute trading system.
+
+Section 27 wired the regime lean into the order budget on a reading of "weight"
+as position size. **That reading was wrong and was never asked for. Position
+size belongs to the operator alone and stays at one contract.** Reverted the
+same day; `regime.py` no longer contains any function that accepts a budget, so
+reaching for one again means writing it rather than calling it.
+
+### What regime IS allowed to do
+
+Exactly one thing: state the confidence as arithmetic.
+
+```
+Base confidence:        HIGH
+14:00 UTC adjustment:   +21
+Adjusted confidence:    HIGH
+
+Base confidence:        HIGH
+10:00 UTC adjustment:   -25
+Adjusted confidence:    MEDIUM
+```
+
+Confidence is now scored out of 100 - 4 agreeing signals = 100, 3 = 70, 2 = 50,
+1 = 25 - with HIGH at 85 and MEDIUM at 40, which preserves every existing
+verdict exactly. The regime lean converts to points as
+`round((weight - 1) * 100)`, capped at +-25, so it can move a label but never
+erase one. Shown in the narration as its own line, so a moved label is never
+mistaken for the signals having changed.
+
+### What it must never do, each one pinned by a test
+
+| prohibition | test |
+|---|---|
+| skip a 15-minute market | `test_it_never_skips_a_market_or_stops_polling` |
+| stop polling | same |
+| prevent the strategy evaluating | `test_it_never_prevents_the_strategy_from_evaluating` |
+| block an otherwise qualified order | `test_it_never_blocks_an_otherwise_qualified_order` |
+| disable alerts or archiving | `test_it_never_disables_alerts_or_archiving` |
+| **touch position size** | `test_it_never_touches_position_size` |
+
+The order path asserts `contracts_for_budget(limits.budget, contract_ask)`
+verbatim and that no regime symbol appears in the refusal logic;
+`strategy.py`'s `matches` is asserted to contain no notion of hour, session or
+regime at all. A comment is not a test, and this one was already violated once.
+
+### Every window is recorded through settlement
+
+`observations` now carries `regime_weight` and `confidence_adjustment`
+alongside the existing `session`, `hour_utc`, `weekday`, `vol_regime` and the
+settled `won`. Archiving is unconditional and the regime is written INTO it
+rather than around it. Confirmed live at 19:13 UTC: `hour=19 us weight=1.163
+adj=+16`, recorded on a signal that did not qualify - because recording does
+not depend on qualifying.
+
+### The estimates stay honest on their own
+
+The lean is shrunk empirical-Bayes by how uncertain each hour is
+(`tau = 0.0140` against a typical `se = 0.0260`, so ~79% of every hour's
+deviation is discarded). If hours ever differ only by sampling error, `tau^2`
+floors at zero, every adjustment becomes exactly 0 and every label is the base
+label - **no opinion required, the arithmetic switches it off.** Pinned by
+`test_an_hour_that_is_pure_noise_weighs_exactly_one`.
+
+And the operator's own hypothesis is held to the same standard: 17-20 UTC
+measured +0.0010/ct [-0.0272, +0.0305], p=0.542 against every other hour, and
+`test_the_operators_afternoon_is_not_singled_out` asserts that block averages
+~1.00 so the weighting cannot quietly reintroduce an effect the pre-registered
+test failed to find. Its live adjustments are +3, -4, +16, -11.
+
+---
+
+## 29. The similarity layer, and two things that should never have been gates (2026-09-21)
+
+### Enter now or wait? Measured first, because nobody had
+
+`scripts/measure_wait.py`, 71 days, one entry per market:
+
+```
+a cheaper ask appeared later    1337 (26%)
+it only got dearer              2548 (50%)
+mean ask drift, first to last   +0.0531   (5.3c DEARER)
+
+now       +0.0060 [-0.0050, +0.0168]   +30.54   <- deployed
+patient   +0.0202 [+0.0093, +0.0308]  +102.71   <- ORACLE, needs foresight
+last      -0.0301 [-0.0407, -0.0203]  -153.40
+late      -0.0116 [-0.0234, +0.0005]   -42.87
+
+last - now   -0.0362 [-0.0413, -0.0308]  WORSE
+late - now   -0.0176 [-0.0303, -0.0050]  WORSE
+```
+
+Every implementable waiting policy is significantly worse. Only the oracle,
+allowed to pick the cheapest ask the window ever showed, beats entering now.
+
+**The operator's correction, which was right:** a late ask of ~95c is not an
+artifact to argue away. A 15-minute contract decays toward its outcome, so a
+late price is simply the price after the information has arrived. It happens
+regardless, and that is exactly WHY waiting is expensive - you end up buying
+certainty you could have bought cheaply.
+
+### The similarity layer
+
+`src/btc15_signal/similar.py` plus a 74,582-row corpus over 6,428 settled
+markets (`scripts/build_cohort.py`). At every 15-minute setup it fingerprints
+the market, retrieves ~60 comparable settled lifecycles and compares three real
+policies at OUR price:
+
+```
+ENTER NOW              posterior - ask - fee
+WAIT FOR RETRACEMENT   rest a limit below the ask; fill in P(dip), else NO TRADE
+PASS                   neither pays
+```
+
+Two rules built in, both the operator's:
+
+1. **Win rate never decides.** Every verdict is net edge. 89% at 93c is a PASS.
+2. **A thin cohort is not evidence.** The win probability is shrunk toward the
+   corpus base rate (0.789) by cohort size.
+
+The "no fill = no trade" term is the part that matters: waiting is not free
+optionality, and its cost is the setups that never come back.
+
+First live read, 15:34 UTC:
+
+```
+KXBTC15M-26SEP211545-45 UP ask=0.83 cohort=60 p(win)=0.86 (raw 0.88) edge=+1.57c
+now=+0.0157  wait_limit=-0.0109 @ 0.80 (fills 57%)  drift=+0.104
+ACTION=ENTER NOW
+```
+
+**SHADOW ONLY.** Recorded in `shadow_decisions`, settled with the window,
+graded by `scripts/score_shadow.py`. Promotion requires its win probability to
+be calibrated AND its disagreements with the deployed rule to be paying.
+
+### Two things that should never have been gates
+
+**The level.** Deployed as a gate in section 23 on the operator's instruction,
+then corrected by them: it "should have not become a block, it was supposed to
+be a confidence helper like the time of the day". They are right, and the
+evidence always said so - the difference between having a blocking level and
+not was +0.0140 [-0.0067, +0.0344], p=0.090, and the gate was refusing about
+half of all qualifying setups on that. `require_blocking_level` is now false
+and the level contributes CONFIDENCE POINTS instead, shrunk by its own
+uncertainty exactly as the clock is:
+
+```
+shrink = 1 - se^2/effect^2 = 0.429
+level in the way  +6 points
+no level          -6 points
+```
+
+It appears in Checks only when it actually gates. A green tick must never
+imply something had a say when it did not.
+
+**Confidence is now one line of arithmetic** in the alert:
+
+```
+confidence: base HIGH (4/4) · clock +16 · level -6 · adjusted HIGH
+```
+
+### One message, not two
+
+The separate LLM commentary message repeated what the alert already carried -
+checks, context, confidence, similar-regime read - so
+`brain_commentary_enabled` defaults to false.
+
+### Everything that supported an order travels with it
+
+`decision_records` captures the gates, settle, edge, distance, volatility,
+momentum, spread, session, regime lean, level, fill and cohort read against the
+proposal id, and the fill message prints it as **WHY THIS TRADE**. Those facts
+were previously scattered across four tables joined on drifting timestamps, so
+"why was this trade taken" was a reconstruction rather than a record.
+
+---
+
+## 30. Five corrections to the similarity layer (2026-09-21)
+
+An operator review of section 29 raised five points. Three were correctness
+bugs, one was already right, one was a naming error that made a correct sign
+look backwards. All verified against the code rather than assumed.
+
+### 1. Deduplication — WAS A BUG, fixed
+
+The corpus holds 74,582 decision minutes across 6,428 markets, and the query
+window spans +-2 minutes, so a nearest-60 could return five minutes of the same
+lifecycle and count them as five pieces of evidence. Measured before the fix:
+
+```
+ask=0.92 nd=1.6 rem=660 : 60 rows -> 51 unique markets
+worst case              : 9 duplicate rows in 60
+```
+
+**The bias is not random.** A market that sat in the band for many minutes is
+disproportionately one that went on to win, so duplicates inflate the win rate
+in the flattering direction. `neighbours()` now keeps only the closest row per
+ticker: `n` is always unique lifecycles. Verified: 60 rows, 60 unique.
+
+### 2. Conditional wait probability — ALREADY CORRECT
+
+The review asked that `EV(wait)` use `P(win | dipped and filled)` rather than
+reusing the enter-now probability, because a dip may carry adverse information.
+It already did:
+
+```python
+dipped = [r for r in rows if r["best_later_ask"] <= dip_price]
+dip_posterior = (dip_wins + PRIOR * base) / (len(dipped) + PRIOR)
+wait_limit = dip_rate * (dip_posterior - dip_price - dip_fee)
+```
+
+The posterior is rebuilt from the dipped subset alone, and shrunk on that
+subset's own size. Left unchanged.
+
+### 3. Walk-forward isolation — WAS UNENFORCED, fixed
+
+Nothing stopped a comparable market that settled AFTER the decision from
+informing it. Live this was vacuous today - the corpus ends 2026-09-20 and
+every read is later - but it stops being vacuous the moment live markets join
+the corpus or a historical decision is replayed, and a leak found then would
+invalidate every number measured in between. `read()` and `neighbours()` now
+take `as_of_ms` and admit only markets settled by `open_ms + 900_000 <= as_of`.
+The live path passes `now_ms`. Proven to bite:
+
+```
+as_of 2026-07-14 (corpus start):   0 neighbours
+as_of 2026-07-19:                 51 neighbours
+as_of 2026-08-13:                 60 neighbours
+```
+
+### 4. Decisions without proposals — WAS A BUG, fixed
+
+`decision_records` was keyed on `proposal_id`, so the archive held only the
+decisions that became orders. PASS, WAIT, DECLINED and unfilled are the
+counterfactuals and are arguably the more valuable half. Now keyed on
+**observation_id**, with `signal_id`, `market_id`, `strategy_version` and an
+OPTIONAL `proposal_id`, and written on the decline path too. First live row:
+
+```
+obs=1790020800000:576  sig=dc016f3d3daf5820  mkt=KXBTC15M-26SEP211615-15
+strategy=dba3e62c15  action=DECLINED  proposal=None
+reason=price has only held the band 0s, waiting for 60s
+ask=0.77  shield=None  level_adj=-6  cohort=60
+```
+
+`strategy_version` is a digest of the rule file plus the settle timer, entry
+window and slippage - without it the archive silently averages decisions taken
+under different rules, and 2026-09-21 alone would have pooled four bands and
+two settle timers.
+
+### 5. The level sign — NAMING ERROR, fixed
+
+The semantics were right and the name was not. `blocking_level` read as "an
+obstacle to our move", which makes `+6` look backwards. It is the opposite: a
+level standing between BTC and the target, blocking the move that would BEAT
+us. Renamed **protective_level** throughout, displayed as "resistance $85,845
+shields the target" / "nothing shielding the target", and the confidence line
+now reads `shield -6`. The old name survives as an alias so a rename cannot
+break a caller.
+
+### Uncertainty is now displayed
+
+"86% from 60 markets" reads as a fact and is not one:
+
+```
+Comparable unique markets: 60
+Estimated win probability: 89% (raw 93%, base 79%)
+95% interval: [84%, 97%] - 60 markets settles nothing
+Net edge after costs: -3.43c
+Shadow preference: PASS
+```
+
+The review's own point stands and is now on the face of the message: a 1.57c
+edge from 60 neighbours is nowhere near established. The layer remains
+SHADOW-ONLY until `scripts/score_shadow.py` shows its probabilities calibrated
+and its disagreements paying.

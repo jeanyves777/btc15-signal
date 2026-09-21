@@ -372,12 +372,26 @@ async def decision_commentary(brain: Brain, facts: dict, send) -> None:
     reply = await read_decision(brain, facts)
     if reply.ok and reply.text:
         verdict = facts.get("verdict", {})
-        await send(
-            f"🧠 <b>{verdict.get('action', '?')}</b> · "
+        # The regime adjustment is shown as its own arithmetic - base,
+        # delta, adjusted - so a moved label is never mistaken for the
+        # signals having changed. Time-of-day may only ever appear HERE:
+        # it does not skip a market, stop a poll, prevent evaluation,
+        # block a qualified order, or silence an alert.
+        delta = verdict.get("regime_adjustment", 0)
+        parts = [
+            f"\U0001f9e0 <b>{verdict.get('action', '?')}</b> \u00b7 "
             f"confidence {verdict.get('confidence', '?').lower()} "
-            f"({verdict.get('signals_agreeing', 0)}/{verdict.get('signals_total', 5)} "
-            f"signals agree)\n<i>" + reply.text + "</i>"
-        )
+            f"({verdict.get('signals_agreeing', 0)}/"
+            f"{verdict.get('signals_total', 4)} signals agree)"
+        ]
+        if delta:
+            parts.append(
+                f"\u2003base <b>{verdict.get('base_confidence', '?')}</b>"
+                f" \u00b7 {verdict.get('regime_hour', 'regime')} "
+                f"adjustment <b>{delta:+d}</b> \u00b7 adjusted "
+                f"<b>{verdict.get('adjusted_confidence', '?')}</b>"
+            )
+        await send("\n".join(parts) + "\n<i>" + reply.text + "</i>")
 
 
 def raw_book(db_path: str, ticker: str) -> dict:

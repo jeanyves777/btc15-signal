@@ -67,7 +67,8 @@ class KalshiExecutionClient:
         return response.json()
 
     async def execute_with_take_profit(
-        self, proposal: TradeProposal, slippage: float = 0.0
+        self, proposal: TradeProposal, slippage: float = 0.0,
+        ceiling: float | None = None,
     ) -> ExecutionResult:
         """Buy, and optionally rest a take-profit behind the fill.
 
@@ -80,8 +81,34 @@ class KalshiExecutionClient:
         otherwise have been no trade at all.
         """
         path = "/portfolio/events/orders"
-        # 0.99 is the cap: event_order requires a price strictly inside (0, 1).
-        limit = min(proposal.entry_limit + max(0.0, slippage), 0.99)
+        # THE LIMIT IS THE CEILING, NOT THE PRICE.
+        #
+        # An immediate-or-cancel limit fills at the BEST AVAILABLE price and
+        # never at the limit - our own fills prove it: limit 0.87 filled 0.84,
+        # limit 0.80 filled 0.75, limit 0.81 filled 0.76. So the limit does not
+        # decide what we pay; it decides how far we are willing to cross a book
+        # that has moved since the price was read.
+        #
+        # Pricing it at `ask + 1c` meant 11% of orders were under-priced before
+        # they left, and every one of those came back "no fill; the book moved".
+        # A measured 5c allowance covered 100% of recorded drift, but "covered
+        # every move so far" is not the same as "cannot miss", and a miss costs
+        # an entire trade while crossing costs a few cents.
+        #
+        # So the entry crosses to the ceiling. Inside it we always pay the real
+        # ask; outside it we do not trade at all - and above 0.95 no measured
+        # bucket's interval excludes zero, so refusing there is the rule
+        # working, not an execution failure. The ceiling is also the guard that
+        # an unbounded chase lacked when 0.85 became 0.963 on 2026-09-21.
+        limit = proposal.entry_limit + max(0.0, slippage)
+        if ceiling is not None:
+            # Cross exactly TO the ceiling - it is both the floor and the cap.
+            # Flooring alone let a 0.93 ask send 0.98; capping alone left the
+            # limit only as good as the drift estimate in `slippage`, and a
+            # move larger than that estimate is a lost trade rather than a few
+            # cents paid. The ceiling makes the limit independent of both.
+            limit = ceiling
+        limit = min(limit, 0.99)
         book_side, yes_price = event_order(proposal.side, limit)
         entry = await self._post(
             path,
@@ -143,7 +170,8 @@ class KalshiExecutionClient:
         )
 
     async def close_position(
-        self, ticker: str, side: str, count: float, limit_price: float
+        self, ticker: str, side: str, count: float, limit_price: float,
+        floor: float | None = None,
     ) -> ExecutionResult:
         """Sell out of an open position at `limit_price` or better.
 
@@ -153,10 +181,18 @@ class KalshiExecutionClient:
         and reduce_only means a stale count can never open a new position on
         the opposite side.
 
-        A no-fill is not an error. It means nobody was bidding at that price,
-        and the position simply rides to settlement - exactly what would have
-        happened without this call.
+        THE LIMIT IS A FLOOR, NOT A PRICE. A sell IOC fills at the best
+        available BID and never at its own limit, so pricing the exit at the
+        quoted bid made it as fragile as the entry was: on
+        KXBTC15M-26SEP211700-00 the quote said 0.98, the order went out at
+        0.98, and nothing filled. Crossing down to `floor` takes whatever real
+        bid is there above it, which is the whole point of cashing out.
+
+        A no-fill is still not an error - it means nobody was bidding above the
+        floor, and the position rides to settlement as it would have anyway.
         """
+        if floor is not None:
+            limit_price = min(limit_price, floor)
         exit_side, yes_price = event_order(side, limit_price, exiting=True)
         order = await self._post(
             "/portfolio/events/orders",

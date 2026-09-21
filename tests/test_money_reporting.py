@@ -456,7 +456,9 @@ def test_a_reporting_failure_cannot_erase_a_real_position():
     auto = source.split("---- unattended execution")[1]
     auto = auto[: auto.index("    head = head_for(store, settings)")]
 
-    order_call = auto.index("await trader.execute_with_take_profit(claimed")
+    # The call is now multi-line (it carries the ceiling), so match the
+    # call itself rather than its first argument.
+    order_call = auto.index("await trader.execute_with_take_profit(")
     mark_failed = auto.index('"failed"')
     send = auto.index("messages.auto_filled(")
     # The failure handler sits between the order and the reporting, so only the
@@ -697,18 +699,36 @@ def test_sessions_are_derived_not_stored(tmp_path):
 
 
 def test_the_session_view_never_gates_a_trade():
-    """Two of five sessions have intervals straddling zero; filtering on that
-    would be fitting the sample rather than the market."""
+    """Session may scale SIZE; it must never refuse a trade.
+
+    Section 4 banned session data from the trade path because two of five
+    intervals straddle zero and filtering on that fits the sample rather than
+    the market. That reasoning is about REMOVING trades: a filter fitted to
+    noise destroys real opportunity permanently, while a bounded multiplier
+    only sizes some trades slightly wrong.
+
+    So the ban is now on the property that actually matters - session can
+    never produce a refusal - rather than on the mention of a table. The
+    reporting view stays out of the order path either way.
+    """
     from pathlib import Path
 
+    from btc15_signal.regime import MIN_WEIGHT, weight_for_hour
+
     source = Path("src/btc15_signal/main.py").read_text(encoding="utf-8")
-    # The measured table is for display only - it must not appear in the rule
-    # path or in auto_block_reason.
     assert "MEASURED_SESSION_EDGE" in source
     auto = source.split("---- unattended execution")[1]
     auto = auto[: auto.index("    head = head_for(store, settings)")]
+    # The reporting table and view remain display-only.
     assert "MEASURED_SESSION_EDGE" not in auto
     assert "by_session" not in auto
+    # And the weight cannot starve an order: every hour stays clear of zero.
+    assert MIN_WEIGHT > 0
+    assert all(weight_for_hour(h).weight >= MIN_WEIGHT for h in range(24))
+    # It must not appear in the refusal logic at all.
+    blocked = auto[: auto.index("if blocked:")]
+    assert "auto_block_reason" in blocked
+    assert "regime" not in blocked.split("auto_block_reason")[0]
 
 
 def test_the_cash_out_figure_is_net_like_every_other_money_figure():
@@ -872,9 +892,18 @@ def test_archiving_sits_outside_every_trading_gate():
     loop = source.split("while True:")[1]
     assert loop.index("archive_observation(") < loop.index("await primary_signal(")
 
-    # And the archiver itself applies no entry-window or spread gate.
+    # And the archiver itself applies no entry-window or spread gate. Sliced to
+    # THIS function's body - the next top-level def - rather than to
+    # primary_signal, because helpers now sit between the two and a wider slice
+    # tests whatever happens to have been added there.
     body = source.split("def archive_observation(")[1]
-    body = body[: body.index("async def primary_signal(")]
+    tail = body.split(chr(10))
+    cut = next(
+        (i for i, ln in enumerate(tail[1:], 1)
+         if ln.startswith("def ") or ln.startswith("async def ")),
+        len(tail),
+    )
+    body = chr(10).join(tail[:cut])
     assert "entry_to_seconds" not in body
     assert "max_spread_bps" not in body
     assert "store.observe_full(" in body
@@ -921,10 +950,10 @@ def test_observations_settle_with_the_trade_and_cannot_drift(tmp_path):
     assert coverage["settled"] == 0
     assert coverage["windows"] == 1
 
-    assert store.settle_observations(1000, True, 84150.0) == 3
+    assert store.settle_observations(1000, "UP", 84150.0) == 3
     assert store.observation_coverage()["settled"] == 3
     # Settling twice must not rewrite an outcome.
-    assert store.settle_observations(1000, False, 1.0) == 0
+    assert store.settle_observations(1000, "DOWN", 1.0) == 0
 
 
 def test_the_same_poll_is_never_archived_twice(tmp_path):
@@ -948,3 +977,81 @@ def test_record_still_accepts_the_older_ten_field_tuple(tmp_path):
     assert store.db.execute(
         "SELECT failed_gates FROM predictions WHERE window_open=1000"
     ).fetchone()[0] is None
+
+
+# ------------------ do not present noise as information
+
+
+def test_no_edge_is_claimed_at_a_price_nobody_measured():
+    """The commentary said "+0.0006 expected edge" about a 65c contract by
+    applying the 0.85-0.93 band figure to a price outside it. Unknown is not
+    zero, and it is certainly not a number."""
+    from btc15_signal.main import measured_edge_at
+
+    for unmeasured in (0.50, 0.65, 0.68, 0.80, 0.84, 0.95, 0.99):
+        assert measured_edge_at(unmeasured) is None, unmeasured
+    assert measured_edge_at(0.86) == 0.0177
+    assert measured_edge_at(0.91) == 0.0114
+
+
+def test_an_unmeasured_price_says_so_rather_than_quoting_a_figure():
+    from btc15_signal.decision import decision_facts
+
+    facts = decision_facts(
+        ticker="T", remaining_s=600, side="UP", btc=85_046.0, target=84_935.0,
+        our_ask=0.65, exit_bid=0.64, yes_bid=0.64, yes_ask=0.65, no_ask=0.36,
+        yes_levels=[(0.64, 3000.0)], no_levels=[(0.35, 1000.0)],
+        momentum_5m_bps=0.8, volatility_5m_bps=3.0, futures_basis_bps=1.0,
+        taker_imbalance=0.1, spread_bps=1.0, session="us", vol_regime="low",
+        book_age_s=8.0, rule_match=False, failed_gates="contract price band",
+        holding=False, entry_paid=None, unrealised=None,
+        model_probability=0.98, measured_edge=None, slippage=0.01,
+    )
+    assert facts["economics"]["price_was_measured"] is False
+    assert facts["economics"]["edge_after_fees"] is None
+    assert facts["economics"]["worth_doing"] is False
+    joined = " ".join(facts["summary"]["evidence"])
+    assert "no edge has ever been measured" in joined
+
+
+def test_a_hair_above_zero_is_not_worth_having():
+    """`> 0` announced +0.0006 - six hundredths of a cent - as worth having."""
+    from btc15_signal.decision import decision_facts
+
+    def edge_words(measured, price):
+        facts = decision_facts(
+            ticker="T", remaining_s=600, side="UP", btc=1.0, target=0.9,
+            our_ask=price, exit_bid=price - 0.01, yes_bid=price - 0.01,
+            yes_ask=price, no_ask=1 - price, yes_levels=[(price, 100.0)],
+            no_levels=[(1 - price, 100.0)], momentum_5m_bps=1.0,
+            volatility_5m_bps=5.0, futures_basis_bps=0.0, taker_imbalance=0.0,
+            spread_bps=1.0, session="us", vol_regime="low", book_age_s=1.0,
+            rule_match=True, failed_gates="", holding=False, entry_paid=None,
+            unrealised=None, model_probability=0.9, measured_edge=measured,
+            slippage=0.01,
+        )
+        return " ".join(facts["summary"]["evidence"]), facts["economics"]["worth_doing"]
+
+    thin_words, thin_ok = edge_words(0.0140, 0.86)   # ~+0.0055 after fee
+    fat_words, fat_ok = edge_words(0.0177, 0.86)     # ~+0.0092 after fee
+    assert fat_ok and "worth having" in fat_words
+
+    barely_words, barely_ok = edge_words(0.0090, 0.86)  # ~+0.0005 after fee
+    assert not barely_ok
+    assert "too thin to be worth having" in barely_words
+
+
+def test_an_observed_rate_is_suppressed_below_a_usable_sample():
+    """"observed 100% (1 samples)" read as corroboration directly beneath a
+    model reading of 71%. It was one coin flip."""
+    from btc15_signal.messages import _calibration
+
+    thin = _calibration(0.71, 1.0, 1)
+    assert "100%" not in thin
+    assert "too few settled signals" in thin
+
+    solid = _calibration(0.98, 0.87, 46)
+    assert "observed 87%" in solid and "46 samples" in solid
+
+    # And the model figure is never called a probability.
+    assert "Model score" in thin and "Model score" in solid

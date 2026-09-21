@@ -209,7 +209,7 @@ def test_settlement_updates_the_same_rows_and_creates_none(tmp_path):
         store.observe_full(observation(remaining_s=remaining))
     before = store.observation_coverage()["rows"]
 
-    updated = store.settle_observations(1000, True, 84_150.0)
+    updated = store.settle_observations(1000, "UP", 84_150.0)
 
     after = store.observation_coverage()
     assert updated == before, "settlement must touch every row of the window"
@@ -221,8 +221,8 @@ def test_settlement_updates_the_same_rows_and_creates_none(tmp_path):
 def test_settlement_never_rewrites_an_outcome(tmp_path):
     store = Store(str(tmp_path / "a.db"))
     store.observe_full(observation())
-    store.settle_observations(1000, True, 1.0)
-    assert store.settle_observations(1000, False, 2.0) == 0
+    store.settle_observations(1000, "UP", 1.0)
+    assert store.settle_observations(1000, "DOWN", 2.0) == 0
     assert store.lifecycle(1000)[0]["won"] == 1
 
 
@@ -230,7 +230,7 @@ def test_settlement_leaves_other_windows_alone(tmp_path):
     store = Store(str(tmp_path / "a.db"))
     store.observe_full(observation(window_open=1000))
     store.observe_full(observation(window_open=2000, signal_id="sig-2"))
-    store.settle_observations(1000, True, 1.0)
+    store.settle_observations(1000, "UP", 1.0)
     assert store.lifecycle(2000)[0]["won"] is None
 
 
@@ -304,7 +304,7 @@ def test_research_rows_exclude_legacy_and_unsettled(tmp_path):
     store.observe_full(observation(remaining_s=600, signal_id=None))       # legacy
     store.observe_full(observation(remaining_s=500, signal_id="sig-1"))    # unsettled
     store.observe_full(observation(remaining_s=400, signal_id="sig-1"))
-    store.settle_observations(1000, True, 84_150.0)
+    store.settle_observations(1000, "UP", 84_150.0)
     store.observe_full(observation(remaining_s=300, signal_id="sig-1"))    # after settle
 
     usable = store.research_rows()
@@ -324,3 +324,22 @@ def test_a_legacy_row_can_never_join_a_reconstructed_path(tmp_path):
     path = store.lifecycle_by_signal("sig-1")
     assert len(path) == 1
     assert path[0]["remaining_s"] == 500
+
+
+def test_a_window_holding_both_sides_settles_each_row_on_its_own_side(tmp_path):
+    """The model's side flips whenever BTC crosses the strike mid-window, so one
+    window holds both UP and DOWN rows. Stamping a single boolean across all of
+    them wrote the PREDICTION's outcome onto rows that had bet the other way -
+    432 of 2,527 settled rows, 17.1% of the live archive, carried an inverted
+    `won`, and every live-tape study that read the column inherited it."""
+    store = Store(str(tmp_path / "a.db"))
+    store.observe_full(observation(remaining_s=600, side="UP"))
+    store.observe_full(observation(remaining_s=500, side="DOWN"))
+    store.observe_full(observation(remaining_s=400, side="UP"))
+
+    assert store.settle_observations(1000, "UP", 84_150.0) == 3
+
+    rows = {r["remaining_s"]: r for r in store.lifecycle(1000)}
+    assert rows[600]["won"] == 1, "UP row, UP won"
+    assert rows[500]["won"] == 0, "DOWN row in the same window must NOT win"
+    assert rows[400]["won"] == 1

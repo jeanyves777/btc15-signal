@@ -386,8 +386,10 @@ def test_a_disabled_strategy_under_live_auto_is_announced_not_just_logged():
 
 
 def test_the_deployed_band_matches_what_was_measured():
-    """0.70-0.99 measured +0.0166/contract, CI [+0.0084, +0.0247], p=0.0007 -
-    2.8x the trades of 0.85-0.95 for 18% less edge."""
+    """0.85-0.93, net of fees: +0.0149/contract, CI [+0.0047, +0.0255],
+    n=6,721. Set from the per-bucket measurement, not the aggregate: only
+    0.85-0.90 has an interval excluding zero, and every bucket above 0.93 needs
+    a win rate the data cannot demonstrate."""
     import json
     from pathlib import Path
 
@@ -395,8 +397,12 @@ def test_the_deployed_band_matches_what_was_measured():
 
     rule = EntryRule.load("strategy.json")
     assert rule.enabled, "automation is off at the strategy"
-    assert rule.min_ask == 0.80
-    assert rule.max_ask == 0.99
+    # Floor lowered 0.85 -> 0.70 by operator decision on 2026-09-21, against
+    # the measurement (FINDINGS section 21). The guard is not deleted: it still
+    # catches an ACCIDENTAL change, which is what it was written for. Restoring
+    # 0.85 is `cp strategy.json.bak.band85 strategy.json` plus this line.
+    assert rule.min_ask == 0.70
+    assert rule.max_ask == 0.93
     # The 0-1x distance zone measured -0.0420/contract; keep a floor above it.
     assert rule.min_normalized_distance >= 1.0
 
@@ -441,7 +447,15 @@ def test_an_entry_may_pay_slightly_through_the_touch():
     from btc15_signal.execution import KalshiExecutionClient
     from btc15_signal.store import TradeProposal
 
-    assert Settings().entry_slippage == 0.01
+    # 0.05, not 0.01. Measured over the signed ask drift across the ~1.93s
+    # submit lag at qualifying polls: 1c covered 89.1% of moves, 3c covered
+    # 99.1%, 5c covered 100.0% (max observed 4.13c). The 11% the old allowance
+    # missed all returned "no fill; the book moved".
+    assert Settings().entry_slippage == 0.05
+    # And the entry crosses to a CEILING, because an IOC fills at the best
+    # available price - so a wider limit is not a worse price, it is only
+    # permission to cross. Above this no measured bucket excludes zero.
+    assert Settings().max_entry_price == 0.95
 
     sent = {}
 
@@ -468,6 +482,27 @@ def test_an_entry_may_pay_slightly_through_the_touch():
 
     # Never past the bounds event_order accepts.
     asyncio.run(Fake().execute_with_take_profit(proposal("UP", 0.99), 0.05))
+    assert sent["price"] == "0.9900"
+
+    # WITH A CEILING the limit stops depending on the ask at all: it crosses
+    # exactly to the ceiling, so no move inside the tradeable region can
+    # outrun it. An IOC still fills at the best available price, so this is
+    # permission to cross, not a price paid.
+    for ask in (0.70, 0.80, 0.90, 0.93):
+        asyncio.run(
+            Fake().execute_with_take_profit(proposal("UP", ask), 0.05, ceiling=0.95)
+        )
+        assert sent["price"] == "0.9500", ask
+    # The ceiling caps as well as floors - flooring alone sent 0.98 on a 0.93
+    # ask, which is outside every band where an edge was measured.
+    asyncio.run(
+        Fake().execute_with_take_profit(proposal("UP", 0.93), 0.05, ceiling=0.95)
+    )
+    assert sent["price"] == "0.9500"
+    # And it still cannot leave the bounds event_order accepts.
+    asyncio.run(
+        Fake().execute_with_take_profit(proposal("UP", 0.99), 0.05, ceiling=1.50)
+    )
     assert sent["price"] == "0.9900"
 
 
@@ -632,12 +667,211 @@ def test_an_order_can_never_be_placed_against_another_attempts_price(tmp_path):
         assert fresh.id != rejected.id
 
 
-def test_drift_is_measured_from_the_last_order_not_the_first_proposal():
-    """The first proposal of a window may be a manual button offered far below
-    the band, which would make every drift look enormous and block all retries."""
+# ------------------------- the caps must bind on EVERY path, not just one
+
+
+def test_the_attempt_cap_is_enforced_inside_the_execution_block():
+    """Separating alerting from trading gave `trading_open` its own way into the
+    block, which bypassed both caps. The 10:00 window on 2026-09-21 placed SIX
+    orders against a limit of three and chased 0.85 to 0.963 against a cap of
+    0.08. A limit that only one of several paths respects is not a limit."""
     from pathlib import Path
 
     source = Path("src/btc15_signal/main.py").read_text(encoding="utf-8")
-    drift = source.split("drift = contract_ask - (")[1][:400]
+    block = source.split("if rule.enabled and rule_match and auto_on and trader is not None:")[1]
+    block = block[: block.index("count = contracts_for_budget")]
+
+    assert "attempts >= settings.auto_retry_limit" in block
+    assert "drift > settings.auto_retry_max_drift" in block
+    # Both set `blocked` rather than falling through to place an order.
+    assert block.count("blocked = ") >= 3
+
+
+def test_drift_accumulates_from_the_first_order_not_the_last():
+    """Measured against the last attempt it is measured incrementally, so a
+    steady climb never trips: 0.85 -> 0.926 -> 0.963 is eleven cents in steps
+    that each look small."""
+    from pathlib import Path
+
+    source = Path("src/btc15_signal/main.py").read_text(encoding="utf-8")
+    drift = source.split("first_order = store.db.execute(")[1][:400]
+    assert "ORDER BY attempt ASC" in drift, "must anchor on the FIRST order"
     assert "entry_order_id IS NOT NULL" in drift
-    assert "ORDER BY attempt DESC" in drift
+
+
+def test_the_caps_would_have_stopped_the_real_chase():
+    """Replay of the actual 10:00 window, attempt by attempt."""
+    from btc15_signal.config import Settings
+
+    settings = Settings()
+    first = 0.85
+    observed = [(1, 0.85), (2, 0.85), (3, 0.85), (4, 0.926), (5, 0.926), (6, 0.963)]
+
+    allowed = []
+    for attempt, price in observed:
+        prior = attempt - 1
+        if prior >= settings.auto_retry_limit:
+            continue
+        if prior and (price - first) > settings.auto_retry_max_drift:
+            continue
+        allowed.append(price)
+
+    assert len(allowed) == 3, "the attempt cap must bind at three"
+    assert max(allowed) == 0.85, "nothing above the original price should fill"
+    assert 0.963 not in allowed
+
+
+# ------------------- observe freely, order rarely, never chase
+
+
+def test_a_retry_may_never_pay_more_than_the_first_order():
+    """Observing costs nothing and a window has ten minutes in it. If the price
+    runs away, wait to see whether it comes back; missing a winner is better
+    than risking 96c to make 4c."""
+    from btc15_signal.config import Settings
+
+    assert Settings().auto_retry_max_drift == 0.0
+
+
+def test_the_worked_example_behaves_as_specified():
+    """85c order, 92c wait, 98c rejected outright, 89c wait, 86c order.
+
+    The shape is the point: the price running up never buys, and only a return
+    to at-or-below the first price does. (86c rather than the 84c originally
+    sketched, because 84c is now below the band floor and would be refused by
+    the rule before any retry logic was reached.)
+    """
+    from btc15_signal.config import Settings
+    from btc15_signal.strategy import EntryRule
+
+    settings = Settings()
+    rule = EntryRule.load("strategy.json")
+    first = None
+    decisions = []
+    for price in (0.85, 0.92, 0.98, 0.89, 0.85):
+        if not rule.min_ask <= price <= rule.max_ask:
+            decisions.append("rejected")
+        elif first is not None and price - first > settings.auto_retry_max_drift:
+            decisions.append("wait")
+        else:
+            decisions.append("order")
+            if first is None:
+                first = price
+    assert decisions == ["order", "wait", "rejected", "wait", "order"]
+
+
+def test_the_band_top_is_where_the_edge_is_demonstrable():
+    """Per-bucket net of fees: only 0.85-0.90 has a CI excluding zero, and
+    0.95-0.97 needs a 96.3% true win rate the data cannot demonstrate."""
+    from btc15_signal.strategy import EntryRule
+
+    rule = EntryRule.load("strategy.json")
+    # See FINDINGS section 21: floor lowered to 0.70 by operator decision. The
+    # CEILING is the part this test is actually about and it has not moved.
+    assert rule.min_ask == 0.70
+    assert rule.max_ask == 0.93, "above 0.93 every bucket's CI includes zero"
+
+    # A 96c entry is now refused by the rule itself, not merely by a chase cap.
+    assert not rule.min_ask <= 0.96 <= rule.max_ask
+
+
+def test_position_ownership_is_reported_before_the_attempt_cap():
+    """After a fill the honest refusal is "a position is already open". Letting
+    the attempt cap answer first hid whether the position guard worked at all."""
+    from pathlib import Path
+
+    source = Path("src/btc15_signal/main.py").read_text(encoding="utf-8")
+    block = source.split("if rule.enabled and rule_match and auto_on and trader is not None:")[1]
+    block = block[: block.index("count = contracts_for_budget")]
+
+    assert block.index("auto_block_reason(") < block.index("auto_retry_limit")
+    # the later checks only apply if nothing more serious already refused
+    assert "if not blocked and attempts >= settings.auto_retry_limit:" in block
+
+
+def test_a_failed_order_is_followed_by_a_cooldown():
+    """Firing again on the next poll re-reads the same disturbed book."""
+    from btc15_signal.config import Settings
+
+    assert Settings().auto_retry_cooldown_s >= 15
+
+
+def test_only_submitted_orders_count_toward_the_cap(tmp_path):
+    """Observation is unlimited; a proposal that never reached the exchange is
+    not an attempt."""
+    from btc15_signal.store import Store
+
+    store = Store(str(tmp_path / "c.db"))
+    offered = store.create_proposal("primary", 1000, "T", "UP", 0.86, 0, 1, 9999, 9999, 1)
+    assert store.order_attempts(1000) == (0, None), "an unsent proposal is not an attempt"
+
+    store.finish_proposal(offered.id, "unfilled", "no fill", "ORDER-1", None)
+    assert store.order_attempts(1000) == (1, "unfilled")
+
+
+# ----------------- wait for the price to settle, do not clip the band
+
+
+def test_the_price_must_hold_the_band_before_we_buy(tmp_path):
+    """Entering on the first qualifying minute measured +0.0080/contract, CI
+    [-0.0019, +0.0180] - it does not clear zero. After two minutes in the band:
+    +0.0219 [+0.0090, +0.0347]."""
+    from btc15_signal.store import Store
+
+    store = Store(str(tmp_path / "s.db"))
+    base = 1_700_000_000_000
+
+    def observe(offset_s, ask):
+        store.observe_full({
+            "window_open": 1000, "remaining_s": 600 - offset_s,
+            "observed_ms": base + offset_s * 1000, "ticker": "T",
+            "signal_id": "sig", "our_ask": ask,
+        })
+
+    # Clipping the band for one poll is not settling in it.
+    observe(0, 0.70)
+    observe(12, 0.86)
+    now = base + 12_000
+    assert store.band_streak_seconds(1000, 0.85, 0.93, now) == 0.0
+
+    # Held across several polls, the streak is measured from the first of them.
+    for i, ask in enumerate((0.86, 0.87, 0.86, 0.88), start=2):
+        observe(12 * i, ask)
+    now = base + 12 * 5 * 1000
+    assert store.band_streak_seconds(1000, 0.85, 0.93, now) >= 36
+
+
+def test_a_price_that_leaves_the_band_resets_the_streak(tmp_path):
+    from btc15_signal.store import Store
+
+    store = Store(str(tmp_path / "s.db"))
+    base = 1_700_000_000_000
+    for i, ask in enumerate((0.86, 0.87, 0.70, 0.86)):
+        store.observe_full({
+            "window_open": 1000, "remaining_s": 600 - i,
+            "observed_ms": base + i * 12_000, "ticker": "T",
+            "signal_id": "sig", "our_ask": ask,
+        })
+    now = base + 3 * 12_000
+    # Only the final in-band poll counts; the excursion to 0.70 broke it.
+    assert store.band_streak_seconds(1000, 0.85, 0.93, now) < 12
+
+
+def test_the_settle_requirement_is_enforced_before_an_order():
+    from pathlib import Path
+
+    from btc15_signal.config import Settings
+
+    assert Settings().entry_band_settle_s >= 60
+
+    source = Path("src/btc15_signal/main.py").read_text(encoding="utf-8")
+    block = source.split("if rule.enabled and rule_match and auto_on and trader is not None:")[1]
+    block = block[: block.index("count = contracts_for_budget")]
+    # The streak is now computed ABOVE this block so the alert can show its
+    # countdown - on 2026-09-21 it decided most refusals and appeared in no
+    # message. What matters here is unchanged and is what this asserts: the
+    # order path still refuses on it, using the configured threshold.
+    assert "settled_s < settings.entry_band_settle_s" in block
+    assert "band_streak_seconds(" in source.split(
+        "if rule.enabled and rule_match and auto_on and trader is not None:"
+    )[0], "the streak must still be computed before the order path runs"

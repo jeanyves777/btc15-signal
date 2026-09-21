@@ -78,6 +78,21 @@ class BinanceClient:
             len(completed),
         )
 
+    async def recent_bars(self, limit: int = 1500) -> list[tuple[int, float, float]]:
+        """The last `limit` one-minute bars as (open_time, high, low).
+
+        Separate from `snapshot`, which fetches sixteen bars for the current
+        window only. Support and resistance need about a day, and that is a
+        second request - so it is deliberately NOT part of the snapshot and is
+        called on the level tracker's slow clock, off the order path.
+        """
+        response = await self.client.get(
+            self.spot + "/api/v3/klines",
+            params={"symbol": self.symbol, "interval": "1m", "limit": limit},
+        )
+        response.raise_for_status()
+        return [(int(r[0]), float(r[2]), float(r[3])) for r in response.json()]
+
     async def close_at(self, window_open_ms: int) -> float:
         response = await self.client.get(
             self.spot + "/api/v3/klines",

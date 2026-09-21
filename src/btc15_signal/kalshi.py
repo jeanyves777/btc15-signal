@@ -12,9 +12,26 @@ class KalshiMarket:
     close_ms: int
     yes_ask: float
     no_ask: float
+    # The REAL quoted bids. Until 2026-09-21 this model carried asks only and
+    # the exit path inferred a bid as `1 - opposite ask`. That arithmetic is
+    # right - Kalshi's book satisfies no_bid = 1 - yes_ask exactly - but it
+    # made a fabricated number look like a quote, and there was nothing to
+    # compare against when a sell at that price did not fill.
+    yes_bid: float = 0.0
+    no_bid: float = 0.0
 
     def ask(self, side: str) -> float:
         return self.yes_ask if side == "UP" else self.no_ask
+
+    def bid(self, side: str) -> float:
+        """What we could sell this side into, as quoted.
+
+        Quoted, NOT achievable. On 2026-09-21 a 0.979 NO bid did not fill a
+        single contract while the Kalshi app offered 0.93 to cash out - the
+        1-10c book-to-quote offset FINDINGS section 7 records as unresolved.
+        Anything that spends money on this number must discount it first.
+        """
+        return self.yes_bid if side == "UP" else self.no_bid
 
 
 class KalshiClient:
@@ -45,6 +62,8 @@ class KalshiClient:
                         close_ms=closed,
                         yes_ask=float(item["yes_ask_dollars"]),
                         no_ask=float(item["no_ask_dollars"]),
+                        yes_bid=float(item.get("yes_bid_dollars") or 0.0),
+                        no_bid=float(item.get("no_bid_dollars") or 0.0),
                     )
                 )
         if len(matches) != 1:

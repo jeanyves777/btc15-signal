@@ -8,5 +8,5 @@
   "require_momentum_alignment": false,
   "min_momentum_bps": 0.0,
   "fee_buffer": 0.0,
-  "require_blocking_level": false
+  "require_blocking_level": true
 }
