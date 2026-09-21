@@ -1689,3 +1689,143 @@ The review's own point stands and is now on the face of the message: a 1.57c
 edge from 60 neighbours is nowhere near established. The layer remains
 SHADOW-ONLY until `scripts/score_shadow.py` shows its probabilities calibrated
 and its disagreements paying.
+
+---
+
+## 31. Kalshi market structure: fees, queue, and where the volume is (2026-09-21)
+
+Four external facts about the exchange, established from live order tickets and
+from the recorded book. None of them is in the code's assumptions, and three of
+them change how a fill should be read.
+
+### Maker fills are free. Taker fills are not.
+
+From the operator's own order tickets, at ordinary mid-book prices:
+
+| book | limit | crosses? | fee |
+|---|---|---|---|
+| bid 60c / ask 61c | **59c** (below bid) | rests - **maker** | **$0** |
+| bid 40c / ask 41c | **38c** (below bid) | rests - **maker** | **$0** |
+| bid 35c / ask 36c | **38c** (above ask) | crosses - taker | $0.02 |
+| bid 65c / ask 66c | **66c** (at ask) | crosses - taker | $0.02 |
+
+`0.07 x 0.36 x 0.64 = $0.016 -> $0.02` confirms `kalshi_fee_charged` is exactly
+right for takers. **It models no maker case at all**, so it overstates the cost
+of any maker fill by the whole fee.
+
+The size of that matters: the fee is ~1.3-1.7c at the prices this bot trades,
+against a measured edge of ~1.5c. **Eliminating it would come close to doubling
+the edge** - the single largest improvement available anywhere in the system.
+
+**The app displays profit NET of the fee it already charged.** A position bought
+at 88.7c and marked at a 96.4c bid showed `+$0.07`: 7.70c gross minus the 0.71c
+entry fee already paid. Our model adds the fee to cost instead; same number from
+the opposite side. No double-count, but any comparison between a screenshot and
+a computed figure has to know which convention it is reading.
+
+### The maker rebate is real and unreachable at one contract
+
+Contracts already resting at our own best bid, over the recorded books in the
+0.70-0.93 band (n=1,586 snapshots):
+
+```
+p10          215
+median     3,989
+p90        7,640
+max       44,614
+
+queue <=   50 contracts :  5% of the time
+queue >= 1000 contracts : 81% of the time
+```
+
+A 1-lot joining a ~4,000-deep queue fills only once roughly 4,000 contracts
+trade through that price - that is, when the level is **swept**. A swept level
+is exactly the adverse case, and the adverse case is expensive:
+
+```
+discount   filled  win|filled   delta vs band   net (no fee)
+   1c        54%      68.9%        -9.6%          -0.0713
+   3c        46%      65.9%       -12.7%          -0.0804
+   5c        41%      63.1%       -15.5%          -0.0869
+```
+
+**The fee saving is ~1.3c; the adverse selection is ~10c.** Two measurements
+bracket the truth by the queue assumption, and the depth data says which end
+applies:
+
+- fills on any touch (front of queue): **+0.0213/contract** - requires a
+  position in the queue a 1-lot does not have
+- fills only when the level is swept (back of queue): **-0.0713/contract**
+
+Against **+0.0003** for simply crossing. Do not rest entries below the market.
+
+### The volume is where the edge is not
+
+Per-minute traded volume against the edge at ask >= 0.90, by minutes remaining:
+
+| min left | median vol/min | edge |
+|---|---|---|
+| 11 | 0 | +0.0208 (n=201) |
+| 7 | 1,490 | +0.0101 (n=1,589) |
+| 6 | 1,144 | +0.0100 (n=2,203) |
+| 5 | 4,444 | +0.0021 |
+| 3 | 8,828 | -0.0019 |
+| 2 | 11,802 | **-0.0084** (n=4,391) |
+| 1 | 40,289 | -0.0039 |
+
+**Volume rises 30x into the close and the edge crosses to negative on the way.**
+The crowd buying 90c contracts in the last two minutes for a net 5-8% is, in
+aggregate, paying for the privilege.
+
+This reframes the fill problem. **The bot trades in the illiquid part of the
+window by design**, because that is where the edge is: at 6-11 minutes the
+median traded volume is 0-1,500 per minute. The book shows a quote and almost
+nothing changes hands. A low fill rate is the PRICE of trading where the edge
+is, not a malfunction - and the obvious fix, trading later, destroys the thing
+being protected: **+0.0100 at 6 minutes against -0.0084 at 2**.
+
+### How fast the ask moves, and what an allowance has to cover
+
+Signed ask drift across the measured ~1.93s decision-to-submit lag, at
+qualifying polls (n=423):
+
+```
+p50 +0.00c   p90 +1.10c   p95 +1.59c   p99 +2.72c   max +4.13c
+
+1c allowance covers 89.1%    3c covers 99.1%    5c covers 100.0%
+```
+
+The 1c allowance that was deployed was therefore under-priced on about one
+qualifying order in nine - and every one of those returned "no fill; the book
+moved". This is what motivated pricing the entry at a ceiling rather than at
+`ask + slippage` (the cross-to-ceiling change, committed as cb1230d).
+
+Qualifying moments are NOT the fast ones, which was worth checking and is the
+opposite of the intuition: 11% of qualifying polls exceed a 1c allowance
+against 15% of all polls.
+
+### Section 7's order-book mapping: narrowed, not closed
+
+The structure is now identified:
+
+```
+max(book_yes)      = yes_bid
+1 - max(book_no)   = yes_ask
+```
+
+Median error **-0.10c** across 4,115 recorded snapshots, which is the right
+answer. But only **22%** agree within 1c, tails run **+-12c**, and the error
+gets WORSE with more time remaining (12% within 1c at 660s, 42% at 60s) -
+the opposite of what staleness would do, and the book/quote capture skew is
+only ~338ms. Worst cases are structural, not drift: `quote_bid 0.380` against
+`book_best 0.994`.
+
+Two uneliminated candidates, both in `recorder.py`: the `depth: 32` request may
+return a window that is not centred on the touch, and `live[0]` selects a
+market without the "exactly one open market" guard the trading path enforces.
+
+**Consequence:** queue position cannot be simulated from the recorded book, so
+the maker question above cannot be narrowed further by analysis. It would need
+a live experiment - rest one contract at the bid, record fill rate, fill price
+and outcome - and the live path now carries Kalshi's authoritative bid
+(section 24) to do it with.
