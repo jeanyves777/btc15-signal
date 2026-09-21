@@ -1055,3 +1055,30 @@ def test_an_observed_rate_is_suppressed_below_a_usable_sample():
 
     # And the model figure is never called a probability.
     assert "Model score" in thin and "Model score" in solid
+
+
+def test_the_settled_trade_carries_the_side_it_actually_held(tmp_path):
+    """`settle_observations` scores the realised figure on the side HELD, and
+    read `trade["side"]` from a dict that never had the key - so every
+    settlement following a fill raised KeyError and the watchdog restarted the
+    service. It crashed at 17:00, 17:15, 17:45 and 18:00 on 2026-09-21 before
+    the missing column was noticed."""
+    from btc15_signal.store import Store
+
+    store = Store(str(tmp_path / "s.db"))
+    store.create_proposal("primary", 1000, "T", "DOWN", 0.85, 0.0, 1, 9999, 9999, 1)
+    store.db.execute(
+        "UPDATE trade_proposals SET status='filled', fill_price=0.84, fee_paid=0.0095"
+    )
+    store.db.commit()
+
+    trade = store.trade_for_window(1000)
+    assert trade["side"] == "DOWN", "the held side must survive the round trip"
+
+    store.observe((
+        1000, 600, 1, "T", 84000.0, 84100.0, "DOWN", 0.9, 8,
+        0.85, 0.85, 0.16, 5.0, 10.0, 12.0, 1.2, 1.0, 2.0, 0.1,
+        84200.0, 83900.0, 8.0, 1, None,
+    ))
+    # The call that used to raise.
+    assert store.settle_observations(1000, "DOWN", 84_150.0) == 1

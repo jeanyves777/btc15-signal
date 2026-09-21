@@ -222,7 +222,14 @@ class KalshiExecutionClient:
             filled,
             order["order_id"],
             None,
-            f"Sold {filled:g} at {limit_price:.0%}",
+            # NOT `limit_price` - that is the floor we were willing to cross
+            # down to, never what we got. A sell IOC fills at the best
+            # available bid, and it does: crossing to a 0.90 floor returned
+            # 0.982, 0.998 and 0.997 on 2026-09-21 while this line called
+            # every one of them "Sold 1 at 90%". The real price is read back
+            # by `fill_detail` and lands on `trade_proposals.exit_price`.
+            f"Sold {filled:g} (crossed to {limit_price:.0%}; "
+            f"filled at the best bid)",
         )
 
     async def fill_detail(self, order_id: str, side: str) -> tuple[float, float, float] | None:

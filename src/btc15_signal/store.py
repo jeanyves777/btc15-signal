@@ -460,15 +460,20 @@ class Store:
         """
         row = self.db.execute(
             f"SELECT status, count, fill_price, COALESCE(fill_price, entry_limit), "
-            f"fee_paid, exit_price, exit_count FROM trade_proposals "
+            f"fee_paid, exit_price, exit_count, side FROM trade_proposals "
             f"WHERE window_open=? AND strategy='primary' AND status IN {ACCOUNTED_SQL}",
             (window_open,),
         ).fetchone()
         if not row:
             return None
-        status, count, raw_fill, paid, fee, exit_price, exit_count = row
+        status, count, raw_fill, paid, fee, exit_price, exit_count, side = row
         return {
             "status": status,
+            # The side actually HELD. `settle_observations` scores the realised
+            # figure on this rather than on each observation's own side, and
+            # reading a key that was never here crashed the service at every
+            # settlement that followed a fill.
+            "side": side,
             # False when the fill was never read back and `paid` is standing in
             # from the posted limit. A buy limit only ever fills at or below
             # itself, so an unconfirmed price always overstates the cost.
