@@ -7,6 +7,12 @@ dependencies = [
   "cryptography>=43,<47",
   "httpx[socks]>=0.27,<1",
   "pydantic-settings>=2.4,<3",
+  # The IANA time zone database. The daily capital review reconciles on
+  # the NEW YORK day because that is the exchange's own reset boundary,
+  # and Windows ships no system tz database - without this `zoneinfo`
+  # raises ZoneInfoNotFoundError. A hand-rolled DST offset would be
+  # silently wrong for an hour twice a year, at a day boundary.
+  "tzdata>=2024.1",
 ]
 
 [project.optional-dependencies]

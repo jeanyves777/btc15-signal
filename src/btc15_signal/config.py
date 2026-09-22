@@ -380,6 +380,24 @@ class Settings(BaseSettings):
     recovery_add_distance_floor: float = 10.0  # BRTI normalized distance
     recovery_add_max_contracts: int = 1  # per position, on top of the base
 
+    # THE DAILY SIZING CONTROLLER (capital.py). One authority for base entries
+    # and recovery adds alike.
+    #
+    # The base tier changes ONLY at the daily review, from reconciled settled
+    # cash - never from an open position's mark, because sizing on unrealised
+    # gains compounds exposure exactly when a position is most likely to give
+    # them back. $30 of capital per contract matches the authorised test
+    # account: one contract now, two if the account doubles, and never more
+    # than `max_base_contracts` whatever the balance says.
+    #
+    # The day is NEW YORK because that is the exchange's own reset - Kalshi
+    # documents its utilisation caps resetting at midnight New York time - and
+    # a system keeping books on a different day from its venue will file trades
+    # in the wrong one twice a year at the DST boundaries.
+    capital_sizing_enabled: bool = True
+    capital_per_contract: float = 30.0
+    max_base_contracts: int = 2
+
     high_confidence_distance_min: float = 2.0
     high_confidence_distance_max: float = 4.0
     dry_run: bool = True

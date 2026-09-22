@@ -13,6 +13,7 @@ import httpx
 from . import autotrade, messages
 from . import brain as brain_mod
 from .binance import BinanceClient, MarketSnapshot
+from .capital import CapitalController, ny_day
 from .config import Settings
 from .decision import decision_facts
 from .execution import KalshiExecutionClient
@@ -975,6 +976,30 @@ def recovery_size(
     )
 
 
+def partial_exit_pnl(
+    *, paid: float, bid: float, filled: float, held: float,
+    entry_fee: float | None, exit_fee: float | None,
+) -> float:
+    """Realised P&L for the portion actually sold, fees allocated to it.
+
+    Selling one of two contracts realises one contract's gain and carries ONE
+    contract's share of the entry fee. Charging the whole entry fee against
+    the part sold overstates that cash flow and leaves the remaining contract
+    owing nothing, so the settlement of the remainder is overstated in turn -
+    and the deficit, which is folded from these amounts in order, inherits
+    both errors.
+
+    `held` is the size the entry fee was charged on. A full exit allocates all
+    of it, which is the previous behaviour and the common case.
+    """
+    share = (filled / held) if held else 1.0
+    return (
+        (bid - paid) * filled
+        - (entry_fee or 0.0) * share
+        - (exit_fee or 0.0)
+    )
+
+
 def confidence_size(
     settings: Settings, snapshot: MarketSnapshot, prediction, base: int
 ) -> tuple[int, str]:
@@ -1407,6 +1432,7 @@ async def primary_signal(
     now_ms: int,
     trader: KalshiExecutionClient | None = None,
     levels: LevelTracker | None = None,
+    capital=None,
 ) -> None:
     rule = EntryRule.load(settings.strategy_path)
     # Read from the cache only. The tracker refreshes on its own slow clock
@@ -1675,6 +1701,13 @@ async def primary_signal(
             # scale, throttle or otherwise touch what gets ordered. The budget
             # comes from settings and nothing else.
             count = contracts_for_budget(limits.budget, contract_ask)
+            # THE SINGLE SIZING AUTHORITY. The base tier comes from the daily
+            # capital review - reconciled settled cash on the New York day -
+            # and is the same object the recovery add-on asks. Two independent
+            # rules that both change size is how a cap gets exceeded by the sum
+            # of two things that each looked bounded.
+            if capital is not None and settings.capital_sizing_enabled:
+                count = min(count, capital.base_contracts(now_ms))
             # Size up ONLY inside the measured edge band. Everywhere else the
             # deployed size is unchanged, so this can never trade bigger on a
             # setup the data does not support.
@@ -2269,7 +2302,10 @@ async def cash_out_exit(
         # 2026-09-22 that gap is what let the settlement recap four minutes
         # later report this profit as missing and the next signal put it back.
         filled = result.filled_count if result else count
-        banked = (bid - paid) * filled - (entry_fee or 0.0) - (exit_fee or 0.0)
+        banked = partial_exit_pnl(
+            paid=paid, bid=bid, filled=filled, held=count,
+            entry_fee=entry_fee, exit_fee=exit_fee,
+        )
         # REALISED AT THE EXIT FILL, not when this loop noticed. The deficit
         # replays in realisation order, and our own discovery time has been
         # observed 917 seconds behind the broker's.
@@ -2484,6 +2520,8 @@ async def service() -> None:
     hourly = HourlyShadow(settings) if settings.hourly_enabled else None
     reference = ReferenceShadow(settings) if settings.reference_enabled else None
     recovery_add = RecoveryAddRunner(settings, store, telegram)
+    capital = CapitalController(settings, store)
+    CAPITAL_DAY = {"ny": None}
     levels = LevelTracker()
     if hourly:
         print(f"hourly ladder recording (shadow) -> {settings.hourly_database_path}",
@@ -2506,6 +2544,21 @@ async def service() -> None:
             try:
                 await process_telegram(telegram, store, kalshi, trader, settings)
                 mark("telegram")
+
+                # THE DAILY CAPITAL REVIEW. At startup, and again the first
+                # time a poll lands in a new New York day - the exchange's own
+                # reset boundary, so our books and Kalshi's start together.
+                today_ny = ny_day(now_ms)
+                if CAPITAL_DAY["ny"] != today_ny:
+                    reviewed = await capital.reconcile(trader, now_ms)
+                    if reviewed is not None:
+                        CAPITAL_DAY["ny"] = today_ny
+                        print(
+                            f"capital review [{today_ny}]: cash "
+                            f"{reviewed.reconciled_cash:.2f}, base tier "
+                            f"{reviewed.base_contracts}",
+                            flush=True,
+                        )
 
                 # Settle first. A closed market's result does not depend on
                 # another market being open, and running this after the lookup
@@ -2648,7 +2701,7 @@ async def service() -> None:
                 mark("archive")
                 await primary_signal(
                     settings, store, telegram, contract, snapshot, opened, remaining,
-                    now_ms, trader, levels,
+                    now_ms, trader, levels, capital,
                 )
                 await reversion_signal(
                     settings, store, telegram, contract, snapshot, opened, remaining, now_ms

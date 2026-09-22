@@ -106,6 +106,19 @@ class MoneySnapshot:
         return round(self.realised + self.open_mark, 6)
 
 
+def _capital(row: dict):
+    """A capital_days row as a `capital.Capital`. Imported lazily so `store`
+    does not depend on a module that depends on it."""
+    from .capital import Capital
+
+    return Capital(
+        ny_day=row["ny_day"], reconciled_cash=row["reconciled_cash"],
+        open_exposure=row["open_exposure"], base_contracts=row["base_contracts"],
+        account_ceiling=row["account_ceiling"],
+        reconciled_ms=row["reconciled_ms"],
+    )
+
+
 ACCOUNTED_SQL = "('filled','protected','unprotected','exited')"
 
 
@@ -416,6 +429,30 @@ class Store:
             "CREATE INDEX IF NOT EXISTS realised_events_order "
             "ON realised_events(realised_ms, event_id)"
         )
+        # THE DAILY CAPITAL REVIEW, keyed on the NEW YORK day - the exchange's
+        # own reset boundary, not UTC. `reconciled_cash` is settled cash only:
+        # sizing on an open position's mark would compound exposure exactly
+        # when a position is winning and most likely to be given back.
+        self.db.execute("""
+            CREATE TABLE IF NOT EXISTS capital_days (
+                ny_day TEXT PRIMARY KEY,
+                reconciled_cash REAL NOT NULL,
+                open_exposure REAL NOT NULL,
+                base_contracts INTEGER NOT NULL,
+                account_ceiling REAL NOT NULL,
+                reconciled_ms INTEGER NOT NULL
+            )
+        """)
+        # Funds claimed by an order this process has decided on but the broker
+        # has not seen yet. The UNIQUE key is the atomicity: two orders in one
+        # poll cannot both spend the same balance.
+        self.db.execute("""
+            CREATE TABLE IF NOT EXISTS fund_reservations (
+                key TEXT PRIMARY KEY,
+                amount REAL NOT NULL,
+                created_ms INTEGER NOT NULL
+            )
+        """)
         # `settings` holds REAL only. The open mark has to be carried per
         # ticker, not as one total, so a position that has already been banked
         # can be excluded from it - which is the whole fix.
@@ -1734,6 +1771,74 @@ class Store:
         self.db.commit()
         # The deficit folds from events, not from this table.
         self.sync_events_from_settlements(now_ms)
+
+    # ------------------------------------------------- capital and reservations
+
+    def record_capital_day(self, capital) -> None:
+        self.db.execute(
+            "INSERT OR REPLACE INTO capital_days (ny_day, reconciled_cash, "
+            "open_exposure, base_contracts, account_ceiling, reconciled_ms) "
+            "VALUES (?,?,?,?,?,?)",
+            (capital.ny_day, capital.reconciled_cash, capital.open_exposure,
+             capital.base_contracts, capital.account_ceiling,
+             capital.reconciled_ms),
+        )
+        self.db.commit()
+
+    def capital_for_day(self, ny_day: str):
+        rows = self._dicts(
+            "SELECT * FROM capital_days WHERE ny_day = ?", (ny_day,)
+        )
+        return _capital(rows[0]) if rows else None
+
+    def previous_capital_day(self, ny_day: str):
+        rows = self._dicts(
+            "SELECT * FROM capital_days WHERE ny_day < ? ORDER BY ny_day DESC "
+            "LIMIT 1",
+            (ny_day,),
+        )
+        return _capital(rows[0]) if rows else None
+
+    def reserve_funds(self, key: str, amount: float, now_ms: int) -> bool:
+        """Claim funds atomically. False when the key is already reserved.
+
+        The UNIQUE key is what stops a base entry and a recovery add, decided
+        in the same poll, from both spending the same balance: the second
+        insert fails rather than succeeding against a stale read.
+        """
+        try:
+            self.db.execute(
+                "INSERT INTO fund_reservations (key, amount, created_ms) "
+                "VALUES (?,?,?)",
+                (key, round(float(amount), 6), now_ms),
+            )
+            self.db.commit()
+            return True
+        except sqlite3.IntegrityError:
+            return False
+
+    def release_funds(self, key: str) -> None:
+        self.db.execute("DELETE FROM fund_reservations WHERE key = ?", (key,))
+        self.db.commit()
+
+    RESERVATION_TTL_MS = 5 * 60_000
+
+    def reserved_funds(self, now_ms: int) -> float:
+        """Live reservations. Stale ones expire rather than stranding funds.
+
+        A reservation outlives its order if the process dies between reserving
+        and placing. Without a TTL that money is never spendable again, which
+        is a slower way to stop trading than a crash but just as complete.
+        """
+        self.db.execute(
+            "DELETE FROM fund_reservations WHERE created_ms < ?",
+            (now_ms - self.RESERVATION_TTL_MS,),
+        )
+        self.db.commit()
+        row = self.db.execute(
+            "SELECT COALESCE(SUM(amount), 0) FROM fund_reservations"
+        ).fetchone()
+        return round(float(row[0] or 0.0), 6)
 
     def record_realised_event(
         self, event_id: str, ticker: str, realised_ms: int, amount: float,
