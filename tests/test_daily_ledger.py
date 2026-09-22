@@ -23,6 +23,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
+from btc15_signal.capital import ny_day_start_ms
 from btc15_signal.store import Store  # noqa: E402
 
 DAY = 86_400_000
@@ -35,7 +36,13 @@ NOW = int(time.time() * 1000)
 
 
 def window_today(now_ms: int) -> int:
-    return now_ms - (now_ms % DAY) + 3_600_000
+    """An hour into the CURRENT New York accounting day.
+
+    The day moved from UTC to New York so the whole account is kept on the
+    exchange's own boundary; a fixture built on UTC arithmetic lands outside
+    it for four or five hours a day depending on the season.
+    """
+    return ny_day_start_ms(now_ms) + 3_600_000
 
 
 def test_cash_out_is_banked_before_the_settlement_arrives(tmp_path):
@@ -129,7 +136,7 @@ def test_a_local_figure_never_overrides_the_exchange(tmp_path):
 def test_yesterday_is_not_counted_in_today(tmp_path):
     now = NOW
     store = Store(str(tmp_path / "t.db"))
-    yesterday = now - (now % DAY) - 3_600_000
+    yesterday = ny_day_start_ms(now) - 3_600_000
     store.record_realised("OLD", yesterday, 5.0, True, "exchange", now)
     store.record_realised(TICKER, window_today(now), 0.55, True, "cash_out", now)
     markets, _, dollars = store.ledger_today(now)

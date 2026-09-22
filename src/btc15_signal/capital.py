@@ -108,15 +108,27 @@ class CapitalController:
             if cash < 0:
                 return existing
             _orders, resting = await trader.resting_exposure()
-            held = self._store.get_setting("open_mark", 0.0)
-            exposure = round(max(0.0, resting) + max(0.0, held), 6)
+            held_cost = self._store.open_position_cost()
+            exposure = round(max(0.0, resting) + max(0.0, held_cost), 6)
+            # AVAILABLE CASH IS NOT CAPITAL. An open position and a resting
+            # order both reduce spendable cash without reducing what the
+            # account is worth - the money is committed, not gone. Sizing off
+            # cash alone would shrink the tier every time a trade was on, and
+            # grow it again the moment one settled, which is a sizing rule
+            # driven by whether we happen to be in a position.
+            #
+            # Capital is settled cash PLUS the COST BASIS of what is
+            # committed. Cost, never the mark: unrealised gains are excluded,
+            # so a winning open position cannot raise tomorrow's size on money
+            # that has not arrived.
+            capital_for_tier = round(cash + exposure, 6)
             tier = tier_for(
-                cash,
+                capital_for_tier,
                 self._settings.capital_per_contract,
                 self._settings.max_base_contracts,
             )
             capital = Capital(
-                ny_day=day, reconciled_cash=round(cash, 6),
+                ny_day=day, reconciled_cash=capital_for_tier,
                 open_exposure=exposure, base_contracts=tier,
                 account_ceiling=self._settings.recovery_add_test_budget,
                 reconciled_ms=now_ms,
@@ -173,6 +185,21 @@ class CapitalController:
         ceiling_room = self._settings.recovery_add_test_budget - exposure
         reserved = self._store.reserved_funds(now_ms)
         return round(min(cash, ceiling_room) - reserved, 6)
+
+    async def reserve_checked(
+        self, trader, key: str, amount: float, now_ms: int
+    ) -> bool:
+        """Read available funds and claim them in one go.
+
+        The read and the claim have to be adjacent: two orders that each read
+        the balance and then each reserve against it will both succeed on a
+        stale figure. `Store.reserve_funds` re-checks the live total of
+        reservations inside its own transaction, so the loser is refused.
+        """
+        available = await self.available(trader, now_ms)
+        if available < 0:
+            return False
+        return self._store.reserve_funds(key, amount, now_ms, available=available)
 
     def reserve(self, key: str, amount: float, now_ms: int) -> bool:
         """Claim funds for an order about to be sent. Atomic; False if taken.

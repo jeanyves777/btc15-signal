@@ -1700,14 +1700,31 @@ async def primary_signal(
             # shown in the alert and archived for measurement - and it must not
             # scale, throttle or otherwise touch what gets ordered. The budget
             # comes from settings and nothing else.
-            count = contracts_for_budget(limits.budget, contract_ask)
             # THE SINGLE SIZING AUTHORITY. The base tier comes from the daily
-            # capital review - reconciled settled cash on the New York day -
-            # and is the same object the recovery add-on asks. Two independent
-            # rules that both change size is how a cap gets exceeded by the sum
-            # of two things that each looked bounded.
+            # capital review - reconciled capital on the New York day - and is
+            # the same object the recovery add-on asks. Two independent rules
+            # that both change size is how a cap gets exceeded by the sum of
+            # two things that each looked bounded.
+            #
+            # THE BUDGET MUST NOT SILENTLY CAP THE TIER. `auto_budget` is a
+            # per-CONTRACT allowance, so the money available to an order scales
+            # with the tier; treating it as a per-ORDER total would pin the size
+            # at one contract for ever, and the growth controller would look
+            # like it was working while changing nothing. When the operator's
+            # budget really is the binding constraint, it is printed rather
+            # than applied quietly.
             if capital is not None and settings.capital_sizing_enabled:
-                count = min(count, capital.base_contracts(now_ms))
+                tier = capital.base_contracts(now_ms)
+                count = contracts_for_budget(limits.budget * tier, contract_ask)
+                if count < tier:
+                    print(
+                        f"auto: budget caps the tier - {limits.budget:.2f}/contract "
+                        f"x {tier} affords {count} at {contract_ask:.2f}",
+                        flush=True,
+                    )
+                count = min(count, tier)
+            else:
+                count = contracts_for_budget(limits.budget, contract_ask)
             # Size up ONLY inside the measured edge band. Everywhere else the
             # deployed size is unchanged, so this can never trade bigger on a
             # setup the data does not support.
@@ -2550,6 +2567,10 @@ async def service() -> None:
                 # reset boundary, so our books and Kalshi's start together.
                 today_ny = ny_day(now_ms)
                 if CAPITAL_DAY["ny"] != today_ny:
+                    # Move the whole accounting day together, carrying any
+                    # losses already booked today so the floor is not refunded
+                    # by the change itself.
+                    store.migrate_day_boundary(now_ms)
                     reviewed = await capital.reconcile(trader, now_ms)
                     if reviewed is not None:
                         CAPITAL_DAY["ny"] = today_ny

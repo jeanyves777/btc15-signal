@@ -213,10 +213,31 @@ def test_a_reservation_reduces_available_funds(tmp_path):
     assert asyncio.run(controller.available(Broker(cash=10.0), NOW)) == before
 
 
-def test_a_stale_reservation_expires_rather_than_stranding_funds(tmp_path):
+def test_a_reservation_does_not_expire_on_a_clock(tmp_path):
+    """A timer cannot decide an order is gone. An order may still be resting,
+    or its submission outcome unknown; releasing its money because five
+    minutes passed hands the same dollars out twice. Only a proven outcome -
+    cancelled, rejected, expired, or filled and now counted as position
+    exposure - releases a reservation."""
     store = Store(str(tmp_path / "s.db"))
-    store.reserve_funds("orphan", 5.0, NOW - (6 * 60_000))
-    assert store.reserved_funds(NOW) == 0.0, "a dead reservation must not persist"
+    store.reserve_funds("still-resting", 5.0, NOW - (60 * 60_000))
+    assert store.reserved_funds(NOW) == 5.0, "an hour old and still held"
+    store.release_funds("still-resting", reason="broker confirmed cancelled")
+    assert store.reserved_funds(NOW) == 0.0
+
+
+def test_two_different_orders_cannot_overspend_the_same_balance(tmp_path):
+    """A UNIQUE key stops the SAME order reserving twice. It does nothing
+    about two DIFFERENT orders against one balance, which is the case that
+    actually overspends."""
+    store = Store(str(tmp_path / "s.db"))
+    assert store.reserve_funds("base:W1", 6.0, NOW, available=10.0) is True
+    assert store.reserve_funds("add:W1", 6.0, NOW, available=10.0) is False, (
+        "6 + 6 does not fit in 10"
+    )
+    assert store.reserved_funds(NOW) == 6.0
+    assert store.reserve_funds("add:W1", 4.0, NOW, available=10.0) is True
+    assert store.reserved_funds(NOW) == 10.0
 
 
 # --------------------------------------------- event identity and partials
@@ -238,7 +259,9 @@ def test_a_revised_settlement_updates_the_amount_in_place(tmp_path):
     store.record_realised("KX-A", NOW, 0.54, True, "exchange", NOW, realised_ms=NOW)
     rows = store.settlement_events("KX-A")
     ids = {r["event_id"] for r in rows}
-    assert ids == {"cash_out:KX-A", "exchange:KX-A"}
+    # The exit is keyed on its own instant, so two partial exits are two
+    # events; the settlement keeps one stable identity per market.
+    assert ids == {f"cash_out:KX-A:{NOW}", "exchange:KX-A"}
     total = sum(r["amount"] for r in rows)
     assert round(total, 6) == 0.54, "the events sum to the exchange's figure"
 

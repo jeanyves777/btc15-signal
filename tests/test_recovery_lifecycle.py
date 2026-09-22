@@ -22,6 +22,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from btc15_signal.brti import BRTIFeatures  # noqa: E402
+from btc15_signal.capital import ny_day_start_ms
 from btc15_signal.config import Settings  # noqa: E402
 from btc15_signal.recovery_add import AddState  # noqa: E402
 from btc15_signal.recovery_add_runner import RecoveryAddRunner  # noqa: E402
@@ -31,7 +32,7 @@ from btc15_signal.validation import kalshi_fee_charged as fee  # noqa: E402
 TICKER = "KXBTC15M-26SEP221500-00"
 NOW = int(time.time() * 1000)
 DAY = 86_400_000
-TODAY = NOW - (NOW % DAY)
+TODAY = ny_day_start_ms(NOW)
 WINDOW = TODAY + 3_600_000
 
 

@@ -18,11 +18,12 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
+from btc15_signal.capital import ny_day_start_ms
 from btc15_signal.store import Store  # noqa: E402
 
 DAY = 86_400_000
 NOW = int(time.time() * 1000)
-TODAY = NOW - (NOW % DAY)
+TODAY = ny_day_start_ms(NOW)
 
 
 def settlement(store: Store, ticker: str, window_ms: int, pnl: float) -> None:

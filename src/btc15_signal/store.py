@@ -450,7 +450,8 @@ class Store:
             CREATE TABLE IF NOT EXISTS fund_reservations (
                 key TEXT PRIMARY KEY,
                 amount REAL NOT NULL,
-                created_ms INTEGER NOT NULL
+                created_ms INTEGER NOT NULL,
+                state TEXT NOT NULL DEFAULT 'held'
             )
         """)
         # `settings` holds REAL only. The open mark has to be carried per
@@ -1685,6 +1686,82 @@ class Store:
             flush=True,
         )
 
+    def sync_events_from_fills(self, now_ms: int) -> None:
+        """One cash-flow event per SELL FILL, keyed on the broker's fill id.
+
+        `cash_out:{ticker}` was not a unique identity. Two partial exits in the
+        same market collapse onto one key, and the second silently overwrites
+        the first - one of the two cash flows disappears from an order-
+        sensitive fold, and the settlement remainder is then computed against
+        the wrong banked total. The broker's `fill_id` is unique per execution
+        and stable across redelivery, which is exactly what an event id has to
+        be.
+
+        Entry cost and fee are allocated to the portion sold, so a partial
+        carries its own share and the remainder is left owing the rest.
+        """
+        floor = now_ms - self.LEDGER_SYNC_LOOKBACK_MS
+        for fill in self._dicts(
+            "SELECT fill_id, ticker, side, count, yes_price, no_price, fee_cost, "
+            "filled_ms, window_ms FROM fills WHERE action = 'sell' AND filled_ms >= ?",
+            (floor,),
+        ):
+            event_id = f"cash_out:{fill['fill_id']}"
+            basis = self._entry_basis(fill["ticker"])
+            if basis is None:
+                continue
+            entry_price, bought, entry_fee = basis
+            sold = float(fill["count"] or 0)
+            if sold <= 0:
+                continue
+            # A sell of the YES side exits an UP position at `yes_price`; a
+            # sell of NO exits a DOWN position, whose price is the no side.
+            exit_price = float(
+                fill["no_price"] if fill["side"] == "no" else fill["yes_price"]
+            )
+            share = sold / bought if bought else 1.0
+            amount = round(
+                (exit_price - entry_price) * sold
+                - entry_fee * share
+                - float(fill["fee_cost"] or 0.0),
+                6,
+            )
+            # SUPERSEDE THE PROVISIONAL EVENT, carrying its applied amount.
+            # Deleting an event the fold has already applied would strand that
+            # amount and move the deficit for no reason; the broker's id is
+            # the identity we keep, the arithmetic is unchanged.
+            provisional = f"cash_out:{fill['ticker']}:{int(fill['filled_ms'])}"
+            carried = self.db.execute(
+                "SELECT applied FROM realised_events WHERE event_id = ?",
+                (provisional,),
+            ).fetchone()
+            self.record_realised_event(
+                event_id, fill["ticker"], int(fill["filled_ms"]), amount,
+                "cash_out", now_ms, fill["window_ms"],
+            )
+            if carried is not None:
+                self.db.execute(
+                    "UPDATE realised_events SET applied = ? WHERE event_id = ?",
+                    (carried[0], event_id),
+                )
+                self.db.execute(
+                    "DELETE FROM realised_events WHERE event_id = ?", (provisional,)
+                )
+                self.db.commit()
+
+    def _entry_basis(self, ticker: str) -> tuple[float, float, float] | None:
+        """(price, contracts, fee) of the BUY side, from the broker's fills."""
+        row = self.db.execute(
+            "SELECT SUM(count), SUM(fee_cost), SUM(count * CASE WHEN side='no' "
+            "THEN no_price ELSE yes_price END) FROM fills "
+            "WHERE ticker = ? AND action = 'buy'",
+            (ticker,),
+        ).fetchone()
+        if not row or not row[0]:
+            return None
+        bought = float(row[0])
+        return round(float(row[2]) / bought, 6), bought, float(row[1] or 0.0)
+
     def _emit_event(
         self, ticker: str, window_ms: int, pnl: float, source: str,
         now_ms: int, realised_ms: int | None,
@@ -1699,6 +1776,17 @@ class Store:
         """
         when = int(realised_ms if realised_ms is not None else now_ms)
         amount = float(pnl)
+        if source != "exchange":
+            # A PROVISIONAL exit event, keyed on the instant the cash flow
+            # happened rather than on the ticker: two partial exits are two
+            # instants and therefore two events, where `cash_out:{ticker}`
+            # would have let the second overwrite the first. The broker's own
+            # fill id supersedes this as soon as the fill syncs.
+            self.record_realised_event(
+                f"cash_out:{ticker}:{when}", ticker, when, amount,
+                source, now_ms, window_ms,
+            )
+            return
         if source == "exchange":
             banked = sum(
                 float(event["amount"])
@@ -1799,42 +1887,89 @@ class Store:
         )
         return _capital(rows[0]) if rows else None
 
-    def reserve_funds(self, key: str, amount: float, now_ms: int) -> bool:
-        """Claim funds atomically. False when the key is already reserved.
+    def open_position_cost(self) -> float:
+        """What open positions COST, not what they are marked at.
 
-        The UNIQUE key is what stops a base entry and a recovery add, decided
-        in the same poll, from both spending the same balance: the second
-        insert fails rather than succeeding against a stale read.
+        Capital for sizing includes committed money at its cost basis, so a
+        winning position cannot inflate tomorrow's tier on a gain that has not
+        settled. `open_mark` is the mark and is deliberately not used here.
         """
+        row = self.db.execute(
+            f"SELECT COALESCE(SUM(count * COALESCE(fill_price, entry_limit)), 0) "
+            f"FROM trade_proposals WHERE status IN {HELD_SQL}"
+        ).fetchone()
+        return round(float(row[0] or 0.0), 6)
+
+    def reserve_funds(
+        self, key: str, amount: float, now_ms: int, available: float | None = None
+    ) -> bool:
+        """Claim funds, checked against what is actually available. Atomic.
+
+        A UNIQUE KEY ALONE DOES NOT PREVENT OVERSPENDING. It stops the SAME
+        order reserving twice; it does nothing about two DIFFERENT orders - a
+        base entry and a recovery add in the same poll - each reserving a
+        different key against the same balance and together exceeding it. So
+        the check and the insert happen in one IMMEDIATE transaction, and the
+        sum of live reservations plus this request must fit inside
+        `available`.
+
+        `available` is the spendable figure the caller just read. Passing None
+        keeps the old unchecked behaviour and is only for callers that have
+        already done the arithmetic themselves.
+        """
+        amount = round(float(amount), 6)
         try:
+            self.db.execute("BEGIN IMMEDIATE")
+            if available is not None:
+                held = self.db.execute(
+                    "SELECT COALESCE(SUM(amount), 0) FROM fund_reservations "
+                    "WHERE key != ?",
+                    (key,),
+                ).fetchone()[0]
+                if round(float(held or 0.0) + amount, 6) > round(available, 6):
+                    self.db.execute("ROLLBACK")
+                    return False
             self.db.execute(
-                "INSERT INTO fund_reservations (key, amount, created_ms) "
-                "VALUES (?,?,?)",
-                (key, round(float(amount), 6), now_ms),
+                "INSERT INTO fund_reservations (key, amount, created_ms, state) "
+                "VALUES (?,?,?,'held')",
+                (key, amount, now_ms),
             )
-            self.db.commit()
+            self.db.execute("COMMIT")
             return True
         except sqlite3.IntegrityError:
+            self.db.execute("ROLLBACK")
             return False
 
-    def release_funds(self, key: str) -> None:
-        self.db.execute("DELETE FROM fund_reservations WHERE key = ?", (key,))
-        self.db.commit()
+    def release_funds(self, key: str, reason: str = "released") -> None:
+        """Free a reservation. Only call this once the outcome is KNOWN.
 
-    RESERVATION_TTL_MS = 5 * 60_000
-
-    def reserved_funds(self, now_ms: int) -> float:
-        """Live reservations. Stale ones expire rather than stranding funds.
-
-        A reservation outlives its order if the process dies between reserving
-        and placing. Without a TTL that money is never spendable again, which
-        is a slower way to stop trading than a crash but just as complete.
+        Known means the broker has told us: cancelled, rejected, expired, or
+        filled and therefore now counted as position exposure instead. A
+        reservation released on a timer while its order is still resting hands
+        the same dollars out twice.
         """
         self.db.execute(
-            "DELETE FROM fund_reservations WHERE created_ms < ?",
-            (now_ms - self.RESERVATION_TTL_MS,),
+            "DELETE FROM fund_reservations WHERE key = ?", (key,)
         )
         self.db.commit()
+        if reason != "released":
+            print(f"reservation released [{key}]: {reason}", flush=True)
+
+    def reservation_keys(self) -> list[str]:
+        return [
+            row[0] for row in self.db.execute("SELECT key FROM fund_reservations")
+        ]
+
+    def reserved_funds(self, now_ms: int) -> float:
+        """Dollars currently claimed by orders whose outcome is not yet known.
+
+        NOTHING EXPIRES HERE. A reservation used to time out after five
+        minutes, which is wrong in the exact case it matters: an order that is
+        still resting, or one whose submission outcome is unknown, has not
+        released its money and a clock cannot decide that it has. Releases are
+        driven by reconciliation - `RecoveryAddRunner.reconcile` and the
+        order path - so the only way funds come back is the broker saying so.
+        """
         row = self.db.execute(
             "SELECT COALESCE(SUM(amount), 0) FROM fund_reservations"
         ).fetchone()
@@ -1959,13 +2094,75 @@ class Store:
     def set_recovery_epoch(self, epoch_ms: int, now_ms: int) -> None:
         self.set_setting("recovery_epoch_ms", float(epoch_ms), now_ms)
 
+    def day_start_ms(self, now_ms: int) -> int:
+        """The start of the accounting day. NEW YORK, matching the exchange.
+
+        THE WHOLE DAY MOVES TOGETHER. The capital review, the realised ledger,
+        the trade counters and the daily loss floor were split across two
+        calendars for a few hours on 2026-09-22 - the review on New York, the
+        rest on UTC - which is worse than either alone: a loss counted in one
+        day and a floor measured over another is a floor that does not bound
+        what it claims to.
+
+        Kalshi's own utilisation resets at midnight New York, so that is the
+        boundary the account is actually kept on, but the exchange's reset does
+        not by itself define OUR accounting fields - it is the reason to pick
+        the same day for all of them, deliberately, rather than to inherit one
+        field at a time.
+        """
+        from .capital import ny_day_start_ms
+
+        return ny_day_start_ms(now_ms)
+
+    def migrate_day_boundary(self, now_ms: int) -> float:
+        """Carry today's pre-New-York losses across the timezone change. Once.
+
+        Returns the carried amount (<= 0). Idempotent: the marker is written
+        with the day it applies to, so a restart cannot bank it twice.
+        """
+        from .capital import ny_day
+
+        day = ny_day(now_ms)
+        marker = self.db.execute(
+            "SELECT text_value FROM settings_text WHERE key='day_boundary_migrated'"
+        ).fetchone()
+        if marker and marker[0] == day:
+            return self.get_setting("day_boundary_carry", 0.0)
+        utc_start = now_ms - (now_ms % 86_400_000)
+        ny_start = self.day_start_ms(now_ms)
+        carry = 0.0
+        if ny_start > utc_start:
+            _, _, carry = self.exchange_record(utc_start)
+            _, _, after = self.exchange_record(ny_start)
+            carry = round(min(0.0, carry - after), 6)
+        self.set_setting("day_boundary_carry", carry, now_ms)
+        self.set_setting_text("day_boundary_migrated", day, now_ms)
+        if carry:
+            print(
+                f"day boundary moved to New York: carrying {carry:+.4f} of "
+                f"losses already booked today so the floor is not refunded",
+                flush=True,
+            )
+        return carry
+
+    def day_boundary_carry(self, now_ms: int) -> float:
+        """The carried loss, but only on the day the migration happened."""
+        from .capital import ny_day
+
+        marker = self.db.execute(
+            "SELECT text_value FROM settings_text WHERE key='day_boundary_migrated'"
+        ).fetchone()
+        if not marker or marker[0] != ny_day(now_ms):
+            return 0.0
+        return self.get_setting("day_boundary_carry", 0.0)
+
     def ledger_today(self, now_ms: int | None = None) -> tuple[int, int, float]:
         """(markets, winners, dollars) realised today, from the ledger alone."""
         import time
 
         if now_ms is None:
             now_ms = int(time.time() * 1000)
-        start = now_ms - (now_ms % 86_400_000)
+        start = self.day_start_ms(now_ms)
         row = self.db.execute(
             "SELECT COUNT(*), COALESCE(SUM(pnl > 0), 0), COALESCE(SUM(pnl), 0) "
             "FROM daily_ledger WHERE window_ms >= ?",
@@ -1978,7 +2175,7 @@ class Store:
 
         if now_ms is None:
             now_ms = int(time.time() * 1000)
-        start = now_ms - (now_ms % 86_400_000)
+        start = self.day_start_ms(now_ms)
         return {
             row[0] for row in self.db.execute(
                 "SELECT ticker FROM daily_ledger WHERE window_ms >= ?", (start,)
@@ -2262,7 +2459,7 @@ class Store:
         if not markets:
             # No ledger rows yet - fall back to the mirror, as before.
             markets, winners, realised = self.exchange_record(
-                now_ms - (now_ms % 86_400_000)
+                self.day_start_ms(now_ms)
             )
             has_mirror = bool(markets) or bool(self.exchange_record()[0])
             if not markets:
@@ -2342,7 +2539,7 @@ class Store:
         Read from durable rows rather than in-memory counters, so a restart
         cannot quietly reset a limit that has already been breached.
         """
-        day_start = now_ms - (now_ms % 86_400_000)
+        day_start = self.day_start_ms(now_ms)
         # An exited trade still consumed a slot and still cost money, so it
         # counts against the daily and hourly caps exactly like a held one.
         traded = "('filled','protected','unprotected','executing','partial','exited')"
@@ -2388,6 +2585,16 @@ class Store:
             if pnl is not None:
                 realised += pnl
         realised = min(realised, exchange_today)
+        # THE TIMEZONE MIGRATION MUST NOT REFUND THE LOSS ALLOWANCE.
+        #
+        # Midnight New York is LATER in absolute time than midnight UTC, so
+        # moving the accounting day shortens the window on the day of the
+        # change, and every loss booked between the two midnights would fall
+        # outside it. The floor would quietly hand back allowance on a day that
+        # had already spent it - a stop-loss that resets when you change a
+        # setting is not a stop-loss. The carry is computed once, at migration,
+        # and only applies to the day the change happened.
+        realised += self.day_boundary_carry(now_ms)
 
         # 'filled' covers a position partially sold too - mark_exited only
         # promotes to 'exited' once the whole position is gone, so the remainder
