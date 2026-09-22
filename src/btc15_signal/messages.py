@@ -21,6 +21,41 @@ def bar(fraction: float, width: int = 10) -> str:
     return BAR_FULL * filled + BAR_EMPTY * (width - filled)
 
 
+def recovery_line(state, last_add: dict | None = None) -> str:
+    """What recovery is doing right now, and why. Empty when inactive.
+
+    Two facts, because one without the other is unreadable: how much is
+    outstanding, and what the add-on last decided. A deficit shown with no
+    explanation of the silence beside it is what sent the operator to the
+    database to find two refusals that missed by fractions - momentum -0.6 bps
+    against a floor of zero, distance 9.9x against 10x.
+    """
+    if state is None or not getattr(state, "active", False):
+        return ""
+    lines = [
+        f"\U0001f527 <b>Recovery: ${state.deficit:,.2f} outstanding</b> · "
+        f"${state.required_per_trade():,.2f} a trade · "
+        f"{max(1, state.steps)} step(s)"
+    ]
+    if last_add:
+        status = str(last_add.get("state") or "")
+        reason = (last_add.get("cancel_reason") or "").strip()
+        price = last_add.get("limit_price")
+        if status.endswith("PENDING") and last_add.get("order_id"):
+            lines.append(
+                f"   <i>add resting at {price:.2f} · order "
+                f"{str(last_add['order_id'])[:8]}</i>"
+            )
+        elif status.endswith("EXECUTED"):
+            lines.append(
+                f"   <i>add filled {last_add.get('filled_count')} at "
+                f"{last_add.get('fill_price')}</i>"
+            )
+        elif reason:
+            lines.append(f"   <i>no add: {escape(reason[:90])}</i>")
+    return "\n".join(lines)
+
+
 def _money_block(snapshot) -> str:
     """The two money lines every message carries, from ONE snapshot.
 
@@ -78,8 +113,44 @@ def _money_block(snapshot) -> str:
             if line:
                 lines.append(f"<i>{line}</i>")
     elif not lines:
-        return "\U0001f4b0 <b>Live: nothing settled yet</b>"
+        lines.append("\U0001f4b0 <b>Live: nothing settled yet</b>")
+    # RECOVERY LAST, under the money it is working against. Empty when
+    # inactive, so a quiet system stays quiet - a permanent status line for a
+    # subsystem that is off is noise, and noise is what hides the real one.
+    recovery = recovery_line(
+        getattr(snapshot, "recovery", None), getattr(snapshot, "last_add", None)
+    )
+    if recovery:
+        lines.append(recovery)
     return "\n".join(lines)
+
+
+def recovery_armed(state, trigger: str = "") -> str:
+    """Announced when a realised loss opens a deficit."""
+    head = (
+        f"\U0001f527 <b>RECOVERY ARMED</b> · ${state.deficit:,.2f} outstanding"
+    )
+    body = [
+        head,
+        f"<i>{escape(trigger)}</i>" if trigger else "",
+        "",
+        f"Plan: {max(1, state.steps)} step(s), "
+        f"${state.required_per_trade():,.2f} a trade.",
+        "Base entries stay at one contract. Recovery may add ONE extra "
+        "contract, resting 2¢ below a fill, and only while the BRTI evidence "
+        "still holds.",
+    ]
+    return "\n".join(x for x in body if x != "")
+
+
+def recovery_cleared(snapshot) -> str:
+    """Announced the moment the money is back. Recovery stops immediately."""
+    return "\n".join([
+        "✅ <b>RECOVERY CLEARED</b> · deficit back to $0.00",
+        "<i>Sizing returns to base. Any unfilled recovery add is cancelled.</i>",
+        "",
+        _money_block(snapshot),
+    ])
 
 
 def session_close(*, session, day_snapshot, ny_day: str) -> str:

@@ -2569,6 +2569,30 @@ async def service() -> None:
                 await process_telegram(telegram, store, kalshi, trader, settings)
                 mark("telegram")
 
+                # RECOVERY STATE, FOLDED ONCE A POLL. This is what keeps
+                # `money_snapshot` read-only: the fold happens here, the
+                # rendering path just reads the row. It also catches the
+                # arm/clear transitions, which went entirely unreported until
+                # the operator asked why a -$0.86 loss produced no visible
+                # recovery - it had armed, blocked two adds and cleared, all
+                # in silence.
+                try:
+                    event, rstate = store.recovery_transition(now_ms)
+                    if event == "armed":
+                        last = store.last_realised_loss()
+                        await telegram.send(
+                            messages.recovery_armed(
+                                rstate,
+                                f"{last[0]} settled {last[1]:+.2f}" if last else "",
+                            )
+                        )
+                    elif event == "cleared":
+                        await telegram.send(
+                            messages.recovery_cleared(store.money_snapshot(now_ms))
+                        )
+                except Exception as exc:  # noqa: BLE001 - reporting is never fatal
+                    print(f"recovery report failed: {exc!r}", flush=True)
+
                 # SESSION CLOSE REPORTS. Driven off the hour boundary the
                 # poll stepped over, not a timer, so a slow cycle or a restart
                 # that straddles a close still reports it rather than losing

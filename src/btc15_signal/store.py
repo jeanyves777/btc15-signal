@@ -132,6 +132,10 @@ class MoneySnapshot:
     lifetime: "LifetimeRecord | None" = None
     # And the session breakdown from the same rows as `markets`, so it sums.
     sessions: tuple = ()
+    # Recovery state travels with the money, so every message can show
+    # what it is doing without a second read that might disagree.
+    recovery: object | None = None
+    last_add: dict | None = None
 
     @property
     def losers(self) -> int:
@@ -2542,6 +2546,8 @@ class Store:
             open_mark=round(open_mark, 6), taken_ms=now_ms, has_mirror=has_mirror,
             lifetime=self.lifetime_record(),
             sessions=tuple(session_breakdown(self.session_rows(now_ms))),
+            recovery=self.stored_deficit(),
+            last_add=self.last_add_decision(),
         )
 
     def session_rows(self, now_ms: int | None = None) -> list[tuple[int, float]]:
@@ -2590,6 +2596,58 @@ class Store:
         self.set_setting_text(
             f"session_reported:{ny_day}:{session}", str(now_ms), now_ms
         )
+
+    def recovery_transition(self, now_ms: int, plan_steps: int | None = None):
+        """(event, state) when recovery arms or clears, else (None, state).
+
+        Recovery ran for nearly an hour on 2026-09-22 - armed by a -$0.86
+        loss, two adds blocked, one order placed, then cleared - and NONE of
+        it reached Telegram. The operator's question was "I did not see the
+        recovery happening", and they were right: the word never appeared in
+        any message. A subsystem that moves real money silently is one nobody
+        can supervise.
+
+        The previous state is persisted, so a restart mid-recovery does not
+        re-announce something already reported.
+        """
+        state = self.recovery_state(plan_steps or DEFAULT_RECOVERY_STEPS, now_ms)
+        row = self.db.execute(
+            "SELECT text_value FROM settings_text WHERE key='recovery_announced'"
+        ).fetchone()
+        was_active = bool(row and row[0] == "active")
+        if state.active == was_active:
+            return None, state
+        self.set_setting_text(
+            "recovery_announced", "active" if state.active else "clear", now_ms
+        )
+        return ("armed" if state.active else "cleared"), state
+
+    def last_realised_loss(self) -> tuple[str, float] | None:
+        """The most recent losing market, to name what armed recovery."""
+        row = self.db.execute(
+            "SELECT ticker, pnl FROM daily_ledger WHERE pnl < 0 "
+            "ORDER BY COALESCE(window_ms, first_ms) DESC LIMIT 1"
+        ).fetchone()
+        return (str(row[0]), float(row[1])) if row else None
+
+    def last_add_decision(self, window_open_ms: int | None = None) -> dict | None:
+        """The most recent add-on decision, for showing WHY it did or did not.
+
+        Without this the recovery line can say a deficit is outstanding but
+        not why nothing is being done about it - which is exactly the gap that
+        made two razor-thin refusals (momentum -0.6 bps, distance 9.9x against
+        a 10x floor) invisible until someone went looking in the database.
+        """
+        if window_open_ms is not None:
+            rows = self._dicts(
+                "SELECT * FROM recovery_adds WHERE window_open_ms = ?",
+                (window_open_ms,),
+            )
+        else:
+            rows = self._dicts(
+                "SELECT * FROM recovery_adds ORDER BY created_ms DESC LIMIT 1"
+            )
+        return rows[0] if rows else None
 
     def lifetime_record(self) -> LifetimeRecord:
         """Realised performance across every reconciled market. One per market.
