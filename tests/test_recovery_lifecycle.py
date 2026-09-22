@@ -65,6 +65,9 @@ class Broker:
         base = {"order_id": order_id, "status": self.status}
         return {**base, **self.fill} if self.fill else base
 
+    async def balance_dollars(self):
+        return getattr(self, 'balance', 30.0)
+
     async def resting_exposure(self):
         return (len(self.placed), self.resting)
 
@@ -249,25 +252,36 @@ def test_add_pnl_is_reported_separately_from_the_account(tmp_path):
 
 # ---------------------------------------------- the three separate limits
 
-def test_the_budget_state_keeps_spend_exposure_and_losses_apart(tmp_path):
+def test_the_budget_state_keeps_the_account_and_the_history_apart(tmp_path):
     _settings, store = build(tmp_path)
     store._bump_add_budget(12.0, NOW)
     store.db.commit()
-    state = store.add_budget_state(30.0, resting=3.0)
-    assert state["authorised_purchase_cap"] == 30.0
-    assert state["purchase_spend"] == 12.0
-    assert state["current_resting_exposure"] == 3.0
-    assert state["purchase_room_left"] == 15.0
+    state = store.add_budget_state(30.0, resting=3.0, balance=25.0)
+    assert state["account_size"] == 30.0
+    assert state["broker_balance"] == 25.0
+    assert state["open_and_resting_exposure"] == 3.0
+    assert state["account_room"] == 25.0, "min(cash, ceiling - exposure)"
+    assert state["lifetime_spend"] == 12.0, "recorded, but it gates nothing"
     assert state["realised_add_pnl"] == 0.0, "spend is not a loss figure"
 
 
-def test_profitable_adds_still_consume_the_purchase_cap(tmp_path):
-    """The operator's point: this is a spend cap, not a loss budget."""
+def test_room_is_the_lesser_of_cash_and_the_ceiling(tmp_path):
+    _settings, store = build(tmp_path)
+    assert store.account_room(30.0, balance=5.0, exposure=0.0) == 5.0
+    assert store.account_room(30.0, balance=100.0, exposure=28.0) == 2.0
+    assert store.account_room(30.0, balance=-1.0, exposure=0.0) == -1.0
+    assert store.account_room(30.0, balance=10.0, exposure=-1.0) == -1.0
+
+
+def test_profitable_adds_do_not_exhaust_the_account(tmp_path):
+    """The correction. Three profitable $9 adds spend $27 of LIFETIME total,
+    but the money settled back - the account still has room."""
     _settings, store = build(tmp_path)
     for _ in range(3):
         store._bump_add_budget(9.0, NOW)
     store.db.commit()
-    assert store.add_budget_room(30.0, 0.0) == 3.0
+    assert store.add_budget_room(30.0, 0.0) == 3.0, "the old lifetime view"
+    assert store.account_room(30.0, balance=31.0, exposure=0.0) == 30.0
 
 
 # --------------------------------------------- order-sensitive rebuilding

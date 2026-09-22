@@ -371,6 +371,9 @@ class Settings(BaseSettings):
     # day or a restart - a cap that resets is not a cap, it is a per-episode
     # allowance that can be spent repeatedly.
     recovery_add_enabled: bool = False
+    # The TESTING ACCOUNT size, not a lifetime spend cap: what the add-on may
+    # have committed at any one moment, checked against live cash and live
+    # exposure before every order.
     recovery_add_test_budget: float = 30.0
     recovery_add_dip: float = 0.02  # rest this far below the ACTUAL fill
     recovery_add_min_seconds: int = 120  # add-entry deadline before close

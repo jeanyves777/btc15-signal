@@ -383,6 +383,39 @@ class Store:
                 updated_ms INTEGER NOT NULL
             )
         """)
+        # REALISED EVENTS: the cash-flow sequence the deficit is folded from.
+        #
+        # `daily_ledger` is one row per MARKET and is right for reporting, but
+        # wrong for a path-dependent figure. Two reasons, both measured on the
+        # live database:
+        #
+        #   * `first_ms` is DISCOVERY time, not realisation time.
+        #     KXBTC15M-26SEP221300-00 settled at 17:00:08 and was first banked
+        #     at 17:15:25 - 917 seconds late. Ordering by it replays a delayed
+        #     settlement 15 minutes after it actually happened.
+        #   * a partial exit and the settlement of the remainder are two cash
+        #     flows at two times. Aggregating them under one ticker loses that
+        #     ordering entirely.
+        #
+        # `realised_ms` is the BROKER's timestamp for when the money became
+        # real - `settlements.settled_ms` for a settlement, the exit fill's
+        # `filled_ms` for a cash-out - and never ours.
+        self.db.execute("""
+            CREATE TABLE IF NOT EXISTS realised_events (
+                event_id TEXT PRIMARY KEY,
+                ticker TEXT NOT NULL,
+                realised_ms INTEGER NOT NULL,
+                amount REAL NOT NULL,
+                source TEXT NOT NULL,
+                window_ms INTEGER,
+                applied REAL,
+                recorded_ms INTEGER NOT NULL
+            )
+        """)
+        self.db.execute(
+            "CREATE INDEX IF NOT EXISTS realised_events_order "
+            "ON realised_events(realised_ms, event_id)"
+        )
         # `settings` holds REAL only. The open mark has to be carried per
         # ticker, not as one total, so a position that has already been banked
         # can be excluded from it - which is the whole fix.
@@ -1307,24 +1340,42 @@ class Store:
         state = self.stored_deficit()
         deficit, markets = state.deficit, state.markets
         opened_ms, steps = state.opened_ms, state.steps
-        # ORDERED BY WHEN THE MONEY BECAME REAL, not by the market's own clock.
+        # FOLDED FROM `realised_events`, IN BROKER REALISATION ORDER.
         #
         # The deficit is path-dependent because profit stops reducing it at
-        # zero, so the order is part of the answer. `window_ms` is the wrong
-        # key: an early cash-out realises while its window is still running,
-        # and can realise BEFORE a market that opened earlier. Ordering by the
-        # market's time would then apply a profit to a debt that did not exist
-        # yet, and floor it away.
+        # zero, so the order is part of the answer and it has to be the order
+        # the money actually moved in.
         #
-        # `first_ms` is when this row was first banked, which is the moment the
-        # money became ours. `ticker` is the tie-breaker, so two rows banked in
-        # the same millisecond replay identically on every rebuild - a duplicate
-        # sync or a restart has to produce the same number or the deficit is
-        # not a fact about the account, it is a fact about the run.
-        for ticker, pnl, applied in self.db.execute(
-            "SELECT ticker, pnl, COALESCE(recovery_applied, 0.0) FROM daily_ledger "
-            "ORDER BY COALESCE(first_ms, window_ms), ticker"
+        # Two earlier keys were both wrong. `window_ms` is the market's clock:
+        # an early cash-out realises while its own window is still running and
+        # can realise BEFORE a market that opened earlier, so a profit could be
+        # applied to a debt that did not exist yet. `first_ms` is OUR discovery
+        # time: a settlement credited at 17:00:08 was first banked at 17:15:25,
+        # 917 seconds later, so a delayed settlement replayed in the wrong
+        # place. `realised_ms` is the broker's own timestamp, and `event_id`
+        # is the tie-breaker, so a duplicate sync and a restart produce the
+        # same number - the deficit is a fact about the account, not about the
+        # run that computed it.
+        #
+        # THE EPOCH IS COMPARED ON REALISATION, NOT ON THE MARKET'S TIME. A
+        # position already open when recovery activates settles afterwards, so
+        # its money becomes real afterwards and it COUNTS. Only events whose
+        # money was already real before activation are excluded - those are
+        # history, whenever the broker happens to deliver them.
+        epoch = self.recovery_epoch_ms()
+        for event_id, ticker, amount, applied, realised_ms in self.db.execute(
+            "SELECT event_id, ticker, amount, COALESCE(applied, 0.0), realised_ms "
+            "FROM realised_events ORDER BY realised_ms, event_id"
         ).fetchall():
+            if epoch and realised_ms < epoch:
+                if applied == 0.0:
+                    self.db.execute(
+                        "UPDATE realised_events SET applied = amount "
+                        "WHERE event_id = ?",
+                        (event_id,),
+                    )
+                continue
+            pnl = amount
             realised = float(pnl or 0.0)
             delta = realised - float(applied or 0.0)
             if abs(delta) < 1e-9:
@@ -1339,8 +1390,13 @@ class Store:
             elif not opened_ms:
                 opened_ms = now_ms
             self.db.execute(
-                "UPDATE daily_ledger SET recovery_applied=? WHERE ticker=?",
-                (realised, ticker),
+                "UPDATE realised_events SET applied=? WHERE event_id=?",
+                (realised, event_id),
+            )
+            # Kept in step so the per-market view and the event view agree.
+            self.db.execute(
+                "UPDATE daily_ledger SET recovery_applied=pnl WHERE ticker=?",
+                (ticker,),
             )
         return self._write_deficit(
             RecoveryState(deficit, deficit > 0, markets, opened_ms, steps), now_ms
@@ -1538,9 +1594,21 @@ class Store:
 
     def record_realised(
         self, ticker: str, window_ms: int, pnl: float, won: bool | None,
-        source: str, now_ms: int,
+        source: str, now_ms: int, realised_ms: int | None = None,
     ) -> None:
-        """Bank one market's final money. Append-only in the way that matters.
+        """Bank one market's final money, and emit its cash-flow event.
+
+        `realised_ms` is the BROKER's timestamp for when the money became
+        real - a settlement's `settled_ms`, an exit's `filled_ms`. It defaults
+        to `now_ms` only because a caller that does not know cannot do better;
+        every caller that does know passes it, because the deficit is folded
+        in realisation order and our own discovery time has been observed 917
+        seconds late.
+
+        For an `exchange` event the amount recorded is the REMAINDER - the
+        settlement total minus whatever cash-outs on the same market already
+        banked - so a partial exit and the settlement of the rest are two
+        events at two times that sum to the exchange's own figure.
 
         A row is never deleted and never silently replaced by a smaller
         figure that merely arrived later. The broker is still the authority -
@@ -1548,6 +1616,7 @@ class Store:
         broker wins - but the change is counted in `revisions` and the source
         recorded, so a disagreement shows up instead of being absorbed.
         """
+        self._emit_event(ticker, window_ms, pnl, source, now_ms, realised_ms)
         existing = self.db.execute(
             "SELECT pnl, source, revisions FROM daily_ledger WHERE ticker=?", (ticker,)
         ).fetchone()
@@ -1577,6 +1646,33 @@ class Store:
             f"ledger revision [{ticker}]: {previous_source} {previous:+.4f} -> "
             f"exchange {pnl:+.4f}",
             flush=True,
+        )
+
+    def _emit_event(
+        self, ticker: str, window_ms: int, pnl: float, source: str,
+        now_ms: int, realised_ms: int | None,
+    ) -> None:
+        """One cash-flow event per (source, market), at broker time.
+
+        A settlement carries the REMAINDER after any cash-out on the same
+        market, so the events sum to the exchange's total while each keeps its
+        own timestamp. That is what lets a partial exit at 18:57 and the
+        settlement of the rest at 19:00 replay as the two separate cash flows
+        they were, instead of one aggregate at whichever time we noticed.
+        """
+        when = int(realised_ms if realised_ms is not None else now_ms)
+        amount = float(pnl)
+        if source == "exchange":
+            banked = sum(
+                float(event["amount"])
+                for event in self.settlement_events(ticker)
+                if event["source"] != "exchange"
+            )
+            amount = round(amount - banked, 6)
+            if abs(amount) < 1e-9 and banked:
+                return
+        self.record_realised_event(
+            f"{source}:{ticker}", ticker, when, amount, source, now_ms, window_ms
         )
 
     # How far back a sync looks. Kalshi settles in batches and can credit a
@@ -1609,14 +1705,15 @@ class Store:
         floor = now_ms - self.LEDGER_SYNC_LOOKBACK_MS
         epoch = self.recovery_epoch_ms()
         for row in self.db.execute(
-            "SELECT ticker, COALESCE(window_ms, settled_ms), pnl FROM settlements "
-            "WHERE COALESCE(settled_ms, window_ms) >= ?",
+            "SELECT ticker, COALESCE(window_ms, settled_ms), pnl, settled_ms "
+            "FROM settlements WHERE COALESCE(settled_ms, window_ms) >= ?",
             (floor,),
         ).fetchall():
-            ticker, window_ms, pnl = row
+            ticker, window_ms, pnl, settled_ms = row
             window_ms = int(window_ms)
             self.record_realised(
                 ticker, window_ms, float(pnl), float(pnl) > 0, "exchange", now_ms,
+                realised_ms=int(settled_ms) if settled_ms else None,
             )
             # A MARKET OLDER THAN THE RECOVERY EPOCH IS HISTORY, NOT A DEBT.
             #
@@ -1635,6 +1732,83 @@ class Store:
                     (ticker,),
                 )
         self.db.commit()
+        # The deficit folds from events, not from this table.
+        self.sync_events_from_settlements(now_ms)
+
+    def record_realised_event(
+        self, event_id: str, ticker: str, realised_ms: int, amount: float,
+        source: str, now_ms: int, window_ms: int | None = None,
+    ) -> None:
+        """One cash flow, at the BROKER's timestamp for it.
+
+        Idempotent on `event_id`: a re-sync writes nothing. The amount may be
+        revised (a cash-out banked at +0.55 that the exchange settles at
+        +0.54), and the fold applies the delta.
+        """
+        existing = self.db.execute(
+            "SELECT amount FROM realised_events WHERE event_id = ?", (event_id,)
+        ).fetchone()
+        if existing is None:
+            self.db.execute(
+                "INSERT INTO realised_events (event_id, ticker, realised_ms, "
+                "amount, source, window_ms, applied, recorded_ms) "
+                "VALUES (?,?,?,?,?,?,NULL,?)",
+                (event_id, ticker, int(realised_ms), float(amount), source,
+                 window_ms, now_ms),
+            )
+        elif abs(float(existing[0]) - float(amount)) > 1e-9:
+            self.db.execute(
+                "UPDATE realised_events SET amount = ?, realised_ms = ?, "
+                "recorded_ms = ? WHERE event_id = ?",
+                (float(amount), int(realised_ms), now_ms, event_id),
+            )
+        self.db.commit()
+
+    def last_exit_fill_ms(self, ticker: str) -> int | None:
+        """When the broker says the exit actually traded. None if unknown."""
+        row = self.db.execute(
+            "SELECT MAX(filled_ms) FROM fills WHERE ticker = ? AND action = 'sell'",
+            (ticker,),
+        ).fetchone()
+        return int(row[0]) if row and row[0] else None
+
+    def settlement_events(self, ticker: str) -> list[dict]:
+        return self._dicts(
+            "SELECT * FROM realised_events WHERE ticker = ? "
+            "ORDER BY realised_ms, event_id",
+            (ticker,),
+        )
+
+    def sync_events_from_settlements(self, now_ms: int) -> None:
+        """Turn the broker's record into an ordered cash-flow sequence.
+
+        A cash-out is a PROVISIONAL event at its fill time. The exchange's
+        settlement is the total for that market, so its own event carries the
+        REMAINDER - the total minus whatever the cash-outs already banked -
+        at `settled_ms`. The events therefore sum to the exchange's figure
+        while each keeps its own true timestamp, which is what a partial exit
+        followed by a settlement actually looks like.
+        """
+        floor = now_ms - self.LEDGER_SYNC_LOOKBACK_MS
+        for row in self.db.execute(
+            "SELECT ticker, COALESCE(window_ms, settled_ms) AS wms, pnl, settled_ms "
+            "FROM settlements WHERE COALESCE(settled_ms, window_ms) >= ?",
+            (floor,),
+        ).fetchall():
+            ticker, window_ms, pnl, settled_ms = row
+            if not settled_ms:
+                continue
+            banked = sum(
+                float(e["amount"]) for e in self.settlement_events(ticker)
+                if e["source"] != "exchange"
+            )
+            remainder = round(float(pnl) - banked, 6)
+            if abs(remainder) < 1e-9 and banked:
+                continue  # the cash-out already accounted for all of it
+            self.record_realised_event(
+                f"exchange:{ticker}", ticker, int(settled_ms), remainder,
+                "exchange", now_ms, int(window_ms),
+            )
 
     def position_entry_ms(self, window_open: int, ticker: str) -> int | None:
         """When the base position was actually BOUGHT, from the broker's fills.
@@ -1751,8 +1925,42 @@ class Store:
         ).fetchone()
         return (float(row[0]), int(row[1])) if row else (0.0, 0)
 
+    def account_room(
+        self, account_size: float, balance: float, exposure: float
+    ) -> float:
+        """Dollars this order may spend, against a $30 TESTING ACCOUNT.
+
+        THE CORRECTED MODEL. The $30 was described as a testing account, and a
+        lifetime purchase cap is not that: it counts money that came back.
+        Three profitable $9 adds would exhaust a $30 "budget" while the
+        account itself was larger than when it started, and recovery would
+        stop for lack of a number rather than lack of funds.
+
+        An account is a stock, not a running total. What limits an order is
+        what is available RIGHT NOW:
+
+            room = min(broker cash, account_size - open and resting exposure)
+
+        Both terms matter. The broker balance stops us spending money we do
+        not have; the account ceiling stops the test growing past the size it
+        was authorised at, however well it goes. Cumulative spend is still
+        recorded, because it says how much trading the test has done - but it
+        does not gate anything.
+
+        A balance or exposure that could not be read is passed as a negative
+        number and yields no room: an unknown account is not an empty one, but
+        it is certainly not a licence to spend.
+        """
+        if balance < 0 or exposure < 0:
+            return -1.0
+        return round(min(balance, account_size - exposure), 6)
+
     def add_budget_room(self, ceiling: float, resting: float) -> float:
-        """Dollars of PURCHASE SPEND still available under the authorised cap.
+        """DEPRECATED lifetime purchase-spend headroom. Not a gate.
+
+        Kept so the cumulative figure stays visible in reports and tests, but
+        `account_room` is what decides whether an order may be placed. See its
+        docstring for why a lifetime cap was the wrong instrument.
 
         THREE DIFFERENT LIMITS, AND THIS IS ONLY ONE OF THEM. The $30 the
         operator authorised is a cumulative purchase-spend ceiling: every
@@ -1780,16 +1988,28 @@ class Store:
         committed, _ = self.add_budget_committed()
         return round(ceiling - committed - max(0.0, resting), 6)
 
-    def add_budget_state(self, ceiling: float, resting: float) -> dict:
-        """All three limits, named, so a report cannot conflate them."""
+    def add_budget_state(
+        self, account_size: float, resting: float, balance: float | None = None
+    ) -> dict:
+        """The limits, named and kept apart so a report cannot conflate them.
+
+        `account_room` is the one that gates an order. `lifetime_spend` is
+        history and gates nothing.
+        """
         spend, fills = self.add_budget_committed()
         summary = self.add_pnl_summary()
+        held = self.get_setting("open_mark", 0.0)
+        exposure = round(max(0.0, resting) + max(0.0, held), 6)
         return {
-            "authorised_purchase_cap": round(ceiling, 6),
-            "purchase_spend": round(spend, 6),
-            "purchase_spend_fills": fills,
-            "current_resting_exposure": round(max(0.0, resting), 6),
-            "purchase_room_left": self.add_budget_room(ceiling, resting),
+            "account_size": round(account_size, 6),
+            "broker_balance": None if balance is None else round(balance, 6),
+            "open_and_resting_exposure": exposure,
+            "account_room": (
+                None if balance is None
+                else self.account_room(account_size, balance, exposure)
+            ),
+            "lifetime_spend": round(spend, 6),
+            "lifetime_spend_fills": fills,
             "realised_add_pnl": round(float(summary.get("pnl") or 0.0), 6),
             "realised_add_fees": round(float(summary.get("fees") or 0.0), 6),
         }

@@ -63,6 +63,9 @@ class FakeTrader:
             }
         return {"order_id": order_id, "status": "resting"}
 
+    async def balance_dollars(self):
+        return getattr(self, 'balance', 30.0)
+
     async def resting_exposure(self):
         return (1, self._resting)
 
@@ -228,14 +231,35 @@ def test_room_counts_lifetime_fills_and_resting_orders(tmp_path):
     assert store.add_budget_room(30.0, 5.0) == 21.0
 
 
-def test_an_exhausted_budget_blocks_the_add(tmp_path):
+def test_no_cash_blocks_the_add(tmp_path):
+    """The account is a stock, not a running total: what stops an order is
+    money not being there now."""
+    settings, store = make(tmp_path)
+    trader = FakeTrader()
+    trader.balance = 0.10
+    run(RecoveryAddRunner(settings, store), trader)
+    assert trader.placed == []
+    assert store.open_add(WINDOW)["state"] == AddState.SKIPPED
+
+
+def test_exposure_at_the_account_ceiling_blocks_the_add(tmp_path):
+    settings, store = make(tmp_path)
+    trader = FakeTrader(resting=29.9)
+    run(RecoveryAddRunner(settings, store), trader)
+    assert trader.placed == []
+    assert "cap" in (store.open_add(WINDOW)["cancel_reason"] or "")
+
+
+def test_lifetime_spend_alone_does_not_block(tmp_path):
+    """The operator's correction: a lifetime purchase cap would stop recovery
+    after PROFITABLE trades, because the money came back but the tally did
+    not."""
     settings, store = make(tmp_path)
     store._bump_add_budget(30.0, NOW)
     store.db.commit()
     trader = FakeTrader()
     run(RecoveryAddRunner(settings, store), trader)
-    assert trader.placed == []
-    assert store.open_add(WINDOW)["state"] == AddState.SKIPPED
+    assert trader.placed, "funds are available; history must not veto"
 
 
 def test_unreadable_exposure_blocks_the_add(tmp_path):

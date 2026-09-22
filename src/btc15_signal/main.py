@@ -2270,8 +2270,12 @@ async def cash_out_exit(
         # later report this profit as missing and the next signal put it back.
         filled = result.filled_count if result else count
         banked = (bid - paid) * filled - (entry_fee or 0.0) - (exit_fee or 0.0)
+        # REALISED AT THE EXIT FILL, not when this loop noticed. The deficit
+        # replays in realisation order, and our own discovery time has been
+        # observed 917 seconds behind the broker's.
         store.record_realised(
-            ticker, opened, banked, banked > 0, "cash_out", now_ms
+            ticker, opened, banked, banked > 0, "cash_out", now_ms,
+            realised_ms=store.last_exit_fill_ms(ticker) or now_ms,
         )
     await telegram.send(
         messages.cash_out(

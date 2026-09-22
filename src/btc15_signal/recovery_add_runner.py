@@ -116,19 +116,29 @@ class RecoveryAddRunner:
         remaining_s, now_ms, opened,
     ) -> None:
         state = self._store.recovery_state(self._settings.recovery_steps)
-        # An unreadable exposure is -1, which `evaluate` treats as no room.
+        # FUNDS ARE CHECKED FRESH, EVERY ORDER, against the testing account.
+        #
+        # Not a lifetime spend total: money that came back is available again,
+        # and a cap that counts it would stop recovery for lack of a number
+        # rather than lack of funds. What gates the order is cash on hand and
+        # exposure already committed, read now. Either being unreadable yields
+        # no room - an unknown account is not an empty one, but it is not a
+        # licence to spend either.
         resting = 0.0
+        balance = -1.0
         if trader is not None:
             _orders, resting = await trader.resting_exposure()
-        room = (
-            -1.0 if resting < 0
-            else self._store.add_budget_room(
-                self._settings.recovery_add_test_budget, resting
-            )
+            balance = await trader.balance_dollars()
+        held = self._store.get_setting("open_mark", 0.0)
+        exposure = (
+            -1.0 if resting < 0 else round(max(0.0, resting) + max(0.0, held), 6)
         )
-        # `evaluate` works in committed dollars, so hand it what is spent, not
-        # what is left.
+        room = self._store.account_room(
+            self._settings.recovery_add_test_budget, balance, exposure
+        )
         committed, _fills = self._store.add_budget_committed()
+        # `evaluate` reasons in "already committed against the ceiling", so the
+        # account ceiling minus the room available expresses the same gate.
         spent = -1.0 if room < 0 else round(
             self._settings.recovery_add_test_budget - room, 6
         )

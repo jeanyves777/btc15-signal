@@ -253,6 +253,27 @@ class KalshiExecutionClient:
         except (httpx.HTTPError, ValueError, KeyError):
             return None
 
+    async def balance_dollars(self) -> float:
+        """Cash on hand. Negative when it could not be read.
+
+        An order is sized against what the account HAS, checked now - not
+        against a running total of what it has spent. Money that settled back
+        is spendable again, and a cap that cannot see that stops trading for
+        lack of a number rather than lack of funds.
+        """
+        path = "/portfolio/balance"
+        try:
+            response = await self.client.get(
+                self.base_url + path, headers=self._headers("GET", path)
+            )
+            response.raise_for_status()
+            body = response.json()
+            if "balance_dollars" in body:
+                return float(body["balance_dollars"])
+            return round(float(body.get("balance") or 0) / 100.0, 4)
+        except (httpx.HTTPError, ValueError, KeyError, TypeError):
+            return -1.0
+
     async def resting_exposure(self) -> tuple[int, float]:
         """(orders, dollars) committed to resting buys that have not filled.
 
