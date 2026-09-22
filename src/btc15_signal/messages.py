@@ -21,6 +21,23 @@ def bar(fraction: float, width: int = 10) -> str:
     return BAR_FULL * filled + BAR_EMPTY * (width - filled)
 
 
+def _live_line(markets: int, winners: int, dollars: float) -> str:
+    """The money line, written the SAME way wherever it appears.
+
+    There were two spellings - "+4.35 · 22 settled (20W-2L)" in the header and
+    "+$4.35 · 20W–2L" in the new signal layout - which read as two different
+    figures on a phone. One function, one format.
+    """
+    if not markets:
+        return "\U0001f4b0 <b>Live today: nothing settled yet</b>"
+    chip = "\U0001f4b0" if dollars >= 0 else "\U0001f4b8"
+    sign = "+" if dollars >= 0 else "−"
+    return (
+        f"{chip} <b>Live today: {sign}${abs(dollars):,.2f}</b> · "
+        f"{winners}W–{markets - winners}L"
+    )
+
+
 def scoreboard(
     settled: int,
     wins: int,
@@ -60,12 +77,7 @@ def scoreboard(
         # line whenever nothing had settled yet - precisely the state in which a
         # first real trade is the only thing worth showing.
         if live and live[0]:
-            trades, live_wins, dollars = live
-            chip = "\U0001f4b0" if dollars >= 0 else "\U0001f4b8"
-            head += (
-                f"\n{chip} <b>Live today: {dollars:+,.2f}</b> · {trades} settled"
-                f" ({live_wins}W-{trades - live_wins}L)"
-            )
+            head += "\n" + _live_line(*live)
         return head
     rate = wins / settled
     lines = [
@@ -75,15 +87,7 @@ def scoreboard(
     ]
     if live is None:
         return "\n".join(lines)
-    trades, live_wins, dollars = live
-    if not trades:
-        lines.append("\U0001f4b0 <b>Live today: nothing settled yet</b>")
-    else:
-        chip = "\U0001f4b0" if dollars >= 0 else "\U0001f4b8"
-        lines.append(
-            f"{chip} <b>Live today: {dollars:+,.2f}</b> · {trades} settled"
-            f" ({live_wins}W-{trades - live_wins}L)"
-        )
+    lines.append(_live_line(*live))
     return "\n".join(lines)
 
 
@@ -156,7 +160,7 @@ def signal_alert(
     facts: list[dict],
     executable: bool,
     status_line: str = "",
-    live_line: str = "",
+    record: str = "",
     verdict: str = "",
 ) -> str:
     """One signal - cleared, refused, or paper-only. One layout for all three.
@@ -185,12 +189,12 @@ def signal_alert(
         "",
         *checks_block(facts),
     ]
-    if status_line or live_line:
+    if status_line or record:
         lines.append("")
     if status_line:
         lines.append(status_line)
-    if live_line:
-        lines.append(live_line)
+    if record:
+        lines.append(record)
     return "\n".join(lines)
 
 
@@ -430,7 +434,7 @@ def settlement(
     exited_at: float | None = None,
     paper: bool = False,
     exact: bool = True,
-    live_line: str = "",
+    record: str = "",
 ) -> str:
     """How a window closed, and what it did to the account.
 
@@ -483,8 +487,8 @@ def settlement(
             + ("rule qualified it" if qualified else "rule declined it"),
             f"\U0001f4b5 {'Profit' if won else 'Loss'}: $0.00",
         ]
-        if live_line:
-            lines.append(live_line)
+        if record:
+            lines.append(record)
         return "\n".join(lines)
 
     # "+$0.22" / "-$0.77": the sign leads, the currency symbol sits inside it.
@@ -505,8 +509,8 @@ def settlement(
             f"\U0001f3c1 Market settled <b>{winner}</b>",
             "\U0001f9fe <i>The money for this one is not settled yet.</i>",
         ]
-        if live_line:
-            lines.append(live_line)
+        if record:
+            lines.append(record)
         return "\n".join(lines)
 
     amount = f"{'+' if pnl >= 0 else chr(0x2212)}${abs(pnl):,.2f}"
@@ -553,8 +557,8 @@ def settlement(
         elif pnl is not None:
             lines.append(f"\U0001f4b5 {amount} on {escape(basis)} after fees")
 
-    if live_line:
-        lines.append(live_line)
+    if record:
+        lines.append(record)
     if not exact:
         # The fill was never read back, so this is priced at the posted limit.
         lines.append(

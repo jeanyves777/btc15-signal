@@ -135,22 +135,19 @@ def confidence_label(facts: list[dict], opened: int, blocking_level: float | Non
     return regime_label(max(0, min(100, base + clock + level)))
 
 
-def live_line(store: Store) -> str:
-    """One line of real money, for the new compact signal layout.
+def record_block(store: Store, settings: Settings) -> str:
+    """Both running records, as a FOOTER rather than a header.
 
-    The full scoreboard header is three lines of paper statistics above one
-    line of money. On a signal alert - the message read fastest and acted on
-    soonest - that buries the only figure that is actually the account. This
-    is that figure alone, from the same broker-backed source.
+    Three lines: signal accuracy, the paper figure on the size the bot orders,
+    and the account. They answer different questions and are never merged -
+    merging them once reported -$3.91 on a night whose real loss was $0.85.
+
+    Moved below the alert rather than above it. Leading every message with
+    three lines of statistics pushed the side, the price and the checks - the
+    things acted on - down the screen; dropping them entirely, which the first
+    version of this layout did, lost the signal record the operator tracks.
     """
-    markets, winners, dollars = store.realised_record()
-    if not markets:
-        return "\U0001f4b0 Live today: nothing settled yet"
-    sign = "+" if dollars >= 0 else "−"
-    return (
-        f"\U0001f4b0 Live today: {sign}${abs(dollars):,.2f} · "
-        f"{winners}W–{markets - winners}L"
-    )
+    return head_for(store, settings)
 
 
 def head_for(store: Store, settings: Settings) -> str:
@@ -1810,7 +1807,7 @@ async def primary_signal(
             facts=facts,
             executable=qualified,
             status_line=status,
-            live_line=live_line(store),
+            record=record_block(store, settings),
         )
         store.save_details(proposal.id, detail_body, now_ms)
         buttons = messages.signal_buttons(
@@ -1830,7 +1827,7 @@ async def primary_signal(
             executable=False,
             verdict="NO ENTRY",
             status_line="⚪ Paper only · no order placed",
-            live_line=live_line(store),
+            record=record_block(store, settings),
         )
         store.save_details(key, detail_body, now_ms)
         buttons = messages.signal_buttons(prediction.side, None, key)
@@ -2013,7 +2010,7 @@ async def report_settlement(
         # scoreboard header no longer leads a result message: what the account
         # did is the point, and three lines of paper statistics above it is
         # what made the real figure the easiest thing on screen to miss.
-        live_line=live_line(store),
+        record=record_block(store, settings),
     )
     # "Qualified" means the rule liked the setup, NOT that an order was placed:
     # it is `int(rule_match)` recorded at alert time, and most of these were

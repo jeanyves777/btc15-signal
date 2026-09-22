@@ -138,7 +138,9 @@ def test_the_header_never_merges_paper_and_real_money():
     text = messages.scoreboard(9, 7, -0.33, live=(1, 0, -0.85))
     assert "paper" in text
     assert "Live" in text
-    assert "-0.33" in text and "-0.85" in text
+    # The paper figure keeps a plain hyphen; the money line is written once, by
+    # `_live_line`, with a true minus and a currency symbol.
+    assert "-0.33" in text and "−$0.85" in text
     # and the signal line no longer carries a bare, unlabelled dollar amount
     first_line = text.splitlines()[0]
     assert "$" not in first_line
@@ -513,7 +515,7 @@ def test_the_live_line_survives_an_empty_signal_record():
     from btc15_signal import messages
 
     text = messages.scoreboard(0, 0, 0.0, live=(1, 0, -0.85))
-    assert "Live today: -0.85" in text
+    assert "Live today: −$0.85" in text
     assert "No settled signals" in text  # both facts, not one replacing the other
 
 
