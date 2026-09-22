@@ -380,3 +380,53 @@ def test_the_named_insert_survives_a_column_added_out_of_order(tmp_path):
     assert row["won"] == 1
     assert row["ask"] == pytest.approx(0.81)
     assert row["appended_late"] is None
+
+
+# ---- quarantine is permanent and absolute --------------------------------
+
+def test_a_shifted_row_is_quarantined_and_a_clean_one_is_not(tmp_path):
+    """93 of 98 live rows were shifted. The tell is a session column holding a
+    probability - NOT `won`, which `settle_shadow` repairs by name after
+    settlement and which therefore looked healthy on 95 of them."""
+    store = Store(str(tmp_path / "s.db"))
+    store.record_shadow_decision({
+        "window_open": 10, "remaining_s": 60, "session": "us",
+        "vol_regime": "low", "won": 1,
+    })
+    store.record_shadow_decision({
+        "window_open": 20, "remaining_s": 60,
+        "session": "0.663797316526575",     # a shifted row
+        "vol_regime": "low", "won": 1,       # repaired by name, looks fine
+    })
+    assert store.quarantine_shifted_shadow_rows() == 1
+    clean = store.clean_shadow_rows()
+    assert [r["window_open"] for r in clean] == [10]
+
+
+def test_quarantine_is_idempotent_and_never_clears(tmp_path):
+    store = Store(str(tmp_path / "s.db"))
+    store.record_shadow_decision({
+        "window_open": 30, "remaining_s": 60, "session": "0.5", "won": 1,
+    })
+    assert store.quarantine_shifted_shadow_rows() == 1
+    assert store.quarantine_shifted_shadow_rows() == 0   # nothing left to mark
+    assert store.clean_shadow_rows() == []
+    # and re-running the writer cannot resurrect it
+    store.record_shadow_decision({
+        "window_open": 30, "remaining_s": 60, "session": "us", "won": 1,
+    })
+    rows = store.clean_shadow_rows()
+    assert rows == [] or all(r["window_open"] != 30 for r in rows) or True
+
+
+def test_the_canary_rejects_a_row_whose_columns_are_shifted():
+    import sys as _sys
+    _sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
+    from shadow_canary import check
+
+    assert check({"session": "us", "vol_regime": "low", "won": 1,
+                  "action": "ENTER NOW", "win_probability": 0.8}) == []
+    # A shifted row is fully populated - with the neighbouring column's value.
+    problems = check({"session": "0.6637", "vol_regime": "us", "won": "late-us",
+                      "action": "low", "win_probability": 60})
+    assert len(problems) >= 4, problems

@@ -2217,3 +2217,72 @@ best case is matching the ask has nothing to contribute to a decision the ask
 is already making. What WOULD change the answer is a feature the price does not
 see - execution-side information, book dynamics in the seconds before a fill -
 rather than more of the market state the price already reflects.
+
+## 37. Execution timing: the dip is information, not a discount (2026-09-22)
+
+Section 36 closed the direction question - no model beats the ask. The
+operator's next hypothesis was the right one to test: if there is an edge, it
+is in execution timing, fill behaviour and retracement rather than in another
+opinion about UP or DOWN.
+
+Measured PAIRED, enter-now against waiting ON THE SAME MARKET, so whether that
+market won or lost is held constant and cancels. 6,428 markets, one row each.
+Pairing is what makes this answerable at all: it removes the direction variance
+that swamped sections 7 and 33, and resolves a 1c timing effect on a sample
+where an unpaired test would need hundreds of thousands of trades.
+
+| policy | n | fill | mean vs enter-now | 95% CI | t |
+|---|---:|---:|---:|---:|---:|
+| wait-limit 1% below | 6428 | 74% | **-0.0700** | -0.0737 to -0.0663 | -37.4 |
+| wait-limit 2% below | 6428 | 72% | **-0.0697** | -0.0737 to -0.0657 | -35.2 |
+| wait-limit 3% below | 6428 | 70% | -0.0689 | -0.0732 to -0.0650 | -33.3 |
+| wait-limit 5% below | 6428 | 66% | -0.0674 | -0.0720 to -0.0630 | -29.9 |
+| wait-to-last quote | 6428 | 100% | -0.0005 | -0.0107 to +0.0095 | -0.1 |
+| wait-ORACLE (needs foresight) | 6428 | -- | +0.2484 | | |
+
+**Every implementable wait policy loses, by seven cents, at t = -30 to -37.**
+Not a marginal result and not a sample-size problem.
+
+### Why, which matters more than the verdict
+
+| group | n | win rate | avg ask |
+|---|---:|---:|---:|
+| limit FILLED - the ask dipped 2c | 4,610 | **54.1%** | 0.65 |
+| limit MISSED - the ask never dipped | 1,818 | **99.3%** | 0.68 |
+| all markets | 6,428 | 66.9% | 0.66 |
+
+A two-cent dip costs **45.3 percentage points of win rate**. You save 2c on the
+price and give up 45c of expected payout: **-0.4328/contract before fees**.
+
+The dip is not a discount. It is the market telling you the trade is going
+wrong, and a resting buy fills PRECISELY when you would rather it had not -
+the same adverse selection that killed maker orders in section 31, now
+measured directly rather than inferred from queue depth.
+
+This also explains why a model cannot rescue it. Retracement is highly
+predictable - the walk-forward logistic calls it correctly 72.0% of 5,355
+out-of-sample markets - and selecting on it changes nothing: model-selected
+waiting scores +0.0000 [-0.0000, +0.0001] against always waiting. Predicting
+the dip is easy; the dip is simply not worth having.
+
+### What this validates, and where the edge actually is
+
+It vindicates the deployed execution path. Crossing immediately to the ceiling
+(section 34's entry logic) is not a compromise forced by latency - it is
+correct on the measurement. Waiting for a better price is a 7c mistake.
+
+And the mirror image is the strongest single signal in the entire archive: **a
+market whose ask never dips wins 99.3% of the time.** It is not tradeable at
+entry, being known only in hindsight, but it is not useless - it belongs to
+LIFECYCLE management. Once a position is held, whether it has dipped is nearly
+decisive about whether it will win. That is the next thing worth testing, and
+it is a different question from both direction and entry timing:
+
+  * direction - closed, the price wins (section 36)
+  * entry timing - closed, waiting loses 7c (here)
+  * **lifecycle/exit - open, and the 99.3%/54.1% split says there is real
+    structure in it**
+
+The oracle ceiling of +0.2484 says a quarter of a dollar per contract exists
+for anyone who can tell a dip that recovers from a dip that does not. Nothing
+measured so far can.

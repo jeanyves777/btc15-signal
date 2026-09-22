@@ -171,6 +171,13 @@ class Store:
             "execution_risk": "REAL", "latency_ms": "REAL",
             "baseline_probability": "REAL", "mode": "TEXT",
             "realised_pnl": "REAL", "filled": "INTEGER",
+            # PERMANENT. Set once on the rows the old positional insert
+            # shifted, and never cleared: a quarantined row is evidence of the
+            # bug, not evidence about the market, and the reason it is marked
+            # rather than deleted is that deleting it would make the archive
+            # look clean and the sample look merely small.
+            "quarantined": "INTEGER DEFAULT 0",
+            "quarantine_reason": "TEXT",
         })
         self.db.execute("""
             CREATE TABLE IF NOT EXISTS strategy_alerts (
@@ -960,6 +967,58 @@ class Store:
             written += 1
         self.db.commit()
         return written
+
+    def quarantine_shifted_shadow_rows(self) -> int:
+        """Mark every column-shifted legacy row, permanently. Returns the count.
+
+        THE TELL IS A NUMERIC `session`. The old positional insert shifted
+        every value one place once `dip_n` was appended to the table by a
+        migration, so a row written after that point holds a probability where
+        a session string belongs - "0.663797316526575" is not a trading
+        session. `won` is NOT a usable tell: `settle_shadow` updates it by name
+        after settlement, so it was being silently repaired on 95 of the 98
+        rows while everything around it stayed wrong, which is exactly why this
+        went unnoticed.
+
+        Idempotent, and it only ever sets the flag. Nothing clears it.
+        """
+        marked = 0
+        for row in self.db.execute(
+            "SELECT rowid, session, won FROM shadow_decisions "
+            "WHERE COALESCE(quarantined, 0) = 0"
+        ).fetchall():
+            rowid, session, won = row[0], row[1], row[2]
+            shifted = False
+            reason = ""
+            if session is not None:
+                try:
+                    float(session)          # a session that parses as a number
+                    shifted, reason = True, "numeric session (column shift)"
+                except (TypeError, ValueError):
+                    pass
+            if not shifted and won is not None and won not in (0, 1):
+                shifted, reason = True, "non-boolean won (column shift)"
+            if shifted:
+                self.db.execute(
+                    "UPDATE shadow_decisions SET quarantined=1, quarantine_reason=? "
+                    "WHERE rowid=?",
+                    (reason, rowid),
+                )
+                marked += 1
+        self.db.commit()
+        return marked
+
+    def clean_shadow_rows(self, since_ms: int | None = None) -> list[dict]:
+        """Every shadow decision that is safe to analyse. Quarantine is absolute."""
+        self.db.row_factory = sqlite3.Row
+        where = "WHERE COALESCE(quarantined, 0) = 0"
+        args: list = []
+        if since_ms is not None:
+            where += " AND created_at >= ?"
+            args.append(since_ms)
+        return [dict(r) for r in self.db.execute(
+            f"SELECT * FROM shadow_decisions {where} ORDER BY created_at", args
+        )]
 
     def save_details(self, key: str, body: str, now_ms: int) -> None:
         """Freeze the DETAILS text for one decision."""
