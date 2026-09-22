@@ -2286,3 +2286,84 @@ it is a different question from both direction and entry timing:
 The oracle ceiling of +0.2484 says a quarter of a dollar per contract exists
 for anyone who can tell a dip that recovers from a dip that does not. Nothing
 measured so far can.
+
+## 38. Meta-labelling: the first result that points the right way (2026-09-22)
+
+The operator's reframing, and it is the correct one: the intelligence must not
+compete with Kalshi's price on direction. It answers a narrower question -
+*the base strategy says this qualifies; do historically similar QUALIFIED
+setups show enough loss risk to skip it?* - and is graded in dollars:
+
+    veto value = losses avoided - profits missed from false vetoes
+
+**Why this is winnable where sections 36 and 37 were not.** At 80c a correct
+veto saves the whole 80c stake while a false veto costs only the 20c forgone
+profit, so four false vetoes are paid for by one correct one. A veto pays
+whenever the vetoed subset wins LESS than its price - the model does not need
+to be right, it needs to find a pocket where the favourite-longshot edge
+reverses.
+
+Measured on both populations, separately, as specified.
+
+### Population 1 - all qualified signals (the training population)
+
+1,700 of 6,428 corpus markets qualify under the deployed rule. Walk-forward,
+1,415 out of sample:
+
+| veto when P(loss) >= | vetoed | win% vetoed | avoided | missed | VETO VALUE | 95% CI |
+|---|---:|---:|---:|---:|---:|---:|
+| 20% | 742 | 74.4% | 142.59 | 131.84 | **+10.75** | -10.96 to +34.17 |
+| 25% | 354 | 72.3% | 72.57 | 64.18 | **+8.39** | -7.52 to +24.83 |
+| 30% | 77 | 70.1% | 17.04 | 12.82 | +4.22 | -3.45 to +12.48 |
+
+Base strategy against base plus veto, same signals, same order:
+
+| policy | trades | P&L | max drawdown | win% |
+|---|---:|---:|---:|---:|
+| base strategy alone | 1415 | **-12.18** | **-18.44** | 78.0% |
+| + veto at P(loss)>=20% | 673 | **-1.43** | **-11.89** | 81.9% |
+| + veto at P(loss)>=25% | 1061 | -3.79 | -12.47 | 79.8% |
+| + veto at P(loss)>=30% | 1338 | -7.96 | -18.23 | 78.4% |
+
+Four things point the same way, which is more than sections 33, 36 or 37 ever
+managed:
+
+  * the effect is MONOTONIC in the threshold - tighter vetoes help more
+  * drawdown falls 35% (-18.44 to -11.89), not just P&L
+  * it beats the random-veto control of the same size (+8.39 against +2.34)
+  * it is positive in ALL FOUR sessions (asia +0.84, europe +2.95, late-us
+    +4.16, us +0.44) rather than being carried by one cell
+
+And two that do not:
+
+  * **every interval spans zero.** +8.39 [-7.52, +24.83] is not a finding.
+  * the decile table shows no monotonic edge structure - the negative-edge
+    deciles are scattered (1, 2, 5, 8, 10), which is what noise looks like.
+
+Note also what the base line says: the qualified population is **-12.18 out of
+sample**, so the veto is reducing a loss rather than growing a profit. That is
+still worth having; it is not the same claim.
+
+### Population 2 - actual live executions (the executability check)
+
+44 qualified live signals, 37 executed, 86.4% win rate at an average ask of
+0.81 - an edge of +5.4 points over the price. Realised P&L on the executed
+subset, read from the exchange: **+2.98**.
+
+A perfect oracle veto could have saved at most **+4.80** across 6 losers;
+vetoing everything would have cost **-1.78** net. So on the live sample the
+qualified population is healthy and there is little for a veto to do. The two
+populations disagree, and 44 signals cannot resolve that.
+
+### What it would take
+
+Per vetoed decision the effect is **+0.0237** with a standard deviation of
+**0.4386**. For 80% power at 5%:
+
+    n = (1.96 + 0.84)^2 x 0.4386^2 / 0.0237^2 = 2,685 vetoed decisions
+    at the observed 25% veto rate, ~10,700 qualified signals
+
+Against 1,415 corpus out-of-sample and 44 live. **Verdict: REMAIN SHADOW** -
+but this is the first line of investigation that deserves to keep running
+rather than to be closed. Sections 36 and 37 were refuted; this one is merely
+underpowered, which is a different and better problem.
