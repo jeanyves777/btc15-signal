@@ -136,25 +136,34 @@ def test_the_fill_report_says_when_the_position_resolves():
 
 def test_the_fill_report_names_the_strike_it_settles_against():
     """The report carried the ticker and the price paid but never the strike -
-    the one number that decides whether the position wins. A ticker suffix is
-    not a price anybody reads at a glance."""
+    the one number that decides whether the position wins."""
     text = messages.order_filled(
         side="UP", ticker="KXBTC15M-26SEP221115-15", contracts=2, paid=0.69,
         confidence="HIGH", facts=facts(), remaining=432,
         target=85_906.05, price=85_946.05,
     )
-    assert "$85,906.05" in text
-    assert "BTC $40 above" in text
-    assert "above target" not in text, "the line already says Target once"
-    # below the strike reads the other way round
-    below = messages.order_filled(
-        side="DOWN", ticker="T", contracts=1, paid=0.77,
-        confidence="MEDIUM", facts=facts(),
-        target=86_100.00, price=86_040.00,
-    )
-    assert "BTC $60 below" in below
-    # and it stays optional
-    assert "Target" not in messages.order_filled(
+    assert "$85,906.05" in text and "$85,946.05" in text
+    assert "Target" not in messages.order_filled(      # stays optional
         side="UP", ticker="T", contracts=1, paid=0.69,
         confidence="HIGH", facts=facts(),
     )
+
+
+def test_the_same_gap_reads_opposite_for_the_two_sides():
+    """"BTC $40 above" said neither what it was above nor whether being above
+    was good. It is only good for an UP position: the identical $40 is the
+    trade working or failing depending on a word elsewhere in the message."""
+    def standing(side, target, price):
+        text = messages.order_filled(
+            side=side, ticker="T", contracts=1, paid=0.7,
+            confidence="HIGH", facts=facts(), target=target, price=price,
+        )
+        return next(l for l in text.splitlines() if "BTC" in l)
+
+    # BTC ABOVE the strike
+    assert "in the money" in standing("UP", 85_906.05, 85_946.05)
+    assert "out of the money" in standing("DOWN", 85_906.05, 85_946.05)
+    # BTC BELOW the strike - the verdicts swap, the distance does not
+    assert "in the money" in standing("DOWN", 86_100.00, 86_040.00)
+    assert "out of the money" in standing("UP", 86_100.00, 86_040.00)
+    assert "$60" in standing("UP", 86_100.00, 86_040.00)

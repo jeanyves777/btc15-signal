@@ -125,14 +125,27 @@ def side_chip(side: str) -> str:
 
 
 def _gap(price: float, target: float, name_target: bool = True) -> str:
-    """How far BTC sits from the strike, in dollars and in plain words.
-
-    `name_target` is dropped where the line already names it - "Target
-    $85,906.05 · BTC $40 above target" says the word twice in nine words.
-    """
+    """How far BTC sits from the strike, in dollars and in plain words."""
     delta = price - target
     where = "above" if delta > 0 else "below"
     return f"BTC ${abs(delta):,.0f} {where}" + (" target" if name_target else "")
+
+
+def _standing(price: float, target: float, side: str) -> str:
+    """Where BTC is, and WHETHER THAT IS WINNING. Never just a direction.
+
+    "BTC $40 above" said neither what it was above nor whether being above was
+    good - and it is only good for an UP position. An UP bet needs BTC to
+    settle above the strike and a DOWN bet needs it below, so the same $40 is
+    the trade working or the trade failing depending on a word elsewhere in the
+    message. Stated here so it cannot be read backwards.
+    """
+    delta = price - target
+    ahead = (delta > 0) if side == "UP" else (delta < 0)
+    return (
+        f"BTC <code>${price:,.2f}</code> · "
+        f"${abs(delta):,.0f} {'in the money' if ahead else 'out of the money'}"
+    )
 
 
 def checks_block(facts: list[dict], title: str = "Checks") -> list[str]:
@@ -266,9 +279,9 @@ def order_filled(
         # price paid but never the strike, so the one number that decides
         # whether this position wins was the one thing it did not carry - and
         # a ticker suffix is not a price anybody reads at a glance.
-        gap = (f" · {_gap(price, target, name_target=False)}"
-               if price is not None else "")
-        lines.append(f"\U0001f3af Target <code>${target:,.2f}</code>{gap}")
+        lines.append(f"\U0001f3af Target <code>${target:,.2f}</code>")
+        if price is not None:
+            lines.append(f"\U0001f4ca {_standing(price, target, side)}")
     if remaining is not None:
         # HOW LONG THE MONEY IS AT RISK. The entry alert carried this and the
         # fill report did not, so the one message sent while a position is
