@@ -130,6 +130,8 @@ class MoneySnapshot:
     # The lifetime figures come from the SAME read as today's, so a message
     # can never show a profit in one line that the other has not counted.
     lifetime: "LifetimeRecord | None" = None
+    # And the session breakdown from the same rows as `markets`, so it sums.
+    sessions: tuple = ()
 
     @property
     def losers(self) -> int:
@@ -152,6 +154,8 @@ def _capital(row: dict):
         reconciled_ms=row["reconciled_ms"],
     )
 
+
+from .sessions import breakdown as session_breakdown  # noqa: E402
 
 ACCOUNTED_SQL = "('filled','protected','unprotected','exited')"
 
@@ -2537,6 +2541,54 @@ class Store:
             markets=markets, winners=winners, realised=round(realised, 6),
             open_mark=round(open_mark, 6), taken_ms=now_ms, has_mirror=has_mirror,
             lifetime=self.lifetime_record(),
+            sessions=tuple(session_breakdown(self.session_rows(now_ms))),
+        )
+
+    def session_rows(self, now_ms: int | None = None) -> list[tuple[int, float]]:
+        """(window_ms, pnl) for every market settled in the current NY day.
+
+        The same rows `ledger_today` counts, so the session breakdown built
+        from them sums exactly to the day's total rather than being a second
+        opinion about it.
+        """
+        import time
+
+        if now_ms is None:
+            now_ms = int(time.time() * 1000)
+        start = self.day_start_ms(now_ms)
+        return [
+            (int(row[0]), float(row[1]))
+            for row in self.db.execute(
+                "SELECT COALESCE(window_ms, first_ms), pnl FROM daily_ledger "
+                "WHERE COALESCE(window_ms, first_ms) >= ? ORDER BY 1",
+                (start,),
+            )
+        ]
+
+    def session_rows_for(self, session: str, now_ms: int) -> list[tuple[int, float]]:
+        """Just one session's markets, within the current NY day."""
+        from .sessions import session_of
+
+        return [
+            (ms, pnl) for ms, pnl in self.session_rows(now_ms)
+            if session_of(ms) == session
+        ]
+
+    def session_reported(self, ny_day: str, session: str) -> bool:
+        """Has this session's close already been reported today?
+
+        Keyed on the day AND the session so a restart cannot repeat a report,
+        and so a gap that straddles two closes still reports both once each.
+        """
+        row = self.db.execute(
+            "SELECT 1 FROM settings_text WHERE key = ?",
+            (f"session_reported:{ny_day}:{session}",),
+        ).fetchone()
+        return bool(row)
+
+    def mark_session_reported(self, ny_day: str, session: str, now_ms: int) -> None:
+        self.set_setting_text(
+            f"session_reported:{ny_day}:{session}", str(now_ms), now_ms
         )
 
     def lifetime_record(self) -> LifetimeRecord:

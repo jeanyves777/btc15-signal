@@ -29,6 +29,12 @@ from .regime import base_points as regime_base_points
 from .regime import confidence_points as regime_confidence_points
 from .regime import label_for as regime_label
 from .regime import weight_at, weight_for_hour
+from .sessions import (
+    breakdown as session_breakdown,
+)
+from .sessions import (
+    closes_between,
+)
 from .similar import Cohorts, Fingerprint
 from .store import RecoveryState, Store, TradeProposal
 from .store import position_pnl as store_position_pnl
@@ -2539,6 +2545,7 @@ async def service() -> None:
     recovery_add = RecoveryAddRunner(settings, store, telegram)
     capital = CapitalController(settings, store)
     CAPITAL_DAY = {"ny": None}
+    LAST_POLL = {"ms": 0}
     levels = LevelTracker()
     if hourly:
         print(f"hourly ladder recording (shadow) -> {settings.hourly_database_path}",
@@ -2561,6 +2568,35 @@ async def service() -> None:
             try:
                 await process_telegram(telegram, store, kalshi, trader, settings)
                 mark("telegram")
+
+                # SESSION CLOSE REPORTS. Driven off the hour boundary the
+                # poll stepped over, not a timer, so a slow cycle or a restart
+                # that straddles a close still reports it rather than losing
+                # it - and `session_reported` keys on the day and the session
+                # so it can never be sent twice.
+                for closed in closes_between(LAST_POLL["ms"], now_ms):
+                    today_key = ny_day(now_ms)
+                    if store.session_reported(today_key, closed):
+                        continue
+                    try:
+                        rows = store.session_rows_for(closed, now_ms)
+                        results = session_breakdown(rows)
+                        result = results[0] if results else None
+                        if result is None:
+                            from .sessions import SessionResult
+
+                            result = SessionResult(closed, 0, 0, 0.0)
+                        await telegram.send(
+                            messages.session_close(
+                                session=result,
+                                day_snapshot=store.money_snapshot(now_ms),
+                                ny_day=today_key,
+                            )
+                        )
+                        store.mark_session_reported(today_key, closed, now_ms)
+                    except Exception as exc:  # noqa: BLE001 - reporting is never fatal
+                        print(f"session report failed: {exc!r}", flush=True)
+                LAST_POLL["ms"] = now_ms
 
                 # THE DAILY CAPITAL REVIEW. At startup, and again the first
                 # time a poll lands in a new New York day - the exchange's own

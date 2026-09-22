@@ -67,8 +67,49 @@ def _money_block(snapshot) -> str:
             f"\U0001f4c5 Today (New York): {sign}${abs(snapshot.headline):,.2f} · "
             f"{snapshot.markets} closed · {snapshot.winners}W–{snapshot.losers}L"
         )
+        # The day broken into sessions, under the day's own count. These SUM
+        # to the line above - a breakdown that does not add up to the total it
+        # sits beneath invites the reader to trust neither.
+        sessions = getattr(snapshot, "sessions", None)
+        if sessions:
+            from .sessions import one_line
+
+            line = one_line(sessions)
+            if line:
+                lines.append(f"<i>{line}</i>")
     elif not lines:
         return "\U0001f4b0 <b>Live: nothing settled yet</b>"
+    return "\n".join(lines)
+
+
+def session_close(*, session, day_snapshot, ny_day: str) -> str:
+    """The report sent when a trading session ends.
+
+    Two things, in this order: how THAT session went, then where the day
+    stands. The session is the news; the day is the context it belongs in.
+    A session read without the day behind it is how a good hour gets mistaken
+    for a good day.
+    """
+    from .sessions import LABELS, one_line
+
+    sign = "+" if session.dollars >= 0 else "−"
+    chip = "\U0001f4b0" if session.dollars >= 0 else "\U0001f4b8"
+    rate = (session.winners / session.markets) if session.markets else 0.0
+    lines = [
+        f"\U0001f514 <b>{LABELS.get(session.name, session.name)} session closed</b>",
+        f"<i>{escape(ny_day)} · New York accounting day</i>",
+        "",
+        f"{chip} <b>Session: {sign}${abs(session.dollars):,.2f}</b> · "
+        f"{session.markets} closed · {session.winners}W–{session.losers}L",
+    ]
+    if session.markets:
+        lines.append(f"<code>{bar(rate)}</code> <i>{rate:.0%} of this session won</i>")
+    lines += ["", _money_block(day_snapshot)]
+    breakdown = one_line(list(day_snapshot.sessions or ()))
+    if breakdown and not session.markets:
+        # `_money_block` already prints the breakdown when the day has
+        # markets; this covers the quiet-session case.
+        lines.append(f"<i>{breakdown}</i>")
     return "\n".join(lines)
 
 
