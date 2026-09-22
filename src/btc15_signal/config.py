@@ -105,6 +105,21 @@ class Settings(BaseSettings):
     # alert now carries the checks, the context, the confidence arithmetic
     # and the similar-regime read, so the second message repeated it.
     brain_commentary_enabled: bool = False
+    # THE INTELLIGENCE LAYER'S AUTHORITY. Three values, and the default is the
+    # only one that is safe without evidence:
+    #
+    #   shadow - infer, record, grade. NEVER touches an order. (default)
+    #   assist - may adjust confidence and entry TIMING, never the decision to
+    #            trade and never the size. Requires a passed promotion report.
+    #   live   - may return ENTER NOW / WAIT / PASS as the decision. Requires a
+    #            SECOND explicit authorisation on top of the assist review.
+    #
+    # Nothing in the code promotes this. It is changed by a person, having read
+    # `scripts/promotion_report.py`, and `intelligence_authorised` must be set
+    # in the same breath - two independent switches, so a single stray edit or
+    # a copied .env cannot hand a shadow model control of real money.
+    intelligence_mode: str = "shadow"
+    intelligence_authorised: bool = False
     # How far above the quoted ask the entry limit is set. An IOC limit fills
     # at the BEST AVAILABLE price, never at the limit - our own fills prove it
     # (limit 0.87 filled 0.84, limit 0.80 filled 0.75, limit 0.81 filled 0.76)

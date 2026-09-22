@@ -1,5 +1,6 @@
 import math
 import sqlite3
+import time
 from dataclasses import dataclass
 from uuid import uuid4
 
@@ -86,6 +87,20 @@ def position_pnl(
 
 
 class Store:
+    def _add_columns(self, table: str, columns: dict[str, str]) -> None:
+        """Add any missing columns to an existing table, idempotently.
+
+        Live databases predate most of these tables' current shapes, and
+        `CREATE TABLE IF NOT EXISTS` will not widen one that already exists.
+        Done by name rather than by rewriting the table so an upgrade cannot
+        lose rows, and checked against `PRAGMA table_info` so re-running it is
+        free.
+        """
+        existing = {row[1] for row in self.db.execute(f"PRAGMA table_info({table})")}
+        for name, kind in columns.items():
+            if name not in existing:
+                self.db.execute(f"ALTER TABLE {table} ADD COLUMN {name} {kind}")
+
     def __init__(self, path: str) -> None:
         self.db = sqlite3.connect(path)
         self.db.execute("""
@@ -141,6 +156,22 @@ class Store:
                 PRIMARY KEY (window_open, remaining_s)
             )
         """)
+        # Added after the table shipped. Provenance and linkage: without them a
+        # recorded recommendation cannot be tied to the observation it was made
+        # from, or to the corpus and rule versions that produced it, so it can
+        # never be re-derived or audited - and a graded number nobody can
+        # reproduce is not evidence.
+        self._add_columns("shadow_decisions", {
+            "observation_id": "INTEGER", "signal_id": "TEXT", "market_id": "TEXT",
+            "model_version": "TEXT", "feature_schema": "TEXT",
+            "training_cutoff_ms": "INTEGER", "strategy_version": "TEXT",
+            "fill_probability": "REAL", "pass_net": "REAL",
+            "effective_n": "REAL", "neighbour_ids": "TEXT",
+            "neighbour_scores": "TEXT", "regime_contribution": "REAL",
+            "execution_risk": "REAL", "latency_ms": "REAL",
+            "baseline_probability": "REAL", "mode": "TEXT",
+            "realised_pnl": "REAL", "filled": "INTEGER",
+        })
         self.db.execute("""
             CREATE TABLE IF NOT EXISTS strategy_alerts (
                 strategy TEXT NOT NULL, window_open INTEGER NOT NULL,
@@ -1334,27 +1365,31 @@ class Store:
         Pure bookkeeping for a layer that is not allowed to act, so nothing it
         does may propagate into the loop that is.
         """
+        # WRITTEN BY NAME, NEVER BY POSITION.
+        #
+        # This was `VALUES (?,?,...)` with a hand-counted `"?" * 30`, which
+        # means every new column is a chance to shift every value one place
+        # left and write a probability into a price. That is not hypothetical:
+        # a blind edit of exactly this pattern put 30 values into the 24-column
+        # observations insert on 2026-09-21 and broke `observe()` outright. By
+        # name, an unknown key is caught here and a new column simply defaults.
         try:
+            columns = [
+                info[1] for info in self.db.execute(
+                    "PRAGMA table_info(shadow_decisions)"
+                )
+            ]
+            # `created_at` is NOT NULL, and a caller that forgets it used to
+            # lose the row entirely to a swallowed IntegrityError - a decision
+            # missing from the archive is a decision that cannot be graded,
+            # which is the one failure this table exists to prevent.
+            row = dict(row)
+            row.setdefault("created_at", int(time.time() * 1000))
+            present = [name for name in columns if name in row]
             self.db.execute(
-                "INSERT OR REPLACE INTO shadow_decisions VALUES ("
-                + ",".join("?" * 30) + ")",
-                (
-                    row.get("window_open"), row.get("created_at"),
-                    row.get("ticker"), row.get("side"), row.get("remaining_s"),
-                    row.get("ask"), row.get("cohort_n"),
-                    row.get("win_probability"), row.get("raw_win_rate"),
-                    row.get("net_edge_now"), row.get("enter_now_net"),
-                    row.get("wait_limit_net"), row.get("wait_real_net"),
-                    row.get("dip_price"), row.get("dip_rate"), row.get("dip_n"),
-                    row.get("mean_drift"),
-                    row.get("win_low"), row.get("win_high"),
-                    row.get("edge_low"), row.get("prior"),
-                    row.get("wait_limit_low"),
-                    row.get("ran_away_rate"),
-                    row.get("session"), row.get("vol_regime"),
-                    row.get("action"), row.get("reason"),
-                    row.get("rule_qualified"), row.get("traded"), row.get("won"),
-                ),
+                f"INSERT OR REPLACE INTO shadow_decisions "
+                f"({','.join(present)}) VALUES ({','.join('?' * len(present))})",
+                [row[name] for name in present],
             )
             self.db.commit()
         except sqlite3.Error as exc:

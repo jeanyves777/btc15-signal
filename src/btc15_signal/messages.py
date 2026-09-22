@@ -148,6 +148,35 @@ def checks_block(facts: list[dict], title: str = "Checks") -> list[str]:
     return lines
 
 
+def intelligence_line(read, mode: str = "shadow") -> str:
+    """One line. The full reasoning lives behind 📋 DETAILS.
+
+    Deliberately terse, and deliberately labelled with the mode: this layer has
+    no authority over the order while it is in shadow, and a confident-looking
+    recommendation printed beside the checks that DID decide will be read as
+    though it participated. It did not.
+
+    ENTER NOW shows what it expects to make; PASS shows what it expects to
+    lose, because "PASS" with no number is an opinion and "PASS - expected net
+    -6.5c" is an argument.
+    """
+    if read is None:
+        return ""
+    net = read.enter_now_net if read.action == "ENTER NOW" else -abs(read.enter_now_net)
+    tag = "" if mode == "live" else f" <i>({escape(mode)})</i>"
+    if read.action == "ENTER NOW":
+        fill = "" if read.fill_rate is None else f" · fill {read.fill_rate:.0%}"
+        return (
+            f"\U0001f9e0 <b>Intelligence: ENTER NOW</b> · "
+            f"p(win) {read.win_probability:.0%}{fill} · "
+            f"net {net * 100:+.1f}¢ · {read.n} matches{tag}"
+        )
+    return (
+        f"\U0001f9e0 <b>Intelligence: {escape(read.action)}</b> · "
+        f"expected net {net * 100:+.1f}¢ · {read.n} matches{tag}"
+    )
+
+
 def signal_alert(
     *,
     side: str,

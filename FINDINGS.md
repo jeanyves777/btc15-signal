@@ -2144,3 +2144,76 @@ permission to cross, never the price paid).
 The DETAILS button replays text frozen at decision time rather than recomputing
 it, because re-deriving the context when the button is pressed would describe a
 market that has already moved - and the audit trail is the whole point.
+
+## 36. The intelligence investigation: two models, neither beats the price (2026-09-22)
+
+Built the walk-forward, regime-conditioned pre-trade layer to specification and
+measured it. Two results decide the promotion question, and both are negative.
+
+### Neither model beats the market
+
+Expanding-window walk-forward over `data/cohort.db`, 6,428 markets deduplicated
+to one row each, 5 folds:
+
+| model | n | Brier | LogLoss |
+|---|---:|---:|---:|
+| logistic baseline (`baseline.py`, 8 features) | 5,355 | 0.2114 | 0.6111 |
+| **the market price itself** | 5,355 | **0.2112** | **0.6106** |
+| cohort nearest-neighbour (`similar.py`) | 5,278 | 0.2133 | 0.6159 |
+
+**The ask is the best available estimate of the outcome.** Neither the
+retrieval layer nor the logistic regression improves on simply reading the
+price, and the retrieval layer is the worst of the three. This is what section
+1's favourite-longshot finding predicts: these markets are priced well, they
+merely win slightly MORE than their price, and that residual is a property of
+the price rather than something a model adds to it.
+
+The spec's selection rule - prefer the simplest model when performance is
+indistinguishable - therefore does not even reach the tie-break. A 6,428-market
+retrieval layer is not beating eight coefficients, and eight coefficients are
+not beating one number that is already on the screen.
+
+Calibration, where it has data, is genuinely good:
+
+    predicted 0.54 -> observed 0.56  (n=1594)
+    predicted 0.69 -> observed 0.69  (n=3025)
+    predicted 0.85 -> observed 0.83  (n=658)
+
+So the layer is honest about its own uncertainty. It simply has no information
+the price does not already carry.
+
+### The live shadow archive is 95% corrupt
+
+`record_shadow_decision` wrote `VALUES (?,?,...)` positionally against a
+hand-counted width. When `dip_n` was appended to the live table by a later
+migration the tuple order stopped matching the column order, and every value
+from that point shifted one place: `session` holds a probability, `dip_n` holds
+the volatility regime, `win_low` holds a session.
+
+**93 of 98 rows are affected.** It stayed invisible because `settle_shadow`
+updates `won` BY NAME after settlement, so the one column anybody checks was
+being silently repaired while the rest stayed wrong.
+
+This is the third time this exact pattern has cost something: the same blind
+positional edit put 30 values into the 24-column observations insert on
+2026-09-21 and broke `observe()` outright. The insert is now by NAME, and
+`tests/test_intelligence.py` adds a column mid-test to prove a migration cannot
+shift the others.
+
+Five usable rows remain. Three of those are executable ENTER NOW decisions, at
+-0.0962/contract with a 95% interval of [-0.6855, +0.2368]. That is not
+evidence of anything, and it is not supposed to look like it.
+
+### Verdict: REMAIN SHADOW
+
+Blocking, in order of how much work each needs:
+
+1. no model beats the market price out of sample - the finding, not a data gap
+2. the live archive cannot support a claim until it refills post-fix
+3. 3 settled executable decisions against a 200-decision floor
+
+The honest reading is that item 1 is not waiting on more data. A layer whose
+best case is matching the ask has nothing to contribute to a decision the ask
+is already making. What WOULD change the answer is a feature the price does not
+see - execution-side information, book dynamics in the seconds before a fill -
+rather than more of the market state the price already reflects.
