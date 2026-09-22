@@ -257,6 +257,8 @@ def order_filled(
     remaining: int | None = None,
     target: float | None = None,
     price: float | None = None,
+    decision_ask: float | None = None,
+    size_reason: str = "",
 ) -> str:
     """An order that actually filled, with the gates AS THEY WERE at execution.
 
@@ -270,10 +272,27 @@ def order_filled(
         f"<code>{escape(ticker)}</code>",
         "",
         f"\U0001f4e6 {contracts:g} contract{'s' if contracts != 1 else ''} "
-        f"at {paid * 100:.0f}¢",
+        f"filled at {paid * 100:.0f}¢",
         f"\U0001f4b5 Cost ${cost:,.2f} · Maximum profit "
         f"${contracts - cost:,.2f}",
     ]
+    # TWO DIFFERENT PRICES, NAMED. The checks below show the ask the decision
+    # was taken on; the line above shows what the book actually gave. On
+    # 2026-09-22 those read 75¢ and 69¢ in the same message with nothing
+    # saying they were different facts.
+    if decision_ask is not None and abs(decision_ask - paid) >= 0.005:
+        better = decision_ask - paid
+        lines.append(
+            f"\U0001f9fe Decision ask {decision_ask * 100:.0f}¢ · filled "
+            f"{paid * 100:.0f}¢ "
+            f"({abs(better) * 100:.0f}¢ {'better' if better > 0 else 'worse'})"
+        )
+    if size_reason:
+        # SIZING IS THE OPERATOR'S, AND SAYS SO. The model never changes it -
+        # it is config plus a measured distance band - so the message names
+        # the rule that chose the size rather than leaving two contracts
+        # looking like something the intelligence decided.
+        lines.append(f"\U0001f4d0 Size {contracts:g} · {escape(size_reason)}")
     if target is not None:
         # WHAT IT SETTLES AGAINST. The fill report named the ticker and the
         # price paid but never the strike, so the one number that decides

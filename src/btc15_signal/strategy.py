@@ -118,7 +118,12 @@ class EntryRule:
         band = f"{self.min_ask * 100:.0f}–{self.max_ask * 100:.0f}¢"
         facts = [
             {
-                "name": "Price",
+                # "Price" read as the price paid, beside a fill line showing a
+                # different number - 75c in the checks against 69c in the
+                # package. It is the ask the DECISION was taken on; the fill is
+                # whatever the book gave afterwards, and the two are not the
+                # same fact.
+                "name": "Decision ask",
                 "passed": self.min_ask <= ask <= self.max_ask,
                 "pass_text": f"{ask * 100:.0f}¢ within {band}",
                 "fail_text": f"{ask * 100:.0f}¢ · needs {band}",

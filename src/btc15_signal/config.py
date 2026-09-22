@@ -237,6 +237,45 @@ class Settings(BaseSettings):
     # records and does not trade. `hourly_trading_enabled` is read by nothing:
     # it exists so that turning hourly trading on is a code change someone has
     # to make deliberately, not a config flag someone can flip by accident.
+    # SETTLEMENT REFERENCE RECORDER (FINDINGS 40). Shadow only.
+    #
+    # The contract settles on the average of sixty CF Benchmarks BRTI prices in
+    # the final minute - confirmed from Kalshi's own `rules_primary`, not
+    # assumed - while every decision this bot makes reads Binance spot. Section
+    # 40 measured the combined gap at a median 6 bps and a 40.5% outcome flip
+    # inside 5 bps of the strike, but compared one Binance minute-close against
+    # a 60-second average and so could not say how much was the FEED and how
+    # much was the AVERAGING. This recorder separates them.
+    #
+    # It records and nothing else. There is deliberately no flag here that
+    # turns any of it into a trading input: promoting it has to be a code
+    # change someone makes on purpose, the same reasoning as
+    # `hourly_trading_enabled`.
+    reference_enabled: bool = True
+    reference_database_path: str = "runtime/settlement_reference.db"
+    # Fast enough that a 60-second mean has real samples in it, slow enough to
+    # stay off the 10-second trading beat.
+    reference_poll_seconds: float = 5.0
+    # Beyond this the value describes a market that has already moved, so the
+    # row is marked stale rather than averaged in as if it were current.
+    #
+    # 3,000 ms was wrong and the live smoke test caught it: Kalshi's BRTI
+    # series runs 2-3 seconds behind wall clock by nature, so a 3-second
+    # threshold marks perfectly good official data stale and discards its
+    # price. A recorder that throws away the reference it exists to record is
+    # worse than one that records it late. 15,000 ms flags a feed that has
+    # genuinely stopped while leaving normal publication lag alone.
+    reference_stale_ms: int = 15_000
+    reference_reconcile_seconds: float = 300.0
+    reference_debug: bool = False
+    # CF Benchmarks gates index values behind an entitlement; with no key the
+    # values endpoint answers "Unknown id" for every ticker. Absent a key the
+    # recorder writes `missing` rows with the reason and keeps the official
+    # 60-second averages coming from Kalshi. It never substitutes an exchange.
+    cfb_base_url: str = "https://www.cfbenchmarks.com/api/v1"
+    cfb_index_id: str = "BRTI"
+    cfb_api_key: str = ""
+
     hourly_enabled: bool = True
     hourly_trading_enabled: bool = False
     hourly_series: str = "KXBTCD"
@@ -290,7 +329,54 @@ class Settings(BaseSettings):
     # So size up where the edge is 2.4x, and only there. Above 4x the edge
     # fades (5x+ measures +0.0064), which is why this is a BAND and not a
     # floor - the old ">= 3x is better" reading had it backwards.
+    #
+    # OFF since 2026-09-22, by the operator's decision. Intelligence must not
+    # change size: the band doubled exposure on
+    # KXBTC15M-26SEP221330-30 ("3.0x vol is inside the measured 2-4x edge
+    # band", 2 contracts at 81c) and the market settled against us for -$1.64
+    # instead of about -$0.82. The measurement above is not withdrawn, but the
+    # distance it was measured on is Binance-derived, and FINDINGS 41/43 show
+    # that quantity disagrees with Kalshi's official BRTI reference on about
+    # 20% of markets - so the evidence behind the band is itself in question.
+    # Sizing returns to one contract until it has independent evidence.
+    #
+    # This flag gates the BAND ONLY. `high_confidence_contracts` is left alone
+    # because the loss-recovery path reads it too, and recovery is the
+    # operator's separate decision.
+    confidence_sizing_enabled: bool = False
     high_confidence_contracts: int = 2
+    # LOSS RECOVERY, the operator's 2026-09-22 rule. The deficit is realised
+    # net dollars still missing; it is divided across this many upsized trades
+    # to get the share one trade has to be able to win before the upsize is
+    # allowed to apply at all. Four is the operator's own worked example:
+    # $1.64 over 4 trades is $0.41 a trade, which 2 contracts at 75c can cover
+    # and 2 at 90c cannot.
+    #
+    # It is a plan length, not a limit: recovery ends when the money is back,
+    # not when the steps run out, and the divisor floors at 1.
+    recovery_steps: int = 4
+    # OFF. Recovery buys no larger BASE position; it acts only through the
+    # conditional add-on, which rests ONE extra contract 2c below the actual
+    # fill and only while the BRTI evidence holds. With both on they stack:
+    # two contracts upfront plus a third resting behind them, for a deficit
+    # that justified one. The base entry is one contract whether or not a
+    # deficit is outstanding.
+    recovery_upfront_upsize_enabled: bool = False
+
+    # THE CONDITIONAL RECOVERY ADD-ON (recovery_add.py).
+    #
+    # Live-test authorisation: $30 total, and `recovery_test_budget` is a
+    # CUMULATIVE spend ceiling, not a concurrent-exposure one. It counts every
+    # dollar the add-on has ever committed and does not reset on a loss, a new
+    # day or a restart - a cap that resets is not a cap, it is a per-episode
+    # allowance that can be spent repeatedly.
+    recovery_add_enabled: bool = False
+    recovery_add_test_budget: float = 30.0
+    recovery_add_dip: float = 0.02  # rest this far below the ACTUAL fill
+    recovery_add_min_seconds: int = 120  # add-entry deadline before close
+    recovery_add_distance_floor: float = 10.0  # BRTI normalized distance
+    recovery_add_max_contracts: int = 1  # per position, on top of the base
+
     high_confidence_distance_min: float = 2.0
     high_confidence_distance_max: float = 4.0
     dry_run: bool = True

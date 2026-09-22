@@ -2424,3 +2424,621 @@ recovery measured +1.43 there against +1.48 for doing nothing, because the two
 losses that day fell back to back and the recovery was holding double size when
 the second one landed. The operator has asked for loss-triggered recovery; it
 is implemented as asked, capped, and this is the number to watch.
+
+---
+
+## 40. Close-call exits, and the feed that cannot see the strike (2026-09-22)
+
+The operator's proposal, after `KXBTC15M-26SEP221130-30` lost the full 77c: in
+the last two minutes the entry buffer is irrelevant, so a position sitting on
+the wrong side of the strike should be sold at the executable bid rather than
+risk the whole stake. Section 2 closed the general stop-loss but never
+conditioned any variant on TIME REMAINING, so this is a new rule and was
+measured rather than assumed - `scripts/measure_close_call.py`, 4,279 qualified
+trades from the 6,435-market corpus, live side convention, paired against hold,
+net of both fees and the deployed 1c exit slippage.
+
+### The deciding number
+
+An exit is worth taking only where the crossed subset wins LESS often than its
+own bid. It does not.
+
+| last N min | crossed | mean bid | win rate | edge vs bid |
+|---|---|---|---|---|
+| 1 | 629 | 0.217 | 21.8% | +0.001 |
+| 2 | 722 | 0.271 | 28.0% | +0.009 |
+| 3 | 784 | 0.309 | 32.0% | +0.011 |
+| 5 | 853 | 0.369 | 36.9% | +0.000 |
+
+**At one minute out the bid is accurate to a tenth of a cent.** Kalshi prices a
+late adverse cross essentially perfectly, so closing into it pays the spread a
+second time and a second fee for nothing - section 2's argument, now confirmed
+in the exact regime that was supposed to be its exception.
+
+### Every variant of the policy, against holding
+
+| window | min bid | fired | would have won | exit - hold | 95% CI |
+|---|---|---|---|---|---|
+| 1m | none | 389 | 35% | -0.0014 | [-0.0044, +0.0016] |
+| 1m | 0.30 | 160 | 70% | -0.0005 | [-0.0027, +0.0017] |
+| 2m | none | 620 | 32% | -0.0040 | [-0.0082, +0.0002] |
+| 2m | 0.30 | 272 | 62% | -0.0022 | [-0.0055, +0.0012] |
+| **3m** | none | 738 | 34% | **-0.0052** | **[-0.0102, -0.0002]** |
+
+Nothing is positive and the widest window is significantly negative. The scale
+matters more than the significance: hold-to-settlement earns **+0.0028/contract,
++$11.91 in total** across these 4,279 trades, and the 2-minute exit gives back
+**-$17.23**. The policy costs more than the entire edge it is protecting.
+
+The "would have won" column is the reason. A bid floor makes the rule fire less
+often and more wrongly - at 0.30 it sells 272 positions of which **62% go on to
+settle at $1.00**. A high bid near expiry does not mean rescue, it means the
+market has not yet given up on the position, and those are precisely the ones
+that recover.
+
+### The discriminators the proposal named, each asked the same question
+
+Cross depth, how long the cross had persisted, distance velocity and short-term
+volatility, bucketed inside the last two minutes (n=722):
+
+| discriminator | best bucket | n | mean bid | win rate | edge vs bid |
+|---|---|---|---|---|---|
+| cross depth | < 2 bps | 201 | 0.448 | 42.3% | -0.025 |
+| cross depth | >= 20 bps | 41 | 0.016 | 0.0% | -0.016 |
+| minutes offside | 2-3 | 82 | 0.270 | 23.2% | -0.039 |
+| velocity | all buckets | - | - | - | positive |
+| volatility | all buckets | - | - | - | positive |
+
+None is usable. The shallow-cross bucket's 2.5c is inside the ~2.7c round trip
+(1c slippage plus two fees at those prices). The deep-cross bucket is genuinely
+dead - 0% of 41 - but its bid is 1.6c, so there is nothing left to recover; the
+market has already taken it. "Offside 2-3 minutes" is -0.039 while 3-4 is
++0.019 and 4+ is +0.026, which is non-monotonic and therefore noise, in one
+bucket out of fourteen examined.
+
+### Why it cannot work here: the system cannot see the strike
+
+The decisive fact is not about exit policy at all. **The settlement oracle is
+not Binance spot, and the gap is far larger than the distances a close-call
+rule would trade on.** Comparing each market's final-minute Binance close with
+its `expiration_value`, over all 6,435 settled markets:
+
+| | |
+|---|---|
+| median absolute basis | **6.00 bps** |
+| p90 / p99 | 10.81 / 14.98 bps |
+| mean signed basis | **+5.5 bps** (Binance reads high) |
+| markets where spot and oracle disagree on the OUTCOME | **1,247 (19.4%)** |
+| final minute within 5 bps of strike | 1,697 (26.4%) |
+| ...of those, outcome flipped | **688 (40.5%)** |
+
+Inside the close-call zone the feed the bot watches is wrong about which side
+won **two times in five**. `binance.py` is the only price source in the
+codebase; nothing ingests Kalshi's settlement index.
+
+**Correction (section 41).** The table above compares a single Binance
+minute-close against a 60-second average, which mixes the FEED difference with
+the TIME AGGREGATION and can attribute neither. Measured apart, the gap is
+**almost entirely feed**: aggregation contributes a median 0.72 bps of the 6.22
+and removes none of the outcome disagreement. The verdict on the close-call
+exit is unaffected - the 19.4% figure is still the right description of what
+the bot can see - but the attribution in this section was not established by
+this measurement. Section 41 does it properly.
+
+The losing trade shows it directly. At 1:58 remaining the Kalshi app read
+$86,281.91 - **$9.10 below** the $86,291.01 strike, with DOWN comfortably in
+the money - while the bot's own archived observations at the same moment read
+$86,291.23 and $86,298.19, i.e. **above** the strike. The two feeds disagreed on
+the SIGN. A close-call exit driven by the Binance feed would have sold a
+position its own broker's index still had winning. At 0:48 the app read
+$86,292.77 (+$1.76, **0.2 bps**) against the bot's $86,316.67 - a $24 gap, 14x
+the margin being adjudicated.
+
+**A rule that acts on a 0.2 bps margin using a feed with a 6 bps median basis is
+not measuring the thing it is deciding about.**
+
+### What the entry actually did, contrary to the account of it
+
+The "6.2x volatility buffer" did not collapse in the last two minutes. The
+archived path shows it gone at **7:22 remaining** (normalized distance 0.09,
+BTC $86,286 against a $86,291 strike) and the favoured side flipping to UP at
+**6:21**. The position was underwater from -0.17 at 7:46 onward and never
+recovered. There was no late reversal to catch; there was a trade that was
+wrong five minutes after it was placed, which is what a 20% loss rate looks
+like from the inside.
+
+**Not deployed. Stop-loss stays off, in the last two minutes as everywhere
+else.**
+
+### What is worth building instead
+
+The oracle ceiling is real and it is large: exiting only the late-crossed
+positions that actually go on to lose is worth **+0.0169/contract, +$72.29** at
+a 2-minute window - **six times the entire hold edge**. Section 37 found the
+same shape in the dip. The structure exists; no feature measured here, or
+there, separates it.
+
+The one lever that has never been tried is the input, not the model. **Ingest
+Kalshi's own settlement index and record it beside the Binance price at every
+poll.** 40.5% of close calls being coin flips is not irreducible noise - it is
+the error bar of the wrong instrument, and it is the only reason the deciding
+number has nothing in it. Recording the basis costs nothing, changes no order,
+and is a precondition for any future close-call study being worth running. Until
+that data exists, a shadow HOLD/EXIT log would only be recording decisions made
+on a feed that cannot see the strike.
+
+---
+
+## 41. The settlement reference: feed, not averaging (2026-09-22)
+
+Section 40 blamed a 6 bps gap between Binance spot and the settlement oracle
+for making close-call exits unmeasurable, but it compared **one Binance
+minute-close against a 60-second average** and so folded two different things
+into one number. The operator caught it. Separated, they are not close to equal
+and the conclusion changes.
+
+### What the contract actually settles on, from Kalshi rather than assumption
+
+`GET /series/KXBTC15M` and `rules_primary` on every market:
+
+> "If the simple average of the sixty seconds of CF Benchmarks' BRTI before
+> 12:15 PM EDT is at least the simple average of the sixty seconds of CF
+> Benchmarks' BRTI before 12:00 PM EDT, then the market resolves to Yes."
+
+**Both ends are 60-second BRTI averages.** The strike is not a spot print
+either - it is the same statistic taken at the window open - which nothing in
+this system modelled. The identity that follows is exact:
+
+    floor_strike[N] == expiration_value[N-1]
+
+on **6,420 consecutive pairs, max difference $0.0000**, and
+`expiration_value >= floor_strike` reproduces **6,435 of 6,435** settled
+results. So Kalshi's own API publishes two official BRTI 60-second averages per
+window, for free, and the app display never needs to be read.
+
+### The decomposition
+
+Each line holds one variable fixed. 1,416 settled markets, true per-second
+Binance bars over the identical 60 seconds the contract settles on.
+
+| | median abs | p90 | mean signed |
+|---|---|---|---|
+| **FEED** (60s Binance vs 60s BRTI) | **6.23 bps** | 9.90 | +5.80 |
+| **AGGREGATION** (Binance last vs Binance 60s) | **0.72 bps** | 3.29 | +0.13 |
+| TOTAL (what section 40 reported) | 6.22 bps | 10.61 | +5.94 |
+
+| outcome disagreement with official | | |
+|---|---|---|
+| Binance last tick (section 40) | 270 / 1,416 | 19.07% |
+| Binance 60-second mean | 273 / 1,416 | 19.28% |
+
+**Averaging is not the problem.** Switching from a last tick to a 60-second
+mean - the obvious fix, and the one the proposal implied - changes the
+disagreement by three markets in the wrong direction. It is noise. The entire
+gap is the feed: Binance BTCUSDT against a multi-venue USD index.
+
+### The basis is systematic, and that is the useful part
+
+Mean +5.80 bps, and it drifts by period while staying tight within one:
+
+| period | n | median | sd |
+|---|---|---|---|
+| 2026-07 mid | 511 | +6.40 | 1.23 |
+| 2026-08 mid | 157 | +9.46 | 2.47 |
+| 2026-08 late | 174 | +1.04 | 1.51 |
+| 2026-09 early | 158 | +1.58 | 2.23 |
+| 2026-09 mid | 85 | +3.09 | 1.99 |
+
+A fixed constant would therefore be wrong most of the time, but a **trailing
+median of the previous 20 settled windows - fitted on earlier markets only,
+never on the one being scored** - tracks it:
+
+| | raw | calibrated |
+|---|---|---|
+| residual median error | 6.23 bps | **0.76 bps** |
+| outcome disagreement | 19.41% | **4.01%** |
+
+**Four fifths of the disagreement is a correctable basis, not irreducible
+noise.** The remaining 4% is what an actual BRTI subscription would buy.
+
+### The recorder
+
+`reference_shadow.py`, `reference.py`, `reference_store.py`, wired into the
+service behind the trading path on the same contract as the hourly shadow.
+Shadow only: no entry, exit or sizing path reads any of it, and there is
+deliberately no flag that changes that.
+
+* **BRTI is the only reference.** CF Benchmarks gates index values behind an
+  entitlement, so without `CFB_API_KEY` every poll writes a `missing` row
+  naming the reason and `basis_bps` stays NULL. Binance is recorded in its own
+  column as a comparison and is **never** promoted into the reference column;
+  no other exchange is ever substituted. A basis measured against a stand-in is
+  not a basis.
+* **Gaps are records.** Missing, stale and errored polls are written with the
+  reason, collapsed one row per run, so coverage is auditable rather than
+  assumed - a recorder that only writes when the feed works cannot be told from
+  one that was switched off.
+* **Staleness is measured, not trusted.** Event timestamp, receipt timestamp
+  and age are all stored; past `reference_stale_ms` the row is `stale` and
+  carries no price, because a stale print averaged in as current is exactly how
+  a 60-second mean goes quietly wrong.
+* **Named-column inserts and `PRAGMA user_version` migrations**, because a
+  positional insert is what put 93 shadow rows into permanent quarantine
+  (section 38).
+* 14 tests in `tests/test_reference_recorder.py` pin the harmlessness contract:
+  a feed that raises on every call must leave `poll` and `reconcile` silent.
+
+### Where this leaves the HOLD/EXIT model
+
+**Not started, as specified.** `computed_brti_error_bps` is the gate and it is
+currently unpopulated: 0 markets have our own BRTI ticks, because the feed is
+not entitled. Until the recorder reproduces official settlements from its own
+observations, any shadow decision it logged would be a decision made on the
+wrong number - the precise mistake section 40 exists to record.
+
+**The single highest-value action is a CF Benchmarks entitlement.** Everything
+else is built and running.
+
+    python scripts/reconcile_settlement.py --limit 400   # decompose + calibrate
+    python scripts/reconcile_settlement.py --report-only
+
+---
+
+## 42. Kalshi serves BRTI itself. Two prior conclusions were wrong (2026-09-22)
+
+Sections 40 and 41 were built on a premise that is false: that the settlement
+reference is unreachable without a CF Benchmarks subscription. **Kalshi
+publishes BRTI through its own API, to our existing production credentials.**
+The operator said so; this section is the verification, and the correction.
+
+**What was wrong, and why.** Section 41 concluded "no BRTI passthrough" after
+probing fourteen invented routes (`/index/BRTI`, `/indices`, ...), authenticated
+and not, and getting 404 on all of them. The routes were guesses. The published
+OpenAPI and AsyncAPI specifications name the real ones. **Guessing at an API
+surface and reporting the absence as a finding was the error** - the specs were
+one fetch away and are now the authority for every contract here.
+
+### The endpoints, verified against production
+
+| purpose | call |
+|---|---|
+| per-second BRTI, charting | `GET /live_data/events/{event_ticker}` |
+| raw RTI prints | `GET /cfbenchmarks/values?id=BRTI` |
+| historical RTI, **200 ms** | `GET /cfbenchmarks/history/values?id=BRTI&timespan=HOUR&timestamp=...` |
+| index catalogue | `GET /cfbenchmarks/info` (BRTI `decimals: 2`) |
+| live stream | WS channel `cfbenchmarks_value` |
+
+Signing gotcha, from the docs and confirmed the hard way: **sign the path
+without the query string**. `_headers` already prefixes `/trade-api/v2`, so
+passing it again produces `INCORRECT_API_KEY_SIGNATURE`.
+
+The passthrough costs **50 read tokens** against 10 for an ordinary request,
+so it is a reconciliation and backfill tool, not a per-poll one. The
+`cfbenchmarks_value` channel is the live path: authenticated, roughly one tick
+per second, and it carries **the raw upstream frame plus trailing 60-second and
+quarter-hour final-minute averages**. Kalshi computes the settlement statistic
+and streams it. A 5Hz sibling channel covers BTC.
+
+### The settlement value is readable exactly, live, as it forms
+
+`live_data.details.timeseries` is one point per second, and each `v` is **already
+a trailing 60-second mean** - which is why averaging sixty of them fails badly
+(±50 dollars, 0/25): that double-smooths. The value AT the close instant is the
+settlement:
+
+| function of the series | reproduces `expiration_value` |
+|---|---|
+| mean of the 60 points in the final minute | **0 / 25** |
+| **the single value at close** | **12 / 12 exact** |
+| value at close - 1s | 12 / 12 (to $0.003) |
+| the 1M candlestick close of the final minute | **12 / 12 exact** |
+
+So the quarter-hour final-minute average is observable **second by second as it
+accumulates**, not only after settlement. At T-30s the system can read what the
+contract would settle at if the window ended now - the exact quantity section 40
+said was unknowable.
+
+### Our own recomputation: a tripwire, not the source
+
+Recomputing the average from raw 200 ms history lands **$0.2-$1.1 from official
+(0.02-0.13 bps)** but never to the cent, under every window alignment and
+per-second sampling rule tried. Against Binance's 6.23 bps that is a hundredfold
+improvement, and it is still not the official number.
+
+**Therefore: consume Kalshi's computed average as the source of truth and use
+the independent recomputation only as a disagreement alarm.** Recomputing what
+the exchange already publishes, and then trading on our version, would reinvent
+exactly the instrument mismatch this whole line of work exists to remove.
+
+### What this re-opens
+
+Section 40 closed close-call exits on the measurement that the crossed subset
+wins at its own bid. That measurement used **Binance** distance, and section 41
+showed Binance disagrees with the official outcome 19% of the time and 40% inside
+5 bps of the strike. The discriminators - cross depth, cross duration, velocity -
+were therefore all computed on the wrong instrument.
+
+**The close-call question is re-opened, on BRTI, and only on BRTI.** The oracle
+ceiling of +$72 against a +$11.91 hold edge (section 40) is the prize. Nothing is
+re-deployed on the strength of this section; the entry rule, the exits and the
+sizing are unchanged until a Kalshi-native measurement says otherwise.
+
+### What stands from sections 40 and 41
+
+- The 19.4% outcome disagreement between Binance and official settlement. Still
+  right, still the reason for all of this.
+- The FEED/AGGREGATION decomposition: 6.23 bps versus 0.72 bps. The averaging
+  was never the problem.
+- The walk-forward basis calibration, 19.4% -> 4.0%. Now obsolete as a
+  **decision** input, since the official number is directly readable, but kept
+  as the measurement that proved Binance's error was structured rather than
+  random.
+- `floor_strike[N] == expiration_value[N-1]`, exact on 6,420 pairs.
+
+---
+
+## 43. The BRTI pipeline, and the thresholds that cannot come with it (2026-09-22)
+
+`brti.py` reads the settlement reference from Kalshi and computes the gate
+inputs from it. Shadow only; no entry, exit or sizing path reads any of it.
+
+**Source choice.** `/live_data/events/{event_ticker}`, not the
+`cfbenchmarks_value` WebSocket, for a first deployment. Every response carries
+the entire window at one point per second, so a dropped poll costs freshness
+and never leaves a hole; there is no sequence state to lose and no reconnect to
+get wrong. It is also ordinary cost, against 50 read tokens for a passthrough
+call. The WebSocket is the upgrade when sub-second latency matters and it fits
+behind the same interface. The passthrough keeps its place for backfill and
+for the raw prints.
+
+**Verified on the live feed**, not assumed: each published point is a trailing
+60-second mean, and the mean of the raw 200 ms prints over the matching minute
+reproduces it to a median **$0.247** on an $86,000 index - 0.03 bps. The two
+descriptions of the series agree.
+
+### The thresholds do not transfer, and the size of the gap is the point
+
+A 60-second mean is a low-pass filter, so volatility measured on it is not the
+quantity `min_normalized_distance` was calibrated against. Measured live:
+
+| | Binance raw | Kalshi BRTI 60s mean |
+|---|---|---|
+| step-to-step volatility | 1.0x | **0.67x** |
+| `normalized_distance` on the same market | 2-4 typical | **15 - 22** |
+
+The deployed gate is `min_normalized_distance = 1.5` and the confidence band is
+2.0-4.0x. **On BRTI those numbers would pass essentially every market and size
+up on most of them.** Copying the thresholds across would not be a migration,
+it would be switching the distance gate off and the confidence sizing on, while
+the config still read as though nothing had changed.
+
+So the BRTI fields are named apart from the Binance ones - `brti_momentum_bps`,
+`brti_volatility_bps`, `brti_normalized_distance` - and `tests/test_brti_native.py`
+asserts the names stay distinct, so a threshold measured for one cannot be
+applied to the other by autocomplete.
+
+### What is recorded now
+
+`brti_features`, one row per poll: the official value, signed distance to the
+official strike, BRTI momentum and volatility, the implied side, the settlement
+projection, sample count and staleness - with the Binance view of the same
+instant beside it as **archive**. `sides_agree` counts the live disagreement
+rate that FINDINGS 41 measured at 19.4% on history.
+
+`tests/test_brti_native.py` pins the separation structurally: the module's AST
+is checked for Binance imports and its code for Binance field names, so the rule
+survives future edits rather than depending on the author remembering it.
+
+**Not deployed, and deliberately not next.** The next step is not a strategy
+file, it is a measurement: recompute the gates on BRTI history and find the
+thresholds that mean on this instrument what 1.5 and 2.0-4.0 meant on the old
+one. A `kalshi_brti` strategy written before that measurement would be the
+deployed rule with its gates silently disabled.
+
+---
+
+## 44. Sizing: the band switched off, and recovery rebuilt on realised money (2026-09-22)
+
+Two sizing changes, both the operator's decision, both made after a single
+trade doubled its exposure and lost.
+
+### The trade
+
+`KXBTC15M-26SEP221330-30`, 2 contracts at 81c, reported at the fill as
+*"Size 2 · 3.0x vol is inside the measured 2-4x edge band"*. It settled
+against us: **-$1.6416**, where one contract would have been about -$0.82.
+
+### 1. Confidence sizing is OFF
+
+The operator: *"The intelligence doubled exposure because of confidence. That
+contradicts the earlier requirement that intelligence must not change sizing."*
+
+`confidence_sizing_enabled: bool = False` now gates `confidence_size()`, which
+returns `(base, "")` when off - an empty reason, so no size line claims a band
+that nothing acted on. `high_confidence_contracts` is NOT changed: loss
+recovery reads the same number, and the two mechanisms are meant to stay
+independent.
+
+The 3,841-entry measurement behind the band (section 26, +0.0359/ct in
+2.0-4.0x against +0.0149 overall) is left in the code, not deleted, because it
+is still what was measured. It is also now in question on its own terms: the
+`normalized_distance` it was fitted on is Binance-derived, and sections 41 and
+43 measured that quantity disagreeing with Kalshi's official BRTI reference on
+about 20% of markets. Re-enabling the band needs a number, not a preference.
+
+### 2. Recovery: what was deployed, and why it escalated
+
+What shipped in section 39 was *per loss, replace the target, size up until it
+is repaid*, derived by replaying `settlements`. Two consequences, both visible
+in the live record of 2026-09-22:
+
+| | window | contracts | realised | debt after |
+|---|---|---:|---:|---:|
+| loss | 1130-30 | 1 | -0.7824 | 0.78 |
+| recovery | 1200-00 | 2 | +0.2441 | 0.54 |
+| **still upsized** | 1245-45 | 2 | +0.5515 | 0.00 |
+
+A recovery that wins but does not repay in full keeps sizing up - and a
+recovery that *loses* replaces the debt with its own, larger loss and keeps
+sizing up against that. The cap on the contract count never stopped this,
+because the escalation was in the number of upsized trades, not their size.
+There was also no check that an upsized trade could win enough to matter: 2
+contracts at 90c risk $1.80 to win 19c.
+
+### 3. Recovery now: a deficit, and a trade that can pay for it
+
+The operator's rule, implemented as stated:
+
+1. Activates on a **realised net loss**, after fees.
+2. Tracks the unrecovered **deficit**; a further loss INCREASES it and never
+   restarts or erases it.
+3. Recovery ends when realised profit has covered the deficit - `$0.00 or
+   better` - and not on a win count, paper profit, open mark or gross profit.
+4. Recovery **never creates a trade**. Every strategy gate has already passed
+   before sizing is reached; recovery only changes the size of a trade that
+   was happening anyway.
+5. The deficit is divided across the remaining planned steps
+   (`recovery_steps: int = 4`), and the upsize applies **only if this trade's
+   maximum net profit covers that share**. Otherwise the trade goes out at
+   base size and recovery stays active.
+
+        max_net_profit(count, ask) = count * (1 - ask) - kalshi_fee_charged(ask, count)
+
+        deficit 1.64 over 4 steps -> 0.4104 a trade
+        2 @ 0.90 -> 0.1874 net  ->  base size
+        2 @ 0.75 -> 0.4737 net  ->  recovery size
+
+The feed is **`daily_ledger`**, not `settlements` and never a local rebuild: it
+is the append-only realised record, it counts an early cash-out exactly once,
+and only the exchange may revise a figure it holds. `recovery_applied` on that
+table stores the amount already folded into the deficit, so a row the exchange
+revises moves the deficit by the **delta** - a cash-out banked at +0.5515 and
+settled at +0.5480 costs one cent, not another 55. The deficit itself is one
+persisted row (`recovery_deficit`), so a restart mid-recovery resumes.
+
+Three transitions, one line of arithmetic: `deficit = max(0, deficit - realised)`.
+
+### Judgement calls, stated so they can be overruled in one line
+
+- **No midnight reset.** The deficit is about money that is still missing, not
+  a calendar. `auto_daily_loss_limit` remains the day's own stop. Clearing the
+  `recovery_deficit` row daily is the change if the operator wants one.
+- **Steps decrement only on an upsized trade**, and only on a fill. A trade
+  held at base because it could not cover its share has changed no plan, and
+  an order that bought nothing spent nothing. This keeps the requirement
+  roughly flat as the deficit falls: 1.64/4 = 0.41, then 1.17/3 = 0.39.
+- **A new loss resets the steps to the full plan.** Otherwise the divisor
+  shrinks while the deficit grows and the required share explodes, switching
+  the upsize off exactly where it is wanted on.
+- **A deficit below half a cent is $0.00.** The account trades whole cents.
+
+### The measurement this decision overrides
+
+Section 39 chose per-loss replacement on a measurement: over 94 settled
+markets a cumulative deficit would have sat at recovery size for 93% of
+windows with $6.68 still outstanding and 3 recoveries completed, against 57%
+and 11 for per-loss. The operator has decided for the cumulative deficit with
+that measurement in view, and the eligibility gate is new since it was taken.
+The number to watch is how long the deficit stays open.
+
+### Pinned by tests
+
+`tests/test_intelligence.py`: the band sizes one contract while the flag is
+off and recovery is unaffected by it; a loss opens a deficit of exactly its
+realised net amount; a partial recovery keeps recovery on; the profit that
+clears it turns recovery off and the next trade is base; a second loss
+increases the deficit rather than restarting it; an early cash-out contributes
+once; an exchange revision moves the deficit by the delta only; the deficit
+and the step count survive a `Store` reopen; the operator's worked example at
+both prices; an ineligible trade goes out at base with recovery still active;
+a base-size win still pays the deficit down; steps decrement only on upsized
+trades and a loss resets them. Two structural tests hold the shape: recovery
+is unreachable before the entry gates, and the step is consumed after the
+order call and only on a fill.
+
+### On deployment
+
+Not restarted here. On the first start after this change the deficit folds the
+existing `daily_ledger` history once: at 13:45 that is **$1.2449 outstanding**
+over 4 steps, $0.3112 a trade, which 2 contracts can cover at 81c and cannot
+at 87c. The day's realised total is +$3.45 - the deficit is path-dependent and
+floors at zero, so it measures the money missing since the last time the
+account was whole, not the day.
+
+---
+
+## 45. The conditional recovery add-on: deployed configuration (2026-09-22)
+
+Shipped after the order-safety tests passed, on the operator's $30 live-test
+authorisation. **Profitability is what this test decides; it is not claimed
+here.** The corpus measurement that motivated it (section 43, the 2c
+conditioned add at +0.0621 [+0.0087, +0.1159]) cannot settle it, because a
+minute candle records that the ask REACHED a price, not that a queued order
+traded.
+
+### What is running
+
+| | |
+|---|---|
+| base entry | **1 contract, always** - recovery never enlarges it |
+| recovery upfront upsize | **off** (`recovery_upfront_upsize_enabled`) |
+| confidence-band sizing | **off** (`confidence_sizing_enabled`) |
+| the add | 1 contract, resting 2c below the ACTUAL fill |
+| add deadline | 120s before close, with its own `expiration_time` |
+| distance floor | 10.0 BRTI normalized distance |
+| authorised cap | **$30 cumulative PURCHASE SPEND** |
+
+### The three limits, deliberately not merged
+
+The $30 is a **purchase-spend** ceiling: every dollar ever paid for add
+contracts, plus whatever rests unfilled. It is **not a loss budget** - a run of
+PROFITABLE adds exhausts it just as fast, because the money was spent either
+way and returned as settlement rather than as headroom. `add_budget_state`
+reports purchase spend, current resting exposure and realised add P&L
+separately, so a report cannot quietly substitute one for another.
+
+### Three defects found by deploying it
+
+**The epoch.** Widening the settlement lookback to catch windows that settle
+after midnight pulled three days of finished markets into the ledger
+unapplied. The fold replayed them and drove the deficit **$0.85 -> $10.90**.
+Nothing looked broken: recovery still reported ACTIVE. But the requirement is
+deficit/steps, so it became **$2.73 a trade**, which no two-contract position
+can reach - the add-on would have skipped every setup for a reason that read
+like arithmetic rather than a fault. Backfilled history is now marked applied
+on arrival, keyed on the MARKET's own time, so a trade made after the epoch
+still counts however late the broker delivers it.
+
+**Crossing measured from the wrong instant.** The first live evaluation vetoed
+an add on `KXBTC15M-26SEP221500-00` for "BRTI crossed the strike since entry".
+The add was evaluated at 18:49:40; the base fill happened at **18:49:42**. The
+check looked back to the 18:45 window open, so 4m42s of history from before
+the position existed was allowed to veto it. Entry time now comes from the
+broker's own fill, and an entry time that cannot be established is UNKNOWN -
+which refuses the add rather than silently reading as "crossed".
+
+**Order-sensitive rebuilding.** The deficit floors at zero, so profit stops
+reducing it and the replay order is part of the answer. It was ordered by
+`window_ms`, which is wrong: an early cash-out realises while its own window
+is still running and can realise BEFORE a market that opened earlier, so a
+profit could be applied to a debt that did not exist yet. It now replays in
+realisation order with `ticker` as a stable tie-breaker, so a duplicate sync
+and a restart produce the same number.
+
+### What the first deployment actually proved
+
+One add, SKIPPED, on the crossing condition - which is the refusal path and
+nothing more. Placement, fill, partial fill, the cancel-versus-fill race,
+restart reconciliation, separate add P&L and recovery reaching zero are
+covered by 16 tests in `tests/test_recovery_lifecycle.py` and have **not** yet
+been demonstrated against the exchange. That distinction is the whole point of
+the live test and should not be blurred in a status report.
+
+### Still open
+
+The daily account-growth sizing controller is NOT part of this and is not
+demonstrated: start-of-day balance reconciliation, one shared sizing
+authority, and a fresh exposure check before each order. Keeping it separate
+from recovery is deliberate - two independent things that both change size are
+exactly how a cap gets exceeded by the sum of two rules each of which looked
+bounded.

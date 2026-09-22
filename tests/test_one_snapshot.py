@@ -114,7 +114,11 @@ def test_the_four_checks_stay_visible_on_a_rejection():
             remaining=362, confidence="MEDIUM", facts=facts(),
             executable=executable,
         )
-        for name in ("Price", "Momentum", "Distance", "Model"):
+        # "Decision ask", not "Price": the checks carry the ask the decision
+        # was taken on, which is a different number from the fill reported
+        # beside it. Renamed 2026-09-22 after 75¢ and 69¢ appeared in one
+        # message with nothing saying they were different facts.
+        for name in ("Decision ask", "Momentum", "Distance", "Model"):
             assert f"{name}:" in text, f"{name} missing when executable={executable}"
 
 

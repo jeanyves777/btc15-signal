@@ -22,12 +22,14 @@ from .kalshi import KalshiClient, KalshiMarket
 from .levels import LevelTracker
 from .levels import confidence_points as level_points
 from .model import predict
+from .recovery_add_runner import RecoveryAddRunner
+from .reference_shadow import ReferenceShadow
 from .regime import base_points as regime_base_points
 from .regime import confidence_points as regime_confidence_points
 from .regime import label_for as regime_label
 from .regime import weight_at, weight_for_hour
 from .similar import Cohorts, Fingerprint
-from .store import Store, TradeProposal
+from .store import RecoveryState, Store, TradeProposal
 from .store import position_pnl as store_position_pnl
 from .strategy import EntryRule, ReversionRule, ReversionSetup
 from .telegram import Telegram
@@ -896,31 +898,80 @@ def archive_observation(
         print(f"archive failed: {type(exc).__name__}: {exc}", flush=True)
 
 
-def recovery_size(store: Store, settings: Settings, base: int) -> tuple[int, str]:
-    """Size up to the recovery count while a loss is still outstanding.
+def max_net_profit(count: int, ask: float) -> float:
+    """What this order can win at most, net of fees, if it settles in the money.
 
-    THE OPERATOR'S RULE, implemented as stated: after a loss, trade the
-    recovery size until that loss is repaid, then reset. It never escalates -
-    the cap is `high_confidence_contracts`, whatever the loss was - so this is
-    not a martingale and cannot compound. The $10 martingale measured -15.74 on
-    a day the base system made +4.41 (section 32) and is not what this is.
-
-    Checked BEFORE the confidence band, and it wins, because a loss is a fact
-    about the account while the band is an opinion about the setup.
-
-    Measured cost, recorded rather than argued: on the 94 settled markets to
-    2026-09-22 this sits at the recovery size for 57% of windows and completes
-    11 recoveries. The band-based sizing it now overrides measured +0.48 over
-    flat $1 on the operator's 18 trades of 2026-09-21, and flat $2 measured
-    better than both. The operator has asked for loss-triggered recovery and
-    that is what this does.
+    Settlement pays the dollar with no second fee, so only the entry fee comes
+    off. The fee is the deployed `kalshi_fee_charged` and is never modelled
+    here: a sizing rule that disagreed with the fee schedule would be deciding
+    on money the account does not have.
     """
-    debt, since = store.outstanding_loss()
-    if debt <= 0:
+    return count * (1.0 - ask) - kalshi_fee_charged(ask, count)
+
+
+def recovery_size(
+    store: Store, settings: Settings, base: int, ask: float,
+    state: RecoveryState | None = None,
+) -> tuple[int, str]:
+    """Size up while a realised deficit is outstanding AND this trade can dent it.
+
+    THE OPERATOR'S RULE, 2026-09-22, in two parts.
+
+    The deficit: recovery activates on a realised net loss, tracks what is
+    still missing after fees, and turns off the moment realised profit has
+    covered it - see `Store.recovery_state`. A further loss increases it.
+
+    The eligibility, which is this function: recovery NEVER creates a trade.
+    The strategy's own gates have already passed by the time this is called;
+    all this decides is the size of a trade that is happening anyway. The
+    deficit is divided across the remaining planned steps, and the upsize
+    applies only if this trade's maximum net profit covers that share.
+    Otherwise the trade goes out at BASE size and recovery stays ACTIVE - a
+    base-size win still pays the deficit down.
+
+        deficit 1.64 over 4 steps -> 0.41 a trade
+        2 @ 0.90 -> 0.1874 net     -> not eligible, base size
+        2 @ 0.75 -> 0.4737 net     -> eligible
+
+    That gate exists because 2 contracts at 90c risk $1.80 to win 19c: at the
+    top of the price band the upsize adds exposure it cannot recover with.
+
+    It never escalates - the cap is `high_confidence_contracts`, whatever the
+    deficit is - so this is not a martingale. The $10 martingale measured
+    -15.74 on a day the base system made +4.41 (section 32) and is not this.
+
+    `state` is passed in by the order path so the ledger is folded once per
+    decision; it reads it itself everywhere else.
+
+    THE UPFRONT UPSIZE IS OFF (operator, 2026-09-22). Recovery no longer buys
+    a larger BASE position; it acts only through the conditional add-on in
+    `recovery_add.py`, which rests a second contract 2c below the actual fill
+    and only while the BRTI evidence still holds.
+
+    Leaving both on would stack: two contracts bought upfront and a third
+    rested behind them, on a deficit that justified one extra. The base entry
+    is one contract whether or not a deficit is outstanding.
+
+    The eligibility arithmetic below is kept and still exercised by the
+    add-on's own gate, so turning this back on is a one-line change rather
+    than a rewrite.
+    """
+    state = (
+        store.recovery_state(settings.recovery_steps) if state is None else state
+    )
+    if not state.active or not settings.recovery_upfront_upsize_enabled:
         return base, ""
-    return max(base, settings.high_confidence_contracts), (
-        f"recovering {debt:.2f} outstanding"
-        + (f" after {since} market(s)" if since else " from the last loss")
+    count = max(base, settings.high_confidence_contracts)
+    required = state.required_per_trade()
+    profit = max_net_profit(count, ask)
+    if profit < required:
+        # Base size, and an EMPTY reason: the caller only overrides the size
+        # when there is one, and a line saying "recovering" beside a base-size
+        # order would describe something that is not happening.
+        return base, ""
+    return count, (
+        f"recovering {state.deficit:.2f} outstanding - {profit:.2f} max net "
+        f"covers the {required:.2f} share of {max(1, state.steps)} step(s)"
     )
 
 
@@ -938,7 +989,24 @@ def confidence_size(
     Momentum is required because it is the one condition that separates on its
     own: aligned measures +0.0197, against measures -0.0701 with an interval
     clear of zero.
+
+    OFF SINCE 2026-09-22, by the operator's decision, and the measurement above
+    is recorded rather than deleted because it is still what was measured. The
+    band doubled exposure on KXBTC15M-26SEP221330-30 - "3.0x vol is inside the
+    measured 2-4x edge band", 2 contracts at 81c - and the market settled
+    against us for -$1.64 where one contract would have been about -$0.82.
+    Intelligence must not change size. Beyond the operator's rule, the evidence
+    itself is now in question: `normalized_distance` here is computed from the
+    Binance feed, and FINDINGS 41/43 measured that the Binance view disagrees
+    with Kalshi's official BRTI reference on about 20% of markets. Sizing
+    returns to one contract until it has independent evidence.
+
+    The gate is a flag and not a deletion so that re-enabling it is a
+    deliberate act with a number behind it. It returns `(base, "")` when off:
+    an empty reason, so no size line appears claiming a band nothing acted on.
     """
+    if not settings.confidence_sizing_enabled:
+        return base, ""
     normalized = prediction.distance_bps / max(snapshot.volatility_5m_bps, 1.0)
     direction = 1 if prediction.side == "UP" else -1
     aligned = direction * snapshot.momentum_5m_bps > 0
@@ -1613,12 +1681,35 @@ async def primary_signal(
             count, size_reason = confidence_size(
                 settings, snapshot, prediction, count
             )
-            # RECOVERY WINS OVER THE BAND. An outstanding loss is a fact about
+            # RECOVERY WINS OVER THE BAND. A realised deficit is a fact about
             # the account; the confidence band is an opinion about the setup.
             # Checked second so its reason is the one reported when both apply.
-            recovered, recovery_reason = recovery_size(store, settings, count)
+            #
+            # NOTHING HERE CAN CAUSE A TRADE. Every gate above has already
+            # passed - this block only decides the size of an order that is
+            # going out anyway, and a deficit is never a reason to enter.
+            #
+            # The state is read ONCE and carried to the step below, so the plan
+            # that is charged for this order is the plan its size was chosen
+            # from.
+            recovery = store.recovery_state(settings.recovery_steps)
+            recovered, recovery_reason = recovery_size(
+                store, settings, count, contract_ask, state=recovery
+            )
             if recovery_reason:
                 count, size_reason = recovered, recovery_reason
+            elif recovery.active:
+                # Said out loud, because a silent non-upsize during recovery
+                # looks exactly like recovery not working - which is how the
+                # last sizing defect stayed invisible for a day.
+                upsized = max(count, settings.high_confidence_contracts)
+                print(
+                    f"auto: recovery holding at base - "
+                    f"{max_net_profit(upsized, contract_ask):.2f} max net does "
+                    f"not cover {recovery.required_per_trade():.2f} of "
+                    f"{recovery.deficit:.2f} outstanding",
+                    flush=True,
+                )
             if count > 1:
                 print(f"auto: sizing {count} contracts - {size_reason}", flush=True)
             proposal = create_proposal(
@@ -1656,6 +1747,16 @@ async def primary_signal(
                     attempt=attempts + 1,
                     entry_slippage=settings.entry_slippage,
                 )
+                # ONE STEP OF THE RECOVERY PLAN IS NOW ON THE BOOK. Only a
+                # trade that actually took the upsize spends one, and only on a
+                # FILL: an order that bought nothing changed no plan.
+                #
+                # Here, on the post-order path, for the same reason
+                # `log_execution` is here - the contracts are already at the
+                # exchange, so this write cannot cost a fill, and
+                # `consume_recovery_step` cannot raise.
+                if recovery_reason and getattr(result, "filled_count", 0) > 0:
+                    store.consume_recovery_step(now_ms, settings.recovery_steps)
                 # The shadow row for a window we actually TRADED. `shadow_read`
                 # ran only where the entry alert is built, and this branch
                 # returns long before that, so `shadow_decisions` held rows for
@@ -1743,6 +1844,8 @@ async def primary_signal(
                                     remaining=remaining,
                                     target=snapshot.target,
                                     price=snapshot.price,
+                                    decision_ask=contract_ask,
+                                    size_reason=size_reason,
                                 ),
                                 [("\U0001f4cb WHY THIS TRADE", f"details:{claimed.id}")],
                             )
@@ -2159,6 +2262,17 @@ async def cash_out_exit(
         print(f"cash-out failed {type(exc).__name__}: {exc}", flush=True)
 
     sold = bool(result and result.filled_count > 0)
+    if sold:
+        # BANK IT NOW, before the header is rendered. The proceeds are already
+        # in the account; `settlements` will not carry them for another minute,
+        # and the stale open mark still shows the position we just sold. Until
+        # 2026-09-22 that gap is what let the settlement recap four minutes
+        # later report this profit as missing and the next signal put it back.
+        filled = result.filled_count if result else count
+        banked = (bid - paid) * filled - (entry_fee or 0.0) - (exit_fee or 0.0)
+        store.record_realised(
+            ticker, opened, banked, banked > 0, "cash_out", now_ms
+        )
     await telegram.send(
         messages.cash_out(
             head=head_for(store, settings),
@@ -2364,10 +2478,20 @@ async def service() -> None:
         except (OSError, ValueError) as exc:
             print(f"Kalshi execution disabled: {exc}", flush=True)
     hourly = HourlyShadow(settings) if settings.hourly_enabled else None
+    reference = ReferenceShadow(settings) if settings.reference_enabled else None
+    recovery_add = RecoveryAddRunner(settings, store, telegram)
     levels = LevelTracker()
     if hourly:
         print(f"hourly ladder recording (shadow) -> {settings.hourly_database_path}",
               flush=True)
+    if reference:
+        feed = "BRTI live" if reference.brti_configured else "BRTI NOT entitled"
+        print(
+            f"settlement reference recording (shadow) -> "
+            f"{settings.reference_database_path} [{feed}; official 60s averages "
+            f"from Kalshi either way]",
+            flush=True,
+        )
     print("BTC15 signal started; execution requires Telegram approval", flush=True)
     last_ticker = None
     try:
@@ -2406,6 +2530,36 @@ async def service() -> None:
                         # an ungradeable shadow can never be promoted.
                         store.settle_shadow(row[0], winning_side)
                         store.settle_decision_records(row[0], winning_side)
+                        # BANK IT BEFORE REPORTING IT. The recap renders the
+                        # account, and until this market is in the ledger the
+                        # count and the dollars describe different instants:
+                        # the position has settled, so it is still in the open
+                        # mark, but it is not yet a settled market in the
+                        # record. On 2026-09-22 that printed "+$3.05 - 30W-5L"
+                        # against a ledger holding 30W-6L. Read from the
+                        # broker, never rebuilt, and never fatal - a failed
+                        # sync leaves the recap on the previous snapshot,
+                        # which is stale but internally consistent.
+                        if trader is not None:
+                            try:
+                                store.record_settlements(
+                                    await trader.settlements(), now_ms
+                                )
+                                store.sync_ledger_from_settlements(now_ms)
+                                open_n, open_mark, per_ticker = (
+                                    await trader.open_mark()
+                                )
+                                store.set_setting("open_mark", open_mark, now_ms)
+                                store.set_setting("open_positions", open_n, now_ms)
+                                store.set_setting_text(
+                                    "open_mark_detail", json.dumps(per_ticker), now_ms
+                                )
+                                SETTLEMENT_SYNC["at"] = now_ms
+                            except Exception as exc:  # noqa: BLE001
+                                print(
+                                    f"pre-report settlement sync failed: {exc!r}",
+                                    flush=True,
+                                )
                         sizing, basis = report_sizing(settings)
                         await report_settlement(
                             store, telegram, row, result, settings, sizing, basis
@@ -2432,9 +2586,19 @@ async def service() -> None:
                         # The app's headline is today's realised PLUS the open
                         # position marked to the bid. Both halves or the number
                         # does not match what the operator is looking at.
-                        open_n, open_mark = await trader.open_mark()
+                        open_n, open_mark, per_ticker = await trader.open_mark()
                         store.set_setting("open_mark", open_mark, now_ms)
                         store.set_setting("open_positions", open_n, now_ms)
+                        # Per ticker, so `open_exposure` can drop anything the
+                        # ledger has already banked instead of counting it twice.
+                        store.set_setting_text(
+                            "open_mark_detail", json.dumps(per_ticker), now_ms
+                        )
+                        # The exchange is the authority on money, so every
+                        # settled market it reports is written into the ledger.
+                        # A figure a cash-out banked locally is revised only
+                        # here, and the revision is counted, never silent.
+                        store.sync_ledger_from_settlements(now_ms)
                         SETTLEMENT_SYNC["at"] = now_ms
                         mark("settlement_sync")
                     except Exception as exc:  # noqa: BLE001
@@ -2458,6 +2622,13 @@ async def service() -> None:
                     if hourly:
                         await hourly.poll(now_ms, market)
                         await hourly.settle(now_ms)
+                    # The reference recorder covers the gap between windows
+                    # too: the 60 seconds a market settles on straddle the
+                    # boundary, so stopping here would blind it to exactly the
+                    # minute it exists to measure.
+                    if reference:
+                        await reference.poll(now_ms, None)
+                        await reference.reconcile(now_ms)
                     await asyncio.sleep(settings.poll_seconds)
                     continue
                 opened = contract.open_ms
@@ -2488,6 +2659,40 @@ async def service() -> None:
                 if hourly:
                     await hourly.poll(now_ms, market)
                     await hourly.settle(now_ms)
+                # Settlement reference, same contract as the hourly shadow and
+                # for the same reason: it records, it never orders, and it sits
+                # behind the trading path so a slow feed cannot delay a fill.
+                # Both calls swallow their own errors.
+                if reference:
+                    await reference.poll(now_ms, contract)
+                    await reference.reconcile(now_ms)
+                    # THE CONDITIONAL RECOVERY ADD-ON. It runs AFTER the
+                    # reference poll because it reads that poll's BRTI - one
+                    # fetch, one series, one set of numbers, so the recorder
+                    # and the order path cannot disagree about the reference
+                    # at the same instant. It swallows its own errors, and
+                    # with `recovery_add_enabled` off it records the decision
+                    # and places nothing.
+                    brti = reference.current_features()
+                    position = store.open_position_detail(opened)
+                    if brti is not None and position is not None:
+                        # SINCE THE FILL, not since the window opened. The
+                        # first live evaluation vetoed an add on a crossing
+                        # that happened 4m42s BEFORE the position existed.
+                        entry_ms = store.position_entry_ms(opened, position[3])
+                        crossed = (
+                            None if entry_ms is None
+                            else reference.crossed_since(entry_ms, position[0])
+                        )
+                        await recovery_add.step(
+                            trader=trader,
+                            contract=contract,
+                            features=brti,
+                            crossed=crossed,
+                            remaining_s=remaining,
+                            now_ms=now_ms,
+                            opened=opened,
+                        )
                 # Same reasoning as the hourly shadow: a second Binance request
                 # for a day of bars must never sit in front of an order. It
                 # self-throttles and swallows its own errors.
@@ -2508,6 +2713,8 @@ async def service() -> None:
         await kalshi.close()
         if hourly:
             await hourly.close()
+        if reference:
+            await reference.close()
         if trader:
             await trader.close()
 

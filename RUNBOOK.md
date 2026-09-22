@@ -286,6 +286,69 @@ searched rules scored below the *median* best rule on shuffled data. Strike
 selection must be a pre-registered rule measured in advance — "the rung nearest
 N volatility units from spot", say — and never an argmax over the live chain.
 
+## The settlement reference (BRTI) — shadow only
+
+### Why it exists
+
+The bot decides on Binance spot. The contract settles on **the average of sixty
+CF Benchmarks BRTI prices in the final minute**, and its strike is the same
+statistic at the window open — confirmed from Kalshi's own `rules_primary`, not
+assumed. FINDINGS 41 measures the gap: a median **6.2 bps feed basis**, and
+**0.7 bps** from the 60-second averaging. Almost all of it is the feed.
+
+### What it does
+
+Records, and nothing else. No entry, exit or sizing path reads any of it, and
+there is deliberately no config flag that changes that — promoting it has to be
+a code change someone makes on purpose.
+
+- Every `reference_poll_seconds` (5s), one row per source: raw price, event and
+  receipt timestamps, age, staleness, signed distance to the strike, that
+  source's own trailing 60-second mean with its sample count.
+- Every `reference_reconcile_seconds` (5 min), one row per newly settled market
+  comparing computed averages against Kalshi's official `expiration_value`.
+- It runs **behind** the trading path and swallows every error, the same
+  contract as the hourly ladder. A dead feed cannot delay a fill.
+
+### Where it lives
+
+    runtime/settlement_reference.db      its own file, its own locks
+      reference_observations             per poll, per source
+      settlement_reconciliation          per settled market, with the split
+      feed_gaps                          every missing/stale run, with reasons
+      second_bars                        cached 1s bars, so reruns are free
+
+Schema is versioned with `PRAGMA user_version`; every insert names its columns,
+because a positional insert is what put 93 shadow rows into permanent
+quarantine.
+
+### Turning the real feed on
+
+CF Benchmarks gates index values behind an entitlement. Without a key the
+recorder writes a `missing` row every poll naming the reason, and the basis
+column stays NULL — **it never substitutes Coinbase, Kraken or Binance for the
+reference**. The official 60-second averages still arrive from Kalshi either
+way, so the reconciliation keeps working.
+
+    CFB_API_KEY=...        # in .env; CFB_INDEX_ID defaults to BRTI
+
+### Reading it
+
+    python scripts/reconcile_settlement.py --limit 400    # backfill + decompose
+    python scripts/reconcile_settlement.py --report-only
+
+`computed_brti_error_bps` is the gate on everything downstream. **The HOLD/EXIT
+shadow model does not start until the recorder reproduces official settlements
+from its own BRTI ticks.** Today that column is empty because the feed is not
+entitled, so the model has not been started. That is the intended state, not a
+bug.
+
+### The one number to watch
+
+A walk-forward trailing-20 basis correction cuts outcome disagreement from
+19.4% to **4.0%** (FINDINGS 41). It is stored as evidence and read by nothing.
+Do not wire it into a decision without measuring it as a decision first.
+
 ## Known limits
 
 - **`bid_imbalance` is hard-coded to 0.0** in backtests. It has never been
