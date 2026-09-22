@@ -11,6 +11,12 @@ from cryptography.hazmat.primitives.asymmetric import padding
 
 from .store import TradeProposal
 
+# The instrument's own definition, not settings: a Kalshi binary event contract
+# settles at one dollar or nothing, and `revenue` is quoted in cents. They are
+# named so that no dollar figure anywhere in the P&L path is a bare literal.
+CONTRACT_FACE = 1.0
+CENTS_PER_DOLLAR = 100.0
+
 
 @dataclass(frozen=True)
 class ExecutionResult:
@@ -230,6 +236,156 @@ class KalshiExecutionClient:
             # by `fill_detail` and lands on `trade_proposals.exit_price`.
             f"Sold {filled:g} (crossed to {limit_price:.0%}; "
             f"filled at the best bid)",
+        )
+
+    async def settlements(self, limit: int = 200) -> list[dict]:
+        """Every settled market on the account, as the EXCHANGE accounts for it.
+
+        This is the only honest source of realised P&L. Rebuilding it locally
+        from `trade_proposals` got the sign wrong: it reported +1.06 on an
+        account that was actually -1.62, because it priced unfilled rows at
+        `entry_limit` (a limit is permission to cross, never what was paid),
+        modelled the fee instead of reading it, and leaned on
+        `predictions.won`, which is our own settlement guess rather than the
+        exchange's. It also saw 47 of 88 settled markets, because a proposal
+        that filled but never reached a terminal status is excluded by
+        ACCOUNTED_SQL.
+
+        Paginated: Kalshi caps a page at 200 and hands back a cursor.
+        """
+        return await self._paginate("/portfolio/settlements", "settlements", limit)
+
+    async def fills(self, limit: int = 200) -> list[dict]:
+        """Every execution on the account, as the broker recorded it.
+
+        The trade COUNT has to come from here for the same reason the money
+        does. Counting `trade_proposals` rows counts our intentions: it misses
+        anything filled outside the bot, and it miscounts anything whose status
+        never reached a terminal value - 71 proposals sat at `pending` on
+        2026-09-21 alone.
+        """
+        return await self._paginate("/portfolio/fills", "fills", limit)
+
+    async def _paginate(self, path: str, key: str, limit: int) -> list[dict]:
+        """Kalshi caps a page at 200 and hands back a cursor."""
+        out: list[dict] = []
+        cursor = ""
+        while True:
+            query = f"{path}?limit={limit}" + (f"&cursor={cursor}" if cursor else "")
+            response = await self.client.get(
+                self.base_url + query, headers=self._headers("GET", path)
+            )
+            response.raise_for_status()
+            page = response.json()
+            rows = page.get(key) or []
+            out.extend(rows)
+            cursor = page.get("cursor") or ""
+            if not cursor or not rows:
+                return out
+
+    async def open_mark(self) -> tuple[int, float]:
+        """(open positions, unrealised dollars) marked at the live bid.
+
+        The app's headline figure is TODAY'S realised P&L PLUS the open
+        position marked to market - that is how "+$4.05 (+14.67%)" is built,
+        and reproducing it takes both halves. Marking at the BID, not the ask
+        or the midpoint, because the bid is what the position could actually be
+        sold for right now.
+        """
+        response = await self.client.get(
+            self.base_url + "/portfolio/positions?limit=200",
+            headers=self._headers("GET", "/portfolio/positions"),
+        )
+        response.raise_for_status()
+        positions = response.json().get("market_positions") or []
+        count = 0
+        total = 0.0
+        for position in positions:
+            size = float(position.get("position_fp") or 0)
+            if not size:
+                continue
+            ticker = position.get("ticker")
+            path = f"/markets/{ticker}"
+            try:
+                quote = await self.client.get(
+                    self.base_url + path, headers=self._headers("GET", path)
+                )
+                quote.raise_for_status()
+                market = quote.json().get("market", {})
+            except (httpx.HTTPError, ValueError, KeyError):
+                continue
+            field = "yes_bid_dollars" if size > 0 else "no_bid_dollars"
+            bid = float(market.get(field) or 0)
+            cost = float(position.get("market_exposure_dollars") or 0)
+            fees = float(position.get("fees_paid_dollars") or 0)
+            total += abs(size) * bid - cost - fees
+            count += 1
+        return count, total
+
+    @staticmethod
+    def market_open_ms(ticker: str) -> int | None:
+        """The market's own time, parsed from its ticker. None if unrecognised.
+
+        SETTLEMENT TIME IS NOT MARKET TIME. Kalshi settles these in batches
+        hours after close - KXBTC15M-26SEP220445-45 settled at 08:45 UTC, four
+        hours after its window - so bucketing realised P&L by `settled_time`
+        files a trade under the wrong day and hands the daily loss floor the
+        wrong window. The ticker carries the real one:
+
+            KXBTC15M-26SEP220445-45   ->  2026-09-22 04:45 UTC
+            KXBTCD-26SEP2207-T80099   ->  2026-09-22 07:00 UTC (hourly)
+        """
+        import re
+        from datetime import UTC, datetime
+
+        match = re.match(r"^[A-Z0-9]+-(\d{2})([A-Z]{3})(\d{2})(\d{2})(\d{2})?", ticker or "")
+        if not match:
+            return None
+        year, mon, day, hour, minute = match.groups()
+        months = ("JAN", "FEB", "MAR", "APR", "MAY", "JUN",
+                  "JUL", "AUG", "SEP", "OCT", "NOV", "DEC")
+        if mon not in months:
+            return None
+        try:
+            stamp = datetime(
+                2000 + int(year), months.index(mon) + 1, int(day),
+                int(hour), int(minute or 0), tzinfo=UTC,
+            )
+        except ValueError:
+            return None
+        return int(stamp.timestamp() * 1000)
+
+    @staticmethod
+    def settlement_pnl(row: dict) -> float:
+        """Realised dollars for one settled market, from Kalshi's fields only.
+
+        `revenue` alone is NOT the payout. When a position is closed early the
+        exit is booked as buying the OPPOSITE side, and Kalshi nets the
+        offsetting pair immediately at $1 - outside `revenue`, which then reads
+        0 even on a market that won. KXBTC15M-26SEP220615-15 is the proof:
+        2 NO bought for $1.60, closed by buying 2 YES for $0.012,
+        `market_result` "no", `revenue` 0. Scoring that by `revenue` books a
+        $1.62 loss on a trade that made +$0.365.
+
+        So the payout is the netted pairs plus whatever actually settled, and
+        every other term - both costs and the fee - is read, never modelled.
+        """
+        yes_n = float(row.get("yes_count_fp") or 0)
+        no_n = float(row.get("no_count_fp") or 0)
+        pairs = min(yes_n, no_n)
+        # NOTHING HERE IS A TUNING NUMBER. Every dollar term is read off the
+        # row. The two constants are the instrument's definition, not choices:
+        # CONTRACT_FACE is what a Kalshi binary settles at, and CENTS_PER_DOLLAR
+        # is the unit `revenue` is quoted in. A netted pair is one YES and one
+        # NO, so exactly one of them settles at face and the other at zero -
+        # which is why the pair is worth face whatever the result turns out to
+        # be, and why it can be counted without looking at `market_result`.
+        payout = pairs * CONTRACT_FACE + float(row.get("revenue") or 0) / CENTS_PER_DOLLAR
+        return (
+            payout
+            - float(row.get("yes_total_cost_dollars") or 0)
+            - float(row.get("no_total_cost_dollars") or 0)
+            - float(row.get("fee_cost") or 0)
         )
 
     async def fill_detail(self, order_id: str, side: str) -> tuple[float, float, float] | None:

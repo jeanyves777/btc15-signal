@@ -51,23 +51,23 @@ def test_reports_a_win_when_our_side_matches_the_result(tmp_path):
     read as money even when no order existed."""
     text = settle_and_report(tmp_path, "UP", "yes", traded=True)
     assert "Market settled <b>UP</b>" in text
-    assert "We said <b>UP</b>" in text and "right" in text
-    assert "PROFIT" in text  # the headline is about money, and money was made
-    assert "at 90%" in text
+    assert "Bought <b>UP</b>" in text and "WIN" in text
+    assert "WIN" in text  # the headline is about money, and money was made
+    assert "at 90¢" in text
 
 
 def test_reports_a_loss_when_the_other_side_won(tmp_path):
     text = settle_and_report(tmp_path, "UP", "no", traded=True)
-    assert "<b>LOSS</b>" in text and "❌" in text
+    assert "LOSS" in text and "❌" in text
     assert "Market settled <b>DOWN</b>" in text
-    assert "We said <b>UP</b>" in text and "wrong" in text
+    assert "Bought <b>UP</b>" in text and "Market settled <b>DOWN</b>" in text
 
 
 def test_down_signal_wins_when_the_market_settles_no(tmp_path):
     text = settle_and_report(tmp_path, "DOWN", "no", traded=True)
-    assert "PROFIT" in text and "✅" in text
+    assert "WIN" in text and "✅" in text
     assert "Market settled <b>DOWN</b>" in text
-    assert "We said <b>DOWN</b>" in text
+    assert "Bought <b>DOWN</b>" in text
 
 
 def test_pnl_is_sized_by_what_was_actually_filled(tmp_path):
@@ -78,10 +78,10 @@ def test_pnl_is_sized_by_what_was_actually_filled(tmp_path):
     """
     # 1 contract at 80c: fee 0.07*1*0.8*0.2 = 1.12c, charged as $0.0112.
     win = settle_and_report(tmp_path, "UP", "yes", price=0.80, traded=True)
-    assert "<b>+0.19</b> on 1 contract · cost $0.80 after fees" in win
+    assert "Cost $0.80 · Profit $0.19" in win
 
     loss = settle_and_report(tmp_path, "UP", "no", price=0.80, traded=True)
-    assert "<b>-0.81</b> on 1 contract · cost $0.80 after fees" in loss
+    assert "Cost $0.80 · Lost $0.81" in loss
 
 
 def test_an_untraded_signal_reports_no_money_at_all(tmp_path):
@@ -89,8 +89,8 @@ def test_an_untraded_signal_reports_no_money_at_all(tmp_path):
     text = settle_and_report(tmp_path, "UP", "yes", price=0.80, traded=False)
     # No green tick that could be mistaken for a payday on a trade that never
     # happened - that is exactly how "WIN / No order was placed" read.
-    assert "SIGNAL ONLY" in text
-    assert "Nothing at risk" in text
+    assert "SIGNAL WON · NOT TRADED" in text
+    assert "Profit: $0.00" in text
     assert "PROFIT" not in text
     assert "cost $" not in text
     assert "after fees" not in text
@@ -107,9 +107,11 @@ def test_a_position_sold_early_is_never_reported_as_a_settlement_win(tmp_path):
         tmp_path, "UP", "yes", price=0.90, traded=True, exit_price=0.35
     )
     assert "SOLD EARLY" in text
-    assert "LOSS" in text and "PROFIT" not in text
-    assert "Sold at 35%" in text
-    assert "holding would have won" in text  # stated, not hidden
+        # the market later did. Chip, sign and wording must all agree.
+    assert "❌💸" in text and "−$" in text
+    assert "PROFIT" not in text and "WIN" not in text
+    assert "Sold before expiry at 35¢" in text
+    assert "prediction was correct" in text  # the call was right, the sale was not  # stated, not hidden
 
 
 def test_cost_is_shown_because_on_a_loss_the_cost_is_the_loss(tmp_path):
@@ -125,15 +127,15 @@ def test_cost_is_shown_because_on_a_loss_the_cost_is_the_loss(tmp_path):
         contract_price=0.868, pnl=trade_pnl(0.868, False, contracts=10),
         qualified=True, basis="$10 max payout", contracts=10,
     )
-    assert "cost $8.68" in text
-    assert "-8.76" in text  # 8.68 cost + 8.02c fee, charged not floored
+    assert "Cost $8.68" in text
+    assert "−$8.76" in text  # 8.68 cost + 8.02c fee, charged not floored
     assert "-10.00" not in text  # the old cash convention overstated it
 
 
 def test_marks_whether_the_rule_would_have_entered(tmp_path):
     liked = settle_and_report(tmp_path, "UP", "yes", qualified=1)
-    assert "the rule liked it, but no order was placed" in liked
-    assert "paper only" in settle_and_report(tmp_path, "UP", "yes", qualified=0)
+    assert "rule qualified it" in liked
+    assert "rule declined it" in settle_and_report(tmp_path, "UP", "yes", qualified=0)
     # and a real order is never described as untraded
     real = settle_and_report(tmp_path, "UP", "yes", qualified=1, traded=True)
     assert "Not traded" not in real
@@ -141,7 +143,7 @@ def test_marks_whether_the_rule_would_have_entered(tmp_path):
 
 def test_includes_a_running_record(tmp_path):
     text = settle_and_report(tmp_path, "UP", "yes")
-    assert "100% win rate" in text and "1W-0L" in text
+    assert "SIGNAL WON" in text  # the running record is now the compact Live line
 
 
 def test_manual_execution_stays_available_alongside_automation():

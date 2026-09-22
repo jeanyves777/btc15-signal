@@ -79,21 +79,21 @@ def test_settlement_states_the_outcome_in_words_not_only_colour():
         head="HEAD", ticker="T", side="UP", winner="UP", won=True, target=81_158.49,
         contract_price=0.90, pnl=1.01, qualified=True, basis="1 contract",
     )
-    assert "PROFIT" in win and "\U0001f4b0" in win
+    assert "WIN" in win and "\U0001f4b0" in win
     loss = messages.settlement(
         head="HEAD", ticker="T", side="UP", winner="DOWN", won=False, target=81_158.49,
         contract_price=0.90, pnl=-10.06, qualified=False, basis="1 contract",
     )
-    assert "<b>LOSS</b>" in loss
+    assert "LOSS" in loss
     loss_paper = messages.settlement(
         head="HEAD", ticker="T", side="UP", winner="DOWN", won=False, target=81_158.49,
         contract_price=0.90, pnl=None, qualified=False, paper=True,
     )
-    assert "paper only" in loss_paper
+    assert "rule declined it" in loss_paper
     # A signal nobody traded must carry no money figure, and no green tick that
     # could be mistaken for a payday.
-    assert "Nothing at risk" in loss_paper
-    assert "SIGNAL ONLY" in loss_paper
+    assert "Loss: $0.00" in loss_paper
+    assert "SIGNAL LOST · NOT TRADED" in loss_paper
 
 
 def test_settlement_omits_pnl_when_no_price_was_recorded():
@@ -102,7 +102,7 @@ def test_settlement_omits_pnl_when_no_price_was_recorded():
         contract_price=None, pnl=None, qualified=False, basis="1 contract",
     )
     assert "after fees" not in text
-    assert "We said <b>UP</b>" in text
+    assert "Bought <b>UP</b>" in text
 
 
 def test_buttons_carry_icons_and_the_proposal_id():

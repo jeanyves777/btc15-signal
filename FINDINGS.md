@@ -1947,3 +1947,200 @@ excludes zero and is more than twice the pooled edge.
 about $1.87 against $0.93, so the old floor tripped after half as many bad
 trades. A floor that stops a normal losing run early is a silent stop, not a
 safety control.
+
+## 33. The out-of-the-money strategy: the entry is the problem, the take-profit makes it worse (2026-09-21)
+
+Operator specification: from the START of the window, buy whichever side is
+available at about a 35% chance, set a take-profit at 150% of what was paid,
+and watch both sides for the same opportunity. Measured by
+`scripts/measure_oom.py` over 6,435 settled markets, 4,876 trades, both sides
+taken independently.
+
+| Fee model | n | TP hit | held won | per trade | 95% CI | ROI |
+|---|---:|---:|---:|---:|---:|---:|
+| taker entry, **maker** take-profit (free) | 4876 | 45.3% | 3.5% | -$0.0402 | -0.0488 to -0.0310 | -12.3% |
+| taker both ways | 4876 | 45.3% | 3.5% | -$0.0472 | -0.0557 to -0.0382 | -14.5% |
+| UP side only | 2462 | 45.0% | 4.4% | -$0.0371 | -0.0503 to -0.0238 | -11.4% |
+| DOWN side only | 2414 | 45.6% | 2.6% | -$0.0433 | -0.0564 to -0.0298 | -13.3% |
+
+Both intervals sit entirely below zero, and both sides lose independently, so
+this is not one side's spread. The free maker exit does not rescue it.
+
+**The premise is true and it does not help.** 45.3% of these contracts DO reach
+1.5x - cheap contracts really do come back. But of the 2,209 that hit the
+take-profit, **1,428 (64.6%) would have settled as winners worth $1.00** and
+were sold at ~$0.62. Of the 2,667 that never reached it, only **93 (3.5%)** went
+on to win. The take-profit sells the winners and keeps the losers:
+
+    given up by selling early      -$513.22
+    saved by selling before expiry +$460.34
+    net                             -$52.88
+
+Held to expiry the same entries lose **-$0.0293**/trade; with the take-profit
+they lose **-$0.0402**. The difference is **-$0.0108**/trade, 95% CI
+[-0.0195, -0.0022] - an interval clearing zero on the negative side, so the
+take-profit is reliably harmful rather than merely useless.
+
+**Why the entry itself has no edge.** 1,521 of 4,876 settle as winners = 31.2%,
+bought at an average of ~$0.325. That is the far side of the favourite-longshot
+bias in section 1: favourites win MORE than their price, so longshots win LESS
+than theirs. Buying the 35% side is taking the wrong end of the only durable
+bias this market has, and the fee finishes it.
+
+This independently reproduces the deployed spike-reversion result
+(`reversion_strategy.json`, `enabled: false`): -$0.0440/contract over 760
+trades, 95% CI [-0.0609, -0.0277]. Two differently-constructed tests of the
+same idea - one with a spike/rejection setup and a fixed 0.50 exit, one with no
+setup at all and a 1.5x exit - land within half a cent of each other. The
+agreement is the finding; the parameters are not what is wrong.
+
+**Decision: not deployed.** No take-profit level is worth searching, because
+the diagnosis is structural rather than parametric - the entry is on the wrong
+side of the bias, and any exit rule that helps the losers cuts the winners by
+more. What would change this: an entry filter that predicts WHICH cheap
+contracts come back, tested walk-forward, and section 7 applies in full to any
+such filter that a search finds.
+
+## 34. Realised P&L was rebuilt locally and had the sign wrong (2026-09-22)
+
+Telegram reported **`Live: +1.06`** on an account that was actually **down
+$1.62**, over **47** of the **88** markets that had really settled. The figure
+was reconstructed from `trade_proposals` rather than read from the exchange,
+and it was wrong in four independent ways:
+
+| Cause | Effect |
+|---|---|
+| `COALESCE(fill_price, entry_limit)` | a limit is permission to cross, never the price paid - our own fills went limit 0.87 / filled 0.84 |
+| fee computed by `kalshi_fee_charged` | a faithful copy of the formula is still not the debit Kalshi applied |
+| settlement taken from `predictions.won` | our own guess at the result, not the exchange's |
+| `ACCOUNTED_SQL` excludes `pending` | a proposal that FILLS but never reaches a terminal status stays `pending` for ever - 71 such rows on 2026-09-21 alone, and 41 settled markets missing overall |
+
+**The fix: read `/portfolio/settlements` and never model money again.** Mirrored
+into a `settlements` table once a minute on the same beat as the settlement
+sweep, so it survives an outage and a report never waits on the network.
+
+**The trap, which cost the most time to find: `revenue` is not the payout.**
+Closing a position early is booked as BUYING THE OPPOSITE SIDE, and Kalshi nets
+the offsetting pair at $1 immediately - outside `revenue`, which then reads 0 on
+a market that won. `KXBTC15M-26SEP220615-15`: 2 NO bought for $1.60, closed by
+buying 2 YES for $0.012, `market_result` "no", `revenue` **0**. Scoring that by
+`revenue` books a $1.63 loss on a trade that made **+$0.365**. The correct
+payout is the netted pairs PLUS whatever actually settled:
+
+    payout = min(yes_count, no_count) * $1.00 + revenue/100
+    pnl    = payout - yes_total_cost - no_total_cost - fee_cost
+
+Verified against the live account: 88 settlements, API total and mirror total
+agree to **0.000000**.
+
+**The daily loss floor deliberately does NOT switch over.** It now takes the
+MORE NEGATIVE of the exchange figure and the old local reconstruction. A floor
+must never be relaxed by a source that can be stale or empty - if the mirror has
+not synced, reading it alone returns 0.00 and silently disables the floor on a
+day that has already lost money. It can be early to stop, never late.
+
+The cash-out message also stopped modelling its fees: `fill_detail` was already
+returning the charged amount and discarding it, and the entry fee was on
+`trade_proposals.fee_paid` the whole time.
+
+Covered by `tests/test_exchange_pnl.py`, which pins the netting case with the
+real API row. `scripts/sync_settlements.py` backfills and verifies.
+
+**Still open:** the `pending` status leak itself. Marking expired proposals
+`expired` would make "what did the filter actually take?" answerable - section
+33's filtering question currently rests on 17 identifiable trades out of 88.
+
+### 34a. The correction: right formula, wrong scope (2026-09-22)
+
+The fix above was verified against the API and still reported a number the
+operator could see was wrong. `Live: -1.40` went out while the Kalshi app
+showed **+$4.05 (+14.67%)**. The formula was correct; two things around it were
+not.
+
+**It was reporting ALL TIME. The app reports TODAY.** Every settlement since
+the account opened was being summed into a line printed beside a screen showing
+one day. The two are not close and never will be:
+
+| Market day (`window_ms`) | Markets | P&L |
+|---|---:|---:|
+| 2026-09-19 | 5 | -2.6753 |
+| 2026-09-20 | 30 | -2.6569 |
+| 2026-09-21 | 37 | +0.0022 |
+| 2026-09-22 | 18 | **+4.0734** |
+| all time | 90 | -1.2566 |
+
+**It was bucketing by SETTLEMENT time, which is not the market's time.** Kalshi
+settles in batches hours after close - `KXBTC15M-26SEP220445-45` settled at
+08:45 UTC, four hours after its window. Grouped by `settled_time`, 2026-09-21
+read **-3.3256**; grouped by the market's own time, parsed from the ticker, the
+same day reads **+0.0022**. The daily loss floor was being handed a window that
+mixed one day's trades with another's.
+
+**And the app's headline is not realised alone.** It is today's realised P&L
+PLUS the open position marked to the bid. Reproducing it needs both halves:
+
+    realised today (18 settled)          +3.9251
+    open position marked at the bid      +0.1415
+    total                                +4.0666
+    the app, six minutes earlier         +4.0500
+
+The 1.7c gap is the bid moving between the screenshot and the query.
+
+**Also corrected: the count.** Executed trades now come from
+`/portfolio/fills` - 159 of them across 90 markets - because counting
+`trade_proposals` counts intentions, misses anything filled outside the bot and
+miscounts anything stuck at `pending`.
+
+**And the dashboard was left quoting its own total.** It now prefers the same
+mirror, because two surfaces reporting different P&L for one account is the
+failure this whole path was rewritten to end.
+
+The lesson worth keeping: *agreeing with the API is not the same as being
+right.* Both numbers were faithfully computed from Kalshi's own fields. The
+error was in what question they answered, and only the operator's screen
+exposed it.
+
+## 35. The Telegram rewrite, and the two numbers that disagreed (2026-09-22)
+
+Operator specification: keep all four checks visible on entry-ready signals,
+executed orders AND rule-rejected signals; move only the extended context and
+the similar-regime read behind a DETAILS button; separate the trade OUTCOME
+from the predicted DIRECTION in results; and - the requirement that found a
+real defect - **every displayed check must come from the same decision
+snapshot**.
+
+**The contradiction was real.** Momentum was computed in two places with two
+conventions. `EntryRule.check_detail` signed it FOR OUR SIDE - a DOWN bet with
+the market falling scores +3.3 bps, because the market is moving our way -
+while `entry_context` printed the RAW market figure, -3.3 bps. The same alert
+carried both, three lines apart, with nothing to say which one the rule had
+used. `EntryRule.check_facts` is now the single source: `check_detail` derives
+from it, the alert renders from it, the fill report renders from it, and the
+confidence label is scored from it. Pinned by `tests/test_one_snapshot.py`.
+
+**A refusal now says by how much it missed.** The old paper alert printed only
+the NAMES of the failed gates - "model confidence, contract price band, target
+distance, momentum strength" - which states that a setup was refused four times
+without stating how close any of them came. Each fact now carries its own pass
+and fail wording, so `0.8x volatility - needs 1.5x` replaces `target distance`.
+
+**Results state the money and the call separately**, because they come apart.
+A DOWN position sold at 100c on a market that later settled UP is a PROFIT and
+a WRONG PREDICTION simultaneously. Headlining by the call books a loss the
+account never took; headlining by the money alone hides that the signal was
+wrong. Both are stated, with their own ticks.
+
+**A defect introduced and caught in the same pass:** with `pnl=None` the new
+layout rendered `LOSS - $0.00` under a red chip, asserting a loss on money that
+had simply not been computed. It now reports the CALL and says the money is
+unsettled - the same class of error as section 34, where a figure nobody had
+measured was presented as fact.
+
+Kept, though the specification did not show them: the rule-qualified marker on
+untraded signals (a signal the rule approved and nobody pressed is a trade that
+got away; one it refused is not), and the unconfirmed-fill warning (a limit is
+permission to cross, never the price paid).
+
+The DETAILS button replays text frozen at decision time rather than recomputing
+it, because re-deriving the context when the button is pressed would describe a
+market that has already moved - and the audit trail is the whole point.

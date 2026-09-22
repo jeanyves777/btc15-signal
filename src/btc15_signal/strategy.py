@@ -91,6 +91,88 @@ class EntryRule:
         failed = [label for passed, label in checks if not passed]
         return not failed, ", ".join(failed)
 
+    def check_facts(
+        self,
+        prediction: Prediction,
+        snapshot: MarketSnapshot,
+        ask: float,
+        *,
+        blocking_level: float | None = None,
+        levels_ready: bool = True,
+    ) -> list[dict]:
+        """The gates as structured facts, computed ONCE from ONE snapshot.
+
+        THE SINGLE SOURCE, and it has to be. Momentum is signed FOR OUR SIDE
+        here - a DOWN bet with the market falling scores +3.3 - while
+        `entry_context` printed the raw market figure, so the same trade read
+        "momentum +3.3 bps" in the gates and "momentum -3.3 bps" three lines
+        below. One number, one sign, one place it is computed.
+
+        Each fact carries its own pass and fail wording so that no surface has
+        to reformat it and drift: a check renders identically in an entry
+        alert, an execution report and a rejection.
+        """
+        distance = prediction.distance_bps / max(snapshot.volatility_5m_bps, 1.0)
+        direction = 1 if prediction.side == "UP" else -1
+        momentum = direction * snapshot.momentum_5m_bps
+        band = f"{self.min_ask * 100:.0f}–{self.max_ask * 100:.0f}¢"
+        facts = [
+            {
+                "name": "Price",
+                "passed": self.min_ask <= ask <= self.max_ask,
+                "pass_text": f"{ask * 100:.0f}¢ within {band}",
+                "fail_text": f"{ask * 100:.0f}¢ · needs {band}",
+                "value": ask,
+            },
+            {
+                "name": "Momentum",
+                "passed": (
+                    momentum >= self.min_momentum_bps
+                    and (not self.require_momentum_alignment or momentum > 0)
+                ),
+                "pass_text": f"{momentum:+.1f} bps",
+                "fail_text": (
+                    f"{momentum:+.1f} bps · needs "
+                    f"≥{self.min_momentum_bps:.0f} bps"
+                ),
+                "value": momentum,
+            },
+            {
+                "name": "Distance",
+                "passed": distance >= self.min_normalized_distance,
+                "pass_text": f"{distance:.1f}× volatility",
+                "fail_text": (
+                    f"{distance:.1f}× volatility · needs "
+                    f"{self.min_normalized_distance:.1f}×"
+                ),
+                "value": distance,
+            },
+            {
+                "name": "Model",
+                "passed": prediction.raw_probability >= self.min_raw_probability,
+                "pass_text": f"{prediction.raw_probability:.0%}",
+                "fail_text": (
+                    f"{prediction.raw_probability:.0%} · needs "
+                    f"{self.min_raw_probability:.0%}"
+                ),
+                "value": prediction.raw_probability,
+            },
+        ]
+        # Only a GATE belongs in Checks. When the level is not required it is a
+        # confidence contributor and lives in the details with its points, where
+        # a green tick cannot imply it had a say in whether this trade is
+        # allowed.
+        if self.require_blocking_level:
+            detail = self._level_detail(blocking_level, levels_ready)
+            facts.append({
+                "name": "Level",
+                "passed": levels_ready and blocking_level is not None,
+                "pass_text": detail,
+                "fail_text": detail,
+                "value": blocking_level,
+            })
+        return facts
+
     def check_detail(
         self,
         prediction: Prediction,
@@ -100,47 +182,22 @@ class EntryRule:
         blocking_level: float | None = None,
         levels_ready: bool = True,
     ) -> list[tuple[str, bool, str]]:
-        """Every gate with its verdict and the actual numbers, for display.
+        """The same gates as `(name, passed, detail)` triples.
 
-        A bare "rule says no: contract price band" does not say how close it
-        was, and a near miss is a different decision from a clear reject.
+        Derived from `check_facts` rather than recomputed, so the archive and
+        the alert can never disagree about a number.
         """
-        distance = prediction.distance_bps / max(snapshot.volatility_5m_bps, 1.0)
-        direction = 1 if prediction.side == "UP" else -1
-        momentum = direction * snapshot.momentum_5m_bps
-        checks = [
+        return [
             (
-                "price band",
-                self.min_ask <= ask <= self.max_ask,
-                f"{ask:.0%} vs {self.min_ask:.0%}-{self.max_ask:.0%}",
-            ),
-            (
-                "momentum",
-                momentum >= self.min_momentum_bps
-                and (not self.require_momentum_alignment or momentum > 0),
-                f"{momentum:+.1f} bps vs >={self.min_momentum_bps:.0f}",
-            ),
-            (
-                "distance",
-                distance >= self.min_normalized_distance,
-                f"{distance:.1f}x vol vs >={self.min_normalized_distance:.1f}",
-            ),
-            (
-                "model",
-                prediction.raw_probability >= self.min_raw_probability,
-                f"{prediction.raw_probability:.0%} vs >={self.min_raw_probability:.0%}",
-            ),
+                fact["name"].lower(),
+                fact["passed"],
+                fact["pass_text"] if fact["passed"] else fact["fail_text"],
+            )
+            for fact in self.check_facts(
+                prediction, snapshot, ask,
+                blocking_level=blocking_level, levels_ready=levels_ready,
+            )
         ]
-        # Only a GATE belongs in Checks. When the level is not required it is a
-        # confidence contributor and lives in Context with its points, where a
-        # green tick cannot imply it had a say in whether this trade is allowed.
-        if self.require_blocking_level:
-            checks.append((
-                "level",
-                levels_ready and blocking_level is not None,
-                self._level_detail(blocking_level, levels_ready),
-            ))
-        return checks
 
     def _level_detail(self, blocking_level: float | None, levels_ready: bool) -> str:
         if not levels_ready:

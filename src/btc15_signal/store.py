@@ -148,6 +148,43 @@ class Store:
                 PRIMARY KEY (strategy, window_open)
             )
         """)
+        # The exchange's own record of every settled market. Realised P&L is
+        # READ from here, not rebuilt: see KalshiExecutionClient.settlements.
+        self.db.execute("""
+            CREATE TABLE IF NOT EXISTS settlements (
+                ticker TEXT PRIMARY KEY, event_ticker TEXT, market_result TEXT,
+                yes_count REAL, yes_cost REAL, no_count REAL, no_cost REAL,
+                revenue_cents INTEGER, fee_cost REAL, pnl REAL,
+                settled_ms INTEGER, synced_at INTEGER, window_ms INTEGER
+            )
+        """)
+        # `window_ms` was added after the table shipped: settled_ms is hours
+        # later than the market itself, so grouping by it files a trade under
+        # the wrong day. See KalshiExecutionClient.market_open_ms.
+        if "window_ms" not in {
+            r[1] for r in self.db.execute("PRAGMA table_info(settlements)")
+        }:
+            self.db.execute("ALTER TABLE settlements ADD COLUMN window_ms INTEGER")
+        # What the 📋 DETAILS button shows. Written at decision time and read
+        # back verbatim, never recomputed: re-deriving the context when the
+        # button is pressed would describe a market that has already moved,
+        # and the whole point of the button is the audit trail of the moment
+        # the call was made.
+        self.db.execute("""
+            CREATE TABLE IF NOT EXISTS decision_details (
+                key TEXT PRIMARY KEY, body TEXT NOT NULL, created_at INTEGER NOT NULL
+            )
+        """)
+        # The broker's own record of every execution. The trade COUNT comes
+        # from here, not from `trade_proposals`, which records intentions.
+        self.db.execute("""
+            CREATE TABLE IF NOT EXISTS fills (
+                fill_id TEXT PRIMARY KEY, ticker TEXT NOT NULL, order_id TEXT,
+                action TEXT, side TEXT, count REAL, yes_price REAL, no_price REAL,
+                fee_cost REAL, is_taker INTEGER, filled_ms INTEGER,
+                window_ms INTEGER, synced_at INTEGER
+            )
+        """)
         self.db.execute("""
             CREATE TABLE IF NOT EXISTS settings (
                 key TEXT PRIMARY KEY, value REAL NOT NULL, updated_at INTEGER NOT NULL
@@ -845,6 +882,134 @@ class Store:
             )
         return out[-limit:]
 
+    def entry_fee(self, proposal_id: str) -> float | None:
+        """The fee Kalshi charged on the entry, or None if not read back yet."""
+        row = self.db.execute(
+            "SELECT fee_paid FROM trade_proposals WHERE id=?", (proposal_id,)
+        ).fetchone()
+        return float(row[0]) if row and row[0] is not None else None
+
+    def record_settlements(self, rows: list[dict], now_ms: int) -> int:
+        """Mirror Kalshi's settlement rows locally, so P&L survives an outage.
+
+        Upsert by ticker: re-syncing the same settlement must not double-count
+        it, and a settlement can be re-reported with corrected figures.
+        """
+        from datetime import datetime
+
+        from .execution import KalshiExecutionClient
+
+        written = 0
+        for row in rows:
+            ticker = row.get("ticker")
+            if not ticker:
+                continue
+            stamp = row.get("settled_time") or ""
+            try:
+                settled_ms = int(
+                    datetime.fromisoformat(stamp.replace("Z", "+00:00")).timestamp() * 1000
+                )
+            except (ValueError, AttributeError):
+                settled_ms = now_ms
+            self.db.execute(
+                "INSERT OR REPLACE INTO settlements VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (
+                    ticker, row.get("event_ticker"), row.get("market_result"),
+                    float(row.get("yes_count_fp") or 0),
+                    float(row.get("yes_total_cost_dollars") or 0),
+                    float(row.get("no_count_fp") or 0),
+                    float(row.get("no_total_cost_dollars") or 0),
+                    int(row.get("revenue") or 0),
+                    float(row.get("fee_cost") or 0),
+                    KalshiExecutionClient.settlement_pnl(row),
+                    settled_ms, now_ms,
+                    KalshiExecutionClient.market_open_ms(ticker) or settled_ms,
+                ),
+            )
+            written += 1
+        self.db.commit()
+        return written
+
+    def save_details(self, key: str, body: str, now_ms: int) -> None:
+        """Freeze the DETAILS text for one decision."""
+        self.db.execute(
+            "INSERT OR REPLACE INTO decision_details VALUES (?,?,?)",
+            (key, body, now_ms),
+        )
+        self.db.commit()
+
+    def details(self, key: str) -> str | None:
+        row = self.db.execute(
+            "SELECT body FROM decision_details WHERE key=?", (key,)
+        ).fetchone()
+        return row[0] if row else None
+
+    def record_fills(self, rows: list[dict], now_ms: int) -> int:
+        """Mirror the broker's executions. Upsert by `fill_id`."""
+        from datetime import datetime
+
+        from .execution import KalshiExecutionClient
+
+        written = 0
+        for row in rows:
+            fill_id = row.get("fill_id") or row.get("trade_id")
+            ticker = row.get("ticker") or row.get("market_ticker")
+            if not fill_id or not ticker:
+                continue
+            stamp = row.get("created_time") or ""
+            try:
+                filled_ms = int(
+                    datetime.fromisoformat(stamp.replace("Z", "+00:00")).timestamp() * 1000
+                )
+            except (ValueError, AttributeError):
+                filled_ms = int(row.get("ts") or 0) * 1000 or now_ms
+            self.db.execute(
+                "INSERT OR REPLACE INTO fills VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (
+                    fill_id, ticker, row.get("order_id"), row.get("action"),
+                    row.get("side"), float(row.get("count_fp") or 0),
+                    float(row.get("yes_price_dollars") or 0),
+                    float(row.get("no_price_dollars") or 0),
+                    float(row.get("fee_cost") or 0),
+                    1 if row.get("is_taker") else 0,
+                    filled_ms,
+                    KalshiExecutionClient.market_open_ms(ticker) or filled_ms,
+                    now_ms,
+                ),
+            )
+            written += 1
+        self.db.commit()
+        return written
+
+    def exchange_record(self, since_ms: int | None = None) -> tuple[int, int, float]:
+        """(markets, winners, dollars) straight off the exchange's own numbers.
+
+        Filtered on `window_ms` - the market's own time, parsed from the ticker
+        - and never on `settled_ms`. Kalshi settles in batches hours after
+        close, so a 04:45 market can settle at 08:45; filtering by settlement
+        would have handed the daily loss floor a window that mixed one day's
+        trades with another's.
+        """
+        where, args = "", []
+        if since_ms is not None:
+            where, args = " WHERE COALESCE(window_ms, settled_ms) >= ?", [since_ms]
+        row = self.db.execute(
+            "SELECT COUNT(*), SUM(pnl > 0), COALESCE(SUM(pnl), 0) "
+            f"FROM settlements{where}",
+            args,
+        ).fetchone()
+        return int(row[0] or 0), int(row[1] or 0), float(row[2] or 0.0)
+
+    def executed_trades(self, since_ms: int | None = None) -> tuple[int, int]:
+        """(fills, markets touched) from the broker's own execution record."""
+        where, args = "", []
+        if since_ms is not None:
+            where, args = " WHERE COALESCE(window_ms, filled_ms) >= ?", [since_ms]
+        row = self.db.execute(
+            f"SELECT COUNT(*), COUNT(DISTINCT ticker) FROM fills{where}", args
+        ).fetchone()
+        return int(row[0] or 0), int(row[1] or 0)
+
     def realised_record(self) -> tuple[int, int, float]:
         """(trades, wins, dollars) over orders that were ACTUALLY PLACED.
 
@@ -855,11 +1020,37 @@ class Store:
         trades nobody made, at a size nobody chose.
 
         This is the other question - "what did the account actually do?" - and
-        it uses only real rows: the count that was filled, the price that was
-        paid, and the fee that was charged. A position sold early is scored at
-        its exit price, because that is what it realised; scoring it by who
-        eventually won would credit back a loss already taken.
+        it is READ FROM THE EXCHANGE, never rebuilt. The local reconstruction
+        this replaced reported +1.06 on an account that was down -1.62: it
+        priced rows at `entry_limit` when no fill price was stored, modelled
+        the fee rather than reading the one charged, scored settlement by our
+        own `predictions.won`, and saw only 47 of 88 settled markets because
+        ACCOUNTED_SQL drops a proposal that filled but never reached a terminal
+        status. Every one of those is a way to be confidently wrong about money.
+
+        TODAY, not all time, because that is the figure the operator reads off
+        the Kalshi app and compares against. The app's "+$4.05 (+14.67%)" is
+        today's realised P&L plus the open position marked to the bid; an
+        all-time total reported beside it looks like the bot is lying. The two
+        differed by $5.47 on 2026-09-22: -1.40 all-time against +4.07 today.
+
+        The day is the MARKET's day, from `window_ms`, never the settlement
+        timestamp - Kalshi settles in batches hours late, and a 04:45 market
+        settling at 08:45 would otherwise land on the wrong side of midnight.
+
+        The fallback is the old local path, used only while the settlements
+        mirror is still empty - a fresh database, or before the first sync.
         """
+        import time
+
+        now_ms = int(time.time() * 1000)
+        markets, winners, dollars = self.exchange_record(now_ms - (now_ms % 86_400_000))
+        if markets:
+            return markets, winners, dollars + self.get_setting("open_mark", 0.0)
+        if self.exchange_record()[0]:
+            # The mirror is live, today simply has nothing settled in it yet.
+            return 0, 0, self.get_setting("open_mark", 0.0)
+
         rows = self.db.execute(
             "SELECT t.count, COALESCE(t.fill_price, t.entry_limit), t.fee_paid, "
             "t.exit_price, t.exit_count, p.won FROM trade_proposals t "
@@ -907,9 +1098,17 @@ class Store:
         last = today[1]
         since = (now_ms - last) / 1000 if last else 1e9
 
-        # One accounting path for both legs, shared with realised_record and the
-        # dashboard. They each had their own copy and disagreed about the same
-        # trade; a partially-sold position fell through every one of them.
+        # THE LIMIT TAKES THE WORSE OF THE TWO, DELIBERATELY.
+        #
+        # Reporting wants the exchange's truth, but a loss floor must never be
+        # relaxed by a source that can be stale or empty: if the settlements
+        # mirror has not synced - API down, fresh database, service just
+        # started - reading it alone would return 0.00 and silently switch the
+        # daily floor off on a day that had already lost money. So the local
+        # reconstruction is still computed, and the floor uses whichever is
+        # MORE negative. It can be early to stop, never late.
+        _, _, exchange_today = self.exchange_record(day_start)
+
         realised = 0.0
         for count, paid, fee, exit_price, exit_count, won in self.db.execute(
             "SELECT t.count, COALESCE(t.fill_price, t.entry_limit), t.fee_paid, "
@@ -928,6 +1127,7 @@ class Store:
             )
             if pnl is not None:
                 realised += pnl
+        realised = min(realised, exchange_today)
 
         # 'filled' covers a position partially sold too - mark_exited only
         # promotes to 'exited' once the whole position is gone, so the remainder

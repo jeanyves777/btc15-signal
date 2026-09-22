@@ -148,7 +148,7 @@ def test_the_header_says_so_when_nothing_has_been_traded():
     from btc15_signal import messages
 
     text = messages.scoreboard(9, 7, -0.33, live=(0, 0, 0.0))
-    assert "no trades placed yet" in text
+    assert "nothing settled yet" in text
     assert "-0.00" not in text  # never a money figure implying a real loss
 
 
@@ -426,7 +426,14 @@ def test_price_improvement_is_labelled_per_contract_and_in_total():
 
 
 def test_the_auto_status_money_says_which_period_it_covers():
-    """An unlabelled today-figure beside an all-time one read as a contradiction."""
+    """Both money figures cover TODAY, and each says what it counts.
+
+    They used to cover different periods - `realised today` for the loss floor
+    beside an all-time `Live:` - which read as the bot contradicting itself.
+    Both are now today; they still differ, because the floor counts only what
+    has SETTLED while the Live line also marks the open position, so the labels
+    have to carry that or the contradiction is simply back in a smaller form.
+    """
     from btc15_signal import messages
     from btc15_signal.autotrade import AutoLimits, AutoState
 
@@ -439,7 +446,8 @@ def test_the_auto_status_money_says_which_period_it_covers():
         blocked="",
     )
     assert "realised today" in text
-    assert "Live:" in text  # the all-time figure, distinctly labelled
+    assert "Live today:" in text
+    assert "Live:" not in text.replace("Live today:", "")
 
 
 # ------------------------- defects found while verifying the earlier fixes
@@ -460,7 +468,7 @@ def test_a_reporting_failure_cannot_erase_a_real_position():
     # call itself rather than its first argument.
     order_call = auto.index("await trader.execute_with_take_profit(")
     mark_failed = auto.index('"failed"')
-    send = auto.index("messages.auto_filled(")
+    send = auto.index("messages.order_filled(")
     # The failure handler sits between the order and the reporting, so only the
     # order call can reach it.
     assert order_call < mark_failed < send
@@ -505,7 +513,7 @@ def test_the_live_line_survives_an_empty_signal_record():
     from btc15_signal import messages
 
     text = messages.scoreboard(0, 0, 0.0, live=(1, 0, -0.85))
-    assert "Live: -0.85" in text
+    assert "Live today: -0.85" in text
     assert "No settled signals" in text  # both facts, not one replacing the other
 
 
@@ -783,7 +791,7 @@ def test_a_settlement_recap_says_the_money_was_already_counted():
         contract_price=0.72, pnl=0.25, qualified=True, basis="1 sold at 99%",
         contracts=1, exited_at=0.987,
     )
-    assert "Already counted when it sold" in recap
+    assert "already counted at the sale" in recap
 
     fresh = messages.settlement(
         head="H", ticker="T", side="UP", winner="UP", won=True, target=1.0,

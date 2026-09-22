@@ -36,8 +36,15 @@ def scoreboard(
     * **Signals** - was the call right? Counts every settled signal, including
       the great majority nobody ever placed an order for. Its dollar figure is
       explicitly a per-contract paper figure.
-    * **Live** - what did the account actually do? Real fills, real sizes, real
-      fees, from `Store.realised_record`.
+    * **Live** - what did the account actually do TODAY? Read from THE
+      EXCHANGE'S OWN settlement record via `Store.realised_record`, plus the
+      open position marked to the bid - the same two halves the Kalshi app adds
+      to show "+$4.05 (+14.67%)", so the two agree to the cent.
+
+      It is today's figure and not an all-time one because the operator reads
+      the app beside it. The reconstruction this replaced was wrong twice over:
+      it reported +1.06 on an account down -1.62, and then -1.40 all-time on a
+      day the app showed +4.05.
 
     Merging them is what produced a reported -$3.91 on a night whose real loss
     was $0.85: nine signals, eight of them never traded, priced at ten contracts
@@ -56,8 +63,8 @@ def scoreboard(
             trades, live_wins, dollars = live
             chip = "\U0001f4b0" if dollars >= 0 else "\U0001f4b8"
             head += (
-                f"\n{chip} <b>Live: {dollars:+,.2f}</b> · {trades} trade"
-                f"{'s' if trades != 1 else ''} ({live_wins}W-{trades - live_wins}L)"
+                f"\n{chip} <b>Live today: {dollars:+,.2f}</b> · {trades} settled"
+                f" ({live_wins}W-{trades - live_wins}L)"
             )
         return head
     rate = wins / settled
@@ -70,12 +77,12 @@ def scoreboard(
         return "\n".join(lines)
     trades, live_wins, dollars = live
     if not trades:
-        lines.append("\U0001f4b0 <b>Live: no trades placed yet</b>")
+        lines.append("\U0001f4b0 <b>Live today: nothing settled yet</b>")
     else:
         chip = "\U0001f4b0" if dollars >= 0 else "\U0001f4b8"
         lines.append(
-            f"{chip} <b>Live: {dollars:+,.2f}</b> · {trades} trade"
-            f"{'s' if trades != 1 else ''} ({live_wins}W-{trades - live_wins}L)"
+            f"{chip} <b>Live today: {dollars:+,.2f}</b> · {trades} settled"
+            f" ({live_wins}W-{trades - live_wins}L)"
         )
     return "\n".join(lines)
 
@@ -106,6 +113,133 @@ def _calibration(model: float, observed: float, samples: int) -> str:
         f"🧮 Model score {model:.0%} · observed {observed:.0%} "
         f"({samples} samples)"
     )
+
+
+def side_chip(side: str) -> str:
+    """The direction, as one glyph pair. Green up, red down, never ambiguous."""
+    return "\U0001f7e2⬆️" if side == "UP" else "\U0001f534⬇️"
+
+
+def _gap(price: float, target: float) -> str:
+    """How far BTC sits from the strike, in dollars and in plain words."""
+    delta = price - target
+    where = "above" if delta > 0 else "below"
+    return f"BTC ${abs(delta):,.0f} {where} target"
+
+
+def checks_block(facts: list[dict], title: str = "Checks") -> list[str]:
+    """The gates, rendered identically wherever they appear.
+
+    EVERY SURFACE RENDERS FROM `EntryRule.check_facts`, which computes them
+    once from one snapshot. They used to be reformatted per message, which is
+    how the same trade showed momentum as +3.3 bps in the gates and -3.3 bps in
+    the context below it - one number, two conventions, no way to tell which
+    the rule had actually used.
+    """
+    lines = [f"<b>{escape(title)}</b>"]
+    for fact in facts:
+        tick = "✅" if fact["passed"] else "❌"
+        text = fact["pass_text"] if fact["passed"] else fact["fail_text"]
+        lines.append(f"{tick} {escape(fact['name'])}: {escape(text)}")
+    return lines
+
+
+def signal_alert(
+    *,
+    side: str,
+    ticker: str,
+    ask: float,
+    price: float,
+    target: float,
+    remaining: int,
+    confidence: str,
+    facts: list[dict],
+    executable: bool,
+    status_line: str = "",
+    live_line: str = "",
+    verdict: str = "",
+) -> str:
+    """One signal - cleared, refused, or paper-only. One layout for all three.
+
+    The four checks stay VISIBLE in every case. They ARE the decision, and
+    hiding them behind a button on a refusal is what made a refusal
+    unreadable: the old paper alert printed only the names of the gates that
+    failed - "model confidence, contract price band, target distance, momentum
+    strength" - which says a setup was rejected four times over without saying
+    by how much any of them missed. `EntryRule.check_facts` carries the
+    measured value into the failure text, so a 0.8x distance reads as
+    "0.8x volatility - needs 1.5x" rather than as "target distance".
+
+    Only the extended context and the similar-regime read move behind DETAILS.
+    """
+    chip = side_chip(side)
+    if not verdict:
+        verdict = "ENTRY READY" if executable else "NOT EXECUTED"
+    lines = [
+        f"{chip} <b>{side} SIGNAL · {verdict}</b>",
+        f"<code>{escape(ticker)}</code>",
+        "",
+        f"Price {ask * 100:.0f}¢ · {_gap(price, target)}",
+        f"⏱ {remaining // 60}m {remaining % 60:02d}s · "
+        f"Confidence {escape(confidence)}",
+        "",
+        *checks_block(facts),
+    ]
+    if status_line or live_line:
+        lines.append("")
+    if status_line:
+        lines.append(status_line)
+    if live_line:
+        lines.append(live_line)
+    return "\n".join(lines)
+
+
+def order_filled(
+    *,
+    side: str,
+    ticker: str,
+    contracts: float,
+    paid: float,
+    confidence: str,
+    facts: list[dict],
+    band_held: str = "",
+    exact: bool = True,
+) -> str:
+    """An order that actually filled, with the gates AS THEY WERE at execution.
+
+    The checks are the ones the decision was taken on, not a re-read: re-running
+    them at report time would describe a market that has already moved, and the
+    whole point of showing them here is the audit trail.
+    """
+    cost = contracts * paid
+    lines = [
+        f"{side_chip(side)} <b>{side} ORDER FILLED</b>",
+        f"<code>{escape(ticker)}</code>",
+        "",
+        f"\U0001f4e6 {contracts:g} contract{'s' if contracts != 1 else ''} "
+        f"at {paid * 100:.0f}¢",
+        f"\U0001f4b5 Cost ${cost:,.2f} · Maximum profit "
+        f"${contracts - cost:,.2f}",
+        "",
+        *checks_block(facts, "Checks at execution"),
+    ]
+    if band_held:
+        lines.append(f"✅ Band held: {escape(band_held)}")
+    lines += [
+        "",
+        f"\U0001f9e0 Confidence: {escape(confidence)}",
+        "⏳ Holding to settlement",
+    ]
+    if not exact:
+        # The fill was never read back, so the cost above is the posted limit.
+        # A limit is permission to cross, never the price paid - limit 0.87
+        # filled at 0.84 - so presenting it as settled fact overstates the cost
+        # and understates the profit.
+        lines.append(
+            "⚠️ <i>Priced at the posted limit · the fill was not confirmed, "
+            "so the real cost was this or lower.</i>"
+        )
+    return "\n".join(lines)
 
 
 def entry_alert(
@@ -296,6 +430,7 @@ def settlement(
     exited_at: float | None = None,
     paper: bool = False,
     exact: bool = True,
+    live_line: str = "",
 ) -> str:
     """How a window closed, and what it did to the account.
 
@@ -314,67 +449,118 @@ def settlement(
     # placed" - the tick meant the call was right, the reader saw a payday.
     # Three separate facts, each now stated in its own words:
     #   what the market did · what we said · what it did to the account.
-    right = "right" if won else "wrong"
+    # TWO INDEPENDENT FACTS, NEVER COLLAPSED INTO ONE VERDICT.
+    #
+    #   the MONEY  - did the account gain or lose?
+    #   the CALL   - did the market go the way the signal said?
+    #
+    # They come apart, and the case where they do is the one worth reading: a
+    # position sold at 100c on a DOWN call that later settled UP is a PROFIT
+    # and a WRONG PREDICTION at the same time. Headlining it by the call would
+    # book a loss the account never took; headlining it by the money alone
+    # would hide that the signal was wrong. Both are stated, on their own
+    # lines, with their own ticks.
+    chip_side = side_chip(side)
+    made_money = pnl is not None and pnl >= 0
+    money_tick = "✅\U0001f4b0" if made_money else "❌\U0001f4b8"
+    priced = f" at {contract_price * 100:.0f}¢" if contract_price else ""
+
     if paper:
-        chip, verdict = "\U0001f4dd", "SIGNAL ONLY · NOT TRADED"
-    elif exited_at is not None:
-        made_money = pnl is not None and pnl >= 0
-        chip = "\U0001f4b0" if made_money else "\U0001f4b8"
-        verdict = f"SOLD EARLY · {'PROFIT' if made_money else 'LOSS'}"
-    else:
-        made_money = pnl is not None and pnl >= 0
-        chip = "\U0001f4b0" if made_money else "\U0001f4b8"
-        verdict = "PROFIT" if made_money else "LOSS"
-    lines = [
-        head,
-        RULE,
-        f"{chip} <b>{verdict}</b> · {escape(ticker)}",
-        f"\U0001f3c1 Market settled <b>{winner}</b> · target <code>${target:,.2f}</code>",
-    ]
-    priced = f" at {contract_price:.0%}" if contract_price else ""
-    mark = "✅" if won else "❌"
-    lines.append(
-        f"\U0001f4dd We said <b>{side}</b>{priced} · {mark} <b>{right}</b>"
-    )
-    if paper:
-        why = "the rule liked it, but no order was placed" if qualified else "paper only"
-        lines.append(f"\U0001f4a4 <i>Not traded - {why}.</i>")
+        # No order, so there is no money outcome - only whether the call was
+        # right. The tick here is about the CALL, and the money line says zero
+        # explicitly rather than being left off and read as an omission.
+        tick = "✅\U0001f4c4" if won else "❌\U0001f4c4"
+        lines = [
+            f"{tick} <b>SIGNAL {'WON' if won else 'LOST'} · NOT TRADED</b>",
+            f"<code>{escape(ticker)}</code>",
+            "",
+            f"{chip_side} Signal: <b>{side}</b>{priced}",
+            f"\U0001f3c1 Market settled <b>{winner}</b>",
+            # WHY it was not traded, not just that it was not. A signal the
+            # rule approved and nobody pressed is a different miss from one the
+            # rule refused, and only the first is a trade that got away.
+            "\U0001f4a4 No order was executed · "
+            + ("rule qualified it" if qualified else "rule declined it"),
+            f"\U0001f4b5 {'Profit' if won else 'Loss'}: $0.00",
+        ]
+        if live_line:
+            lines.append(live_line)
+        return "\n".join(lines)
+
+    # "+$0.22" / "-$0.77": the sign leads, the currency symbol sits inside it.
+    # A bare "+0.22" beside a dollar cost two lines down reads as a different
+    # unit, and a hyphen is easy to lose at phone size next to a red chip.
+    if pnl is None:
+        # NO MONEY FIGURE MEANS NO VERDICT ABOUT MONEY. Defaulting to zero put
+        # "LOSS - $0.00" under a red chip on a position whose P&L simply had
+        # not been computed, which asserts a loss the account may never have
+        # taken. Describe the CALL, say the money is still unknown, stop there.
+        tick = "✅" if won else "❌"
+        lines = [
+            f"{tick} <b>{side} CALL {'CORRECT' if won else 'WRONG'} · "
+            f"P&amp;L PENDING</b>",
+            f"<code>{escape(ticker)}</code>",
+            "",
+            f"{chip_side} Bought <b>{side}</b>{priced}",
+            f"\U0001f3c1 Market settled <b>{winner}</b>",
+            "\U0001f9fe <i>The money for this one is not settled yet.</i>",
+        ]
+        if live_line:
+            lines.append(live_line)
+        return "\n".join(lines)
+
+    amount = f"{'+' if pnl >= 0 else chr(0x2212)}${abs(pnl):,.2f}"
+    cost = contracts * contract_price if contracts and contract_price else None
+
     if exited_at is not None:
-        # Said plainly, because the verdict above now describes the sale rather
-        # than the settlement and the two can point opposite ways.
-        outcome = "would have won" if won else "would have lost"
+        lines = [
+            f"{money_tick} <b>SOLD EARLY · {amount}</b>",
+            f"<code>{escape(ticker)}</code>",
+            "",
+            f"{chip_side} Bought <b>{side}</b>{priced}",
+            f"\U0001f4b5 Sold before expiry at {exited_at * 100:.0f}¢",
+            f"\U0001f3c1 Market later settled <b>{winner}</b>",
+            f"{'✅' if won else '❌'} {side} prediction was "
+            f"{'correct' if won else 'wrong'}",
+        ]
+        if made_money and not won:
+            lines.append(
+                "✅ Trade remained profitable because it exited early"
+            )
+        elif not made_money and won:
+            lines.append(
+                "❌ Trade still lost because it exited below cost"
+            )
+        # The running total does not move on this message, and that is correct:
+        # the money was counted the moment the sale happened. Unsaid, a second
+        # message carrying the same total reads as a total that has stalled.
+        lines += ["", "🧾 <i>Profit was already counted at the sale.</i>"]
+    else:
+        lines = [
+            f"{money_tick} <b>{'WIN' if made_money else 'LOSS'} · {amount}</b>",
+            f"<code>{escape(ticker)}</code>",
+            "",
+            f"{chip_side} Bought <b>{side}</b>{priced}",
+            f"\U0001f3c1 Market settled <b>{winner}</b>",
+        ]
+        if cost is not None and pnl is not None:
+            # Cost, not max payout, is the money at risk - on a loss it IS the
+            # loss, so it is named rather than left to be inferred.
+            outcome = (
+                f"Profit ${pnl:,.2f}" if made_money else f"Lost ${abs(pnl):,.2f}"
+            )
+            lines.append(f"\U0001f4b5 Cost ${cost:,.2f} · {outcome}")
+        elif pnl is not None:
+            lines.append(f"\U0001f4b5 {amount} on {escape(basis)} after fees")
+
+    if live_line:
+        lines.append(live_line)
+    if not exact:
+        # The fill was never read back, so this is priced at the posted limit.
         lines.append(
-            f"\U0001f504 <i>Sold at {exited_at:.0%} before expiry · "
-            f"holding {outcome}</i>"
+            "⚠️ <i>Priced at the posted limit · the fill was never "
+            "confirmed, so the real cost was this or lower.</i>"
         )
-    if pnl is not None:
-        money = "\U0001f4b0" if pnl >= 0 else "\U0001f4b8"
-        # Cost, not max payout, is the money at risk - on a loss it IS the loss.
-        cost = (
-            f" · cost ${contracts * contract_price:,.2f}"
-            if contracts and contract_price
-            else ""
-        )
-        lines.append(f"{money} <b>{pnl:+,.2f}</b> on {basis}{cost} after fees")
-        if exited_at is not None:
-            # The running total in the header does not move here, and that is
-            # correct: this money was counted the moment the sale happened.
-            # Without saying so, a second message carrying the same total reads
-            # as a total that has stopped updating.
-            lines.append(
-                "🧾 <i>Already counted when it sold - this is the recap, "
-                "not a second gain.</i>"
-            )
-        if not exact:
-            # The fill was never read back, so this is priced at the posted
-            # limit. Only the order confirmation said so before; the settlement
-            # report presented the same estimate as settled fact.
-            lines.append(
-                "⚠️ <i>Priced at the posted limit · the fill was never "
-                "confirmed, so the real cost was this or lower.</i>"
-            )
-    elif paper:
-        lines.append("\U0001f4b5 <i>Nothing at risk, nothing made.</i>")
     return "\n".join(lines)
 
 
@@ -434,6 +620,26 @@ def execute_buttons(
     """
     label = f"⚠️ Execute anyway {count}" if override else f"✅ Execute {count}"
     return [(label, f"execute:{proposal_id}"), ("⏭ Skip", f"skip:{proposal_id}")]
+
+
+def signal_buttons(
+    side: str, proposal_id: str | None, key: str, *, override: bool = False
+) -> list[tuple[str, str]]:
+    """The action, then DETAILS. The action names the DIRECTION.
+
+    "Execute 1" does not say which way, so on a phone the only thing telling
+    you whether you are buying UP or DOWN was a line further up the message.
+    The button now carries the side and its colour, because that button is the
+    last thing read before real money moves.
+    """
+    buttons: list[tuple[str, str]] = []
+    if proposal_id:
+        verb = "MANUAL" if override else "EXECUTE"
+        buttons.append(
+            (f"{side_chip(side)} {verb} {side}", f"execute:{proposal_id}")
+        )
+    buttons.append(("\U0001f4cb DETAILS", f"details:{key}"))
+    return buttons
 
 
 def status(
@@ -595,6 +801,8 @@ def cash_out(
     remaining: int,
     note: str,
     sold: bool,
+    entry_fee: float | None = None,
+    exit_fee: float | None = None,
 ) -> str:
     """A position banked before expiry because it had already earned its money.
 
@@ -608,13 +816,16 @@ def cash_out(
     # announced "+0.27" and the settlement four minutes later said "+0.25" for
     # the same trade - which reads as the running total failing to move. Every
     # other money figure here is net; this one was the exception.
+    # THE FEES ARE READ, NOT MODELLED, whenever the exchange has told us what
+    # it charged. `kalshi_fee_charged` is a faithful copy of the published
+    # formula and still only a copy; the account is debited by Kalshi, not by
+    # this function. The model stays as the fallback for the moment between
+    # placing the exit and reading its fill back.
     from .validation import kalshi_fee_charged
 
-    profit = (
-        (bid - paid) * count
-        - kalshi_fee_charged(paid, count)
-        - kalshi_fee_charged(bid, count)
-    )
+    fee_in = entry_fee if entry_fee is not None else kalshi_fee_charged(paid, count)
+    fee_out = exit_fee if exit_fee is not None else kalshi_fee_charged(bid, count)
+    profit = (bid - paid) * count - fee_in - fee_out
     lines = [
         head,
         RULE,

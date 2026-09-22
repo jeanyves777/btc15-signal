@@ -115,7 +115,17 @@ def load(db_path: str, stake: float) -> dict:
     pending = db.execute(
         "SELECT COUNT(*) FROM predictions WHERE won IS NULL"
     ).fetchone()[0]
-    return {"signals": signals, "pending": pending, "stake": stake}
+    # The broker's own account record, when the mirror has been synced. Read
+    # defensively: an older database has no `settlements` table at all.
+    try:
+        broker = db.execute(
+            "SELECT COUNT(*), SUM(pnl > 0), COALESCE(SUM(pnl), 0) FROM settlements"
+        ).fetchone()
+    except sqlite3.OperationalError:
+        broker = None
+    return {
+        "signals": signals, "pending": pending, "stake": stake, "broker": broker,
+    }
 
 
 def summarise(data: dict) -> dict:
@@ -132,9 +142,18 @@ def summarise(data: dict) -> dict:
     staked = round(data["stake"] * len(scored), 2)
 
     # The account, as distinct from the paper record above.
+    #
+    # PREFER THE BROKER. The per-signal reconstruction below is kept because it
+    # is what draws the per-day chart, but its TOTAL must not be allowed to
+    # disagree with the one Telegram prints: two surfaces quoting different P&L
+    # for the same account is exactly the failure this whole path was rewritten
+    # to end. Where the settlements mirror has rows, it wins.
     real_rows = [s for s in signals if s["real"] is not None]
     real_net = round(sum(s["real"] for s in real_rows), 4)
     real_wins = sum(1 for s in real_rows if s["real"] > 0)
+    broker = data.get("broker")
+    if broker and broker[0]:
+        _markets, real_wins, real_net = broker[0], broker[1], round(broker[2], 4)
     # Cost is price x contracts. Summing the price alone reported $0.84 spent
     # on a ten-contract position that cost $8.40, and made the ROI ten times too
     # large in the denominator's favour.

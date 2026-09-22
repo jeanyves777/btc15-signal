@@ -115,6 +115,44 @@ def samples_needed(store: Store, effect: float = 0.01) -> int:
     return int((1.96 * (variance ** 0.5) / effect) ** 2) if variance else 0
 
 
+def confidence_label(facts: list[dict], opened: int, blocking_level: float | None) -> str:
+    """HIGH / MEDIUM / LOW for the signal header.
+
+    Scored from the SAME facts the checks are rendered from, so the word and
+    the ticks below it can never disagree - and through the same regime
+    arithmetic `entry_context` uses, so the header and the DETAILS breakdown
+    are two views of one number rather than two numbers.
+
+    The clock and the protective level adjust it and never gate it: both were
+    tried as gates and both measured as noise (FINDINGS 23, p=0.090 and
+    p=0.542). The operator's standing rule is that time of day may raise or
+    lower confidence but can never stop the 15-minute system.
+    """
+    agreeing = sum(1 for fact in facts if fact["passed"])
+    base = regime_base_points(agreeing)
+    clock = regime_confidence_points(weight_at(opened))
+    level = level_points(blocking_level is not None)
+    return regime_label(max(0, min(100, base + clock + level)))
+
+
+def live_line(store: Store) -> str:
+    """One line of real money, for the new compact signal layout.
+
+    The full scoreboard header is three lines of paper statistics above one
+    line of money. On a signal alert - the message read fastest and acted on
+    soonest - that buries the only figure that is actually the account. This
+    is that figure alone, from the same broker-backed source.
+    """
+    markets, winners, dollars = store.realised_record()
+    if not markets:
+        return "\U0001f4b0 Live today: nothing settled yet"
+    sign = "+" if dollars >= 0 else "−"
+    return (
+        f"\U0001f4b0 Live today: {sign}${abs(dollars):,.2f} · "
+        f"{winners}W–{markets - winners}L"
+    )
+
+
 def head_for(store: Store, settings: Settings) -> str:
     """The scoreboard header every Telegram message opens with.
 
@@ -412,8 +450,17 @@ async def process_telegram(
             continue
         data = callback.get("data", "")
         action, separator, proposal_id = data.partition(":")
-        if not separator or action not in {"execute", "skip"}:
+        if not separator or action not in {"execute", "skip", "details"}:
             await telegram.answer_callback(callback_id, "Invalid action")
+            continue
+        if action == "details":
+            # Read back verbatim, never recomputed. The button exists to show
+            # what was true when the call was made, and re-deriving it here
+            # would quietly describe a market that has since moved.
+            body = store.details(proposal_id)
+            await telegram.answer_callback(callback_id, "" if body else "No details stored")
+            if body:
+                await telegram.send(body)
             continue
         if action == "skip":
             skipped = store.skip_proposal(proposal_id)
@@ -986,6 +1033,9 @@ def entry_context(
 # cannot slow anything down, which is the only acceptable cost for something
 # sitting this close to an order.
 POLL_MARKS: dict[str, int] = {}
+# Last successful settlement mirror, so the sync is throttled to once a
+# minute rather than running on every poll.
+SETTLEMENT_SYNC: dict[str, int] = {}
 
 
 def mark(name: str) -> None:
@@ -1610,24 +1660,40 @@ async def primary_signal(
                                 result.entry_order_id, contract_ask,
                                 result.filled_count,
                             )
+                            # THE GATES AS THEY WERE WHEN THE ORDER WENT OUT,
+                            # from the same `check_facts` the alert renders.
+                            # Re-deriving them at report time would describe a
+                            # market that has already moved, and the point of
+                            # showing them on a fill is the audit trail.
+                            fill_facts = rule.check_facts(
+                                prediction, snapshot, contract_ask,
+                                blocking_level=blocking_level,
+                                levels_ready=levels_ready,
+                            )
+                            why = decision_record(
+                                store, settings, claimed, contract,
+                                snapshot, prediction, contract_ask,
+                                opened, remaining, now_ms, settled_s,
+                                blocking_level, paid, fee,
+                            )
+                            store.save_details(claimed.id, why, now_ms)
                             await telegram.send(
-                                messages.auto_filled(
-                                    head=head_for(store, settings),
-                                    ticker=contract.ticker,
+                                messages.order_filled(
                                     side=prediction.side,
-                                    price=paid,
-                                    count=filled_count,
-                                    note=result.note,
-                                    limit=contract_ask,
-                                    fee=fee,
-                                    exact=exact,
-                                    why=decision_record(
-                                        store, settings, claimed, contract,
-                                        snapshot, prediction, contract_ask,
-                                        opened, remaining, now_ms, settled_s,
-                                        blocking_level, paid, fee,
+                                    ticker=contract.ticker,
+                                    contracts=filled_count,
+                                    paid=paid,
+                                    confidence=confidence_label(
+                                        fill_facts, opened, blocking_level
                                     ),
-                                )
+                                    facts=fill_facts,
+                                    band_held=(
+                                        f"{settled_s:.0f}/"
+                                        f"{settings.entry_band_settle_s}s"
+                                    ),
+                                    exact=exact,
+                                ),
+                                [("\U0001f4cb WHY THIS TRADE", f"details:{claimed.id}")],
                             )
                         else:
                             # Nothing was bought. Announcing a cost here claimed
@@ -1672,6 +1738,37 @@ async def primary_signal(
         # nothing further to say until something happens.
         return
     head = head_for(store, settings)
+    # ONE SNAPSHOT, COMPUTED ONCE, USED BY EVERY SURFACE BELOW.
+    #
+    # The gates, the context and the shadow read all describe the same instant,
+    # so they are derived here and passed down rather than each recomputing
+    # from `snapshot`. When they each did their own arithmetic the same alert
+    # printed momentum as +3.3 bps in the checks and -3.3 bps in the context -
+    # one signed for our side, one raw - with nothing to say which the rule
+    # had actually used.
+    facts = rule.check_facts(
+        prediction, snapshot, contract_ask,
+        blocking_level=blocking_level, levels_ready=levels_ready,
+    )
+    detail_body = "\n".join(
+        [f"\U0001f4cb <b>DETAILS</b> · <code>{contract.ticker}</code>", messages.RULE]
+        + [
+            f"  · {label}: <code>{value}</code>"
+            for label, value in entry_context(
+                settings, snapshot, prediction, contract_ask,
+                priced_edge, settled_s, opened,
+                rule_match=rule_match, blocking_level=blocking_level,
+                model_ok=prediction.raw_probability >= 0.9,
+            )
+        ]
+    )
+    shadow = shadow_read(
+        store, settings, contract, snapshot, prediction, contract_ask,
+        opened, remaining, now_ms, rule_match,
+    )
+    if shadow:
+        detail_body += "\n" + messages.RULE + "\n" + shadow
+    confidence = confidence_label(facts, opened, blocking_level)
     if offer_button:
         proposal = create_proposal(
             store,
@@ -1689,54 +1786,54 @@ async def primary_signal(
             now_ms,
             settings.proposal_seconds,
         )
-        text = messages.entry_alert(
-            head=head,
-            live=qualified,
+        # The status line says what is standing between this signal and an
+        # order - which on 2026-09-21 was a settle timer the message never
+        # mentioned while showing five green ticks.
+        if qualified and auto_blocked:
+            status = f"⏳ Auto waiting: {auto_blocked}"
+        elif qualified:
+            status = "✅ Auto will take this"
+        else:
+            failed = sum(1 for fact in facts if not fact["passed"])
+            status = f"\U0001f916 Auto declined: {failed} check{'s' if failed != 1 else ''} failed"
+        missing = missing_for_execution(settings)
+        if missing:
+            status += f"\n⚙️ A press will be refused — still needed: {missing}"
+        text = messages.signal_alert(
             side=prediction.side,
+            ticker=contract.ticker,
             ask=contract_ask,
             price=snapshot.price,
             target=snapshot.target,
             remaining=remaining,
-            ticker=contract.ticker,
-            model=prediction.raw_probability,
-            observed=calibration.observed_rate,
-            samples=calibration.samples,
-            rule_ok=rule_match,
-            rule_reason=failed_checks,
-            checks=rule.check_detail(
-                prediction, snapshot, contract_ask,
-                blocking_level=blocking_level, levels_ready=levels_ready,
-            ),
-            missing=missing_for_execution(settings),
-            auto_blocked=auto_blocked,
-            similar=shadow_read(
-                store, settings, contract, snapshot, prediction, contract_ask,
-                opened, remaining, now_ms, rule_match,
-            ),
-            context=entry_context(
-                settings, snapshot, prediction, contract_ask,
-                priced_edge, settled_s, opened,
-                rule_match=rule_match, blocking_level=blocking_level,
-                model_ok=prediction.raw_probability >= 0.9,
-            ),
+            confidence=confidence,
+            facts=facts,
+            executable=qualified,
+            status_line=status,
+            live_line=live_line(store),
         )
-        buttons = messages.execute_buttons(
-            proposal.count, proposal.id, override=not rule_match
+        store.save_details(proposal.id, detail_body, now_ms)
+        buttons = messages.signal_buttons(
+            prediction.side, proposal.id, proposal.id, override=not rule_match
         )
     else:
-        text = messages.no_entry_alert(
-            head=head,
+        key = f"w{opened}"
+        text = messages.signal_alert(
             side=prediction.side,
+            ticker=contract.ticker,
             ask=contract_ask,
             price=snapshot.price,
             target=snapshot.target,
             remaining=remaining,
-            reason=failed_checks or "validated rule is disabled",
-            model=prediction.raw_probability,
-            observed=calibration.observed_rate,
-            samples=calibration.samples,
+            confidence=confidence,
+            facts=facts,
+            executable=False,
+            verdict="NO ENTRY",
+            status_line="⚪ Paper only · no order placed",
+            live_line=live_line(store),
         )
-        buttons = None
+        store.save_details(key, detail_body, now_ms)
+        buttons = messages.signal_buttons(prediction.side, None, key)
     await telegram.send(text, buttons)
 
     schedule_commentary(
@@ -1912,6 +2009,11 @@ async def report_settlement(
         exited_at=trade["exit_price"] if trade and trade["exit_price"] else None,
         paper=trade is None,
         exact=trade["confirmed"] if trade else True,
+        # The compact money line, from the broker-backed record. The full
+        # scoreboard header no longer leads a result message: what the account
+        # did is the point, and three lines of paper statistics above it is
+        # what made the real figure the easiest thing on screen to miss.
+        live_line=live_line(store),
     )
     # "Qualified" means the rule liked the setup, NOT that an order was placed:
     # it is `int(rule_match)` recorded at alert time, and most of these were
@@ -1982,6 +2084,9 @@ async def cash_out_exit(
         return
 
     captured = (bid - paid) / available
+    # The entry fee Kalshi actually charged, stored when the fill was read back.
+    entry_fee = store.entry_fee(proposal_id)
+    exit_fee = None
     try:
         result = await trader.close_position(
             ticker, side, count, bid, floor=settings.min_exit_price
@@ -1993,9 +2098,10 @@ async def cash_out_exit(
             except (httpx.HTTPError, OSError, ValueError, KeyError):
                 detail = None
             if detail:
-                sold_at, sold_count, _fee = detail
+                sold_at, sold_count, charged = detail
                 store.mark_exited(proposal_id, sold_at, sold_count, result.note)
                 bid = sold_at
+                exit_fee = charged
         print(f"cash-out[{ticker} {side}]: {result.status} - {result.note}", flush=True)
     except (httpx.HTTPError, OSError, RuntimeError, ValueError) as exc:
         result = None
@@ -2014,6 +2120,8 @@ async def cash_out_exit(
             remaining=remaining,
             note=result.note if result else "cash-out order failed; still holding",
             sold=sold,
+            entry_fee=entry_fee,
+            exit_fee=exit_fee,
         )
     )
 
@@ -2251,6 +2359,35 @@ async def service() -> None:
                         await report_settlement(
                             store, telegram, row, result, settings, sizing, basis
                         )
+
+                # Pull the exchange's own settlement record. This is what
+                # every money figure is read from - Telegram, the dashboard and
+                # the daily floor - so it runs on the same beat as settling,
+                # not on a timer that could drift behind a report.
+                #
+                # Kalshi credits a settlement a minute or two after close, so a
+                # sync right after our own sweep may miss the window that just
+                # ended; the next pass picks it up. Never fatal: a failed sync
+                # leaves the mirror as it was, and the floor falls back to the
+                # local reconstruction, which can only be more conservative.
+                if trader is not None and now_ms - SETTLEMENT_SYNC.get("at", 0) >= 60_000:
+                    try:
+                        store.record_settlements(await trader.settlements(), now_ms)
+                        # Executions come from the broker for the same reason
+                        # the money does: `trade_proposals` records what the
+                        # bot INTENDED, misses anything filled outside it, and
+                        # miscounts anything whose status never went terminal.
+                        store.record_fills(await trader.fills(), now_ms)
+                        # The app's headline is today's realised PLUS the open
+                        # position marked to the bid. Both halves or the number
+                        # does not match what the operator is looking at.
+                        open_n, open_mark = await trader.open_mark()
+                        store.set_setting("open_mark", open_mark, now_ms)
+                        store.set_setting("open_positions", open_n, now_ms)
+                        SETTLEMENT_SYNC["at"] = now_ms
+                        mark("settlement_sync")
+                    except Exception as exc:  # noqa: BLE001
+                        print(f"settlement sync failed: {exc!r}", flush=True)
 
                 mark("settlements")
                 try:
