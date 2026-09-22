@@ -1701,6 +1701,7 @@ class Store:
         carries its own share and the remainder is left owing the rest.
         """
         floor = now_ms - self.LEDGER_SYNC_LOOKBACK_MS
+        touched: set[str] = set()
         for fill in self._dicts(
             "SELECT fill_id, ticker, side, count, yes_price, no_price, fee_cost, "
             "filled_ms, window_ms FROM fills WHERE action = 'sell' AND filled_ms >= ?",
@@ -1726,28 +1727,39 @@ class Store:
                 - float(fill["fee_cost"] or 0.0),
                 6,
             )
-            # SUPERSEDE THE PROVISIONAL EVENT, carrying its applied amount.
-            # Deleting an event the fold has already applied would strand that
-            # amount and move the deficit for no reason; the broker's id is
-            # the identity we keep, the arithmetic is unchanged.
-            provisional = f"cash_out:{fill['ticker']}:{int(fill['filled_ms'])}"
-            carried = self.db.execute(
-                "SELECT applied FROM realised_events WHERE event_id = ?",
-                (provisional,),
-            ).fetchone()
             self.record_realised_event(
                 event_id, fill["ticker"], int(fill["filled_ms"]), amount,
                 "cash_out", now_ms, fill["window_ms"],
             )
-            if carried is not None:
-                self.db.execute(
-                    "UPDATE realised_events SET applied = ? WHERE event_id = ?",
-                    (carried[0], event_id),
-                )
-                self.db.execute(
-                    "DELETE FROM realised_events WHERE event_id = ?", (provisional,)
-                )
-                self.db.commit()
+            touched.add(fill["ticker"])
+
+        # SUPERSEDE THE PROVISIONALS, PER TICKER, ALL OF THEM.
+        #
+        # One exit ORDER can produce several FILLS - a resting sell walked
+        # through two price levels is two executions at two instants. The
+        # provisional event was keyed on the moment the bot noticed, which
+        # matches at most one of them, so matching provisional-to-fill by
+        # timestamp would leave the rest behind and double-count the sale.
+        # Once ANY broker fill exists for a market, every provisional for that
+        # market is replaced by the real ones.
+        for ticker in touched:
+            # A provisional id is "cash_out:{ticker}:{ms}" - three parts. A
+            # broker-backed one is "cash_out:{fill_id}" - two.
+            provisionals = [
+                event["event_id"] for event in self.settlement_events(ticker)
+                if event["source"] != "exchange"
+                and event["event_id"].count(":") >= 2
+            ]
+            if not provisionals:
+                continue
+            self.db.executemany(
+                "DELETE FROM realised_events WHERE event_id = ?",
+                [(event_id,) for event_id in provisionals],
+            )
+            self.db.commit()
+            # THE AMOUNT OR THE TIMESTAMP HAS CHANGED, so the ordered fold is
+            # no longer a valid continuation of the stored figure. Replay it.
+            self.rebuild_deficit(now_ms)
 
     def _entry_basis(self, ticker: str) -> tuple[float, float, float] | None:
         """(price, contracts, fee) of the BUY side, from the broker's fills."""
@@ -2113,6 +2125,28 @@ class Store:
         from .capital import ny_day_start_ms
 
         return ny_day_start_ms(now_ms)
+
+    def rebuild_deficit(self, now_ms: int, plan_steps: int | None = None):
+        """Replay the deficit from zero over every event, in realisation order.
+
+        The incremental fold is a valid continuation only while history is
+        append-only. It is not, twice over: the exchange revises a figure a
+        cash-out banked, and a provisional exit is replaced by the broker's
+        real fills - which can be several, at different instants, summing to a
+        different amount. Either changes an event the fold has already applied,
+        and patching a path-dependent total in place after the fact is how a
+        floored quantity silently diverges.
+
+        So the whole sequence is replayed. It is deterministic - ordered by
+        realisation time with the event id as tie-breaker - so a rebuild and a
+        restart produce the same number, which is the property that makes the
+        deficit a fact about the account rather than about the run.
+        """
+        steps = int(plan_steps or DEFAULT_RECOVERY_STEPS)
+        self.db.execute("UPDATE realised_events SET applied = NULL")
+        self.db.execute("DELETE FROM recovery_deficit")
+        self.db.commit()
+        return self.apply_realised_to_deficit(now_ms, steps)
 
     def migrate_day_boundary(self, now_ms: int) -> float:
         """Carry today's pre-New-York losses across the timezone change. Once.

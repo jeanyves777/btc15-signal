@@ -33,6 +33,7 @@ goes live, and it is collected the same way whether or not orders are real.
 import json
 import traceback
 
+from .capital import CapitalController
 from .config import Settings
 from .recovery_add import (
     AddLimits,
@@ -203,6 +204,27 @@ class RecoveryAddRunner:
             print(f"recovery add SKIPPED [{ticker}]: {decision.reason}", flush=True)
             return
 
+        # RESERVE BEFORE SENDING, including the fee. Kalshi reserves worst-case
+        # cost plus fees, so a local claim that omits the fee is smaller than
+        # the money actually committed.
+        cost = decision.price * self._settings.recovery_add_max_contracts
+        claim = round(
+            cost + kalshi_fee_charged(
+                decision.price, self._settings.recovery_add_max_contracts
+            ),
+            6,
+        )
+        if self.live and trader is not None:
+            capital = CapitalController(self._settings, self._store)
+            if not await capital.reserve_checked(
+                trader, f"add:{opened}", claim, now_ms
+            ):
+                base["state"] = AddState.SKIPPED
+                base["cancel_reason"] = (
+                    f"could not reserve {claim:.4f} against available funds"
+                )
+                self._store.record_add(base)
+                return
         expiration = max(
             (contract.close_ms // 1000) - self._limits.min_seconds_remaining,
             now_ms // 1000 + 5,
@@ -236,6 +258,10 @@ class RecoveryAddRunner:
         except Exception as exc:  # noqa: BLE001
             # The order may or may not exist. The deterministic id means the
             # next pass cannot double it, so record and let reconcile settle it.
+            # THE RESERVATION STAYS. The order may or may not exist, so the
+            # money may or may not be committed; releasing it here would let
+            # the next order spend funds an in-flight one might already hold.
+            # `reconcile` resolves it against the broker.
             self._store.update_add(coid, {
                 "cancel_reason": f"placement failed: {type(exc).__name__}: {exc}"[:200],
                 "updated_ms": now_ms,
@@ -243,10 +269,21 @@ class RecoveryAddRunner:
             print(f"recovery add placement failed [{ticker}]: {exc!r}", flush=True)
             return
 
+        order_id = (order.get("order") or order).get("order_id")
         self._store.update_add(coid, {
-            "order_id": (order.get("order") or order).get("order_id"),
+            "order_id": order_id,
             "updated_ms": now_ms,
         })
+        # THE HANDOFF. The broker now reserves this order's cost itself, and
+        # its `balance` is already net of it. Keeping the local reservation as
+        # well would subtract the same dollars twice and refuse the next order
+        # money the account actually has. Released only on a CONFIRMED
+        # placement - an unknown outcome keeps it held until reconciliation
+        # says what happened.
+        if order_id:
+            self._store.release_funds(
+                f"add:{opened}", reason="broker holds the reservation"
+            )
         print(
             f"recovery add PENDING [{ticker}] {decision.price:.2f} - "
             f"{decision.reason}",
@@ -324,6 +361,10 @@ class RecoveryAddRunner:
                 "crossed": crossed,
             }),
         )
+        # Filled: the money is position exposure now, not a pending claim.
+        self._store.release_funds(
+            f"add:{existing['window_open_ms']}", reason="filled"
+        )
         print(
             f"recovery add EXECUTED [{existing['ticker']}] {filled:g} at "
             f"{price:.4f}, fee {fee:.4f}, {'maker' if maker else 'taker'}",
@@ -354,6 +395,9 @@ class RecoveryAddRunner:
             "cancelled_ms": now_ms,
             "updated_ms": now_ms,
         })
+        self._store.release_funds(
+            f"add:{existing['window_open_ms']}", reason="cancel confirmed"
+        )
         print(
             f"recovery add CANCELLED [{existing['ticker']}]: {reason} ({note})",
             flush=True,

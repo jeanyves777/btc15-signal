@@ -201,17 +201,22 @@ class KalshiExecutionClient:
           book has already moved through the limit; refusing to be a taker
           would silently skip exactly the fast moves worth measuring.
         """
+        # `/portfolio/events/orders` (CreateOrderV2), NOT `/portfolio/orders`.
+        # The legacy path now answers 410 Gone, and the add-on used it: every
+        # placement failed and no order ever reached the exchange, while the
+        # record showed a local PENDING that was later cancelled on its
+        # deadline. The V2 shape carries direction in `side` (bid buys, ask
+        # sells) with fixed-point dollar prices - there is no `action` or
+        # `type` field, and sending them is how the wrong shape went unnoticed.
         order_side, yes_price = event_order(side, price)
         return await self._post(
-            "/portfolio/orders",
+            "/portfolio/events/orders",
             {
                 "ticker": ticker,
                 "client_order_id": client_order_id,
                 "side": order_side,
-                "action": "buy",
                 "count": f"{count:.2f}",
                 "price": f"{yes_price:.4f}",
-                "type": "limit",
                 "time_in_force": "good_till_canceled",
                 "expiration_time": expiration_ts,
                 "self_trade_prevention_type": "taker_at_cross",
@@ -228,7 +233,9 @@ class KalshiExecutionClient:
         failure to report. A cancel after the market closed is rejected by
         Kalshi outright, which is why the order carries its own expiry.
         """
-        path = f"/portfolio/orders/{order_id}"
+        # CancelOrderV2. The legacy `/portfolio/orders/{id}` is the same dead
+        # family as the legacy create path.
+        path = f"/portfolio/events/orders/{order_id}"
         try:
             response = await self.client.delete(
                 self.base_url + path, headers=self._headers("DELETE", path)
@@ -243,7 +250,7 @@ class KalshiExecutionClient:
 
     async def order_status(self, order_id: str) -> dict | None:
         """The order as Kalshi sees it, for reconciling a cancel/fill race."""
-        path = f"/portfolio/orders/{order_id}"
+        path = f"/portfolio/events/orders/{order_id}"
         try:
             response = await self.client.get(
                 self.base_url + path, headers=self._headers("GET", path)

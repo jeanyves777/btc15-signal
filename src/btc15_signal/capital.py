@@ -109,7 +109,19 @@ class CapitalController:
                 return existing
             _orders, resting = await trader.resting_exposure()
             held_cost = self._store.open_position_cost()
-            exposure = round(max(0.0, resting) + max(0.0, held_cost), 6)
+            # CONSERVATIVE ON LOSSES, BLIND TO GAINS.
+            #
+            # Cost basis alone excludes unrealised gains, which is right, but
+            # it also ignores unrealised LOSSES - a position bought for $2 and
+            # now worth $0.20 would still count as $2 of capital and could
+            # hold the tier up on money that is already gone. `open_mark` is
+            # the unrealised P&L, so taking only its negative part marks a
+            # losing position down to market while never marking a winning one
+            # up. The asymmetry is deliberate: sizing should shrink on bad news
+            # immediately and grow on good news only once it has settled.
+            unrealised = self._store.get_setting("open_mark", 0.0)
+            held = round(max(0.0, held_cost) + min(0.0, unrealised), 6)
+            exposure = round(max(0.0, resting) + max(0.0, held), 6)
             # AVAILABLE CASH IS NOT CAPITAL. An open position and a resting
             # order both reduce spendable cash without reducing what the
             # account is worth - the money is committed, not gone. Sizing off
