@@ -545,3 +545,54 @@ def test_both_triggers_give_two_and_neither_cancels_the_other(tmp_path):
     # 3. both at once - still capped, never stacked
     both, _ = confidence_size(settings, Snapshot(), InBand(), 1)
     assert recovery_size(store, settings, both)[0] == 2, "must not stack to 4"
+
+
+# ---- bookkeeping behind real money must never stop the loop ---------------
+
+def test_save_details_survives_every_wrong_type(tmp_path):
+    """The live crash: `decision_record` returns a list of (label, value)
+    pairs, and handing that to a TEXT column raised ProgrammingError one second
+    after EVERY fill. The watchdog restarted the service roughly every fifteen
+    minutes between 09:04 and 10:50 on 2026-09-22. The position was never at
+    risk - only the order call may mark a proposal failed - but a service that
+    dies on a schedule eventually dies in a window that matters."""
+    store = Store(str(tmp_path / "s.db"))
+    for body in (
+        [("distance", "2.1x"), ("momentum", "+3.3")],   # the actual culprit
+        ("a", "tuple"),
+        {"a": "dict"},
+        12345,
+        None,
+        object(),
+    ):
+        store.save_details("k", body, 1_790_000_000_000)   # must not raise
+    assert store.details("k") is not None
+
+
+def test_a_stored_detail_body_is_readable_text(tmp_path):
+    store = Store(str(tmp_path / "s.db"))
+    store.save_details(
+        "order-1", [("distance", "2.1x vol"), ("momentum", "+3.3 bps")],
+        1_790_000_000_000,
+    )
+    body = store.details("order-1")
+    assert "distance" in body and "momentum" in body
+
+
+def test_nothing_on_the_post_order_path_writes_unguarded(tmp_path):
+    """Structural. Between placing the order and reporting it, every store
+    write must be one that cannot raise - this is where a bookkeeping bug
+    becomes an outage."""
+    source = Path("src/btc15_signal/main.py").read_text(encoding="utf-8")
+    auto = source.split("---- unattended execution")[1]
+    auto = auto[: auto.index("    head = head_for(store, settings)")]
+    after_order = auto[auto.index("await trader.execute_with_take_profit("):]
+    for call in ("store.save_details(", "store.record_shadow_decision("):
+        if call in after_order:
+            method = call.split(".")[1].rstrip("(")
+            store_src = Path("src/btc15_signal/store.py").read_text(
+                encoding="utf-8"
+            )
+            body = store_src[store_src.index(f"def {method}("):]
+            body = body[: body.index("\n    def ", 1)]
+            assert "try:" in body, f"{method} runs after an order and can raise"

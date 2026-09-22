@@ -1707,7 +1707,24 @@ async def primary_signal(
                                 opened, remaining, now_ms, settled_s,
                                 blocking_level, paid, fee,
                             )
-                            store.save_details(claimed.id, why, now_ms)
+                            # RENDER IT. `decision_record` returns a list of
+                            # (label, value) pairs, and handing that straight
+                            # to a TEXT column raised ProgrammingError one
+                            # second after every fill - the position survived,
+                            # because only the order call may mark a proposal
+                            # failed, but the service died and the watchdog
+                            # restarted it roughly every fifteen minutes.
+                            detail_lines = [
+                                f"\U0001f4cb <b>WHY THIS TRADE</b> · "
+                                f"<code>{contract.ticker}</code>",
+                                messages.RULE,
+                            ] + [
+                                f"  · {label}: <code>{value}</code>"
+                                for label, value in (why or [])
+                            ]
+                            store.save_details(
+                                claimed.id, "\n".join(detail_lines), now_ms
+                            )
                             await telegram.send(
                                 messages.order_filled(
                                     side=prediction.side,

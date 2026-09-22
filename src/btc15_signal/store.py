@@ -1052,13 +1052,36 @@ class Store:
             f"SELECT * FROM shadow_decisions {where} ORDER BY created_at", args
         )]
 
-    def save_details(self, key: str, body: str, now_ms: int) -> None:
-        """Freeze the DETAILS text for one decision."""
-        self.db.execute(
-            "INSERT OR REPLACE INTO decision_details VALUES (?,?,?)",
-            (key, body, now_ms),
-        )
-        self.db.commit()
+    def save_details(self, key: str, body, now_ms: int) -> None:
+        """Freeze the DETAILS text for one decision. NEVER raises.
+
+        THIS SITS ON THE POST-ORDER PATH, so it is bookkeeping standing
+        directly behind real money and it must not be able to stop the loop.
+        It could: passing `decision_record`'s list of (label, value) pairs
+        where a TEXT column was expected raised ProgrammingError one second
+        after every fill, and the watchdog restarted the service roughly every
+        fifteen minutes from 09:04 to 10:50 on 2026-09-22. The position was
+        never at risk - only the order call may mark a proposal failed - but
+        the service died each time, and a service that dies on a schedule
+        eventually dies in a window that matters.
+
+        `body` is coerced rather than type-checked, because the caller having
+        the wrong type is exactly the case that must not propagate.
+        """
+        try:
+            if not isinstance(body, str):
+                if isinstance(body, (list, tuple)):
+                    body = "\n".join(str(item) for item in body)
+                else:
+                    body = str(body)
+            self.db.execute(
+                "INSERT OR REPLACE INTO decision_details VALUES (?,?,?)",
+                (str(key), body, int(now_ms)),
+            )
+            self.db.commit()
+        except (sqlite3.Error, TypeError, ValueError) as exc:
+            print(f"details not saved for {key}: {type(exc).__name__}: {exc}",
+                  flush=True)
 
     def details(self, key: str) -> str | None:
         row = self.db.execute(
