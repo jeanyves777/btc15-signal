@@ -132,3 +132,29 @@ def test_the_fill_report_says_when_the_position_resolves():
         side="UP", ticker="T", contracts=2, paid=0.69,
         confidence="HIGH", facts=facts(),
     )
+
+
+def test_the_fill_report_names_the_strike_it_settles_against():
+    """The report carried the ticker and the price paid but never the strike -
+    the one number that decides whether the position wins. A ticker suffix is
+    not a price anybody reads at a glance."""
+    text = messages.order_filled(
+        side="UP", ticker="KXBTC15M-26SEP221115-15", contracts=2, paid=0.69,
+        confidence="HIGH", facts=facts(), remaining=432,
+        target=85_906.05, price=85_946.05,
+    )
+    assert "$85,906.05" in text
+    assert "BTC $40 above" in text
+    assert "above target" not in text, "the line already says Target once"
+    # below the strike reads the other way round
+    below = messages.order_filled(
+        side="DOWN", ticker="T", contracts=1, paid=0.77,
+        confidence="MEDIUM", facts=facts(),
+        target=86_100.00, price=86_040.00,
+    )
+    assert "BTC $60 below" in below
+    # and it stays optional
+    assert "Target" not in messages.order_filled(
+        side="UP", ticker="T", contracts=1, paid=0.69,
+        confidence="HIGH", facts=facts(),
+    )

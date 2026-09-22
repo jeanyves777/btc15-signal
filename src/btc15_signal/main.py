@@ -1741,6 +1741,8 @@ async def primary_signal(
                                     ),
                                     exact=exact,
                                     remaining=remaining,
+                                    target=snapshot.target,
+                                    price=snapshot.price,
                                 ),
                                 [("\U0001f4cb WHY THIS TRADE", f"details:{claimed.id}")],
                             )

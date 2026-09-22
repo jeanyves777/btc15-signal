@@ -124,11 +124,15 @@ def side_chip(side: str) -> str:
     return "\U0001f7e2⬆️" if side == "UP" else "\U0001f534⬇️"
 
 
-def _gap(price: float, target: float) -> str:
-    """How far BTC sits from the strike, in dollars and in plain words."""
+def _gap(price: float, target: float, name_target: bool = True) -> str:
+    """How far BTC sits from the strike, in dollars and in plain words.
+
+    `name_target` is dropped where the line already names it - "Target
+    $85,906.05 · BTC $40 above target" says the word twice in nine words.
+    """
     delta = price - target
     where = "above" if delta > 0 else "below"
-    return f"BTC ${abs(delta):,.0f} {where} target"
+    return f"BTC ${abs(delta):,.0f} {where}" + (" target" if name_target else "")
 
 
 def checks_block(facts: list[dict], title: str = "Checks") -> list[str]:
@@ -238,6 +242,8 @@ def order_filled(
     band_held: str = "",
     exact: bool = True,
     remaining: int | None = None,
+    target: float | None = None,
+    price: float | None = None,
 ) -> str:
     """An order that actually filled, with the gates AS THEY WERE at execution.
 
@@ -255,6 +261,14 @@ def order_filled(
         f"\U0001f4b5 Cost ${cost:,.2f} · Maximum profit "
         f"${contracts - cost:,.2f}",
     ]
+    if target is not None:
+        # WHAT IT SETTLES AGAINST. The fill report named the ticker and the
+        # price paid but never the strike, so the one number that decides
+        # whether this position wins was the one thing it did not carry - and
+        # a ticker suffix is not a price anybody reads at a glance.
+        gap = (f" · {_gap(price, target, name_target=False)}"
+               if price is not None else "")
+        lines.append(f"\U0001f3af Target <code>${target:,.2f}</code>{gap}")
     if remaining is not None:
         # HOW LONG THE MONEY IS AT RISK. The entry alert carried this and the
         # fill report did not, so the one message sent while a position is
