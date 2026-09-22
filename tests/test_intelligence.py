@@ -430,3 +430,118 @@ def test_the_canary_rejects_a_row_whose_columns_are_shifted():
     problems = check({"session": "0.6637", "vol_regime": "us", "won": "late-us",
                       "action": "low", "win_probability": 60})
     assert len(problems) >= 4, problems
+
+
+# ---- the operator's loss-recovery rule ------------------------------------
+
+def _settle(store, ticker, window_ms, pnl):
+    store.record_settlements([{
+        "ticker": ticker, "market_result": "yes",
+        "yes_count_fp": "1", "yes_total_cost_dollars": "0",
+        "no_count_fp": "0", "no_total_cost_dollars": "0",
+        "revenue": 0, "fee_cost": "0",
+        "settled_time": "2026-09-22T00:00:00Z",
+    }], window_ms)
+    store.db.execute(
+        "UPDATE settlements SET pnl=?, window_ms=? WHERE ticker=?",
+        (pnl, window_ms, ticker),
+    )
+    store.db.commit()
+
+
+def test_a_loss_arms_the_recovery_and_a_win_does_not(tmp_path):
+    """The defect the operator caught: three live losses on 2026-09-22 were
+    each followed by a $1 trade. There was no loss-triggered recovery at all -
+    the $2 trades came from the confidence band, on unrelated windows."""
+    store = Store(str(tmp_path / "s.db"))
+    _settle(store, "KXBTC15M-A", 1_000, +0.20)
+    assert store.outstanding_loss()[0] == 0.0, "a win must not arm it"
+    _settle(store, "KXBTC15M-B", 2_000, -0.88)
+    debt, _since = store.outstanding_loss()
+    assert debt == pytest.approx(0.88), "a loss must arm it"
+
+
+def test_the_recovery_resets_once_the_loss_is_repaid(tmp_path):
+    """"recover the lost two dollar AND RESET" - per loss, not a ledger."""
+    store = Store(str(tmp_path / "s.db"))
+    _settle(store, "KXBTC15M-A", 1_000, -0.90)
+    _settle(store, "KXBTC15M-B", 2_000, +0.40)
+    assert store.outstanding_loss()[0] == pytest.approx(0.50)
+    _settle(store, "KXBTC15M-C", 3_000, +0.60)
+    assert store.outstanding_loss()[0] == 0.0, "repaid; it must reset"
+
+
+def test_a_second_loss_replaces_rather_than_compounds(tmp_path):
+    """It must never become a martingale. A new loss REPLACES the target, so
+    the amount to recover cannot grow without bound."""
+    store = Store(str(tmp_path / "s.db"))
+    _settle(store, "KXBTC15M-A", 1_000, -0.90)
+    _settle(store, "KXBTC15M-B", 2_000, -0.80)
+    debt, _ = store.outstanding_loss()
+    assert debt == pytest.approx(0.80), "the second loss replaced the first"
+    assert debt < 1.70, "a cumulative ledger would compound to 1.70"
+
+
+def test_the_recovery_size_is_capped_and_never_escalates(tmp_path):
+    from btc15_signal.config import Settings
+    from btc15_signal.main import recovery_size
+
+    store = Store(str(tmp_path / "s.db"))
+    settings = Settings()
+    _settle(store, "KXBTC15M-A", 1_000, -25.0)   # an enormous loss
+    count, reason = recovery_size(store, settings, base=1)
+    assert count == settings.high_confidence_contracts, reason
+    assert count <= 2, "the recovery must never escalate beyond the cap"
+
+
+def test_no_outstanding_loss_leaves_the_size_alone(tmp_path):
+    from btc15_signal.config import Settings
+    from btc15_signal.main import recovery_size
+
+    store = Store(str(tmp_path / "s.db"))
+    _settle(store, "KXBTC15M-A", 1_000, +0.20)
+    count, reason = recovery_size(store, Settings(), base=1)
+    assert count == 1
+    assert reason == "", "no recovery, no override"
+
+
+def test_both_triggers_give_two_and_neither_cancels_the_other(tmp_path):
+    """The operator wants BOTH, independently: the measured distance band
+    keeps its $2, and a loss arms its own $2 whether or not the next setup
+    happens to land in the band. Neither may suppress the other, and the two
+    together must still never exceed the cap."""
+    from btc15_signal.config import Settings
+    from btc15_signal.main import confidence_size, recovery_size
+
+    settings = Settings()
+    store = Store(str(tmp_path / "s.db"))
+
+    class Snapshot:
+        volatility_5m_bps = 5.0
+        momentum_5m_bps = -10.0
+
+    class InBand:          # 3.0x vol, momentum aligned for DOWN
+        side = "DOWN"
+        distance_bps = 15.0    # a MAGNITUDE; the side carries the direction
+
+    class OutOfBand:       # 0.2x vol - nowhere near the band
+        side = "DOWN"
+        distance_bps = 1.0
+
+    # 1. band alone, no loss outstanding
+    band_only, _ = confidence_size(settings, Snapshot(), InBand(), 1)
+    assert band_only == 2, "the distance band must still size up on its own"
+    assert recovery_size(store, settings, band_only)[0] == 2
+
+    # 2. loss outstanding, setup NOT in the band - this is the case that was
+    #    silently doing nothing, and the whole reason the rule was missing.
+    _settle(store, "KXBTC15M-L", 1_000, -0.88)
+    flat, _ = confidence_size(settings, Snapshot(), OutOfBand(), 1)
+    assert flat == 1, "out of band, the band contributes nothing"
+    recovered, reason = recovery_size(store, settings, flat)
+    assert recovered == 2, "a loss must size up regardless of the band"
+    assert "recovering" in reason
+
+    # 3. both at once - still capped, never stacked
+    both, _ = confidence_size(settings, Snapshot(), InBand(), 1)
+    assert recovery_size(store, settings, both)[0] == 2, "must not stack to 4"

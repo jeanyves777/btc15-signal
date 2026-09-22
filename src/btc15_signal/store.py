@@ -968,6 +968,38 @@ class Store:
         self.db.commit()
         return written
 
+    def outstanding_loss(self) -> tuple[float, int]:
+        """(dollars still to recover, markets since the loss that opened it).
+
+        The operator's recovery rule: "if the $2 lost we just keep trading $2
+        to recover the lost two dollar AND RESET". Per loss, not a running
+        ledger - a cumulative ledger never clears, because in this account
+        losses arrive faster than 0.63-dollar wins repay 1.48-dollar losses.
+        Measured over 94 settled markets: cumulative would sit at $2 for 93% of
+        windows with $6.68 still outstanding and only 3 recoveries ever
+        completed, where per-loss sits at $2 for 57% and completes 11.
+
+        DERIVED FROM THE BROKER'S SETTLEMENTS, not from a stored counter. A
+        counter has to survive restarts, crashes and manual trades, and every
+        one of those is a way for the live size to drift away from what the
+        record says it should be. Replaying the settled history is idempotent
+        and cannot disagree with the money.
+        """
+        debt = 0.0
+        since = 0
+        for row in self.db.execute(
+            "SELECT pnl FROM settlements WHERE ticker LIKE 'KXBTC15M%' "
+            "AND window_ms IS NOT NULL ORDER BY window_ms"
+        ):
+            pnl = float(row[0] or 0.0)
+            if pnl < 0:
+                debt = -pnl          # a new loss REPLACES the target, per the rule
+                since = 0
+            elif debt > 0:
+                debt = max(0.0, debt - pnl)
+                since += 1
+        return debt, since
+
     def quarantine_shifted_shadow_rows(self) -> int:
         """Mark every column-shifted legacy row, permanently. Returns the count.
 

@@ -896,6 +896,34 @@ def archive_observation(
         print(f"archive failed: {type(exc).__name__}: {exc}", flush=True)
 
 
+def recovery_size(store: Store, settings: Settings, base: int) -> tuple[int, str]:
+    """Size up to the recovery count while a loss is still outstanding.
+
+    THE OPERATOR'S RULE, implemented as stated: after a loss, trade the
+    recovery size until that loss is repaid, then reset. It never escalates -
+    the cap is `high_confidence_contracts`, whatever the loss was - so this is
+    not a martingale and cannot compound. The $10 martingale measured -15.74 on
+    a day the base system made +4.41 (section 32) and is not what this is.
+
+    Checked BEFORE the confidence band, and it wins, because a loss is a fact
+    about the account while the band is an opinion about the setup.
+
+    Measured cost, recorded rather than argued: on the 94 settled markets to
+    2026-09-22 this sits at the recovery size for 57% of windows and completes
+    11 recoveries. The band-based sizing it now overrides measured +0.48 over
+    flat $1 on the operator's 18 trades of 2026-09-21, and flat $2 measured
+    better than both. The operator has asked for loss-triggered recovery and
+    that is what this does.
+    """
+    debt, since = store.outstanding_loss()
+    if debt <= 0:
+        return base, ""
+    return max(base, settings.high_confidence_contracts), (
+        f"recovering {debt:.2f} outstanding"
+        + (f" after {since} market(s)" if since else " from the last loss")
+    )
+
+
 def confidence_size(
     settings: Settings, snapshot: MarketSnapshot, prediction, base: int
 ) -> tuple[int, str]:
@@ -1585,6 +1613,12 @@ async def primary_signal(
             count, size_reason = confidence_size(
                 settings, snapshot, prediction, count
             )
+            # RECOVERY WINS OVER THE BAND. An outstanding loss is a fact about
+            # the account; the confidence band is an opinion about the setup.
+            # Checked second so its reason is the one reported when both apply.
+            recovered, recovery_reason = recovery_size(store, settings, count)
+            if recovery_reason:
+                count, size_reason = recovered, recovery_reason
             if count > 1:
                 print(f"auto: sizing {count} contracts - {size_reason}", flush=True)
             proposal = create_proposal(

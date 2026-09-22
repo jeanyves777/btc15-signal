@@ -2367,3 +2367,60 @@ Against 1,415 corpus out-of-sample and 44 live. **Verdict: REMAIN SHADOW** -
 but this is the first line of investigation that deserves to keep running
 rather than to be closed. Sections 36 and 37 were refuted; this one is merely
 underpowered, which is a different and better problem.
+
+## 39. The loss recovery was never built (2026-09-22)
+
+The operator: *"The recovery step never triggers after a loss. The $2 only
+happened one time before and I don't see it again, it should trigger right
+after a loss."*
+
+Correct, and the reason is that **no loss-triggered recovery existed in the
+code**. What was deployed is `high_confidence_contracts = 2`, which fires on
+the distance/momentum band and has nothing to do with the previous outcome. The
+three live losses of 2026-09-22 were each followed by a $1 trade:
+
+    07:30  1 ct  -0.78  ->  07:45  1 ct   (should have been $2)
+    08:30  1 ct  -0.88  ->  09:15  1 ct   (should have been $2)
+    10:15  1 ct  -0.88  ->  10:30  1 ct   (should have been $2)
+
+The $2 orders that did appear (05:45, 06:15, 07:15, 08:00) were band-triggered,
+on windows with no preceding loss. Both readings of the conversation were
+implemented as one, and the wrong one shipped.
+
+**Now both trigger, independently.** The distance band keeps its $2, a loss
+arms its own $2 whether or not the next setup lands in the band, and the two
+never stack - the cap is `high_confidence_contracts` either way, so this cannot
+become a martingale.
+
+### Per loss, not a running ledger
+
+"recover the lost two dollar AND RESET" reads as per-loss, and the measurement
+says it has to be. Over 94 settled markets:
+
+| rule | $2 on | recoveries completed | debt left |
+|---|---:|---:|---:|
+| cumulative ledger | 87/94 (93%) | 3 | $6.68 |
+| **per loss, resets** | 54/94 (57%) | **11** | $0.71 |
+
+A cumulative ledger never clears, because in this account 0.63-dollar average
+wins do not keep up with 1.48-dollar average losses - it would have become
+permanent flat $2 with $6.68 still outstanding. A new loss therefore REPLACES
+the recovery target rather than adding to it, which also makes escalation
+impossible by construction.
+
+### Derived from the broker, not from a counter
+
+`Store.outstanding_loss` replays settled `pnl` from the exchange mirror rather
+than keeping a stored counter. A counter has to survive restarts, crashes and
+manual trades, and each of those is a way for the live size to drift from what
+the record says it should be. Replaying is idempotent and cannot disagree with
+the money.
+
+### The cost, recorded beside the decision
+
+Flat $2 measured better than both sizing rules on the operator's 18 trades of
+2026-09-21 (+2.96 against +1.96 deployed and +1.48 flat $1), and the $2
+recovery measured +1.43 there against +1.48 for doing nothing, because the two
+losses that day fell back to back and the recovery was holding double size when
+the second one landed. The operator has asked for loss-triggered recovery; it
+is implemented as asked, capped, and this is the number to watch.
