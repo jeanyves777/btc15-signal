@@ -165,7 +165,7 @@ def head_for(store: Store, settings: Settings) -> str:
     # "per contract" whatever report_basis actually was, so a payout basis
     # labelled a ten-contract figure as a one-contract one.
     return messages.scoreboard(
-        *store.scoreboard(**sizing), basis=basis, live=store.realised_record()
+        *store.scoreboard(**sizing), basis=basis, live=store.money_snapshot()
     )
 
 

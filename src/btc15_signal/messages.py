@@ -21,6 +21,57 @@ def bar(fraction: float, width: int = 10) -> str:
     return BAR_FULL * filled + BAR_EMPTY * (width - filled)
 
 
+def _money_block(snapshot) -> str:
+    """The two money lines every message carries, from ONE snapshot.
+
+    Lifetime leads because that is the question the account actually answers -
+    a good day inside a losing record is not a good result, and a headline
+    that resets at midnight hides which one you are having. Today is kept, as
+    the secondary line, because it is what the Kalshi app shows.
+
+    Both lines come from the same read, so the profit and the counts can never
+    disagree: on 2026-09-22 a settlement recap printed "+$3.05 - 30W-5L" while
+    the ledger held 30W-6L, because the dollars and the record were taken a
+    minute apart.
+
+    PAPER RESULTS ARE NOT HERE. `scoreboard` prices every signal at a
+    hypothetical size, including the great majority never traded; it is a
+    measure of the strategy, not of the account, and it is labelled where it
+    appears.
+    """
+    # A bare (markets, winners, dollars) tuple is still accepted: callers that
+    # only have today's figures - and the tests that pin the paper/real
+    # separation - should not have to build a snapshot to render one line.
+    if isinstance(snapshot, tuple):
+        markets, winners, dollars = snapshot
+        if not markets:
+            return "\U0001f4b0 <b>Live: nothing settled yet</b>"
+        sign = "+" if dollars >= 0 else "−"
+        chip = "\U0001f4b0" if dollars >= 0 else "\U0001f4b8"
+        return (
+            f"{chip} <b>Live today: {sign}${abs(dollars):,.2f}</b> · "
+            f"{winners}W–{markets - winners}L"
+        )
+    lifetime = getattr(snapshot, "lifetime", None)
+    lines = []
+    if lifetime is not None and lifetime.markets:
+        chip = "\U0001f4b0" if lifetime.dollars >= 0 else "\U0001f4b8"
+        sign = "+" if lifetime.dollars >= 0 else "−"
+        lines.append(
+            f"{chip} <b>{lifetime.label()}: {sign}${abs(lifetime.dollars):,.2f}</b> · "
+            f"{lifetime.markets} closed · {lifetime.winners}W–{lifetime.losers}L"
+        )
+    if snapshot.markets:
+        sign = "+" if snapshot.headline >= 0 else "−"
+        lines.append(
+            f"\U0001f4c5 Today (New York): {sign}${abs(snapshot.headline):,.2f} · "
+            f"{snapshot.markets} closed · {snapshot.winners}W–{snapshot.losers}L"
+        )
+    elif not lines:
+        return "\U0001f4b0 <b>Live: nothing settled yet</b>"
+    return "\n".join(lines)
+
+
 def _live_line(markets: int, winners: int, dollars: float) -> str:
     """The money line, written the SAME way wherever it appears.
 
@@ -76,8 +127,8 @@ def scoreboard(
         # Real money is still reported. Returning early here dropped the Live
         # line whenever nothing had settled yet - precisely the state in which a
         # first real trade is the only thing worth showing.
-        if live and live[0]:
-            head += "\n" + _live_line(*live)
+        if live is not None:
+            head += "\n" + _money_block(live)
         return head
     rate = wins / settled
     lines = [
@@ -87,7 +138,8 @@ def scoreboard(
     ]
     if live is None:
         return "\n".join(lines)
-    lines.append(_live_line(*live))
+    # The figures above are labelled paper; the money below is real.
+    lines.append(_money_block(live))
     return "\n".join(lines)
 
 

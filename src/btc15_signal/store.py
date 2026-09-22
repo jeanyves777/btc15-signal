@@ -81,6 +81,37 @@ class TradeProposal:
 HELD_STATUSES = ("filled", "protected", "unprotected")
 HELD_SQL = "('filled','protected','unprotected')"
 @dataclass(frozen=True)
+class LifetimeRecord:
+    """Realised performance over the whole reconciled record.
+
+    `complete` is False when the broker cannot show the account's entire
+    history - Kalshi's settlements endpoint reaches back only so far, and this
+    account has fills older than that. A total that silently omits earlier
+    trading must not be called a lifetime, so the label carries the date it
+    actually starts from.
+    """
+
+    markets: int
+    winners: int
+    dollars: float
+    since_ms: int | None
+    complete: bool
+
+    @property
+    def losers(self) -> int:
+        return self.markets - self.winners
+
+    def label(self) -> str:
+        if self.complete or self.since_ms is None:
+            return "Live lifetime"
+        import datetime as _dt
+
+        # `%-d` is a glibc extension and raises on Windows, where this runs.
+        day = _dt.datetime.fromtimestamp(self.since_ms / 1000, tz=_dt.UTC)
+        return f"Live since {day.day} {day:%b}"
+
+
+@dataclass(frozen=True)
 class MoneySnapshot:
     """One account, one instant. Every message renders from one of these.
 
@@ -96,6 +127,9 @@ class MoneySnapshot:
     open_mark: float
     taken_ms: int
     has_mirror: bool = False
+    # The lifetime figures come from the SAME read as today's, so a message
+    # can never show a profit in one line that the other has not counted.
+    lifetime: "LifetimeRecord | None" = None
 
     @property
     def losers(self) -> int:
@@ -2502,7 +2536,40 @@ class Store:
         return MoneySnapshot(
             markets=markets, winners=winners, realised=round(realised, 6),
             open_mark=round(open_mark, 6), taken_ms=now_ms, has_mirror=has_mirror,
+            lifetime=self.lifetime_record(),
         )
+
+    def lifetime_record(self) -> LifetimeRecord:
+        """Realised performance across every reconciled market. One per market.
+
+        `daily_ledger` is keyed by ticker, so a market counts ONCE however it
+        was traded: base and recovery contracts on the same market are one
+        position, and a partial fill or a partial exit does not make a second
+        trade. The figure is the broker's own settled P&L, net of fees -
+        paper results live in `scoreboard` and are labelled separately, and
+        deposits, withdrawals and unrealised marks never enter here.
+        """
+        row = self.db.execute(
+            "SELECT COUNT(*), COALESCE(SUM(pnl > 0), 0), COALESCE(SUM(pnl), 0), "
+            "MIN(COALESCE(window_ms, first_ms)) FROM daily_ledger"
+        ).fetchone()
+        markets = int(row[0] or 0)
+        since = int(row[3]) if row[3] else None
+        return LifetimeRecord(
+            markets=markets, winners=int(row[1] or 0),
+            dollars=round(float(row[2] or 0.0), 6), since_ms=since,
+            complete=self.history_is_complete(),
+        )
+
+    def history_is_complete(self) -> bool:
+        """Does our record reach the account's first trade?
+
+        Set by `scripts/verify_lifetime.py` after comparing against everything
+        the broker will serve, including `/historical/fills`. Defaults to
+        False: claiming a complete lifetime is a claim that has to be earned,
+        and the honest fallback is to say which date the total starts from.
+        """
+        return bool(self.get_setting("history_complete", 0.0))
 
     def realised_record(self) -> tuple[int, int, float]:
         """(trades, wins, dollars) over orders that were ACTUALLY PLACED.
