@@ -116,3 +116,19 @@ def test_the_four_checks_stay_visible_on_a_rejection():
         )
         for name in ("Price", "Momentum", "Distance", "Model"):
             assert f"{name}:" in text, f"{name} missing when executable={executable}"
+
+
+def test_the_fill_report_says_when_the_position_resolves():
+    """The entry alert carried the countdown and the fill report did not, so
+    the one message sent while money is actually at risk was the only one that
+    never said when it settles."""
+    text = messages.order_filled(
+        side="UP", ticker="T", contracts=2, paid=0.69,
+        confidence="HIGH", facts=facts(), remaining=432,
+    )
+    assert "7m 12s to expiry" in text
+    # and it stays optional, so a caller without a clock is not broken
+    assert "to expiry" not in messages.order_filled(
+        side="UP", ticker="T", contracts=2, paid=0.69,
+        confidence="HIGH", facts=facts(),
+    )

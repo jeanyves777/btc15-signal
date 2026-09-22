@@ -1740,6 +1740,7 @@ async def primary_signal(
                                         f"{settings.entry_band_settle_s}s"
                                     ),
                                     exact=exact,
+                                    remaining=remaining,
                                 ),
                                 [("\U0001f4cb WHY THIS TRADE", f"details:{claimed.id}")],
                             )

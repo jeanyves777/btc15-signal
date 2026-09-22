@@ -237,6 +237,7 @@ def order_filled(
     facts: list[dict],
     band_held: str = "",
     exact: bool = True,
+    remaining: int | None = None,
 ) -> str:
     """An order that actually filled, with the gates AS THEY WERE at execution.
 
@@ -253,6 +254,15 @@ def order_filled(
         f"at {paid * 100:.0f}¢",
         f"\U0001f4b5 Cost ${cost:,.2f} · Maximum profit "
         f"${contracts - cost:,.2f}",
+    ]
+    if remaining is not None:
+        # HOW LONG THE MONEY IS AT RISK. The entry alert carried this and the
+        # fill report did not, so the one message sent while a position is
+        # actually open was the only one that did not say when it resolves.
+        lines.append(
+            f"⏱ {remaining // 60}m {remaining % 60:02d}s to expiry"
+        )
+    lines += [
         "",
         *checks_block(facts, "Checks at execution"),
     ]
