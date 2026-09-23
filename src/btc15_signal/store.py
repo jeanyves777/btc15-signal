@@ -250,6 +250,7 @@ class Store:
         # distance gate or the momentum gate was the one that cost you.
         if "failed_gates" not in columns:
             self.db.execute("ALTER TABLE predictions ADD COLUMN failed_gates TEXT")
+        self._relax_prediction_model_columns()
         # What the similarity layer WOULD have decided, recorded and never
         # acted on. Promotion to an execution policy requires this table to
         # show its calls beating the deployed rule on realised P&L - which is
@@ -547,6 +548,21 @@ class Store:
         # A candidate does not need permission to control an order to be worth
         # watching. These rows are how one earns it: the same decision, taken
         # prospectively, on data the candidate was not fitted to.
+        self.db.execute("""
+            CREATE TABLE IF NOT EXISTS input_gaps (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                window_open INTEGER NOT NULL,
+                ticker TEXT,
+                observed_ms INTEGER NOT NULL,
+                remaining_s INTEGER,
+                reason TEXT NOT NULL,
+                detail TEXT
+            )
+        """)
+        self.db.execute(
+            "CREATE INDEX IF NOT EXISTS input_gaps_window "
+            "ON input_gaps(window_open, reason)"
+        )
         self.db.execute("""
             CREATE TABLE IF NOT EXISTS candidate_evaluations (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -855,6 +871,57 @@ class Store:
             "avg_round_trip_ms": row[3],
         }
 
+    def _relax_prediction_model_columns(self) -> None:
+        """Let `raw_probability` and `bucket` be NULL, meaning "no model".
+
+        THE BUG THIS FIXES. `predictions` declared both NOT NULL, and
+        `record()` inserts with OR IGNORE. On the Kalshi-only path there is no
+        probability model - the deployed one is Binance-weighted and does not
+        run - so `raw_probability` is None, the constraint rejects the row and
+        OR IGNORE swallows it. Every prediction would have vanished silently:
+        no settlement tracking, no grading, no learning, and not one error
+        anywhere. It was found by an end-to-end test; 726 unit tests passed
+        with it present.
+
+        SQLite cannot relax NOT NULL in place, so the table is rebuilt. Every
+        column and row is carried across inside one transaction, and the
+        rebuild only runs while the old constraint is actually there.
+        """
+        info = list(self.db.execute("PRAGMA table_info(predictions)"))
+        if not info:
+            return
+        relax = {"raw_probability", "bucket"}
+        if not any(row[1] in relax and row[3] for row in info):
+            return          # already nullable
+        names = [row[1] for row in info]
+        columns = []
+        for _, name, decl_type, notnull, default, pk in info:
+            parts = [f'"{name}"', decl_type or ""]
+            if pk:
+                parts.append("PRIMARY KEY")
+            elif notnull and name not in relax:
+                parts.append("NOT NULL")
+            if default is not None:
+                parts.append(f"DEFAULT {default}")
+            columns.append(" ".join(p for p in parts if p))
+        joined = ", ".join(f'"{n}"' for n in names)
+        try:
+            self.db.execute("BEGIN IMMEDIATE")
+            self.db.execute(
+                f"CREATE TABLE predictions_migrated ({', '.join(columns)})")
+            self.db.execute(
+                f"INSERT INTO predictions_migrated ({joined}) "
+                f"SELECT {joined} FROM predictions")
+            self.db.execute("DROP TABLE predictions")
+            self.db.execute(
+                "ALTER TABLE predictions_migrated RENAME TO predictions")
+            self.db.commit()
+            print("predictions: raw_probability/bucket now nullable "
+                  "(no-model rows were being silently dropped)", flush=True)
+        except sqlite3.Error as exc:
+            self.db.rollback()
+            print(f"prediction column migration failed: {exc!r}", flush=True)
+
     def record(self, values: tuple) -> bool:
         # `failed_gates` was added later, so a caller may still pass the older
         # ten-field tuple. Padding here rather than demanding every call site
@@ -870,7 +937,18 @@ class Store:
             values,
         )
         self.db.commit()
-        return cursor.rowcount == 1
+        if cursor.rowcount != 1:
+            # OR IGNORE hides a duplicate AND a constraint violation behind
+            # the same silent zero. A duplicate is normal - the same window is
+            # polled many times - so only say something when the row is new.
+            existing = self.db.execute(
+                "SELECT 1 FROM predictions WHERE window_open=?", (values[0],)
+            ).fetchone()
+            if not existing:
+                print(f"prediction NOT recorded for window {values[0]} - "
+                      f"constraint rejected it", flush=True)
+            return False
+        return True
 
     def pending_settlements(self, now_ms: int) -> list[tuple]:
         """(window_open, side, ticker, contract_price, qualified, target) awaiting a result."""
@@ -2727,6 +2805,38 @@ class Store:
                 "SELECT * FROM recovery_adds ORDER BY created_ms DESC LIMIT 1"
             )
         return rows[0] if rows else None
+
+    def record_input_gap(self, *, window_open: int, ticker, observed_ms: int,
+                         remaining_s, reason: str, detail: str = "") -> None:
+        """A poll that produced NO signal because a Kalshi input was missing.
+
+        The operator's rule: never substitute another exchange; record
+        unavailable or stale inputs explicitly. Without this row a feed
+        outage and a quiet market look identical in the archive, and the
+        first thing anyone would do to explain the silence is reach for the
+        other exchange's history - which is how the substitution creeps back
+        in through the analysis rather than the code.
+
+        Never raises: it sits on the poll path.
+        """
+        try:
+            self.db.execute(
+                "INSERT INTO input_gaps (window_open, ticker, observed_ms, "
+                "remaining_s, reason, detail) VALUES (?, ?, ?, ?, ?, ?)",
+                (window_open, ticker, observed_ms, remaining_s, reason, detail),
+            )
+            self.db.commit()
+        except sqlite3.Error as exc:
+            print(f"input gap record failed: {exc!r}", flush=True)
+
+    def input_gap_summary(self) -> list[dict]:
+        """Which inputs went missing, how often, and over how many markets."""
+        return self._dicts(
+            "SELECT reason, COUNT(*) AS polls, "
+            "COUNT(DISTINCT window_open) AS markets, "
+            "MAX(observed_ms) AS last_ms FROM input_gaps "
+            "GROUP BY reason ORDER BY polls DESC"
+        )
 
     def record_candidate_evaluations(self, rows: list[dict]) -> None:
         """Log each candidate's prediction. Never raises; one per market."""

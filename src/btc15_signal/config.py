@@ -266,6 +266,26 @@ class Settings(BaseSettings):
     # worse than one that records it late. 15,000 ms flags a feed that has
     # genuinely stopped while leaving normal publication lag alone.
     reference_stale_ms: int = 15_000
+    # KALSHI ONLY. Quotes, books, executions, settlements and BRTI all come
+    # from Kalshi; the Binance client is not constructed, the Binance-weighted
+    # `predict()` does not run, and there is NO fallback - a missing or stale
+    # reference is recorded as such and produces no signal.
+    #
+    # It is a setting rather than a deletion so the old path stays runnable
+    # for the historical comparison in `scripts/`, not so it can be switched
+    # back on in production. The Binance-trained policy is separately retired
+    # and cannot act whatever this says.
+    kalshi_only: bool = True
+    # The BRTI-native entry rule. Its distance floor is the MEASURED 10x
+    # (FINDINGS 43), not the 1.5 that belongs to Binance raw volatility.
+    kalshi_strategy_path: str = "strategy_kalshi.json"
+    # Contract spread, in CENTS. `max_spread_bps = 2.0` gated Binance SPOT
+    # spread, whose 99th percentile over 10,094 archived observations is
+    # 0.001 bps - it never rejected anything. Reusing it on a Kalshi book
+    # would reject EVERYTHING (a 2c spread on a 79c mid is 253 bps). Measured
+    # contract spreads: median 0.4c, p75 3c, p90 7c, p95 10c, p99 19c, so
+    # this sits at ~p99 and keeps catching only a pathological book.
+    max_contract_spread_cents: float = 20.0
     reference_reconcile_seconds: float = 300.0
     reference_debug: bool = False
     # CF Benchmarks gates index values behind an entitlement; with no key the

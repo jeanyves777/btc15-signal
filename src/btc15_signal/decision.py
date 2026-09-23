@@ -144,8 +144,14 @@ def decision_facts(
     fillable = executable_price(our_levels, count)
 
     implied = our_ask if our_ask is not None else None
+    # None when there is no model to disagree WITH. On the Kalshi-only path
+    # `raw_probability` is None - the deployed model is Binance-weighted and
+    # does not run there - and "model minus price" is not a quantity that
+    # exists. Reporting 0.0 would read as "the model agrees exactly with the
+    # market", which is a claim, not an absence.
     disagreement = (
-        round(model_probability - implied, 4) if implied is not None else None
+        round(model_probability - implied, 4)
+        if implied is not None and model_probability is not None else None
     )
 
     # The fee is certain and always paid. The slippage allowance is NOT: it is
@@ -341,10 +347,18 @@ def decision_facts(
             "taker_imbalance": round(taker_imbalance, 3),
         },
         "probability": {
-            "model": round(model_probability, 4),
+            # None on the Kalshi-only path: the deployed model is
+            # Binance-weighted and does not run there, so there is no model
+            # probability to report. A zero would read as a prediction.
+            "model": (round(model_probability, 4)
+                      if model_probability is not None else None),
             "market_implied": implied,
             "model_minus_market": disagreement,
-            "note": "model probability is NOT calibrated; the market price is the better estimate",
+            "note": ("no model probability on the Kalshi-only path; the market "
+                     "price is the estimate"
+                     if model_probability is None else
+                     "model probability is NOT calibrated; the market price is "
+                     "the better estimate"),
         },
         "economics": {
             "measured_edge_per_contract": measured_edge,

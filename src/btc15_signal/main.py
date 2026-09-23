@@ -13,6 +13,7 @@ import httpx
 from . import autotrade, messages
 from . import brain as brain_mod
 from . import intelligence_policy as intel
+from . import kalshi_signal
 from .adaptive import brti_context_of, context_of
 from .binance import BinanceClient, MarketSnapshot
 from .candidates import CandidateSet
@@ -23,6 +24,7 @@ from .execution import KalshiExecutionClient
 from .features import _session
 from .hourly_shadow import HourlyShadow
 from .kalshi import KalshiClient, KalshiMarket
+from .kalshi_brti import KalshiBRTIRule
 from .levels import LevelTracker
 from .levels import confidence_points as level_points
 from .model import predict
@@ -1448,6 +1450,45 @@ _CANDIDATES: dict = {"loaded": None}
 # Last window we complained about a missing BRTI context, so the log
 # carries one line a window rather than one a poll.
 BRTI_CONTEXT_GAP: dict = {"window": None}
+# Last (window, reason) we logged a missing Kalshi input for, so a feed outage
+# prints once per cause per window rather than once per poll.
+KALSHI_GAP: dict = {"window": None}
+
+
+def kalshi_snapshot(features, contract, opened: int, now_ms: int):
+    """A `MarketSnapshot` whose every number comes from Kalshi.
+
+    Same shape as the Binance one so the archive, the messages and the order
+    path are unchanged - but price and target are the official reference and
+    the strike, momentum and volatility are BRTI's, and the spread is the
+    Kalshi book's.
+
+    The three Binance-only microstructure fields are ZERO and nothing gates on
+    them: `predict()` does not run on this path (see `kalshi_signal`), and the
+    BRTI rule never referenced them. They stay on the dataclass rather than
+    being removed so the historical archive keeps one schema, and zero is
+    honest here - it means "this instrument does not publish it", which is
+    why the value is never read rather than merely never gated.
+    """
+    from .binance import MarketSnapshot
+
+    yes_bid = getattr(contract, "yes_bid", 0.0) or 0.0
+    yes_ask = getattr(contract, "yes_ask", 0.0) or 0.0
+    mid = (yes_bid + yes_ask) / 2 if yes_bid and yes_ask else 0.0
+    spread_bps = ((yes_ask - yes_bid) / mid * 10_000) if mid else 0.0
+    return MarketSnapshot(
+        price=features.value,
+        target=features.target,
+        bid_imbalance=0.0,
+        taker_imbalance=0.0,
+        momentum_5m_bps=features.brti_momentum_bps,
+        volatility_5m_bps=features.brti_volatility_bps,
+        futures_basis_bps=0.0,
+        spread_bps=spread_bps,
+        window_high=0.0,
+        window_low=0.0,
+        elapsed_minutes=max(0, (now_ms - opened) // 60_000),
+    )
 
 
 def active_policy(settings) -> intel.Policy:
@@ -1549,19 +1590,25 @@ def intelligence_verdict(
             / max(getattr(snapshot, "volatility_5m_bps", 1.0) or 1.0, 1.0),
             "our_ask": ask,
         }
-        # BINANCE CONTEXT, ON PURPOSE, AND IT MUST STAY THAT WAY.
+        # ONE CONTEXT, KEYED ON THE INSTRUMENT ACTUALLY IN USE.
         #
-        # Two feature versions run side by side, each keyed by the features
-        # its own model was fitted to:
-        #
-        #   policy v1   Binance features -> context_of        (this line)
-        #   candidates  BRTI features    -> brti_context_of   (forward eval)
-        #
-        # "Unifying" them would hand the policy cells it was never trained on
-        # - a BRTI distance reads 10-20 where Binance reads 2-4 - and the key
-        # would still format, so nothing would fail. Each artefact carries a
-        # `feature_version`; match the key to that, never to the newer name.
-        key = f"{context_of(row)}|{'accept' if rule_match else 'reject'}"
+        # Under Kalshi-only there is one feature family, so the policy and
+        # the candidates share `brti_context_of` and a mismatch is impossible
+        # by construction rather than by convention. The Binance context
+        # survives only for the legacy path, and the Binance-trained policy
+        # is separately retired and cannot act whatever key it is handed.
+        if settings.kalshi_only:
+            brti_row, why_not = brti_context_row(snapshot, ask, opened, brti)
+            if brti_row is None:
+                return intel.Verdict(
+                    base_qualified=bool(rule_match), failed_gates=(),
+                    final_action=intel.NEUTRAL,
+                    reason=f"no {intel.FEATURE_VERSION} context ({why_not})",
+                )
+            context = brti_context_of(brti_row)
+        else:
+            context = context_of(row)
+        key = f"{context}|{'accept' if rule_match else 'reject'}"
         gates = tuple(
             f["name"] for f in (failed_checks or []) if isinstance(f, dict)
         ) if failed_checks and isinstance(failed_checks, list) else tuple(
@@ -1667,15 +1714,41 @@ async def primary_signal(
     # never saw the minutes where the measured edge actually lives.
     if not settings.entry_to_seconds <= remaining <= settings.entry_from_seconds:
         return
-    if snapshot.spread_bps > settings.max_spread_bps:
+    # The spread gate lives in `kalshi_signal.signal_inputs` on the Kalshi
+    # path, measured in CENTS of the contract. `max_spread_bps` describes
+    # Binance SPOT spread and applying it to a Kalshi book rejects every
+    # signal - a 2c spread on a 79c mid is 253 bps against a threshold of 2.
+    if not settings.kalshi_only and snapshot.spread_bps > settings.max_spread_bps:
         return
-    prediction = predict(snapshot)
-    calibration = store.calibration(prediction.bucket)
-    contract_ask = contract.ask(prediction.side)
-    rule_match, failed_checks = rule.matches(
-        prediction, snapshot, contract_ask,
-        blocking_level=blocking_level, levels_ready=levels_ready,
-    )
+    if settings.kalshi_only:
+        # THE ACTIVE RULE IS THE BRTI ONE. The deployed `EntryRule` gates on
+        # `min_normalized_distance = 1.5`, measured against Binance RAW
+        # volatility; BRTI reads 10-20 on the identical market, so reusing it
+        # here would pass the distance gate on everything while still drawing
+        # a tick beside it. Different quantity, different rule, and the floor
+        # below is the measured 10x (FINDINGS 43).
+        #
+        # `predict()` does not run: three of its five terms are Binance-only
+        # and the two that are not are on the wrong scale. There is no
+        # Kalshi-native probability model, so none is reported - see
+        # `kalshi_signal`.
+        kalshi_rule = KalshiBRTIRule.load(settings.kalshi_strategy_path)
+        prediction = kalshi_signal.prediction_from(brti)
+        calibration = None
+        contract_ask = contract.ask(prediction.side)
+        rule_match, facts, failed_names = kalshi_signal.evaluate(
+            kalshi_rule, brti, contract_ask, remaining,
+        )
+        rule_match = rule_match and kalshi_rule.enabled
+        failed_checks = ", ".join(failed_names)
+    else:
+        prediction = predict(snapshot)
+        calibration = store.calibration(prediction.bucket)
+        contract_ask = contract.ask(prediction.side)
+        rule_match, failed_checks = rule.matches(
+            prediction, snapshot, contract_ask,
+            blocking_level=blocking_level, levels_ready=levels_ready,
+        )
     # THE INTELLIGENCE LAYER, on the real decision path. One shared function,
     # the same one historical replay calls, so an evaluation can never
     # describe behaviour the bot does not have.
@@ -2082,10 +2155,17 @@ async def primary_signal(
                             # Re-deriving them at report time would describe a
                             # market that has already moved, and the point of
                             # showing them on a fill is the audit trail.
-                            fill_facts = rule.check_facts(
-                                prediction, snapshot, contract_ask,
-                                blocking_level=blocking_level,
-                                levels_ready=levels_ready,
+                            fill_facts = (
+                                kalshi_signal.evaluate(
+                                    KalshiBRTIRule.load(
+                                        settings.kalshi_strategy_path),
+                                    brti, contract_ask, remaining)[1]
+                                if settings.kalshi_only
+                                else rule.check_facts(
+                                    prediction, snapshot, contract_ask,
+                                    blocking_level=blocking_level,
+                                    levels_ready=levels_ready,
+                                )
                             )
                             why = decision_record(
                                 store, settings, claimed, contract,
@@ -2185,7 +2265,11 @@ async def primary_signal(
     # printed momentum as +3.3 bps in the checks and -3.3 bps in the context -
     # one signed for our side, one raw - with nothing to say which the rule
     # had actually used.
-    facts = rule.check_facts(
+    # The SAME facts the decision was taken on. Re-running the Binance rule
+    # here would not merely render the wrong gates - `check_facts` reads
+    # `prediction.raw_probability`, which is None on the Kalshi path because
+    # no Kalshi-native model exists, so it would raise on the first alert.
+    facts = facts if settings.kalshi_only else rule.check_facts(
         prediction, snapshot, contract_ask,
         blocking_level=blocking_level, levels_ready=levels_ready,
     )
@@ -2197,7 +2281,11 @@ async def primary_signal(
                 settings, snapshot, prediction, contract_ask,
                 priced_edge, settled_s, opened,
                 rule_match=rule_match, blocking_level=blocking_level,
-                model_ok=prediction.raw_probability >= 0.9,
+                # None on the Kalshi path: there is no Kalshi-native
+                # probability model, and `None >= 0.9` raises. False is the
+                # honest reading - "the model does not vouch for this" - and
+                # is what "no model" must mean, never an implied yes.
+                model_ok=(prediction.raw_probability or 0.0) >= 0.9,
             )
         ]
     )
@@ -2755,7 +2843,14 @@ async def reversion_signal(
 
 async def service() -> None:
     settings = Settings()
-    market = BinanceClient(settings.symbol, settings.spot_base_url, settings.futures_base_url)
+    # KALSHI ONLY. The Binance client is not CONSTRUCTED under `kalshi_only`,
+    # so no active code path can reach it even by mistake - a flag checked at
+    # each call site is a flag someone eventually forgets.
+    market = (
+        None if settings.kalshi_only
+        else BinanceClient(settings.symbol, settings.spot_base_url,
+                           settings.futures_base_url)
+    )
     kalshi = KalshiClient(settings.kalshi_base_url, settings.kalshi_series)
     store = Store(settings.database_path)
     telegram = Telegram(settings.telegram_bot_token, settings.telegram_chat_id, settings.dry_run)
@@ -2775,7 +2870,18 @@ async def service() -> None:
     capital = CapitalController(settings, store)
     CAPITAL_DAY = {"ny": None}
     LAST_POLL = {"ms": 0}
-    levels = LevelTracker()
+    # Support/resistance is computed from Binance klines and the deployed rule
+    # has `require_blocking_level: false`, so under Kalshi-only it is not
+    # built at all rather than built and ignored.
+    levels = None if settings.kalshi_only else LevelTracker()
+    if settings.kalshi_only:
+        from . import feature_contract
+        print(
+            f"KALSHI ONLY: quotes, books, executions, settlements and BRTI "
+            f"from Kalshi. Binance client not constructed. "
+            f"features {feature_contract.describe()}",
+            flush=True,
+        )
     if hourly:
         print(f"hourly ladder recording (shadow) -> {settings.hourly_database_path}",
               flush=True)
@@ -3021,8 +3127,44 @@ async def service() -> None:
                     continue
                 opened = contract.open_ms
                 remaining = (contract.close_ms - now_ms) // 1000
-                snapshot = replace(await market.snapshot(opened), target=contract.target)
-                mark("binance_snapshot")
+                if settings.kalshi_only:
+                    # THE REFERENCE POLL MOVES IN FRONT OF THE DECISION.
+                    # It used to sit behind the trading path so a slow feed
+                    # could not delay a fill (FINDINGS 22). That reasoning
+                    # held while BRTI only labelled a context; now it IS the
+                    # signal, and a decision taken before its own inputs are
+                    # fetched is a decision on the previous window. This is a
+                    # SWAP, not an addition - the Binance round trip it
+                    # replaces cost the same.
+                    if reference:
+                        await reference.poll(now_ms, contract)
+                        mark("brti_poll")
+                    brti_features = reference.current_features() if reference else None
+                    inputs = kalshi_signal.signal_inputs(
+                        brti_features, contract, now_ms=now_ms,
+                        stale_limit_ms=settings.reference_stale_ms,
+                        max_spread_cents=settings.max_contract_spread_cents,
+                    )
+                    if isinstance(inputs, kalshi_signal.Unavailable):
+                        # NO FALLBACK. Record which input failed and move on;
+                        # substituting another exchange is how a system trades
+                        # one instrument and settles on another.
+                        store.record_input_gap(
+                            window_open=opened, ticker=contract.ticker,
+                            observed_ms=now_ms, remaining_s=remaining,
+                            reason=inputs.reason, detail=inputs.detail,
+                        )
+                        if KALSHI_GAP["window"] != (opened, inputs.reason):
+                            KALSHI_GAP["window"] = (opened, inputs.reason)
+                            print(f"no signal [{inputs}]", flush=True)
+                        await asyncio.sleep(settings.poll_seconds)
+                        continue
+                    snapshot = kalshi_snapshot(inputs[2], contract, opened, now_ms)
+                    mark("kalshi_snapshot")
+                else:
+                    snapshot = replace(
+                        await market.snapshot(opened), target=contract.target)
+                    mark("binance_snapshot")
                 if contract.ticker != last_ticker:
                     print(f"Live market data connected: {contract.ticker}", flush=True)
                     last_ticker = contract.ticker
@@ -3042,9 +3184,15 @@ async def service() -> None:
                     now_ms, trader, levels, capital,
                     reference.current_features() if reference else None,
                 )
-                await reversion_signal(
-                    settings, store, telegram, contract, snapshot, opened, remaining, now_ms
-                )
+                if not settings.kalshi_only:
+                    # The reversion strategy reads Binance spike/rejection
+                    # structure. It has no Kalshi-native equivalent yet, so
+                    # under Kalshi-only it does not run rather than running on
+                    # numbers that mean something else.
+                    await reversion_signal(
+                        settings, store, telegram, contract, snapshot,
+                        opened, remaining, now_ms,
+                    )
                 # Shadow recording for the hourly ladder, AFTER the trading
                 # path. It records and never trades, so it must never sit in
                 # front of an order: on 2026-09-21 three auto orders missed
