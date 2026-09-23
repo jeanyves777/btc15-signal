@@ -4871,3 +4871,81 @@ because a deferred row never sent anything.
   path gained DEFERRED for a briefly-behind feed; the maintain path has no
   analogue, so a one-poll gap permanently ends the add. That direction is
   safe - it cancels rather than buys - and it is left as designed.
+
+## 53. Crossing-history coverage, fixed at the source (2026-09-23)
+
+Sections 51 and 52 stopped a coverage miss from becoming a permanent refusal.
+This one fixes the coverage.
+
+### What the gate could and could not establish
+
+`crossed_since` returned a bare `None` from four different situations, so the
+caller printed one sentence over all of them. "The feed is 1.4s behind" and
+"there is no series at all" were the same message, and the first resolves
+itself on the next poll while the second does not.
+
+It now returns a `Crossing` carrying the verdict, the reason it could not be
+reached, and how far short the series falls. Coverage must hold at BOTH ends:
+
+| condition | meaning |
+|---|---|
+| series starts after the entry | an earlier crossing would be invisible |
+| series does not reach the entry | no sample in the interval at all - the routine one |
+| series is stale | **new**, see below |
+| clock and series disagree by an hour | a seconds-for-milliseconds slip |
+
+**The staleness rule makes the gate STRICTER, not looser.** A series that
+covers the entry but stopped 60 seconds ago used to answer a confident
+`False` - no crossing - for an interval it had stopped watching. That was a
+false negative in the unsafe direction, and it is now unknown.
+
+**The units rule exists because the failure is silent.** Passing seconds where
+milliseconds are expected makes `now - last` hugely negative, so the staleness
+check simply never fires and a series of any age answers confidently. It
+raises nothing, so it is caught by magnitude.
+
+### The entry instant is confirmed from the broker
+
+`fills` was written only by the 60-second ledger sweep, so for up to a minute
+after an entry the gate measured from the proposal's `created_at` - when we
+ASKED, not when we were filled. `fills_for(ticker)` confirms it on the add
+path, once per window, and only while the broker's own fill is still missing.
+This makes the measurement CORRECT; it does not make coverage easier, because
+the true fill is later than the proposal and so needs a later sample.
+
+### Bounded retries, and a termination that says what happened
+
+Deferral repeats only while the add could still be placed - `evaluate` refuses
+below `min_seconds_remaining`, so the eligibility period is the bound and no
+counter is needed. When that period ends while coverage is still short, the
+recorded reason names **both**: the deadline, and what we were still waiting
+for. Previously it named only the clock, which hid the cause.
+
+### What was not done, deliberately
+
+* `None` is never replaced with an assumed `True` or `False`.
+* No current price stands in for history.
+* No threshold, sizing limit or safeguard was changed.
+* The conservative cancellation of a RESTING add on an unverifiable crossing
+  is untouched.
+
+There is no authoritative source that can supply a BRTI value for an instant
+BRTI has not published yet. The honest handling of that second is to wait for
+it inside the eligibility period and say so, which is what this does.
+
+### Validation
+
+1,114 tests pass (+25). The new ones cover feed lag, the timestamp boundary in
+both directions (a sample exactly at the entry answers; one millisecond past
+the last sample does not), restart with a short buffer, missing samples, a
+mid-series gap, staleness, the units slip, and exhausted eligibility - plus
+the 25 recorded lag values measured from the live database, each asserted to
+be a sub-two-second miss that answers once the feed catches up. Duplicate-order
+protection and fill/cancel reconciliation were re-run unchanged.
+
+Deployed as `24b4dbe` at 19:33:28Z. Startup: single instance, no exceptions,
+observations 7.9s fresh, settlement sync 31.7s, BRTI 4.7s, and nothing left
+unreconciled - 0 non-terminal adds, 0 unsettled filled adds, 0 rows PENDING
+without an order id. The newest BRTI row at that moment carried `ts_ms`
+725ms behind `received_ms`, which is the lag this section is about, visible
+live and well inside what the gate now waits for.
