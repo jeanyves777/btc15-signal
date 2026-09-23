@@ -394,6 +394,22 @@ class Settings(BaseSettings):
     # documents its utilisation caps resetting at midnight New York time - and
     # a system keeping books on a different day from its venue will file trades
     # in the wrong one twice a year at the DST boundaries.
+    # THE ADAPTIVE INTELLIGENCE LAYER. Learns from the outcomes of executed,
+    # rejected and vetoed signals and feeds that evidence back into the live
+    # decision. It may re-rate confidence always; it may change a decision
+    # only where `runtime/intelligence_policy.json` was validated to, and that
+    # artefact is written by `scripts/train_intelligence.py` and never by the
+    # running service.
+    #
+    # It can NEVER change position size - that authority is the capital
+    # controller's alone - and an exception it grants overrides ONE strategy
+    # gate, never a capital, exposure, loss or execution protection.
+    intelligence_enabled: bool = True
+    intelligence_policy_path: str = "runtime/intelligence_policy.json"
+    # A policy older than this stops being applied. Stale evidence quietly
+    # describing a market that has moved on is the failure mode here.
+    intelligence_max_policy_age_ms: int = 30 * 86_400_000
+
     capital_sizing_enabled: bool = True
     capital_per_contract: float = 30.0
     max_base_contracts: int = 2

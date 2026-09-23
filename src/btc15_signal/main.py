@@ -12,6 +12,8 @@ import httpx
 
 from . import autotrade, messages
 from . import brain as brain_mod
+from . import intelligence_policy as intel
+from .adaptive import context_of
 from .binance import BinanceClient, MarketSnapshot
 from .capital import CapitalController, ny_day
 from .config import Settings
@@ -1427,6 +1429,90 @@ def shadow_read(
         return ""
 
 
+# One policy object per process, loaded once. Reloaded only by a restart, so
+# candidate training can never change what is running.
+_POLICY: dict = {"loaded": None}
+
+
+def active_policy(settings) -> intel.Policy:
+    if _POLICY["loaded"] is None:
+        _POLICY["loaded"] = intel.Policy.load(settings.intelligence_policy_path)
+        pol = _POLICY["loaded"]
+        print(
+            f"intelligence policy: version={pol.version} "
+            f"model={pol.model_version} arms={len(pol.arms)} "
+            f"vetoes={pol.vetoes_enabled} admissions={pol.admissions_enabled}",
+            flush=True,
+        )
+    return _POLICY["loaded"]
+
+
+def intelligence_verdict(
+    settings, store, prediction, snapshot, ask, rule_match, failed_checks,
+    opened, remaining, now_ms,
+):
+    """Ask the shared decision function, record the answer, return it.
+
+    Never raises: a failure here falls back to the base strategy explicitly,
+    because a layer that can stop trading by breaking is worse than one that
+    is switched off.
+    """
+    try:
+        policy = active_policy(settings)
+        features_ok = (
+            snapshot is not None
+            and getattr(snapshot, "volatility_5m_bps", None) is not None
+        )
+        row = {
+            "session": getattr(snapshot, "session", None) or "?",
+            "vol_regime": getattr(snapshot, "vol_regime", None) or "?",
+            "normalized_distance": getattr(prediction, "distance_bps", 0.0)
+            / max(getattr(snapshot, "volatility_5m_bps", 1.0) or 1.0, 1.0),
+            "our_ask": ask,
+        }
+        key = f"{context_of(row)}|{'accept' if rule_match else 'reject'}"
+        gates = tuple(
+            f["name"] for f in (failed_checks or []) if isinstance(f, dict)
+        ) if failed_checks and isinstance(failed_checks, list) else tuple(
+            str(x) for x in (failed_checks or ())
+        )
+        verdict = intel.decide(
+            context_key=key, base_qualified=bool(rule_match),
+            failed_gates=gates, ask=ask, policy=policy,
+            enabled=settings.intelligence_enabled, features_ok=features_ok,
+            now_ms=now_ms, max_age_ms=settings.intelligence_max_policy_age_ms,
+        )
+        store.record_intelligence({
+            "window_open": opened,
+            "ticker": getattr(snapshot, "ticker", None),
+            "decided_ms": now_ms, "remaining_s": remaining,
+            "side": getattr(prediction, "side", None), "ask": ask,
+            "base_qualified": int(bool(rule_match)),
+            "failed_gates": ", ".join(gates) or None,
+            "final_action": verdict.final_action,
+            "overrides_gate": verdict.overrides_gate,
+            "reason": verdict.reason,
+            "confidence_delta": verdict.confidence_delta,
+            "calibrated_probability": verdict.calibrated_probability,
+            "expected_net": verdict.expected_net,
+            "evidence_n": verdict.evidence_n,
+            "uncertainty": verdict.uncertainty,
+            "context_key": verdict.context_key,
+            "model_version": verdict.model_version,
+            "policy_version": verdict.policy_version,
+            "feature_version": verdict.feature_version,
+            "training_cutoff_ms": verdict.training_cutoff_ms,
+            "features_ok": int(features_ok),
+        })
+        return verdict
+    except Exception as exc:  # noqa: BLE001 - never stop trading
+        print(f"intelligence failed, falling back to strategy: {exc!r}", flush=True)
+        return intel.Verdict(
+            base_qualified=bool(rule_match), failed_gates=(),
+            final_action=intel.NEUTRAL, reason="intelligence error; base strategy",
+        )
+
+
 async def primary_signal(
     settings: Settings,
     store: Store,
@@ -1463,6 +1549,22 @@ async def primary_signal(
         prediction, snapshot, contract_ask,
         blocking_level=blocking_level, levels_ready=levels_ready,
     )
+    # THE INTELLIGENCE LAYER, on the real decision path. One shared function,
+    # the same one historical replay calls, so an evaluation can never
+    # describe behaviour the bot does not have.
+    #
+    # It is recorded whatever it says - including NEUTRAL, and including when
+    # no order follows. The interesting cases for "did it help?" are exactly
+    # the ones where nothing traded, so they cannot be reconstructed from the
+    # orders afterwards.
+    verdict = intelligence_verdict(
+        settings, store, prediction, snapshot, contract_ask,
+        rule_match, failed_checks, opened, remaining, now_ms,
+    )
+    if verdict.final_action == intel.VETO:
+        rule_match = False
+    elif verdict.final_action == intel.ADMIT:
+        rule_match = True
     qualified = rule.enabled and rule_match and settings.entry_alerts_enabled
 
     # Three states, not two. The rule's verdict informs the decision without
@@ -2668,6 +2770,18 @@ async def service() -> None:
                         # an ungradeable shadow can never be promoted.
                         store.settle_shadow(row[0], winning_side)
                         store.settle_decision_records(row[0], winning_side)
+                        # Grade every intelligence decision on this market,
+                        # including vetoes and refusals - those are the
+                        # counterfactuals that say whether an adjustment
+                        # helped, and they exist nowhere else.
+                        try:
+                            store.grade_intelligence(
+                                row[0], result == ("yes" if winning_side == "UP"
+                                                   else "no"),
+                                0.0, now_ms,
+                            )
+                        except Exception as exc:  # noqa: BLE001
+                            print(f"intelligence grading failed: {exc!r}", flush=True)
                         # BANK IT BEFORE REPORTING IT. The recap renders the
                         # account, and until this market is in the ledger the
                         # count and the dollars describe different instants:

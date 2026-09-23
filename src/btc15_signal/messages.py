@@ -21,6 +21,35 @@ def bar(fraction: float, width: int = 10) -> str:
     return BAR_FULL * filled + BAR_EMPTY * (width - filled)
 
 
+def policy_line(verdict) -> str:
+    """One short line, and ONLY when intelligence changed something.
+
+    A layer that narrates every neutral decision trains the reader to skip it,
+    and the one message that matters then goes unread too. Silence is the
+    correct output for "the pattern supports the existing decision".
+    """
+    if verdict is None or not getattr(verdict, "changed", False):
+        return ""
+    action = verdict.final_action
+    if action == "veto":
+        return (
+            "🧠 <b>Entry declined</b> · qualified setup matches an "
+            f"adverse pattern <i>(n={verdict.evidence_n})</i>"
+        )
+    if action == "admit":
+        return (
+            "🧠 <b>Entry allowed</b> · validated exception to "
+            f"{escape(str(verdict.overrides_gate))} <i>(n={verdict.evidence_n})</i>"
+        )
+    delta = verdict.confidence_delta
+    direction = "raised" if delta > 0 else "lowered"
+    return (
+        f"🧠 Confidence {direction} · similar setups "
+        f"{'out-earned' if delta > 0 else 'underperformed'} "
+        f"<i>(n={verdict.evidence_n})</i>"
+    )
+
+
 def recovery_line(state, last_add: dict | None = None) -> str:
     """What recovery is doing right now, and why. Empty when inactive.
 

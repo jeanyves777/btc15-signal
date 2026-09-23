@@ -496,6 +496,50 @@ class Store:
                 state TEXT NOT NULL DEFAULT 'held'
             )
         """)
+        # EVERY INTELLIGENCE DECISION, recorded BEFORE submission and whether
+        # or not an order follows. This is what answers "what did intelligence
+        # change, why, and did it help" - a question that cannot be answered
+        # retrospectively from the orders alone, because the interesting cases
+        # are the ones where no order exists.
+        self.db.execute("""
+            CREATE TABLE IF NOT EXISTS intelligence_decisions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                window_open INTEGER NOT NULL,
+                ticker TEXT,
+                signal_id TEXT,
+                proposal_id TEXT,
+                decided_ms INTEGER NOT NULL,
+                remaining_s INTEGER,
+                side TEXT,
+                ask REAL,
+                base_qualified INTEGER NOT NULL,
+                failed_gates TEXT,
+                final_action TEXT NOT NULL,
+                overrides_gate TEXT,
+                reason TEXT,
+                confidence_delta INTEGER NOT NULL DEFAULT 0,
+                calibrated_probability REAL,
+                expected_net REAL,
+                evidence_n INTEGER,
+                uncertainty REAL,
+                context_key TEXT,
+                model_version TEXT,
+                policy_version TEXT,
+                feature_version TEXT,
+                training_cutoff_ms INTEGER,
+                features_ok INTEGER,
+                -- filled in after the fact, so an adjustment can be graded
+                order_id TEXT,
+                filled INTEGER,
+                won INTEGER,
+                realised_pnl REAL,
+                graded_ms INTEGER
+            )
+        """)
+        self.db.execute(
+            "CREATE INDEX IF NOT EXISTS intelligence_window "
+            "ON intelligence_decisions(window_open, decided_ms)"
+        )
         # `settings` holds REAL only. The open mark has to be carried per
         # ticker, not as one total, so a position that has already been banked
         # can be excluded from it - which is the whole fix.
@@ -2648,6 +2692,46 @@ class Store:
                 "SELECT * FROM recovery_adds ORDER BY created_ms DESC LIMIT 1"
             )
         return rows[0] if rows else None
+
+    def record_intelligence(self, row: dict) -> None:
+        """Log one decision. Never raises - it sits on the order path."""
+        try:
+            columns = ", ".join(row)
+            placeholders = ", ".join(f":{name}" for name in row)
+            self.db.execute(
+                f"INSERT INTO intelligence_decisions ({columns}) "
+                f"VALUES ({placeholders})",
+                row,
+            )
+            self.db.commit()
+        except sqlite3.Error as exc:
+            print(f"intelligence record failed: {exc!r}", flush=True)
+
+    def grade_intelligence(self, window_open: int, won: bool, pnl: float,
+                           now_ms: int) -> None:
+        """Attach the outcome to every decision taken on this market.
+
+        A veto and a rejected signal are graded too, as counterfactuals - they
+        are the evidence for whether the adjustment helped, and dropping them
+        would leave only the cases that happened to trade.
+        """
+        self.db.execute(
+            "UPDATE intelligence_decisions SET won=?, realised_pnl=?, graded_ms=? "
+            "WHERE window_open=? AND graded_ms IS NULL",
+            (int(won), pnl, now_ms, window_open),
+        )
+        self.db.commit()
+
+    def intelligence_summary(self) -> dict:
+        """Did it help? Counts by action, with outcomes where known."""
+        rows = self._dicts(
+            "SELECT final_action, COUNT(*) AS n, "
+            "COALESCE(SUM(won), 0) AS wins, "
+            "COALESCE(SUM(realised_pnl), 0) AS pnl, "
+            "COALESCE(SUM(graded_ms IS NOT NULL), 0) AS graded "
+            "FROM intelligence_decisions GROUP BY final_action"
+        )
+        return {r["final_action"]: r for r in rows}
 
     def lifetime_record(self) -> LifetimeRecord:
         """Realised performance across every reconciled market. One per market.

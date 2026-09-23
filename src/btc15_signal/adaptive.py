@@ -1,0 +1,273 @@
+"""Outcome feedback over contexts: the reward function and the arm statistics.
+
+THE SHAPE OF THE PROBLEM, named correctly. Adjusting confidence from observed
+outcomes is a CONTEXTUAL BANDIT: a context (session, volatility, distance,
+price, time remaining), an action (accept or reject, and at what confidence),
+and a reward (realised net profit). It only becomes reinforcement learning when
+the actions form a sequence whose earlier choices change the later state -
+enter, hold, add, exit. This module is the bandit half, deliberately: the
+sequence half needs the lifecycle work that is still unproven.
+
+WHAT THE REWARD IS, AND WHAT IT IS NOT.
+
+    accepted signal   ->  REALISED net, from a fill that actually happened
+    rejected signal   ->  HYPOTHETICAL net, at the price we recorded
+
+Those are not the same evidence and are never summed into one number here. A
+rejected winner says the direction was right; it does not say a fill was
+available at that price. FINDINGS 37 measured exactly how wrong that
+assumption can be: a market whose ask never dipped wins 99.3%, while one where
+a 2c limit actually filled wins 54.1%. Anything priced at a quote we never
+crossed is marked `simulated` and carries an explicit fill assumption.
+
+THE TWO ADJUSTMENTS ARE DIFFERENT THINGS, and conflating them is how a
+confidence model quietly becomes an execution rule:
+
+    confidence   how strongly a setup is rated. Cannot admit a signal that a
+                 gate still blocks.
+    execution    whether a setup may trade at all. Changes the gate.
+
+A context whose evidence is thin or inconsistent gets a SMALL or NEUTRAL
+adjustment, never a bold one. That is not timidity - FINDINGS 14 killed a
+positive sub-band that looked strong pooled and died on a period split, and
+the same trap is waiting for every pocket found here.
+"""
+
+import math
+import random
+from dataclasses import dataclass, field
+
+# Wide buckets on purpose. A context split finely enough to be interesting is
+# usually split finely enough to be noise: at four sessions x three volatility
+# regimes x three distances x three prices there are already 108 cells, and
+# the corpus has ~6,400 markets to spread across them.
+DISTANCE_BANDS = ((0.0, 1.5, "dist<1.5"), (1.5, 3.0, "dist1.5-3"),
+                  (3.0, 99.0, "dist3+"))
+PRICE_BANDS = ((0.0, 0.70, "px<70"), (0.70, 0.85, "px70-85"),
+               (0.85, 0.94, "px85-94"), (0.94, 1.0, "px94+"))
+
+
+def _band(value: float, bands) -> str:
+    for low, high, name in bands:
+        if low <= value < high:
+            return name
+    return bands[-1][2]
+
+
+@dataclass(frozen=True)
+class Context:
+    """The state an action is taken in. Hashable, so it keys the arms."""
+
+    session: str
+    vol_regime: str
+    distance: str
+    price: str
+
+    def __str__(self) -> str:
+        return f"{self.session} · {self.vol_regime} · {self.distance} · {self.price}"
+
+
+def context_of(row: dict) -> Context:
+    return Context(
+        session=row.get("session") or "?",
+        vol_regime=row.get("vol_regime") or "?",
+        distance=_band(abs(row.get("normalized_distance") or 0.0), DISTANCE_BANDS),
+        price=_band(row.get("our_ask") or 0.0, PRICE_BANDS),
+    )
+
+
+@dataclass
+class Arm:
+    """One context, one action, and what it has been worth."""
+
+    context: Context
+    action: str                      # "accept" | "reject"
+    rewards: list[float] = field(default_factory=list)
+    wins: int = 0
+    simulated: bool = False          # True when no fill actually happened
+
+    @property
+    def n(self) -> int:
+        return len(self.rewards)
+
+    @property
+    def mean(self) -> float:
+        return sum(self.rewards) / self.n if self.n else 0.0
+
+    @property
+    def total(self) -> float:
+        return sum(self.rewards)
+
+    def interval(self, draws: int = 2000, seed: int = 11) -> tuple[float, float]:
+        if self.n < 2:
+            return 0.0, 0.0
+        rng = random.Random(seed)
+        means = sorted(
+            sum(rng.choice(self.rewards) for _ in self.rewards) / self.n
+            for _ in range(draws)
+        )
+        return means[int(0.025 * draws)], means[int(0.975 * draws) - 1]
+
+
+@dataclass(frozen=True)
+class Proposal:
+    """A suggested adjustment, with the evidence that produced it."""
+
+    context: Context
+    kind: str          # "confidence" | "execution"
+    direction: str     # "raise" | "lower" | "admit" | "block"
+    strength: str      # "neutral" | "small" | "material"
+    n: int
+    mean: float
+    low: float
+    high: float
+    simulated: bool
+    note: str
+
+    def line(self) -> str:
+        mark = " (simulated fills)" if self.simulated else ""
+        return (
+            f"{self.kind:<10} {self.direction:<6} {self.strength:<9} "
+            f"{self.context}  n={self.n} {self.mean:+.4f} "
+            f"[{self.low:+.4f},{self.high:+.4f}]{mark}  {self.note}"
+        )
+
+
+def strength_for(n: int, low: float, high: float, comparisons: int) -> str:
+    """How boldly may this be acted on?
+
+    Thin or interval-spanning-zero evidence earns NEUTRAL - recorded, acted on
+    not at all. The interval is widened for the number of contexts examined,
+    because the best-looking cell in a table of a hundred is partly a
+    selection artefact, and pretending otherwise is how section 14's
+    sub-band survived long enough to be believed.
+    """
+    if n < 40:
+        return "neutral"
+    # Bonferroni-ish widening: scale the half-width by sqrt(comparisons).
+    mid = (low + high) / 2
+    half = (high - low) / 2 * math.sqrt(max(1, comparisons))
+    if (mid - half) > 0 or (mid + half) < 0:
+        return "material" if n >= 120 else "small"
+    return "neutral"
+
+
+def build_arms(rows: list[dict], reward) -> dict[tuple, Arm]:
+    """Group every recorded decision into (context, action) arms.
+
+    `reward(row) -> float` is supplied so the caller decides what counts:
+    realised money for fills, a hypothetical at the recorded price for
+    refusals. The two never merge, because `action` differs.
+    """
+    arms: dict[tuple, Arm] = {}
+    for row in rows:
+        context = context_of(row)
+        action = "accept" if row.get("rule_match") else "reject"
+        key = (context, action)
+        arm = arms.get(key)
+        if arm is None:
+            arm = arms[key] = Arm(
+                context=context, action=action, simulated=(action == "reject")
+            )
+        arm.rewards.append(reward(row))
+        arm.wins += int(bool(row.get("won")))
+    return arms
+
+
+def proposals(arms: dict[tuple, Arm], minimum: int = 40) -> list[Proposal]:
+    """Adjustments the evidence supports. Usually very few, by design."""
+    considered = [a for a in arms.values() if a.n >= minimum]
+    out: list[Proposal] = []
+    for arm in considered:
+        low, high = arm.interval()
+        strength = strength_for(arm.n, low, high, len(considered))
+        if arm.action == "reject":
+            # A refusal that MAKES money means the gate is right there; a
+            # refusal that loses money is a candidate for admitting.
+            if arm.mean <= 0:
+                continue
+            out.append(Proposal(
+                context=arm.context, kind="execution", direction="admit",
+                strength=strength, n=arm.n, mean=arm.mean, low=low, high=high,
+                simulated=True,
+                note="refusals here were profitable to refuse" if arm.mean < 0
+                     else "refused signals netted positive at the recorded price",
+            ))
+        else:
+            direction = "raise" if arm.mean > 0 else "lower"
+            out.append(Proposal(
+                context=arm.context, kind="confidence", direction=direction,
+                strength=strength, n=arm.n, mean=arm.mean, low=low, high=high,
+                simulated=False,
+                note="accepted signals here " + (
+                    "out-earn the book" if arm.mean > 0 else "lose money"
+                ),
+            ))
+    out.sort(key=lambda p: (p.strength != "material", p.strength != "small", -p.n))
+    return out
+
+
+@dataclass
+class Scorecard:
+    """The four numbers any adjustment has to be judged on.
+
+    An evaluation that counts only the winners it would have recovered is a
+    sales pitch. The losers it would also have admitted belong in the same
+    table, at the same prices.
+    """
+
+    recovered: float = 0.0        # profitable refusals a change would admit
+    admitted_losses: float = 0.0  # losing refusals it would also admit
+    avoided: float = 0.0          # losing acceptances a change would block
+    forgone: float = 0.0          # profitable acceptances it would also block
+    recovered_n: int = 0
+    admitted_n: int = 0
+    avoided_n: int = 0
+    forgone_n: int = 0
+
+    @property
+    def net(self) -> float:
+        return round(
+            self.recovered + self.admitted_losses + self.avoided + self.forgone, 6
+        )
+
+    def render(self) -> str:
+        return "\n".join([
+            f"  recovered opportunities   {self.recovered_n:>5}  "
+            f"{self.recovered:+8.2f}",
+            f"  new losses admitted       {self.admitted_n:>5}  "
+            f"{self.admitted_losses:+8.2f}",
+            f"  losing trades avoided     {self.avoided_n:>5}  {self.avoided:+8.2f}",
+            f"  winners wrongly blocked   {self.forgone_n:>5}  {self.forgone:+8.2f}",
+            f"  {'NET':<25} {'':>5}  {self.net:+8.2f}",
+        ])
+
+
+def score_admitting(rows: list[dict], predicate, reward) -> Scorecard:
+    """What admitting the contexts `predicate` selects would have been worth."""
+    card = Scorecard()
+    for row in rows:
+        value = reward(row)
+        if not row.get("rule_match") and predicate(row):
+            if value > 0:
+                card.recovered += value
+                card.recovered_n += 1
+            else:
+                card.admitted_losses += value
+                card.admitted_n += 1
+    return card
+
+
+def score_blocking(rows: list[dict], predicate, reward) -> Scorecard:
+    """What blocking the contexts `predicate` selects would have been worth."""
+    card = Scorecard()
+    for row in rows:
+        value = reward(row)
+        if row.get("rule_match") and predicate(row):
+            if value < 0:
+                card.avoided += -value
+                card.avoided_n += 1
+            else:
+                card.forgone += -value
+                card.forgone_n += 1
+    return card
