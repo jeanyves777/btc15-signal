@@ -4236,6 +4236,69 @@ The next confidence adjustment needs fresh forward evidence strong enough to
 clear a nested, selection-corrected interval. On today's corpus nothing does,
 and that is the correct state rather than a disappointing one.
 
+
+### The context key has the subject and the context the wrong way round
+
+The operator's framing: the layer exists to learn **which matching setups
+deserve stronger confidence, which produce losses, and which rejected setups
+should qualify.** Session and volatility regime are supporting context, not the
+strategy.
+
+The deployed key is `session · vol_regime · distance · price` - context first,
+setup last. Measured over 6,491 decisions on 6,475 markets:
+
+    keying                            cells  n>=120  decisions covered
+    session · vol · distance · price   139     18     3,754  (58%)
+    session · distance · price          60     17     5,363  (83%)
+    vol · distance · price              41     15     5,882  (91%)
+    distance · price  (setup only)      16      8     6,352  (98%)
+
+**Session and regime fragment the corpus and leave 42% of every decision the
+system has ever taken in a cell too small to speak.** The largest deployed cell
+holds 345 decisions; the largest setup-only cell holds 1,798. That is the
+symptom this file has been circling - almost nothing clears any bar - and a
+large part of it is the partition, not the market.
+
+**But re-keying does NOT change today's answer**, and it is worth being exact
+about why:
+
+    keying                     eligible  clear raw  survive multiplicity
+    session · vol · dist · px      7         2              0
+    distance · price               7         5              0
+    vol · distance · price         9         6              0
+    session · distance · price    11         4              0
+
+Five of seven setup-only cells clear zero raw against two under the deployed
+key, so the extra evidence is real. None survives the multiplicity widening
+under any scheme. The binding constraint is **independent DAYS, not markets**:
+the interval is bootstrapped by day, so a cell with 1,798 decisions spread over
+the same ~70 days is barely narrower than one with 345. More markets per cell
+does not buy what it looks like it buys.
+
+**AND CHOOSING A KEYING BECAUSE IT CLEARS MORE WOULD BE THE SELECTION THIS
+ENTRY JUST FINISHED CORRECTING.** Four schemes have now been looked at. The
+keying must be chosen on what the layer is FOR - which is the operator's
+argument and it is sufficient on its own - and then evaluated on evidence that
+arrives afterwards. It must not be chosen on which partition happens to light
+up on data already seen.
+
+So the change is declared here, before it is evaluated:
+
+  * the context key becomes SETUP-FIRST. Distance band and price band are the
+    subject; session and volatility regime are recorded alongside every
+    decision as context and are available for reading, but do not partition
+    the evidence by default.
+  * the bar is unchanged - nested chronological folds, interval clear of zero,
+    multiplicity widened across eligible cells. Fixed before the re-keying, not
+    after seeing what it admits.
+  * historical live rows stay usable: their recorded key is session-first and
+    the setup key is recoverable by dropping the leading components, so no
+    archive is rewritten and no decision loses its provenance.
+
+Not shipped in this release. The current build is safe - zero adjustments, and
+nothing is being acted on - so it goes out after the pending scheduled-training
+proof rather than resetting that clock for a third time.
+
 ### What is live, and what is not
 
     running                          YES  - scheduled, persisted, restart-safe
