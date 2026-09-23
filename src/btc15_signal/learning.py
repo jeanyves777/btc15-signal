@@ -73,10 +73,20 @@ MIN_WITHDRAWAL_N = 20      # enough forward changes to call an active arm bad
 #   arms-shrunk-2      confidence sized from profit. WRONG: an expensive
 #                      contract that wins often loses money and is still a
 #                      high-confidence call.
-#   arms-calibrated-1  confidence sized from the calibration error,
-#                      validated out of sample. Profit drives execution.
-MODEL_VERSION = "arms-calibrated-1"
-SUPERSEDED_MODEL_VERSIONS = ("arms-shrunk-1", "arms-shrunk-2")
+#   arms-calibrated-1  confidence sized from the error against the ASK. Also
+#                      wrong: the ask is the MARKET's prediction, so that
+#                      calibrates Kalshi, not the confidence we display.
+#   arms-calibrated-2  confidence sized from the error against the model's own
+#                      recorded, pre-adjustment score, validated out of
+#                      sample. Profit drives execution; the market comparison
+#                      is reported beside it and never applied.
+MODEL_VERSION = "arms-calibrated-2"
+SUPERSEDED_MODEL_VERSIONS = (
+    "arms-shrunk-1", "arms-shrunk-2",
+    # arms-calibrated-1 sized confidence from the ASK, which
+    # calibrates Kalshi rather than our own score.
+    "arms-calibrated-1",
+)
 
 TRAIN_FRACTION = 0.55
 VALIDATE_FRACTION = 0.25
@@ -172,6 +182,63 @@ def _survives_widening(low: float, high: float, widening: float) -> bool:
     return mid - half > 0 or mid + half < 0
 
 
+BUCKET_WIDTH = 10          # points per reliability bucket
+MIN_BUCKET_N = 40          # below this a bucket speaks mostly for the prior
+
+
+def reliability_curve(rows: list[dict], reward=None) -> dict:
+    """The model's score mapped to the frequency it actually wins at.
+
+    THIS IS THE MODEL'S OWN CALIBRATION, and it is a different question from
+    whether the market price is right. `confidence_label` scores a setup out of
+    100 from its passing gates and the time of day; that score is a PREDICTION,
+    and a prediction is calibrated by comparing it with outcomes - not by
+    comparing the price with outcomes, which measures Kalshi.
+
+    Measured over the corpus the score is informative where it matters: flat
+    around 0.50 from 25 to 67 points, then 71 -> 0.63, 75 -> 0.79, 89 -> 0.83,
+    100 -> 0.86. So it carries real information in its upper half and almost
+    none in its lower half, which is worth knowing and is invisible if the only
+    thing ever compared with outcomes is the ask.
+
+    FITTED ON THE TRAINING SLICE ONLY. The curve is then applied unchanged to
+    the validation slice, so an out-of-sample check is genuinely out of sample;
+    refitting it per slice would let each one grade its own homework.
+
+    Buckets are shrunk toward the overall rate, so a thin bucket reports
+    roughly the base rate rather than a bold number from forty markets.
+    """
+    scored = [r for r in rows if r.get("model_points") is not None]
+    if not scored:
+        return {"prior": 0.0, "buckets": {}, "n": 0}
+    prior = sum(1 for r in scored if r.get("won")) / len(scored)
+    groups: dict[int, list[int]] = defaultdict(list)
+    for row in scored:
+        groups[_bucket(row["model_points"])].append(1 if row.get("won") else 0)
+    buckets = {
+        key: round(shrink(sum(v) / len(v), len(v), prior, MIN_BUCKET_N), 6)
+        for key, v in groups.items()
+    }
+    return {"prior": round(prior, 6), "buckets": buckets, "n": len(scored)}
+
+
+def _bucket(points) -> int:
+    return max(0, min(9, int(points) // BUCKET_WIDTH))
+
+
+def predicted_probability(points, curve: dict) -> float | None:
+    """What the MODEL said this setup's chance was, in probability terms.
+
+    None when the decision carries no recorded score - which is every live row
+    written before the score was recorded. A row with no prediction cannot
+    contribute to a calibration of predictions, and inventing one from today's
+    code would measure today's code.
+    """
+    if points is None or not curve.get("n"):
+        return None
+    return curve["buckets"].get(_bucket(points), curve["prior"])
+
+
 # --------------------------------------------------------------- fitting
 
 
@@ -202,10 +269,20 @@ class ArmFit:
     # 0.5326. Favourites are slightly cheap and longshots dear - the
     # favourite-longshot bias - which is a real, directional signal about
     # WINNING, separate from whether the price leaves money on the table.
+    # THE MODEL'S calibration: observed outcome minus the probability the
+    # model's own recorded confidence score predicted. Drives the label.
     calibration: float = 0.0
     calibration_low: float = 0.0
     calibration_high: float = 0.0
+    calibration_n: int = 0
+    model_probability: float = 0.0
     validate_calibration: float | None = None
+    # THE MARKET's calibration: observed outcome minus the ask, which is what
+    # Kalshi predicted. Reported, never applied - it says whether the PRICE is
+    # right, which is a different claim from whether our confidence is.
+    market_calibration: float = 0.0
+    market_low: float = 0.0
+    market_high: float = 0.0
     # Filled in by `train`, which has the priors and the candidate count.
     shrunk: float = 0.0
     delta: int = 0
@@ -244,6 +321,12 @@ class ArmFit:
             "low": round(self.low, 6), "high": round(self.high, 6),
             "win_rate": round(self.win_rate, 6),
             "mean_ask": round(self.mean_ask, 6),
+            "calibration": round(self.calibration, 6),
+            "calibration_low": round(self.calibration_low, 6),
+            "calibration_high": round(self.calibration_high, 6),
+            "calibration_n": self.calibration_n,
+            "model_probability": round(self.model_probability, 6),
+            "market_calibration": round(self.market_calibration, 6),
             "action": self.action, "gate": self.gate,
             "action_reason": self.action_reason,
             "delta": self.delta, "delta_reason": self.delta_reason,
@@ -258,7 +341,8 @@ class ArmFit:
         }
 
 
-def fit_arms(rows: list[dict], reward, min_n: int = 1) -> dict[str, ArmFit]:
+def fit_arms(rows: list[dict], reward, min_n: int = 1,
+             curve: dict | None = None) -> dict[str, ArmFit]:
     """Group rows into context-action cells and measure each one.
 
     `markets` is counted separately from `n` throughout. They differ whenever a
@@ -277,13 +361,27 @@ def fit_arms(rows: list[dict], reward, min_n: int = 1) -> dict[str, ArmFit]:
         days = [day_of(r["window_open"]) for r in items]
         low, high = cluster_ci(values, days)
         wins = sum(1 for r in items if r.get("won"))
-        # PER-ROW CALIBRATION ERROR: outcome minus the probability the price
-        # predicted, at the instant the decision was made. Bootstrapped by day
-        # exactly like the money, because the same clustering applies.
-        gaps = [
+        # TWO CALIBRATIONS, kept apart because they answer two questions.
+        #
+        #   model   outcome - what OUR confidence score predicted. Drives the
+        #           label, because the label is that score.
+        #   market  outcome - the ask, which is what KALSHI predicted. Reported
+        #           only: it says whether the price is right, which is not a
+        #           statement about our model.
+        market_gaps = [
             (1.0 if r.get("won") else 0.0) - float(r["our_ask"]) for r in items
         ]
-        gap_low, gap_high = cluster_ci(gaps, days)
+        market_low, market_high = cluster_ci(market_gaps, days)
+        scored = [
+            (r, predicted_probability(r.get("model_points"), curve or {}))
+            for r in items
+        ]
+        scored = [(r, p) for r, p in scored if p is not None]
+        model_gaps = [
+            (1.0 if r.get("won") else 0.0) - p for r, p in scored
+        ]
+        model_days = [day_of(r["window_open"]) for r, _p in scored]
+        gap_low, gap_high = cluster_ci(model_gaps, model_days)
         out[key] = ArmFit(
             key=key, n=len(values),
             markets=len({r["window_open"] for r in items}),
@@ -291,8 +389,16 @@ def fit_arms(rows: list[dict], reward, min_n: int = 1) -> dict[str, ArmFit]:
             mean=sum(values) / len(values), low=low, high=high,
             wins=wins, win_rate=wins / len(items),
             mean_ask=sum(float(r["our_ask"]) for r in items) / len(items),
-            calibration=sum(gaps) / len(gaps),
+            calibration=(
+                sum(model_gaps) / len(model_gaps) if model_gaps else 0.0
+            ),
             calibration_low=gap_low, calibration_high=gap_high,
+            calibration_n=len(model_gaps),
+            model_probability=(
+                sum(p for _r, p in scored) / len(scored) if scored else 0.0
+            ),
+            market_calibration=sum(market_gaps) / len(market_gaps),
+            market_low=market_low, market_high=market_high,
             gate_signatures=frozenset(
                 (r.get("failed_gates") or "").strip()
                 for r in items if not r.get("rule_match")
@@ -380,6 +486,10 @@ class TrainingReport:
     baseline_reject: float = 0.0
     training_cutoff_ms: int = 0
     data_end_ms: int = 0
+    # The model's own score mapped to the frequency it wins at. Published
+    # on the artefact because it is the thing a confidence delta is
+    # measured against, and it is interesting in its own right.
+    reliability_curve: dict = field(default_factory=dict)
     notes: list[str] = field(default_factory=list)
 
     def payload(self) -> dict:
@@ -454,9 +564,13 @@ def train(
     )
     priors = {"accept": report.baseline_accept, "reject": report.baseline_reject}
 
-    arms = fit_arms(train_rows, reward)
-    validate_arms = fit_arms(validate_rows, reward)
+    # THE CURVE IS FITTED ON TRAIN AND APPLIED UNCHANGED TO VALIDATE, so
+    # the out-of-sample check is genuinely out of sample.
+    curve = reliability_curve(train_rows)
+    arms = fit_arms(train_rows, reward, curve=curve)
+    validate_arms = fit_arms(validate_rows, reward, curve=curve)
     report.arms_fitted = len(arms)
+    report.reliability_curve = curve
 
     # PASS ONE: how many cells are even eligible to be examined as execution
     # candidates. The multiplicity widening needs this count before any single
@@ -589,11 +703,21 @@ def _calibrate_confidence(arm: ArmFit, validate_arms: dict) -> None:
             f"evidence spans {arm.days} day; no interval can be formed"
         )
         return
-    if not excludes_zero(arm.calibration_low, arm.calibration_high):
+    if arm.calibration_n < MIN_CONFIDENCE_N:
         arm.delta, arm.delta_reason = 0, (
-            f"calibration {arm.calibration:+.4f} interval "
-            f"[{arm.calibration_low:+.4f},{arm.calibration_high:+.4f}] "
-            f"includes zero - the price is not measurably wrong here"
+            f"only {arm.calibration_n} of {arm.n} rows carry a recorded model "
+            f"confidence; INSUFFICIENT EVIDENCE to calibrate it"
+        )
+        return
+    if not excludes_zero(arm.calibration_low, arm.calibration_high):
+        # INSUFFICIENT EVIDENCE, not proof the model is right. An interval
+        # spanning zero says this cell has not shown a measurable calibration
+        # error at this sample size; it does not say there is none.
+        arm.delta, arm.delta_reason = 0, (
+            f"model calibration {arm.calibration:+.4f} interval "
+            f"[{arm.calibration_low:+.4f},{arm.calibration_high:+.4f}] spans "
+            f"zero: INSUFFICIENT EVIDENCE at n={arm.calibration_n}, not a "
+            f"finding that the score is correct"
         )
         return
     if val is None or val.n < MIN_VALIDATE_N:
@@ -617,18 +741,22 @@ def _calibrate_confidence(arm: ArmFit, validate_arms: dict) -> None:
     # market's own estimate and a good one (FINDINGS 36: no model beats the
     # ask), so a few hundred observations should move it a little, not replace
     # it.
-    arm.probability = round(shrink(arm.win_rate, arm.n, arm.mean_ask), 6)
+    arm.probability = round(
+        shrink(arm.win_rate, arm.n, arm.model_probability), 6
+    )
     if arm.delta == 0:
         arm.delta_reason = (
-            f"calibration {arm.calibration:+.4f} rounds to no change"
+            f"model calibration {arm.calibration:+.4f} rounds to no change"
         )
     else:
         arm.delta_reason = (
-            f"wins {arm.win_rate:.3f} against an implied {arm.mean_ask:.3f} "
-            f"({arm.calibration:+.4f}) over n={arm.n} in {arm.days} days; "
-            f"interval [{arm.calibration_low:+.4f},"
-            f"{arm.calibration_high:+.4f}] clear of zero; validate n={val.n} "
-            f"{val.calibration:+.4f} agrees"
+            f"wins {arm.win_rate:.3f} where the model's own score predicted "
+            f"{arm.model_probability:.3f} ({arm.calibration:+.4f}) over "
+            f"n={arm.calibration_n} in {arm.days} days; interval "
+            f"[{arm.calibration_low:+.4f},{arm.calibration_high:+.4f}] clear "
+            f"of zero; validate n={val.n} {val.calibration:+.4f} agrees. "
+            f"[market, not applied: wins {arm.win_rate:.3f} against an ask of "
+            f"{arm.mean_ask:.3f}, {arm.market_calibration:+.4f}]"
         )
 
 

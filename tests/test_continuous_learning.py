@@ -45,7 +45,7 @@ DAY = 86_400_000
 
 def rows_for(context: str, n: int, *, qualified: bool, win_rate: float,
              ask: float = 0.80, start_ms: int = NOW, side: str = "UP",
-             spread_days: int = 10) -> list[dict]:
+             spread_days: int = 10, model_points: int = 85) -> list[dict]:
     """`n` settled markets in one cell, spread over several days.
 
     Spread over days on purpose: the interval is bootstrapped by day, so a
@@ -64,6 +64,7 @@ def rows_for(context: str, n: int, *, qualified: bool, win_rate: float,
             "failed_gates": None if qualified else "target distance",
             "context_key": context,
             "side": side,
+            "model_points": model_points,
             "origin": "corpus",
             "fill_kind": "simulated",
             "fee_cost": None,
@@ -1246,6 +1247,9 @@ def test_an_execution_is_read_from_the_settlement_not_from_the_fills(tmp_path):
     """
     store = make_store(tmp_path)
     _intel_row(store, window=NOW, ticker="T1", side="DOWN", ask=0.77)
+    _fill(store, fill_id="f1", ticker="T1", action="sell", side="no",
+          count=2.0, yes_price=0.22, no_price=0.78, fee_cost=0.0241,
+          filled_ms=NOW)
     _settlement(store, "T1", no_count=2.0, no_cost=1.56, revenue_cents=200,
                 fee_cost=0.0241, pnl=0.4159, market_result="no")
     store.grade_intelligence(NOW, "DOWN", 0.0, NOW + 1000)
@@ -1271,6 +1275,12 @@ def test_a_cashed_out_pair_is_one_position_not_two(tmp_path):
     expensive one, and the size is the netted pair, not their sum."""
     store = make_store(tmp_path)
     _intel_row(store, window=NOW, ticker="T1", side="UP", ask=0.82)
+    _fill(store, fill_id="f1", ticker="T1", action="buy", side="yes",
+          count=2.0, yes_price=0.86, no_price=0.14, fee_cost=0.0169,
+          filled_ms=NOW)
+    _fill(store, fill_id="f2", ticker="T1", action="sell", side="no",
+          count=2.0, yes_price=0.997, no_price=0.003, fee_cost=0.0005,
+          filled_ms=NOW + 60_000)
     _settlement(store, "T1", yes_count=2.0, no_count=2.0, yes_cost=1.72,
                 no_cost=0.006, fee_cost=0.0174, pnl=0.2566)
     store.grade_intelligence(NOW, "UP", 0.0, NOW + 1000)
@@ -1288,6 +1298,9 @@ def test_the_side_we_held_comes_from_the_settlement_counts(tmp_path):
     store = make_store(tmp_path)
     _intel_row(store, window=NOW, ticker="T1", side="UP", ask=0.60)
     _intel_row(store, window=NOW, ticker="T1", side="DOWN", ask=0.40)
+    _fill(store, fill_id="f1", ticker="T1", action="buy", side="no",
+          count=2.0, yes_price=0.60, no_price=0.40, fee_cost=0.02,
+          filled_ms=NOW)
     _settlement(store, "T1", no_count=2.0, no_cost=0.80, revenue_cents=200,
                 fee_cost=0.02, pnl=1.18, market_result="no")
     store.grade_intelligence(NOW, "DOWN", 0.0, NOW + 1000)
@@ -1337,6 +1350,9 @@ def test_a_null_ticker_is_resolved_through_predictions_not_rewritten(tmp_path):
         (NOW, NOW, 1.0, 0.86, "UP", -1, None, "T1"),
     )
     store.db.commit()
+    _fill(store, fill_id="f1", ticker="T1", action="buy", side="yes",
+          count=1.0, yes_price=0.86, no_price=0.14, fee_cost=0.0084,
+          filled_ms=NOW)
     _settlement(store, "T1", yes_count=1.0, yes_cost=0.86, revenue_cents=100,
                 fee_cost=0.0084, pnl=0.1316)
     store.grade_intelligence(NOW, "UP", 0.0, NOW + 1000)
@@ -1460,21 +1476,25 @@ def test_an_expensive_cell_that_wins_is_not_marked_low_confidence():
     result = _fit_one(rows)
     arm = result.arms[f"{CTX}|accept"]
     assert arm.mean < 0, "this cell must genuinely lose money"
-    assert abs(arm.calibration) < 0.03, "and be close to correctly priced"
+    assert abs(arm.calibration) < 0.03, "and its own score must be calibrated"
     assert arm.delta == 0
     assert "calibration" in arm.delta_reason
 
 
-def test_a_measurably_mispriced_cell_does_get_a_confidence_change():
-    """The other half: where the price IS wrong, the label moves."""
+def test_the_market_comparison_is_measured_and_never_applied():
+    """`observed win rate - ask` says whether KALSHI is right. It is worth
+    knowing and it is kept, but it is not a statement about our model and it
+    does not move our label."""
     rows = rows_for(CTX, 400, qualified=True, win_rate=0.90, ask=0.70)
-    result = _fit_one(rows)
-    arm = result.arms[f"{CTX}|accept"]
-    assert arm.calibration > 0.15
-    assert arm.delta > 0, arm.delta_reason
-    assert "wins" in arm.delta_reason and "implied" in arm.delta_reason
-    # The delta is in PROBABILITY POINTS, not dollars.
-    assert arm.delta == max(-12, min(12, round(arm.calibration * 100)))
+    arm = _fit_one(rows).arms[f"{CTX}|accept"]
+    # The market is badly wrong here: 70c on a cell that wins 90%.
+    assert arm.market_calibration > 0.15
+    # ...and our own score is perfectly calibrated to it, so nothing moves.
+    assert abs(arm.calibration) < 0.02
+    assert arm.delta == 0
+    payload = arm.payload()
+    assert payload["market_calibration"] == round(arm.market_calibration, 6)
+    assert payload["calibration"] == round(arm.calibration, 6)
 
 
 def test_confidence_must_hold_out_of_sample():
@@ -1483,11 +1503,16 @@ def test_confidence_must_hold_out_of_sample():
     A cell whose calibration error reverses on the validation slice is not a
     calibration error; it is the fitted period.
     """
+    # One cell beats the pooled rate early and misses it late; a second cell
+    # keeps the pool honest so the curve is not just this cell's own average.
     early = rows_for(CTX, 300, qualified=True, win_rate=0.95, ask=0.70,
-                     start_ms=NOW)
-    late = rows_for(CTX, 220, qualified=True, win_rate=0.45, ask=0.70,
-                    start_ms=NOW + 200 * DAY)
-    result = _fit_one(early + late)
+                     start_ms=NOW, spread_days=30)
+    late = rows_for(CTX, 220, qualified=True, win_rate=0.20, ask=0.70,
+                    start_ms=NOW + 31 * DAY, spread_days=22)
+    other = rows_for("us · low · bd5-10 · px<70|reject", 400, qualified=False,
+                     win_rate=0.55, ask=0.55, start_ms=NOW + 500_000,
+                     spread_days=50)
+    result = _fit_one(early + late + other)
     arm = result.arms[f"{CTX}|accept"]
     assert arm.delta == 0
     assert "out of sample" in arm.delta_reason
@@ -1660,3 +1685,227 @@ def test_the_stale_method_triggers_an_automatic_refit(tmp_path):
     assert snap["policy_valid"] is False
     assert snap["adjusting_confidence"] is False
     assert snap["active_adjustments"] == []
+
+
+# ------------------------- attribution through broker order and fill ids
+
+
+def test_the_opening_side_comes_from_fill_ORDER_not_from_which_leg_cost_more():
+    """Buy YES at 0.80, watch it fall, cash out by buying NO at 0.85, and the
+    NO leg is the expensive one. The old rule reported the position we exited
+    INTO as the position we took. Over this account's 60 closed pairs it
+    misattributed 6, including a -$1.75 loser."""
+    fills = [
+        {"fill_id": "f1", "order_id": "o1", "ticker": "T", "side": "yes",
+         "action": "buy", "count": 2.0, "yes_price": 0.80, "no_price": 0.20,
+         "fee_cost": 0.0224, "filled_ms": 100},
+        {"fill_id": "f2", "order_id": "o2", "ticker": "T", "side": "no",
+         "action": "sell", "count": 2.0, "yes_price": 0.15, "no_price": 0.85,
+         "fee_cost": 0.0179, "filled_ms": 200},
+    ]
+    settlement = {"yes_count": 2.0, "no_count": 2.0, "yes_cost": 1.60,
+                  "no_cost": 1.70, "fee_cost": 0.0403, "pnl": -0.1403}
+    out = learning_data.attribute_execution(fills, settlement)
+    assert out["resolved"], out["reason"]
+    assert out["side"] == "UP"            # the FIRST fill, not the dearer leg
+    assert out["entry_price"] == pytest.approx(0.80)
+    assert out["exit_price"] == pytest.approx(0.85)
+    assert out["pnl_per_contract"] == pytest.approx(-0.1403 / 2)
+    assert out["fill_ids"] == ("f1", "f2")
+    assert out["order_ids"] == ("o1", "o2")
+
+
+def test_adds_are_linked_to_the_entry_and_priced_together():
+    """A base order plus recovery add-ons is one position at a weighted price."""
+    fills = [
+        {"fill_id": "f1", "order_id": "o1", "ticker": "T", "side": "no",
+         "action": "buy", "count": 2.0, "yes_price": 0.30, "no_price": 0.70,
+         "fee_cost": 0.0294, "filled_ms": 100},
+        {"fill_id": "f2", "order_id": "o2", "ticker": "T", "side": "no",
+         "action": "buy", "count": 1.0, "yes_price": 0.20, "no_price": 0.80,
+         "fee_cost": 0.0112, "filled_ms": 200},
+    ]
+    settlement = {"yes_count": 0.0, "no_count": 3.0, "yes_cost": 0.0,
+                  "no_cost": 2.20, "fee_cost": 0.0406, "pnl": 0.7594}
+    out = learning_data.attribute_execution(fills, settlement)
+    assert out["resolved"], out["reason"]
+    assert out["side"] == "DOWN"
+    assert out["contracts"] == 3.0
+    assert out["adds"] == 1
+    assert out["entry_price"] == pytest.approx(2.20 / 3)
+    assert out["pnl_per_contract"] == pytest.approx(0.7594 / 3, abs=1e-6)
+    assert len(out["order_ids"]) == 2
+
+
+def test_attribution_that_does_not_reconcile_is_refused():
+    """The reconciliation is what makes this attribution and not a guess."""
+    fills = [{"fill_id": "f1", "ticker": "T", "side": "yes", "action": "buy",
+              "count": 2.0, "yes_price": 0.80, "no_price": 0.20,
+              "fee_cost": 0.02, "filled_ms": 100}]
+    settlement = {"yes_count": 5.0, "no_count": 0.0, "yes_cost": 4.0,
+                  "no_cost": 0.0, "fee_cost": 0.05, "pnl": 1.0}
+    out = learning_data.attribute_execution(fills, settlement)
+    assert out["resolved"] is False
+    assert "do not reconcile" in out["reason"]
+    assert "yes_count" in out["reason"]
+
+
+def test_a_settled_market_with_no_fills_is_unresolved():
+    out = learning_data.attribute_execution(
+        [], {"yes_count": 2.0, "no_count": 0.0, "yes_cost": 1.6,
+             "no_cost": 0.0, "fee_cost": 0.02, "pnl": 0.38})
+    assert out["resolved"] is False
+    assert "no fill records" in out["reason"]
+
+
+def test_unattributed_markets_are_excluded_from_execution_learning(tmp_path):
+    """A trade we cannot attribute is not evidence about a decision - and it
+    must not quietly become a counterfactual either, because something really
+    did happen there."""
+    store = make_store(tmp_path)
+    _intel_row(store, window=NOW, ticker="T1", side="UP", ask=0.80)
+    _settlement(store, "T1", yes_count=5.0, yes_cost=4.0, fee_cost=0.05,
+                pnl=1.0)
+    _fill(store, fill_id="f1", ticker="T1", action="buy", side="yes",
+          count=2.0, yes_price=0.80, no_price=0.20, fee_cost=0.02,
+          filled_ms=NOW)
+    store.grade_intelligence(NOW, "UP", 0.0, NOW + 1000)
+    rows, prov = learning_data.live_rows(
+        store.db, fingerprint=feature_contract.FINGERPRINT
+    )
+    assert rows == []
+    assert prov.excluded_unattributed == 1
+    assert prov.live_actual_fills == 0
+
+
+# ------------------- confidence calibrates the MODEL, not the market price
+
+
+def test_the_reliability_curve_maps_the_models_score_to_a_frequency():
+    rows = (
+        rows_for(CTX, 200, qualified=True, win_rate=0.90, ask=0.80)
+        + rows_for(CTX, 200, qualified=True, win_rate=0.50, ask=0.80,
+                   start_ms=NOW + 300 * DAY)
+    )
+    for i, row in enumerate(rows):
+        row["model_points"] = 95 if i < 200 else 35
+    curve = learning.reliability_curve(rows)
+    assert curve["n"] == 400
+    assert curve["buckets"][9] > curve["buckets"][3]
+    # A row with no recorded score predicts nothing.
+    assert learning.predicted_probability(None, curve) is None
+    assert learning.predicted_probability(95, curve) == curve["buckets"][9]
+
+
+def test_confidence_follows_the_model_score_not_the_ask():
+    """The two come apart, and only one of them is our model.
+
+    Here the PRICE is right - 80c on a cell that wins 80% - while the model's
+    own score says 0.50, because every one of these rows scored in the middle
+    of its range. That is a miscalibrated confidence label on a correctly
+    priced market, and it is exactly the case the ask can never surface.
+    """
+    # INTERLEAVED IN TIME, so the chronological split puts both cells in both
+    # slices - otherwise the curve is fitted on one cell and checked on the
+    # other, which measures the split rather than the calibration.
+    strong = rows_for(CTX, 400, qualified=True, win_rate=0.80, ask=0.80,
+                      model_points=45, spread_days=40)
+    weak = rows_for("us · low · bd5-10 · px<70|reject", 400, qualified=False,
+                    win_rate=0.20, ask=0.20, start_ms=NOW + 450_000,
+                    model_points=45, spread_days=40)
+    result = _fit_one(strong + weak)
+    arm = result.arms[f"{CTX}|accept"]
+    # The market is well priced here...
+    assert abs(arm.market_calibration) < 0.03
+    # ...and the model's own score is not.
+    assert arm.calibration > 0.10
+    assert arm.delta > 0, arm.delta_reason
+    assert "model's own score" in arm.delta_reason
+    # The market comparison is reported beside it and labelled as not applied.
+    assert "not applied" in arm.delta_reason
+
+
+def test_an_interval_spanning_zero_reports_insufficient_evidence():
+    """Not "the score is correct". The distinction matters: one is a finding,
+    the other is an absence of one."""
+    # A cell that tracks the pooled rate: no measurable calibration error, and
+    # a second cell so the pool is not simply this cell's own average.
+    rows = rows_for(CTX, 300, qualified=True, win_rate=0.72, ask=0.72,
+                    spread_days=30)
+    rows += rows_for("us · low · bd5-10 · px<70|reject", 300, qualified=False,
+                     win_rate=0.70, ask=0.70, start_ms=NOW + 450_000,
+                     spread_days=30)
+    arm = _fit_one(rows).arms[f"{CTX}|accept"]
+    assert arm.delta == 0, arm.delta_reason
+    assert "INSUFFICIENT EVIDENCE" in arm.delta_reason
+    # It must NOT claim the score has been shown correct.
+    assert "not a finding that the score is correct" in arm.delta_reason
+
+
+def test_rows_without_a_recorded_score_cannot_calibrate_it():
+    """Every live row written before the score was recorded has none. A
+    calibration of predictions needs the predictions."""
+    rows = rows_for(CTX, 400, qualified=True, win_rate=0.95, ask=0.70)
+    for row in rows:
+        row["model_points"] = None
+    arm = _fit_one(rows).arms[f"{CTX}|accept"]
+    assert arm.calibration_n == 0
+    assert arm.delta == 0
+    assert "recorded model confidence" in arm.delta_reason
+    assert "INSUFFICIENT EVIDENCE" in arm.delta_reason
+
+
+def test_the_curve_is_fitted_on_train_and_applied_to_validate():
+    """Refitting per slice would let each one grade its own homework."""
+    rows = rows_for(CTX, 600, qualified=True, win_rate=0.80, ask=0.80)
+    for row in rows:
+        row["model_points"] = 90
+    train, validate, _hold = learning.chronological_split(rows)
+    curve = learning.reliability_curve(train)
+    train_arms = learning.fit_arms(train, lambda r: 0.0, curve=curve)
+    validate_arms = learning.fit_arms(validate, lambda r: 0.0, curve=curve)
+    key = f"{CTX}|accept"
+    # Both slices are measured against the SAME predicted probability.
+    assert train_arms[key].model_probability == pytest.approx(
+        validate_arms[key].model_probability
+    )
+
+
+def test_the_ask_based_method_is_retired_and_cannot_act():
+    stale = intel.Policy(
+        version="v", model_version="arms-calibrated-1", feature_version="brti-1",
+        arms={f"{CTX}|accept": {"n": 300, "delta": -12}},
+        feature_fingerprint=feature_contract.FINGERPRINT,
+        feature_definitions=feature_contract.CONTRACT.payload(),
+    )
+    ok, why = learning.policy_is_valid(
+        stale, fingerprint=feature_contract.FINGERPRINT,
+        feature_version="brti-1",
+    )
+    assert not ok
+    assert "superseded method" in why
+
+
+def test_the_model_score_is_computed_by_one_function_for_both_paths():
+    """A calibration compares a PREDICTION with an OUTCOME. If the prediction
+    is recomputed differently in training and live, the comparison measures the
+    difference between the two implementations."""
+    from btc15_signal.levels import confidence_points as level_points
+    from btc15_signal.main import model_confidence_points
+    from btc15_signal.regime import model_points
+
+    facts = [{"passed": True}] * 3 + [{"passed": False}]
+    opened = NOW
+    # THE LEVEL TERM IS NOT ZERO under Kalshi-only: no protective level is
+    # computed, so the live path calls `level_points(False)`, which is -6.
+    # Passing 0 in the corpus scored every historical row six points above the
+    # live one and turned the calibration into a comparison between two
+    # implementations. That is why both sides call these functions rather than
+    # agreeing by inspection.
+    assert level_points(False) == -6
+    assert model_confidence_points(facts, opened, None) == model_points(
+        3, opened, level_points(False)
+    )
+    assert model_confidence_points(facts, opened, None) != model_points(
+        3, opened, 0
+    )

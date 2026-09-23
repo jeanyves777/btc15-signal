@@ -130,6 +130,25 @@ def state_section(runner: LearningRunner, now_ms: int, out: list) -> None:
         out.append(f"    promoted          {last.get('promoted')} of "
                    f"{last.get('candidates_examined')} examined")
         out.append(f"    activated         {bool(last.get('activated'))}")
+        report = last.get("report")
+        curve = {}
+        if report:
+            import json as _json
+            try:
+                curve = (_json.loads(report) or {}).get("reliability_curve") or {}
+            except ValueError:
+                curve = {}
+        if curve.get("buckets"):
+            out.append(THIN)
+            out.append("  THE MODEL'S OWN RELIABILITY (train slice)")
+            out.append("    what our confidence score predicted vs how often "
+                       "it actually won")
+            for key in sorted(curve["buckets"], key=int):
+                low = int(key) * 10
+                out.append(f"    points {low:3d}-{low + 9:3d}   "
+                           f"wins {curve['buckets'][key]:.4f}")
+            out.append(f"    overall {curve.get('prior')}  "
+                       f"over {curve.get('n')} scored rows")
     out.append(THIN)
     out.append("  ACTIVE ADJUSTMENTS")
     adjustments = snap.get("active_adjustments") or []

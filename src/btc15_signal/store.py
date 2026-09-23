@@ -611,6 +611,12 @@ class Store:
             "authority": "TEXT",
             "fill_price": "REAL",
             "fee_cost": "REAL",
+            # THE MODEL'S OWN CONFIDENCE, before any learned adjustment. A
+            # calibration is a comparison between a PREDICTION and an OUTCOME,
+            # so the prediction has to be recorded when it was made -
+            # reconstructing it afterwards measures today's code, not the
+            # decision that was taken.
+            "model_points": "INTEGER",
         })
         # FORWARD EVALUATION. What each frozen candidate WOULD have changed on
         # a live signal, recorded beside what the unchanged strategy actually

@@ -10,10 +10,9 @@ from uuid import NAMESPACE_URL, uuid4, uuid5
 
 import httpx
 
-from . import autotrade, intel_mode, messages, revision
+from . import autotrade, intel_mode, kalshi_signal, messages, revision
 from . import brain as brain_mod
 from . import intelligence_policy as intel
-from . import kalshi_signal
 from .adaptive import brti_context_of, context_of
 from .binance import BinanceClient, MarketSnapshot
 from .candidates import CandidateSet
@@ -25,15 +24,16 @@ from .features import _session
 from .hourly_shadow import HourlyShadow
 from .kalshi import KalshiClient, KalshiMarket
 from .kalshi_brti import KalshiBRTIRule
+from .learning_runner import LearningRunner
 from .levels import LevelTracker
 from .levels import confidence_points as level_points
 from .model import predict
-from .learning_runner import LearningRunner
 from .recovery_add_runner import RecoveryAddRunner
 from .reference_shadow import ReferenceShadow
 from .regime import base_points as regime_base_points
 from .regime import confidence_points as regime_confidence_points
 from .regime import label_for as regime_label
+from .regime import model_points as regime_model_points
 from .regime import weight_at, weight_for_hour
 from .sessions import (
     breakdown as session_breakdown,
@@ -153,12 +153,24 @@ def confidence_label(facts: list[dict], opened: int, blocking_level: float | Non
     order and no size, which is the whole of a confidence adjustment's
     authority.
     """
-    agreeing = sum(1 for fact in facts if fact["passed"])
-    base = regime_base_points(agreeing)
-    clock = regime_confidence_points(weight_at(opened))
-    level = level_points(blocking_level is not None)
     return regime_label(
-        max(0, min(100, base + clock + level + int(intelligence_delta or 0)))
+        max(0, min(100, model_confidence_points(facts, opened, blocking_level)
+                   + int(intelligence_delta or 0)))
+    )
+
+
+def model_confidence_points(facts: list[dict], opened: int,
+                            blocking_level: float | None) -> int:
+    """The model's own score, BEFORE any learned adjustment.
+
+    Recorded on every decision so the confidence it produced can later be
+    compared with what actually happened. A calibration needs the prediction
+    the model made at the time; reconstructing it afterwards from a label is
+    guessing, and reconstructing it from today's code measures today's code.
+    """
+    agreeing = sum(1 for fact in facts if fact["passed"])
+    return regime_model_points(
+        agreeing, opened, level_points(blocking_level is not None)
     )
 
 
@@ -1665,7 +1677,7 @@ def normalise_gates(failed_checks) -> tuple[str, ...]:
 
 def intelligence_verdict(
     settings, store, prediction, snapshot, ask, rule_match, failed_checks,
-    opened, remaining, now_ms, brti=None, ticker=None,
+    opened, remaining, now_ms, brti=None, ticker=None, model_points=None,
 ):
     """Ask the shared decision function, record the answer, return it.
 
@@ -1778,6 +1790,7 @@ def intelligence_verdict(
             "evidence_action": verdict.evidence_action or verdict.final_action,
             "evidence_delta": verdict.evidence_delta,
             "authority": verdict.authority or None,
+            "model_points": model_points,
         })
         # FORWARD EVALUATION, alongside. Every frozen candidate that speaks to
         # this context records what it WOULD have changed, beside what the
@@ -1904,6 +1917,18 @@ async def primary_signal(
         settings, store, prediction, snapshot, contract_ask,
         rule_match, failed_checks, opened, remaining, now_ms, brti,
         ticker=getattr(contract, "ticker", None),
+        # The score the model produced for THIS decision, before the
+        # layer touched it. This is the prediction a calibration compares
+        # against the outcome.
+        #
+        # Only on the Kalshi path: `facts` is assembled there and not in the
+        # legacy branch until much further down, and a score reconstructed
+        # later is a score from a different moment. The learner excludes
+        # non-BRTI rows anyway, so a None here costs nothing.
+        model_points=(
+            model_confidence_points(facts, opened, blocking_level)
+            if settings.kalshi_only else None
+        ),
     )
     if intel_verdict.final_action == intel.VETO:
         rule_match = False

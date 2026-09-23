@@ -53,6 +53,8 @@ from .adaptive import (
     brti_vol_regime,
 )
 from .intelligence_policy import BINANCE_BAND_NAMES
+from .levels import confidence_points as level_points
+from .regime import model_points as regime_model_points
 from .sessions import session_of
 
 # PROVENANCE IS READ OFF THE KEY, not off the `feature_version` column.
@@ -106,6 +108,10 @@ class Provenance:
     excluded_unresolved: int = 0
     excluded_duplicate: int = 0
     excluded_incompatible: int = 0
+    # Markets we TRADED whose fills could not be reconciled to the
+    # settlement row. Excluded from execution-based learning: a trade
+    # we cannot attribute is not evidence about a decision.
+    excluded_unattributed: int = 0
     data_start_ms: int = 0
     data_end_ms: int = 0
     feature_version: str = BRTI_FEATURE_VERSION
@@ -133,6 +139,7 @@ class Provenance:
             "excluded_unresolved": self.excluded_unresolved,
             "excluded_duplicate": self.excluded_duplicate,
             "excluded_incompatible": self.excluded_incompatible,
+            "excluded_unattributed": self.excluded_unattributed,
             "data_start_ms": self.data_start_ms,
             "data_end_ms": self.data_end_ms,
             "feature_version": self.feature_version,
@@ -176,6 +183,20 @@ def _minute_row(point: dict, quote: tuple, distance_floor: float,
         gates.append("momentum strength")
 
     window_ms = point["close_ms"] - 900_000
+    # THE MODEL'S OWN SCORE for this decision, from the same function the live
+    # path calls. `check_facts` returns FOUR facts; the fourth is the reference
+    # freshness check, which passes by construction on a backfilled BRTI point
+    # - the row exists because the reference was there. The other three are the
+    # gates computed above, so agreeing = 4 - failures.
+    #
+    # THE LEVEL TERM IS NOT ZERO. Under Kalshi-only no protective level is
+    # computed, so the live path calls `level_points(False)` - which is -6, not
+    # 0. Passing 0 here scored every corpus row six points above the live one
+    # and made the calibration a comparison between two implementations. The
+    # same function is called on both sides for exactly that reason.
+    points = regime_model_points(
+        4 - len(gates), window_ms, level_points(False)
+    )
     return {
         "window_open": window_ms,
         "ticker": point["ticker"],
@@ -190,6 +211,7 @@ def _minute_row(point: dict, quote: tuple, distance_floor: float,
         "brti_momentum_bps": momentum,
         "side": side, "remaining_s": point["remaining_s"],
         "feature_version": BRTI_FEATURE_VERSION,
+        "model_points": points,
         "origin": CORPUS,
         "fill_kind": SIMULATED_FILL,
         "fee_cost": None,
@@ -396,17 +418,16 @@ def live_rows(db: sqlite3.Connection, *, fingerprint: str,
     # which side we were on inverts the trade. The settlement row states it
     # outright, so that is where the position, the size, the cost and the money
     # are read from; this counts executions and nothing else.
-    fill_counts: dict[str, int] = {}
+    by_ticker: dict[str, list[dict]] = {}
     try:
         fcur = db.cursor()
-        for row in fcur.execute(
-            "SELECT ticker, COUNT(*) FROM fills WHERE action='buy' "
-            "GROUP BY ticker"
-        ):
-            if row[0]:
-                fill_counts[row[0]] = int(row[1] or 0)
+        fcur.row_factory = sqlite3.Row
+        for row in fcur.execute("SELECT * FROM fills ORDER BY filled_ms"):
+            item = dict(row)
+            if item.get("ticker"):
+                by_ticker.setdefault(item["ticker"], []).append(item)
     except sqlite3.Error:
-        fill_counts = {}
+        by_ticker = {}
 
     settled: dict[str, dict] = {}
     try:
@@ -500,6 +521,9 @@ def live_rows(db: sqlite3.Connection, *, fingerprint: str,
         executed_price = None
         contracts = 0.0
         fills_folded = 0
+        adds = 0
+        order_ids: tuple = ()
+        unattributed = ""
         # AN ACTUAL FILL IS THE BROKER'S PRICE AND THE BROKER'S FEE. The
         # recorded ask is what we were quoted; a limit is permission to cross,
         # never the price paid, and an IOC fills at the best available price.
@@ -518,14 +542,24 @@ def live_rows(db: sqlite3.Connection, *, fingerprint: str,
         # the rule here is the project's own: read P&L from Kalshi, never
         # rebuild it. The fills are kept only to say how many executions it
         # took, which settlements does not record.
-        position = _position_from(settlement)
-        if position is not None and position["side"] == side:
+        attribution = attribute_execution(by_ticker.get(ticker, []), settlement)
+        if attribution["resolved"] and attribution["side"] == side:
             fill_kind = ACTUAL_FILL
-            contracts = position["contracts"]
-            executed_price = position["price"]
-            fee_cost = position["fee_per_contract"]
-            realised = position["pnl_per_contract"]
-            fills_folded = fill_counts.get(ticker, 0)
+            contracts = attribution["contracts"]
+            executed_price = attribution["entry_price"]
+            fee_cost = attribution["fee_per_contract"]
+            realised = attribution["pnl_per_contract"]
+            fills_folded = len(attribution["fill_ids"])
+            adds = attribution["adds"]
+            order_ids = attribution["order_ids"]
+        elif settlement is not None and not attribution["resolved"]:
+            # WE TRADED THIS MARKET AND CANNOT SAY WHICH DECISION IT BELONGS
+            # TO. Scoring it as a counterfactual would claim to know what
+            # would have happened on a market where something actually did.
+            prov.excluded_unattributed += 1
+            unattributed = attribution["reason"]
+        if unattributed:
+            continue
         rows.append({
             "window_open": window_open,
             "ticker": ticker,
@@ -539,6 +573,7 @@ def live_rows(db: sqlite3.Connection, *, fingerprint: str,
             "side": side,
             "remaining_s": record.get("remaining_s"),
             "feature_version": record.get("feature_version"),
+            "model_points": record.get("model_points"),
             "origin": LIVE,
             "fill_kind": fill_kind,
             "fee_cost": fee_cost,
@@ -548,6 +583,8 @@ def live_rows(db: sqlite3.Connection, *, fingerprint: str,
             # numbers that have all been quoted as each other here.
             "contracts": contracts,
             "fill_count": fills_folded,
+            "adds": adds,
+            "order_ids": order_ids,
             # The DECISION-time ask stays in `our_ask`, because that is what
             # the price implied when the call was made and it is what a
             # calibration must be measured against. What we actually paid is a
@@ -573,47 +610,114 @@ def live_rows(db: sqlite3.Connection, *, fingerprint: str,
 
 
 
-def _position_from(settlement: dict | None) -> dict | None:
-    """Which leg we held, how many, what it cost, and what it paid.
+def attribute_execution(fills: list[dict], settlement: dict | None) -> dict:
+    """Link entry, adds and exit through the broker's own fill records.
 
-    Read entirely from `/portfolio/settlements`, which states all four.
+    THE PREVIOUS RULE - "the leg that cost more is the one we opened" - IS
+    WRONG, and wrong in the worst place. Buy YES at 0.80, watch it fall, cash
+    out by buying NO at 0.85, and the NO leg is the expensive one: the
+    heuristic reports the position we exited into as the position we took.
+    Measured over this account's 60 closed pairs it misattributes 6 of them,
+    including a -$1.75 loser.
 
-    A CLOSED PAIR IS NOT TWO POSITIONS. Kalshi books an early exit as buying
-    the opposite side and nets the pair at face value, so a cashed-out market
-    shows `yes_count` AND `no_count` non-zero. The leg we OPENED is the
-    expensive one - 2 contracts of YES at 0.86 against 2 of NO at 0.003 is a
-    YES position closed, not a straddle - and the size is the netted pair, not
-    their sum.
+    So the ORDER of the fills decides it. The first fill chronologically is the
+    entry; later fills on the same leg are adds; fills on the opposite leg are
+    the exit, because Kalshi books an early exit as buying the other side.
+    `fill_id` and `order_id` travel with the result so any row can be traced
+    back to the executions behind it.
+
+    AND THE RECONSTRUCTION IS CHECKED. Rebuilding the counts and costs from the
+    fills must reproduce `yes_count`/`no_count`/`yes_cost`/`no_cost` on the
+    settlement row. That check is what makes this attribution rather than
+    another guess - it was verified against all 154 of this account's settled
+    tickers before being relied on. Where it does not reconcile the result is
+    UNRESOLVED and the market is excluded from execution-based learning: a
+    trade we cannot attribute is not evidence about a decision.
+
+    Every fill row acquires `count` contracts of its named `side` at that
+    side's price, whatever `action` says. That is the convention the exchange's
+    own totals reproduce (154/154); reading `action` as a signed direction
+    reproduces 61 of 154.
     """
+    out = {
+        "resolved": False, "reason": "", "side": None, "contracts": 0.0,
+        "entry_price": None, "adds": 0, "exit_contracts": 0.0,
+        "exit_price": None, "pnl_per_contract": None,
+        "fee_per_contract": None, "fill_ids": (), "order_ids": (),
+    }
     if not settlement:
-        return None
-    yes_n = _as_float(settlement.get("yes_count")) or 0.0
-    no_n = _as_float(settlement.get("no_count")) or 0.0
-    yes_cost = _as_float(settlement.get("yes_cost")) or 0.0
-    no_cost = _as_float(settlement.get("no_cost")) or 0.0
-    if yes_n <= 0 and no_n <= 0:
-        return None
-    if yes_n > 0 and no_n > 0:
-        held_yes = yes_cost >= no_cost
-        contracts = min(yes_n, no_n)
-    else:
-        held_yes = yes_n > 0
-        contracts = yes_n if held_yes else no_n
-    if contracts <= 0:
-        return None
-    cost = yes_cost if held_yes else no_cost
-    count = yes_n if held_yes else no_n
+        out["reason"] = "no settlement row: the market did not settle for us"
+        return out
+    if not fills:
+        out["reason"] = "settled but no fill records: attribution impossible"
+        return out
+
+    ordered = sorted(
+        fills, key=lambda f: (f.get("filled_ms") or 0, str(f.get("fill_id")))
+    )
+    legs = {"yes": {"count": 0.0, "cost": 0.0}, "no": {"count": 0.0, "cost": 0.0}}
+    for item in ordered:
+        leg = "yes" if (item.get("side") or "yes") == "yes" else "no"
+        count = _as_float(item.get("count")) or 0.0
+        price = _as_float(item.get(f"{leg}_price")) or 0.0
+        legs[leg]["count"] += count
+        legs[leg]["cost"] += count * price
+
+    # RECONCILE, or refuse.
+    checks = (
+        ("yes_count", legs["yes"]["count"], 0.001),
+        ("no_count", legs["no"]["count"], 0.001),
+        ("yes_cost", legs["yes"]["cost"], 0.011),
+        ("no_cost", legs["no"]["cost"], 0.011),
+    )
+    for name, rebuilt, tolerance in checks:
+        stated = _as_float(settlement.get(name)) or 0.0
+        if abs(rebuilt - stated) > tolerance:
+            out["reason"] = (
+                f"fills do not reconcile to the settlement: {name} rebuilt "
+                f"{rebuilt:.4f} against {stated:.4f}"
+            )
+            return out
+
+    opening = "yes" if (ordered[0].get("side") or "yes") == "yes" else "no"
+    closing = "no" if opening == "yes" else "yes"
+    entry_fills = [
+        f for f in ordered
+        if ("yes" if (f.get("side") or "yes") == "yes" else "no") == opening
+    ]
+    entry_count = legs[opening]["count"]
+    if entry_count <= 0:
+        out["reason"] = "opening leg has no contracts"
+        return out
+
     pnl = _as_float(settlement.get("pnl"))
     fee = _as_float(settlement.get("fee_cost")) or 0.0
-    return {
-        "side": "UP" if held_yes else "DOWN",
-        "contracts": contracts,
-        "price": round(cost / count, 6) if count else None,
-        "fee_per_contract": round(fee / contracts, 6),
-        "pnl_per_contract": None if pnl is None else round(pnl / contracts, 6),
-        "pnl": pnl,
-    }
-
+    out.update({
+        "resolved": True,
+        "reason": "reconciled to the settlement row",
+        "side": "UP" if opening == "yes" else "DOWN",
+        # PER CONTRACT WE TOOK ON. The settlement pnl covers the whole
+        # position including any exit, so the entry size is the denominator
+        # that answers "what did each contract we bought return".
+        "contracts": entry_count,
+        "entry_price": round(legs[opening]["cost"] / entry_count, 6),
+        "adds": max(0, len(entry_fills) - 1),
+        "exit_contracts": legs[closing]["count"],
+        "exit_price": (
+            round(legs[closing]["cost"] / legs[closing]["count"], 6)
+            if legs[closing]["count"] > 0 else None
+        ),
+        "pnl_per_contract": (
+            None if pnl is None else round(pnl / entry_count, 6)
+        ),
+        "fee_per_contract": round(fee / entry_count, 6),
+        "fill_ids": tuple(str(f.get("fill_id")) for f in ordered),
+        "order_ids": tuple(
+            dict.fromkeys(str(f.get("order_id")) for f in ordered
+                          if f.get("order_id"))
+        ),
+    })
+    return out
 
 
 
