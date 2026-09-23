@@ -452,6 +452,45 @@ class Settings(BaseSettings):
     # describing a market that has moved on is the failure mode here.
     intelligence_max_policy_age_ms: int = 30 * 86_400_000
 
+    # ---------------------------------------------------- continuous learning
+    #
+    # The learning loop runs INSIDE the service. It ingests every settled
+    # signal - accepted and rejected - reconciles the executed ones against
+    # Kalshi fills and fees, refits on Kalshi-native features, evaluates the
+    # new fit against the running one on a chronological validation slice, and
+    # activates only what clears the promotion bar.
+    #
+    # TRAINING RUNNING AND AN ADJUSTMENT BEING LIVE ARE DIFFERENT THINGS. Most
+    # runs will activate nothing; that is the loop working. `/learning` reports
+    # them separately and so do the tables.
+    learning_enabled: bool = True
+    # Retrain once this many NEW settled markets have accumulated since the
+    # last completed run. A 15-minute series produces 96 a day, so 24 is about
+    # six hours of fresh evidence - enough to move a cell, short enough that a
+    # regime change is not waited out.
+    learning_min_new_settlements: int = 24
+    # ...and on this schedule regardless, so a quiet market still refreshes.
+    learning_interval_ms: int = 6 * 3_600_000
+    # How often the cheap due-check runs. The poll is every 10s; checking a
+    # file and a watermark 8,640 times a day to make an hourly decision is
+    # waste, and it is waste on the same thread that places orders.
+    learning_check_ms: int = 5 * 60_000
+    # After a failed run, retry on this base delay with exponential backoff up
+    # to the normal interval. A failure must not become a hot loop, and must
+    # not become a permanent stop either.
+    learning_retry_ms: int = 15 * 60_000
+    # Evidence floor for an arm to be consulted at all, live. Matches the
+    # promotion bar in `learning.MIN_PROMOTION_N`; stated here too because it
+    # is the number the running policy is written with.
+    learning_min_evidence: int = 120
+    # How much worse, in dollars per contract over the validation slice, a new
+    # fit may score than the running one and still activate. Zero: a fresher
+    # fit is not automatically a better one.
+    learning_regression_tolerance: float = 0.0
+    # Forward changes an ACTIVE execution arm must have made before its record
+    # can withdraw it. Below this a bad run is indistinguishable from bad luck.
+    learning_min_withdrawal_n: int = 20
+
     capital_sizing_enabled: bool = True
     capital_per_contract: float = 30.0
     max_base_contracts: int = 2

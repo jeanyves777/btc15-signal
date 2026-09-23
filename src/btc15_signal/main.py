@@ -10,7 +10,7 @@ from uuid import NAMESPACE_URL, uuid4, uuid5
 
 import httpx
 
-from . import autotrade, messages
+from . import autotrade, intel_mode, messages
 from . import brain as brain_mod
 from . import intelligence_policy as intel
 from . import kalshi_signal
@@ -28,6 +28,7 @@ from .kalshi_brti import KalshiBRTIRule
 from .levels import LevelTracker
 from .levels import confidence_points as level_points
 from .model import predict
+from .learning_runner import LearningRunner
 from .recovery_add_runner import RecoveryAddRunner
 from .reference_shadow import ReferenceShadow
 from .regime import base_points as regime_base_points
@@ -129,7 +130,8 @@ def samples_needed(store: Store, effect: float = 0.01) -> int:
     return int((1.96 * (variance ** 0.5) / effect) ** 2) if variance else 0
 
 
-def confidence_label(facts: list[dict], opened: int, blocking_level: float | None) -> str:
+def confidence_label(facts: list[dict], opened: int, blocking_level: float | None,
+                     intelligence_delta: int = 0) -> str:
     """HIGH / MEDIUM / LOW for the signal header.
 
     Scored from the SAME facts the checks are rendered from, so the word and
@@ -141,12 +143,23 @@ def confidence_label(facts: list[dict], opened: int, blocking_level: float | Non
     tried as gates and both measured as noise (FINDINGS 23, p=0.090 and
     p=0.542). The operator's standing rule is that time of day may raise or
     lower confidence but can never stop the 15-minute system.
+
+    `intelligence_delta` is the learned calibration, and it enters HERE rather
+    than being rendered as a separate line beside an unchanged word. A layer
+    that reports "confidence lowered" next to a header still reading HIGH has
+    not lowered confidence; it has printed a sentence. The delta is on the same
+    0-100 points scale the rest of this function works in, it is clamped with
+    everything else, and it can only move the LABEL - it reaches no gate, no
+    order and no size, which is the whole of a confidence adjustment's
+    authority.
     """
     agreeing = sum(1 for fact in facts if fact["passed"])
     base = regime_base_points(agreeing)
     clock = regime_confidence_points(weight_at(opened))
     level = level_points(blocking_level is not None)
-    return regime_label(max(0, min(100, base + clock + level)))
+    return regime_label(
+        max(0, min(100, base + clock + level + int(intelligence_delta or 0)))
+    )
 
 
 def record_block(store: Store, settings: Settings) -> str:
@@ -419,9 +432,17 @@ async def process_telegram(
         if command == "/learning":
             if int(message.get("from", {}).get("id", 0)) != settings.telegram_authorized_user_id:
                 continue
+            # The RUNNING learner, not a fresh one. A second runner built here
+            # would read the same files and report a plausible snapshot while
+            # knowing nothing about whether a fit is in progress - which is one
+            # of the four states this message exists to distinguish.
+            runner = LEARNING.get("runner")
+            if runner is None:
+                runner = LearningRunner(settings, store)
             await telegram.send(
                 messages.learning(
                     head=head_for(store, settings),
+                    state=runner.snapshot(int(time.time() * 1000)),
                     candidates=active_candidates(settings),
                     board=store.candidate_scoreboard(),
                 )
@@ -1465,6 +1486,9 @@ def shadow_read(
 # candidate training can never change what is running.
 _POLICY: dict = {"loaded": None}
 _CANDIDATES: dict = {"loaded": None}
+# The running learner, so `/learning` can report the live loop rather than
+# constructing a second one that shares none of its state.
+LEARNING: dict = {"runner": None}
 # Last window we complained about a missing BRTI context, so the log
 # carries one line a window rather than one a poll.
 BRTI_CONTEXT_GAP: dict = {"window": None}
@@ -1522,6 +1546,36 @@ def active_policy(settings) -> intel.Policy:
     return _POLICY["loaded"]
 
 
+def reload_policy(settings=None) -> None:
+    """Drop the cached policy so the next decision reads the new artefact.
+
+    The cache exists so a decision does not hit the disk, and it is correct for
+    a policy that only ever changes between processes - which stopped being
+    true the moment training moved inside the service. A runner that writes a
+    new artefact and leaves the process deciding from the old one in memory has
+    trained nothing anybody can observe.
+    """
+    _POLICY["loaded"] = None
+    # THE CANDIDATES RELOAD WITH IT. They were frozen for the life of the
+    # process because a candidate refitted between making a prediction and its
+    # grading would make the record meaningless - which was right while the
+    # ids were positional (`c01` meant a different cell after every refit, and
+    # `candidate_evaluations` is keyed on the id). The ids are now derived from
+    # the context and every row carries the version that wrote it, so a cell
+    # keeps its name and an old prediction stays attributable. Holding the old
+    # set instead would freeze the forward evaluation on whatever the first run
+    # happened to find.
+    _CANDIDATES["loaded"] = None
+    if settings is not None:
+        pol = active_policy(settings)
+        print(
+            f"intelligence policy reloaded: version={pol.version} "
+            f"arms={len(pol.arms)} vetoes={pol.vetoes_enabled} "
+            f"admissions={pol.admissions_enabled}",
+            flush=True,
+        )
+
+
 def active_candidates(settings) -> CandidateSet:
     """Loaded once per process. A candidate that changed between making a
     prediction and its grading would make the record meaningless, so the
@@ -1576,15 +1630,56 @@ def brti_context_row(snapshot, ask, opened, brti) -> tuple[dict | None, str]:
     }, ""
 
 
+def normalise_gates(failed_checks) -> tuple[str, ...]:
+    """The failing gate NAMES, whatever shape the caller had them in.
+
+    Both live callers hand this a comma-joined STRING - `", ".join(...)` on the
+    Kalshi path, and `rule.matches` returns one on the legacy path. The
+    previous expression tested `isinstance(failed_checks, list)`, which a
+    string is not, and fell through to `tuple(str(x) for x in failed_checks)`:
+    iterating a string yields its CHARACTERS, so "BRTI distance" was stored as
+    thirteen separate gates, `B, R, T, I, ...`.
+
+    Nothing raised. The archive simply filled with per-character gate names,
+    and an admission - which may only rescue a setup whose failing gates are
+    exactly the one it names - could never match, so that path was dead by
+    typo rather than by decision.
+    """
+    if not failed_checks:
+        return ()
+    if isinstance(failed_checks, str):
+        return tuple(part.strip() for part in failed_checks.split(",")
+                     if part.strip())
+    if isinstance(failed_checks, dict):
+        failed_checks = [failed_checks]
+    out = []
+    for item in failed_checks:
+        if isinstance(item, dict):
+            name = item.get("name")
+            if name:
+                out.append(str(name))
+        elif item is not None:
+            out.append(str(item))
+    return tuple(out)
+
+
 def intelligence_verdict(
     settings, store, prediction, snapshot, ask, rule_match, failed_checks,
-    opened, remaining, now_ms, brti=None,
+    opened, remaining, now_ms, brti=None, ticker=None,
 ):
     """Ask the shared decision function, record the answer, return it.
 
     Never raises: a failure here falls back to the base strategy explicitly,
     because a layer that can stop trading by breaking is worse than one that
     is switched off.
+
+    `ticker` IS THE CONTRACT'S, NOT THE SNAPSHOT'S. This used to read
+    `getattr(snapshot, "ticker", None)` - and `MarketSnapshot` has no `ticker`,
+    so every one of the first 1,174 rows stored NULL. Nothing broke: the column
+    was simply always empty, which meant the broker's fills and fees could
+    never be joined to the decision that caused them, and the learning loop saw
+    every executed trade as a simulated one. A field that is silently always
+    None is the same failure as a number under the wrong name.
     """
     try:
         policy = active_policy(settings)
@@ -1627,20 +1722,41 @@ def intelligence_verdict(
         else:
             context = context_of(row)
         key = f"{context}|{'accept' if rule_match else 'reject'}"
-        gates = tuple(
-            f["name"] for f in (failed_checks or []) if isinstance(f, dict)
-        ) if failed_checks and isinstance(failed_checks, list) else tuple(
-            str(x) for x in (failed_checks or ())
-        )
+        gates = normalise_gates(failed_checks)
         verdict = intel.decide(
             context_key=key, base_qualified=bool(rule_match),
             failed_gates=gates, ask=ask, policy=policy,
             enabled=settings.intelligence_enabled, features_ok=features_ok,
             now_ms=now_ms, max_age_ms=settings.intelligence_max_policy_age_ms,
         )
+        # THE SECOND GATE, and the one the operator holds. `decide` answered
+        # "was this validated?"; this answers "am I allowed to?", from two
+        # switches no code path can raise. Confidence, veto and admission are
+        # asked for separately, because they are separate risks - a layer
+        # trusted to re-rate a label is not thereby trusted to spend money on a
+        # trade every deployed gate refused.
+        mode, _mode_why = intel_mode.resolve(
+            settings.intelligence_mode, settings.intelligence_authorised
+        )
+        verdict = intel.authorise(
+            verdict,
+            # CONFIDENCE RIDES ON `intelligence_enabled`, NOT ON THE MODE.
+            #
+            # The mode ladder governs the retrieval layer, which returns a
+            # recommendation and needs authority before it is read as one. A
+            # policy confidence delta is not a recommendation: it re-rates the
+            # header on a decision the gates have already made, and it is
+            # arithmetically incapable of admitting, refusing or resizing
+            # anything. Requiring the execution switch for it would mean the
+            # only way to see a calibration is to grant the power to trade on
+            # one, which is precisely backwards.
+            may_confidence=settings.intelligence_enabled,
+            may_veto=intel_mode.may_veto(mode),
+            may_admit=intel_mode.may_admit(mode),
+        )
         store.record_intelligence({
             "window_open": opened,
-            "ticker": getattr(snapshot, "ticker", None),
+            "ticker": ticker or getattr(snapshot, "ticker", None),
             "decided_ms": now_ms, "remaining_s": remaining,
             "side": getattr(prediction, "side", None), "ask": ask,
             "base_qualified": int(bool(rule_match)),
@@ -1659,6 +1775,9 @@ def intelligence_verdict(
             "feature_version": verdict.feature_version,
             "training_cutoff_ms": verdict.training_cutoff_ms,
             "features_ok": int(features_ok),
+            "evidence_action": verdict.evidence_action or verdict.final_action,
+            "evidence_delta": verdict.evidence_delta,
+            "authority": verdict.authority or None,
         })
         # FORWARD EVALUATION, alongside. Every frozen candidate that speaks to
         # this context records what it WOULD have changed, beside what the
@@ -1687,7 +1806,7 @@ def intelligence_verdict(
             for item in evaluations:
                 item.update({
                     "window_open": opened, "decided_ms": now_ms,
-                    "ticker": getattr(snapshot, "ticker", None),
+                    "ticker": ticker or getattr(snapshot, "ticker", None),
                     "side": getattr(prediction, "side", None), "ask": ask,
                     "remaining_s": remaining,
                 })
@@ -1775,13 +1894,20 @@ async def primary_signal(
     # no order follows. The interesting cases for "did it help?" are exactly
     # the ones where nothing traded, so they cannot be reconstructed from the
     # orders afterwards.
-    verdict = intelligence_verdict(
+    # NAMED `intel_verdict`, NOT `verdict`. There is already a local `verdict`
+    # further down this function holding the auto-trade log string, and it is
+    # assigned on several branches - so binding the intelligence Verdict to the
+    # same name meant that by the time the alert was rendered it was sometimes
+    # a `str`. The collision is invisible on the branches that do not reassign,
+    # which is exactly the kind that survives a test run.
+    intel_verdict = intelligence_verdict(
         settings, store, prediction, snapshot, contract_ask,
         rule_match, failed_checks, opened, remaining, now_ms, brti,
+        ticker=getattr(contract, "ticker", None),
     )
-    if verdict.final_action == intel.VETO:
+    if intel_verdict.final_action == intel.VETO:
         rule_match = False
-    elif verdict.final_action == intel.ADMIT:
+    elif intel_verdict.final_action == intel.ADMIT:
         rule_match = True
     qualified = rule.enabled and rule_match and settings.entry_alerts_enabled
 
@@ -2328,7 +2454,18 @@ async def primary_signal(
     )
     if shadow:
         detail_body += "\n" + messages.RULE + "\n" + shadow
-    confidence = confidence_label(facts, opened, blocking_level)
+    # THE LEARNED ADJUSTMENT, in the word and in a line saying why.
+    #
+    # The delta moves the header; `policy_line` explains it, and returns empty
+    # when the layer changed nothing - silence is the right output for "the
+    # pattern supports the existing decision", and narrating every neutral
+    # trains the reader to skip the one that matters.
+    confidence = confidence_label(
+        facts, opened, blocking_level, intel_verdict.confidence_delta
+    )
+    policy_note = messages.policy_line(intel_verdict)
+    if policy_note:
+        detail_body += "\n" + messages.RULE + "\n" + policy_note
     if offer_button:
         proposal = create_proposal(
             store,
@@ -2908,6 +3045,19 @@ async def service() -> None:
     reference = ReferenceShadow(settings) if settings.reference_enabled else None
     recovery_add = RecoveryAddRunner(settings, store, telegram)
     capital = CapitalController(settings, store)
+    # CONTINUOUS LEARNING, inside the service. It ingests every settled signal,
+    # refits on Kalshi-native features, and activates only what clears the
+    # promotion bar. `startup` recovers whatever the previous process was doing
+    # - including restoring a valid rollback if the artefact on disk cannot act.
+    learner = LearningRunner(
+        settings, store, telegram,
+        on_activate=lambda: reload_policy(settings),
+    )
+    try:
+        learner.startup(int(time.time() * 1000))
+    except Exception as exc:  # noqa: BLE001 - learning never stops trading
+        print(f"learning startup failed: {exc!r}", flush=True)
+    LEARNING["runner"] = learner
     CAPITAL_DAY = {"ny": None}
     LAST_POLL = {"ms": 0}
     # Support/resistance is computed from Binance klines and the deployed rule
@@ -3151,6 +3301,20 @@ async def service() -> None:
                         print(f"settlement sync failed: {exc!r}", flush=True)
 
                 mark("settlements")
+
+                # CONTINUOUS LEARNING. Placed immediately after the settlement
+                # sweep because settlements are what it consumes: the markets
+                # that just resolved are in the mirror by now, so the due-check
+                # sees this poll's evidence rather than the previous poll's.
+                #
+                # The check itself is throttled and the fit runs in a worker
+                # thread, so neither the poll nor an order ever waits on it.
+                try:
+                    await learner.poll(now_ms)
+                    mark("learning")
+                except Exception as exc:  # noqa: BLE001 - never stops trading
+                    print(f"learning poll failed: {exc!r}", flush=True)
+
                 try:
                     contract = await kalshi.active_market(now_ms)
                     mark("active_market")

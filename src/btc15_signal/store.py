@@ -599,6 +599,19 @@ class Store:
             "CREATE INDEX IF NOT EXISTS intelligence_window "
             "ON intelligence_decisions(window_open, decided_ms)"
         )
+        # EVIDENCE AND AUTHORITY, in separate columns. `final_action` and
+        # `confidence_delta` are what took effect; these are what the policy
+        # would have done had the operator granted the permission. Without the
+        # pair, a layer running in shadow leaves a record indistinguishable
+        # from a layer that had nothing to say - and could never be promoted
+        # on it.
+        self._add_columns("intelligence_decisions", {
+            "evidence_action": "TEXT",
+            "evidence_delta": "INTEGER",
+            "authority": "TEXT",
+            "fill_price": "REAL",
+            "fee_cost": "REAL",
+        })
         # FORWARD EVALUATION. What each frozen candidate WOULD have changed on
         # a live signal, recorded beside what the unchanged strategy actually
         # decided, and graded when the market settles.

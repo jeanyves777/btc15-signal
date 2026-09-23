@@ -1,0 +1,673 @@
+"""The learning corpus. Kalshi only, one row per market, no future in it.
+
+THIS MODULE LIVES IN `src/` ON PURPOSE. It used to be `scripts/brti_dataset.py`,
+and while it sat there the service could not call it - so "the learning loop"
+meant a person remembering to run a script, and training, replay and live
+inference each reached for the feature definitions by their own route. The
+requirement they all share is that a context key computed in training names the
+same pocket as one computed on the order path; the only way to guarantee that is
+for both to call the same function in the same package, which is what this is.
+
+WHERE THE DATA COMES FROM, and nowhere else:
+
+    brti_history.db     Kalshi BRTI decision points, backfilled from
+                        /live_data/events and /cfbenchmarks (Kalshi's own
+                        publication of the index the contract settles on)
+    market_data.db      Kalshi contract candles - the book we would have paid
+    btc15.db            live `intelligence_decisions` (the context this system
+                        actually keyed, at the instant it keyed it), graded
+                        against Kalshi settlements, reconciled to Kalshi fills
+
+No Binance table is opened here and none may be added. `cohort.db` - the 6,428
+market corpus every earlier measurement was computed on - is Binance-derived
+and is deliberately NOT reachable from this module. It stays on disk as history
+and is excluded from every active learning path.
+
+THREE THINGS THAT ARE COUNTED SEPARATELY, because conflating them is how this
+system has previously manufactured evidence out of arithmetic:
+
+    markets     distinct 15-minute windows. The unit of opportunity.
+    decisions   rows. A window polled six times is six decisions and ONE
+                market, and resampling rows as though they were markets
+                reports an interval far too narrow.
+    fills       orders that actually executed. Everything else priced at the
+                recorded ask is a SIMULATED fill and is labelled one.
+
+NO FUTURE DATA. Every feature on a row was computed from samples at or before
+that row's own decision instant (`cutoff_rule: t <= decision_ms`, enforced by
+the feature contract and fingerprinted into every artefact). The outcome is
+attached only after the market has settled, and a row whose outcome is not yet
+final is not returned at all - training on an unresolved market is training on
+a guess about the present.
+"""
+
+from __future__ import annotations
+
+import sqlite3
+from dataclasses import dataclass, field
+
+from .adaptive import (
+    BRTI_DISTANCE_BANDS,
+    BRTI_FEATURE_VERSION,
+    brti_context_of,
+    brti_vol_regime,
+)
+from .intelligence_policy import BINANCE_BAND_NAMES
+from .sessions import session_of
+
+# PROVENANCE IS READ OFF THE KEY, not off the `feature_version` column.
+#
+# The live table holds rows from before the BRTI context fix whose
+# `feature_version` column says `brti-1` - it is written from a module
+# constant, so it says that on every row ever recorded - while the key itself
+# is a Binance one (`dist<1.5`) or a broken one (`? · ?`, from the weeks when
+# the live snapshot had no session or vol_regime and every key came out
+# unlabelled). That is the same failure the deployed policy artefact had: a
+# declared version that the contents contradict.
+#
+# So a live row is admitted only if its key is positively keyed on a BRTI
+# distance band AND names a real session and volatility regime. Anything else
+# is history: readable, excluded, counted.
+_BRTI_BANDS = frozenset(name for _lo, _hi, name in BRTI_DISTANCE_BANDS)
+_BINANCE_BANDS = frozenset(BINANCE_BAND_NAMES)
+UNKNOWN_FIELD = "?"
+
+# The deployed KalshiBRTIRule gates, as the live path runs them. They are
+# arguments rather than constants so a caller can ask "what would a different
+# floor have done", but the defaults are the deployed numbers and a training
+# run that does not pass them is training against the deployed rule.
+DEPLOYED_DISTANCE_FLOOR = 10.0
+DEPLOYED_MIN_ASK = 0.70
+DEPLOYED_MAX_ASK = 0.93
+
+CORPUS = "corpus"
+LIVE = "live"
+
+ACTUAL_FILL = "actual"
+SIMULATED_FILL = "simulated"
+
+
+@dataclass
+class Provenance:
+    """What a training set was built from. Recorded into every artefact.
+
+    A policy whose provenance is not written down cannot be audited later, and
+    this system has already shipped one artefact whose declared feature version
+    disagreed with the features it was actually fitted on. Provenance is the
+    record that makes that checkable after the fact rather than by memory.
+    """
+
+    sources: tuple[str, ...] = ()
+    corpus_markets: int = 0
+    corpus_decisions: int = 0
+    live_markets: int = 0
+    live_decisions: int = 0
+    live_actual_fills: int = 0
+    excluded_unresolved: int = 0
+    excluded_duplicate: int = 0
+    excluded_incompatible: int = 0
+    data_start_ms: int = 0
+    data_end_ms: int = 0
+    feature_version: str = BRTI_FEATURE_VERSION
+    feature_fingerprint: str = ""
+    notes: tuple[str, ...] = field(default_factory=tuple)
+
+    @property
+    def markets(self) -> int:
+        return self.corpus_markets + self.live_markets
+
+    @property
+    def decisions(self) -> int:
+        return self.corpus_decisions + self.live_decisions
+
+    def payload(self) -> dict:
+        return {
+            "sources": list(self.sources),
+            "corpus_markets": self.corpus_markets,
+            "corpus_decisions": self.corpus_decisions,
+            "live_markets": self.live_markets,
+            "live_decisions": self.live_decisions,
+            "live_actual_fills": self.live_actual_fills,
+            "markets": self.markets,
+            "decisions": self.decisions,
+            "excluded_unresolved": self.excluded_unresolved,
+            "excluded_duplicate": self.excluded_duplicate,
+            "excluded_incompatible": self.excluded_incompatible,
+            "data_start_ms": self.data_start_ms,
+            "data_end_ms": self.data_end_ms,
+            "feature_version": self.feature_version,
+            "feature_fingerprint": self.feature_fingerprint,
+            "notes": list(self.notes),
+        }
+
+
+# --------------------------------------------------------------- corpus
+#
+# The historical leg: Kalshi BRTI decision points scored against the deployed
+# gates, priced on the Kalshi book.
+
+
+def _minute_row(point: dict, quote: tuple, distance_floor: float,
+                min_ask: float, max_ask: float) -> dict | None:
+    """One decision minute, scored against the BRTI-calibrated gates.
+
+    The band is unchanged (it was always a Kalshi price), the distance floor is
+    the 10x FINDINGS 43 measured rather than the 1.5 that belongs to Binance
+    volatility, and momentum is BRTI momentum.
+    """
+    yes_bid, yes_ask = quote
+    side = point["brti_side"]
+    ask = yes_ask if side == "UP" else round(1 - yes_bid, 4)
+    if not 0 < ask < 1:
+        return None
+    won = (point["result"] == "yes") if side == "UP" else (
+        point["result"] == "no"
+    )
+    distance = point["brti_normalized_distance"] or 0.0
+    momentum = point["brti_momentum_bps"] or 0.0
+    direction = 1 if side == "UP" else -1
+
+    gates = []
+    if not min_ask <= ask <= max_ask:
+        gates.append("contract price band")
+    if distance < distance_floor:
+        gates.append("target distance")
+    if direction * momentum <= 0:
+        gates.append("momentum strength")
+
+    window_ms = point["close_ms"] - 900_000
+    return {
+        "window_open": window_ms,
+        "ticker": point["ticker"],
+        "decided_ms": point["close_ms"] - point["remaining_s"] * 1000,
+        "our_ask": ask, "won": int(won),
+        "rule_match": 0 if gates else 1,
+        "failed_gates": ", ".join(gates) or None,
+        "session": session_of(window_ms),
+        "vol_regime": brti_vol_regime(point["brti_volatility_bps"]),
+        "brti_volatility_bps": point["brti_volatility_bps"] or 0.0,
+        "brti_normalized_distance": distance,
+        "brti_momentum_bps": momentum,
+        "side": side, "remaining_s": point["remaining_s"],
+        "feature_version": BRTI_FEATURE_VERSION,
+        "origin": CORPUS,
+        "fill_kind": SIMULATED_FILL,
+        "fee_cost": None,
+    }
+
+
+def choose_minute(minutes: list[dict], policy: bool) -> dict | None:
+    """Which single minute represents this market.
+
+    ONE row per market, never one per poll. Six polls of the same window are
+    one opportunity; counting them separately would inflate every sample count
+    sixfold with copies that all share an outcome.
+
+    Under the policy the bot takes the FIRST minute whose gates pass and then
+    stops. Where none passes it enters nothing, and the row is the first minute
+    looked at - which is exactly where the policy WOULD have entered with the
+    gates removed, so it is the right price for the refused leg.
+    """
+    if not minutes:
+        return None
+    if not policy:
+        return minutes[0]
+    for row in minutes:
+        if row["rule_match"]:
+            return row
+    return minutes[0]
+
+
+def _load(distance_floor: float, min_ask: float, max_ask: float, policy: bool,
+          brti_path: str = "data/brti_history.db",
+          market_path: str = "data/market_data.db") -> list[dict]:
+    brti = sqlite3.connect(f"file:{brti_path}?mode=ro", uri=True)
+    brti.row_factory = sqlite3.Row
+    points: dict[str, list[dict]] = {}
+    for row in brti.execute(
+        "SELECT * FROM brti_decision_points ORDER BY ticker, remaining_s DESC"
+    ):
+        points.setdefault(row["ticker"], []).append(dict(row))
+    brti.close()
+    if not points:
+        return []
+
+    market = sqlite3.connect(f"file:{market_path}?mode=ro", uri=True)
+    market.row_factory = sqlite3.Row
+    quotes: dict[tuple, tuple] = {}
+    for row in market.execute(
+        "SELECT ticker, end_period_ts, yes_bid_close, yes_ask_close "
+        "FROM contract_candles WHERE yes_bid_close IS NOT NULL "
+        "AND yes_ask_close IS NOT NULL"
+    ):
+        quotes[(row["ticker"], row["end_period_ts"])] = (
+            row["yes_bid_close"], row["yes_ask_close"]
+        )
+    market.close()
+
+    rows = []
+    for ticker, path in points.items():
+        # `path` is already ordered 660s -> 360s: the order the bot sees them.
+        minutes = []
+        for point in path:
+            end_ts = (point["close_ms"] - point["remaining_s"] * 1000) // 1000
+            quote = quotes.get((ticker, end_ts))
+            if quote is None:
+                continue
+            row = _minute_row(point, quote, distance_floor, min_ask, max_ask)
+            if row is not None:
+                minutes.append(row)
+        chosen = choose_minute(minutes, policy=policy)
+        if chosen is not None:
+            rows.append(chosen)
+    rows.sort(key=lambda r: r["window_open"])
+    return rows
+
+
+def load_policy_rows(distance_floor: float = DEPLOYED_DISTANCE_FLOOR,
+                     min_ask: float = DEPLOYED_MIN_ASK,
+                     max_ask: float = DEPLOYED_MAX_ASK,
+                     **paths) -> list[dict]:
+    """THE DEPLOYED POLICY: one row per market, scanned chronologically.
+
+    The bot does not judge a market once. It scans every poll from 660s to 360s
+    remaining and takes the FIRST minute where the gates pass - then alerts once
+    and stops. A market that is refused at 11 minutes and qualifies at 8 is a
+    market the bot TRADES.
+
+    Evaluating only the first minute answers a different question, and answers
+    it pessimistically. Evaluating every poll as its own trade answers a third,
+    and answers it optimistically: it lets one market contribute six correlated
+    outcomes. So the walk is chronological and each market contributes ONE row.
+    """
+    return _load(distance_floor, min_ask, max_ask, policy=True, **paths)
+
+
+def load_brti_rows(distance_floor: float = DEPLOYED_DISTANCE_FLOOR,
+                   min_ask: float = DEPLOYED_MIN_ASK,
+                   max_ask: float = DEPLOYED_MAX_ASK,
+                   **paths) -> list[dict]:
+    """FIRST-MINUTE ANALYSIS: one row per market, judged at 660s only.
+
+    Kept because it answers a real question - "what does the rule think when it
+    first looks?" - but it is NOT the deployed strategy, which re-checks every
+    minute to 360s. Results computed from this must be labelled first-minute.
+    """
+    return _load(distance_floor, min_ask, max_ask, policy=False, **paths)
+
+
+def brti_context(row: dict) -> str:
+    """The context key, from the SAME function the live path calls."""
+    return str(brti_context_of(row))
+
+
+# ----------------------------------------------------------------- live
+#
+# The forward leg: what this system actually decided, in its own words, graded
+# against Kalshi's settlement and reconciled to Kalshi's fills.
+
+
+def _split_key(context_key: str) -> tuple[str, str]:
+    """`"asia · mid · bd10-15 · px85-94|accept"` -> (context, "accept")."""
+    if "|" in context_key:
+        context, action = context_key.rsplit("|", 1)
+        return context, action
+    return context_key, "accept"
+
+
+def brti_keyed(context: str) -> bool:
+    """Is this key positively a well-formed `brti-1` context?
+
+    Positive identification, not absence of evidence. A key qualifies only by
+    carrying a BRTI distance band AND naming a real session and volatility
+    regime - so a malformed key, a Binance key, and a key from some future
+    scheme all fail the same way instead of one of them slipping through on a
+    technicality.
+    """
+    parts = [p.strip() for p in context.split("·")]
+    if len(parts) != 4:
+        return False
+    session, vol, distance, _price = parts
+    if session == UNKNOWN_FIELD or vol == UNKNOWN_FIELD:
+        return False
+    if distance in _BINANCE_BANDS:
+        return False
+    return distance in _BRTI_BANDS
+
+
+def live_rows(db: sqlite3.Connection, *, fingerprint: str,
+              settled_only: bool = True) -> tuple[list[dict], Provenance]:
+    """Settled live signals - ACCEPTED AND REJECTED - one row per market-side.
+
+    Rejected signals are the half that cannot be reconstructed afterwards from
+    the orders, because no order exists for them. They are also the half a veto
+    or an admission is measured against, so a learning loop that ingests only
+    what traded is a learning loop that can only ever confirm itself.
+
+    THE CONTEXT IS THE ONE THE LIVE PATH KEYED, read back verbatim from
+    `intelligence_decisions.context_key`. It is not recomputed here: recomputing
+    it would be a second implementation of the feature definitions and thus the
+    exact failure this module exists to prevent, and it would also silently
+    re-label historical rows whenever the bands changed - which would make every
+    old decision look like it had been taken under today's definitions.
+
+    Rows whose recorded `feature_version` is not the live one are counted as
+    incompatible and dropped. A decision taken under different definitions is
+    not evidence about these ones.
+    """
+    prov = Provenance(sources=("btc15.db:intelligence_decisions",),
+                      feature_fingerprint=fingerprint)
+    cursor = db.cursor()
+    cursor.row_factory = sqlite3.Row
+    try:
+        records = [dict(r) for r in cursor.execute(
+            "SELECT * FROM intelligence_decisions ORDER BY window_open, "
+            "decided_ms"
+        )]
+    except sqlite3.Error:
+        return [], prov
+
+    # Broker truth for the executions: what actually filled, at what price and
+    # what fee. Read from the Kalshi mirror, never rebuilt - a modelled fee on
+    # a real trade is a number the exchange never charged.
+    # KEYED BY (ticker, OUR side), and only on ENTRIES.
+    #
+    # Three things a naive `fills[ticker]` gets wrong, and all three were in
+    # the first version of this:
+    #
+    #   * A SELL is an exit, not an entry. Pricing a decision at the cash-out
+    #     price says the trade was opened at the price it was closed at.
+    #   * A window the model flipped inside has an UP row and a DOWN row. One
+    #     fill cannot belong to both, and letting it match both marked a
+    #     decision nobody executed as an executed one.
+    #   * `yes_price` is not what a DOWN position cost. A DOWN position is NO,
+    #     and the row carries `no_price` explicitly - deriving it as
+    #     `1 - yes_price` is a guess where the exchange has stated the answer.
+    #
+    # The earliest buy wins: that is the entry, and any later buy on the same
+    # side is a scale-in priced separately.
+    # HOW MANY FILLS AN EXECUTION TOOK. That is all the fills table is used
+    # for here.
+    #
+    # `fills.side` does not reliably name the leg we held - this account has
+    # entries booked `buy/yes` and entries booked `sell/no`, and a cash-out of
+    # a YES position reported as `sell/no` carrying `yes_price` 0.997. Any
+    # reading of our position from that field is a guess, and a guess about
+    # which side we were on inverts the trade. The settlement row states it
+    # outright, so that is where the position, the size, the cost and the money
+    # are read from; this counts executions and nothing else.
+    fill_counts: dict[str, int] = {}
+    try:
+        fcur = db.cursor()
+        for row in fcur.execute(
+            "SELECT ticker, COUNT(*) FROM fills WHERE action='buy' "
+            "GROUP BY ticker"
+        ):
+            if row[0]:
+                fill_counts[row[0]] = int(row[1] or 0)
+    except sqlite3.Error:
+        fill_counts = {}
+
+    settled: dict[str, dict] = {}
+    try:
+        scur = db.cursor()
+        scur.row_factory = sqlite3.Row
+        for row in scur.execute("SELECT * FROM settlements"):
+            item = dict(row)
+            if item.get("ticker"):
+                settled[item["ticker"]] = item
+    except sqlite3.Error:
+        settled = {}
+
+    # THE HISTORICAL BRIDGE. `intelligence_decisions.ticker` was NULL on every
+    # row written before 2026-09-23 - it was read off the snapshot, which has
+    # no such attribute - so those rows cannot join to a fill by ticker and
+    # would all be scored as simulated. `predictions` recorded the same
+    # window's contract ticker correctly throughout, so the mapping is
+    # recoverable exactly, from data already stored.
+    #
+    # The rows themselves are NOT rewritten. This resolves the ticker at read
+    # time; the archive keeps saying what it actually said.
+    windows: dict[int, str] = {}
+    try:
+        wcur = db.cursor()
+        for row in wcur.execute(
+            "SELECT window_open, contract_ticker FROM predictions "
+            "WHERE contract_ticker IS NOT NULL"
+        ):
+            windows[int(row[0])] = row[1]
+    except sqlite3.Error:
+        windows = {}
+
+    # ONE ROW PER (market, side). A window the model flipped inside is two
+    # opportunities and must not be collapsed onto one; a window polled forty
+    # times is one opportunity and must not be counted as forty.
+    chosen: dict[tuple, dict] = {}
+    seen_polls = 0
+    for record in records:
+        if record.get("feature_version") != BRTI_FEATURE_VERSION:
+            prov.excluded_incompatible += 1
+            continue
+        context_key = record.get("context_key") or ""
+        context, _action = _split_key(context_key)
+        # A decision taken with no context - the retirement refusal, a missing
+        # BRTI poll - carries no cell to learn about. It is not an exclusion
+        # for uncleanliness; there is simply nothing in it to fit.
+        if not context or "·" not in context:
+            continue
+        # A Binance-keyed or unlabelled live row IS an exclusion, and a counted
+        # one. It describes a cell that does not exist under these definitions.
+        if not brti_keyed(context):
+            prov.excluded_incompatible += 1
+            continue
+        if settled_only and record.get("graded_ms") is None:
+            prov.excluded_unresolved += 1
+            continue
+        if settled_only and record.get("won") is None:
+            prov.excluded_unresolved += 1
+            continue
+        seen_polls += 1
+        key = (record.get("window_open"), record.get("side"))
+        existing = chosen.get(key)
+        qualified = bool(record.get("base_qualified"))
+        if existing is None:
+            chosen[key] = record
+        elif not bool(existing.get("base_qualified")) and qualified:
+            # The first QUALIFYING poll represents the market, exactly as the
+            # corpus leg picks it - the bot alerts on that poll and stops. The
+            # row it displaces is still a poll that did not become a training
+            # row, so it is counted: `excluded_duplicate` has to reconcile
+            # against the polls seen, or it is a number that only looks like an
+            # audit.
+            chosen[key] = record
+            prov.excluded_duplicate += 1
+        else:
+            prov.excluded_duplicate += 1
+
+    rows = []
+    for (window_open, side), record in sorted(
+        chosen.items(), key=lambda kv: (kv[0][0] or 0, kv[0][1] or "")
+    ):
+        context, action = _split_key(record.get("context_key") or "")
+        ticker = record.get("ticker") or windows.get(int(window_open or 0))
+        settlement = settled.get(ticker) if ticker else None
+        ask = record.get("ask")
+        if ask is None:
+            continue
+        fill_kind = SIMULATED_FILL
+        fee_cost = None
+        realised = None
+        executed_price = None
+        contracts = 0.0
+        fills_folded = 0
+        # AN ACTUAL FILL IS THE BROKER'S PRICE AND THE BROKER'S FEE. The
+        # recorded ask is what we were quoted; a limit is permission to cross,
+        # never the price paid, and an IOC fills at the best available price.
+        # THE BROKER'S SETTLEMENT ROW IS THE AUTHORITY, not the fills.
+        #
+        # `fills.side` does not reliably name the leg we held: this account has
+        # entries booked `buy/yes` and entries booked `sell/no`, and a cash-out
+        # of a YES position that reports `sell/no` with `yes_price` 0.997.
+        # Inferring our leg from it means guessing, and a guess about which
+        # side we were on inverts the trade.
+        #
+        # `/portfolio/settlements` states it outright - `yes_count`/`no_count`
+        # are the contracts held on each leg, `yes_cost`/`no_cost` what they
+        # cost, and `pnl` what the exchange actually paid. That is the same
+        # source every money figure in this system is already read from, and
+        # the rule here is the project's own: read P&L from Kalshi, never
+        # rebuild it. The fills are kept only to say how many executions it
+        # took, which settlements does not record.
+        position = _position_from(settlement)
+        if position is not None and position["side"] == side:
+            fill_kind = ACTUAL_FILL
+            contracts = position["contracts"]
+            executed_price = position["price"]
+            fee_cost = position["fee_per_contract"]
+            realised = position["pnl_per_contract"]
+            fills_folded = fill_counts.get(ticker, 0)
+        rows.append({
+            "window_open": window_open,
+            "ticker": ticker,
+            "decided_ms": record.get("decided_ms"),
+            "our_ask": float(ask),
+            "won": int(record.get("won") or 0),
+            "rule_match": int(bool(record.get("base_qualified"))),
+            "failed_gates": record.get("failed_gates"),
+            "context_key": context,
+            "applies_to": action,
+            "side": side,
+            "remaining_s": record.get("remaining_s"),
+            "feature_version": record.get("feature_version"),
+            "origin": LIVE,
+            "fill_kind": fill_kind,
+            "fee_cost": fee_cost,
+            # The size actually executed, and how many fills it took. Carried
+            # so a report can say "9 executions over 14 contracts" instead of
+            # conflating polls, rows, fills and contracts - four different
+            # numbers that have all been quoted as each other here.
+            "contracts": contracts,
+            "fill_count": fills_folded,
+            # The DECISION-time ask stays in `our_ask`, because that is what
+            # the price implied when the call was made and it is what a
+            # calibration must be measured against. What we actually paid is a
+            # separate fact and gets a separate field.
+            "executed_price": executed_price,
+            # FROM THE BROKER'S TWO FILLS, NOT FROM THE DECISION ROW.
+            # `intelligence_decisions.realised_pnl` is a placeholder: the
+            # settlement loop passes a literal 0.0 into `grade_intelligence`,
+            # so every graded row carries 0.0 and not one of them means it.
+            # Reading it would have scored every real trade as break-even -
+            # a column that is always present, always zero, and never true.
+            "realised_pnl": realised,
+        })
+        if fill_kind == ACTUAL_FILL:
+            prov.live_actual_fills += 1
+
+    prov.live_decisions = len(rows)
+    prov.live_markets = len({r["window_open"] for r in rows})
+    if rows:
+        prov.data_start_ms = min(r["window_open"] for r in rows)
+        prov.data_end_ms = max(r["window_open"] for r in rows)
+    return rows, prov
+
+
+
+def _position_from(settlement: dict | None) -> dict | None:
+    """Which leg we held, how many, what it cost, and what it paid.
+
+    Read entirely from `/portfolio/settlements`, which states all four.
+
+    A CLOSED PAIR IS NOT TWO POSITIONS. Kalshi books an early exit as buying
+    the opposite side and nets the pair at face value, so a cashed-out market
+    shows `yes_count` AND `no_count` non-zero. The leg we OPENED is the
+    expensive one - 2 contracts of YES at 0.86 against 2 of NO at 0.003 is a
+    YES position closed, not a straddle - and the size is the netted pair, not
+    their sum.
+    """
+    if not settlement:
+        return None
+    yes_n = _as_float(settlement.get("yes_count")) or 0.0
+    no_n = _as_float(settlement.get("no_count")) or 0.0
+    yes_cost = _as_float(settlement.get("yes_cost")) or 0.0
+    no_cost = _as_float(settlement.get("no_cost")) or 0.0
+    if yes_n <= 0 and no_n <= 0:
+        return None
+    if yes_n > 0 and no_n > 0:
+        held_yes = yes_cost >= no_cost
+        contracts = min(yes_n, no_n)
+    else:
+        held_yes = yes_n > 0
+        contracts = yes_n if held_yes else no_n
+    if contracts <= 0:
+        return None
+    cost = yes_cost if held_yes else no_cost
+    count = yes_n if held_yes else no_n
+    pnl = _as_float(settlement.get("pnl"))
+    fee = _as_float(settlement.get("fee_cost")) or 0.0
+    return {
+        "side": "UP" if held_yes else "DOWN",
+        "contracts": contracts,
+        "price": round(cost / count, 6) if count else None,
+        "fee_per_contract": round(fee / contracts, 6),
+        "pnl_per_contract": None if pnl is None else round(pnl / contracts, 6),
+        "pnl": pnl,
+    }
+
+
+
+
+def _as_float(value) -> float | None:
+    try:
+        return None if value is None else float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def combined_rows(db: sqlite3.Connection | None, *, fingerprint: str,
+                  corpus: list[dict] | None = None) -> tuple[list[dict], Provenance]:
+    """Corpus + live, chronological, deduplicated by (market, side).
+
+    The live leg WINS on a collision. Where both describe the same window, the
+    live row is what this system actually saw and actually paid; the corpus row
+    is a reconstruction of what it would have seen. Preferring the
+    reconstruction would be preferring a model of ourselves to the record.
+    """
+    rows = list(corpus if corpus is not None else load_policy_rows())
+    prov = Provenance(
+        sources=("data/brti_history.db", "data/market_data.db"),
+        feature_fingerprint=fingerprint,
+    )
+    prov.corpus_decisions = len(rows)
+    prov.corpus_markets = len({r["window_open"] for r in rows})
+
+    live: list[dict] = []
+    if db is not None:
+        live, live_prov = live_rows(db, fingerprint=fingerprint)
+        prov.sources = prov.sources + live_prov.sources
+        prov.live_decisions = live_prov.live_decisions
+        prov.live_markets = live_prov.live_markets
+        prov.live_actual_fills = live_prov.live_actual_fills
+        prov.excluded_unresolved = live_prov.excluded_unresolved
+        prov.excluded_duplicate = live_prov.excluded_duplicate
+        prov.excluded_incompatible = live_prov.excluded_incompatible
+
+    index: dict[tuple, dict] = {}
+    for row in rows:
+        index[(row["window_open"], row.get("side"))] = row
+    for row in live:
+        key = (row["window_open"], row.get("side"))
+        if key in index:
+            prov.corpus_decisions -= 1
+            prov.excluded_duplicate += 1
+        index[key] = row
+
+    merged = sorted(index.values(), key=lambda r: (r["window_open"],
+                                                   r.get("side") or ""))
+    prov.corpus_markets = len({
+        r["window_open"] for r in merged if r.get("origin") == CORPUS
+    })
+    if merged:
+        prov.data_start_ms = merged[0]["window_open"]
+        prov.data_end_ms = merged[-1]["window_open"]
+    return merged, prov

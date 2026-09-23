@@ -3529,3 +3529,367 @@ the figure cannot be read as something it is not.
 Deployed as instructed, with the measurement recorded beside it rather than
 instead of it. Sizes and fills are not modelled - ending sizing changes size,
 and a ledger of what happened cannot price what would have.
+
+## 49. Continuous learning inside the service, and what it actually found (2026-09-23)
+
+The intelligence layer had been stuck in a state nobody could tell apart from
+working: a policy artefact loaded, decisions were recorded, `/learning`
+rendered - and **every decision returned neutral for the same reason**, 928 of
+them across 37 markets:
+
+    reason                                          n     policy
+    policy is keyed on retired features binance-1   928   v1-retired
+    no evidence for this context                     84   v1
+    policy is stale                                  84   v1
+    pattern supports the existing decision            1   v1
+
+The retirement guard was right and was doing its job. What was missing was the
+replacement. This entry records building it, and reports separately what the
+system now does and what the evidence actually supports - which are different
+claims and only the first is a success.
+
+### The loop runs in the service, not in a script
+
+`scripts/train_brti_candidates.py` produced the previous candidate artefact.
+A research script a person remembers to run is not a learning loop; it is a
+habit, and habits lapse exactly when the market changes enough to matter. The
+loop now lives in `src/btc15_signal/learning_runner.py` and is driven off the
+service's own poll, immediately after the settlement sweep so it sees this
+poll's evidence rather than the previous one's.
+
+    trigger       when
+    bootstrap     no valid policy is active - nothing else matters
+    settlements   24 new settled markets (about six hours of a 96/day series)
+    interval      6 hours regardless, so a quiet market still refreshes
+
+Training runs in a worker thread with its own read-only connection: the fit
+reads ~38,000 BRTI decision points and bootstraps 128 arms, and on the poll
+thread that is a delayed fill. State - watermark, next due, last error,
+consecutive failures - is persisted in `learning_state` and survives restarts.
+A run left `running` by a killed process is closed out as `interrupted` on the
+next startup, which is what stops a crash mid-fit from wedging the scheduler
+into reporting "training in progress" forever.
+
+**Three records, deliberately not one.** `learning_runs` says when training ran
+and what data it used; `policy_activations` says when a policy became active;
+`policy_withdrawals` says when an active adjustment was taken back and what
+condemned it. They can disagree, and usually do: most runs fit a policy that is
+never activated, which is the loop working, not failing.
+
+### Kalshi only, and the 169 rows that proved it was not
+
+Training reads `brti_decision_points` (Kalshi BRTI) priced on `contract_candles`
+(the Kalshi book), plus the live `intelligence_decisions` graded against Kalshi
+settlements and reconciled to Kalshi fills. `data/cohort.db` - the 6,428-market
+corpus every earlier measurement in this file was computed on - is Binance
+derived and is **not reachable from the module at all**.
+
+The live leg needed the same treatment, and reading the `feature_version`
+column was not enough to give it. That column is written from a module constant
+so it says `brti-1` on every row ever recorded, including rows from before the
+BRTI context fix whose keys are Binance (`dist<1.5`) or unlabelled (`? - ?`).
+**169 live rows** declared `brti-1` over a key that meant something else - the
+same failure the deployed policy artefact had, in the table the policy is
+fitted from. Provenance is now read off the key itself
+(`learning_data.brti_keyed`), positively: a key qualifies only by carrying a
+BRTI distance band AND naming a real session and volatility regime, so a
+malformed key, a Binance key and a future scheme all fail the same way.
+
+    corpus     6,428 markets / 6,428 decisions
+    live          44 markets /    53 decisions    (169 excluded, incompatible)
+                                                  (16 excluded, unresolved)
+                                                  (901 excluded, duplicate polls)
+    TOTAL      6,466 markets / 6,481 decisions
+
+Markets and decisions are counted apart throughout. 901 of those exclusions are
+repeated polls of a window already represented: a market polled forty times is
+one opportunity, and the row kept is the FIRST QUALIFYING poll, because that is
+where the bot alerts and stops.
+
+### What the fit found: two confidence arms, no execution adjustment
+
+128 arms fitted. The bars, stated before the run and not moved after it:
+
+    confidence    n >= 120, >= 2 days, day-clustered interval clear of zero
+    execution     all of the above, PLUS validate n >= 40, sign agreement
+                  between train and validate, and a validation interval
+                  WIDENED by sqrt(candidates examined) still clear of zero,
+                  and forward evidence that does not contradict it
+
+    arms fitted                                   128
+    eligible for confidence (n>=120, >=2 days)      7
+    carrying a confidence adjustment                2
+    ...that survive multiplicity widening           0
+    examined as execution candidates                1
+    PROMOTED                                        0
+
+The two confidence arms are `asia - mid - bd<5 - px<70|reject` (n=129 over 34
+days, -0.0985/ct, [-0.1486, -0.0255]) and `us - mid - bd<5 - px<70|reject`
+(n=187, -0.0788/ct, [-0.1449, -0.0093]). Both are REJECT cells: they say the
+rule's refusal of a sub-70c, sub-5x setup is well founded, and taking one would
+have cost about 8-10c a contract. That is a useful thing to show and a safe one
+to act on, because a confidence adjustment moves a label and can do nothing else.
+
+**Why confidence is not held to the multiplicity bar, stated plainly.** The
+widening corrects for CHOOSING: the policy looks at k cells, keeps whichever
+points hardest against the base decision, and lets that one change an order -
+which is k chances to be fooled. Confidence is not chosen; a delta is computed
+for every eligible cell and which one is consulted is decided by where the
+market puts the next signal. There is no selection to correct. The costs differ
+in the same direction: a wrong confidence label means the operator reads
+"lowered" on a setup that was fine, a wrong veto means a blocked winner, in
+money. **Neither of the two arms would survive the execution bar, and the run
+report says so in its own notes rather than leaving it to be discovered.**
+
+### The Asia veto candidate: seven markets, one session, forgone profit
+
+The one execution candidate is the same `asia - mid - bd10-15 - px85-94|accept`
+veto that FINDINGS 46 froze. It remains **unpromoted**, and it fails on the
+plainest possible criterion: validate n = 38 against a bar of 40.
+
+Its forward record, asked for specifically:
+
+    2026-09-23 03:30Z  UP   0.89  won  +0.1031
+    2026-09-23 03:45Z  DOWN 0.85  won  +0.1410
+    2026-09-23 04:30Z  UP   0.87  won  +0.1220
+    2026-09-23 05:15Z  DOWN 0.89  won  +0.1031
+    2026-09-23 06:00Z  UP   0.86  won  +0.1315
+    2026-09-23 06:15Z  DOWN 0.86  won  +0.1315
+    2026-09-23 06:45Z  DOWN 0.87  won  +0.1220
+
+**Are the seven observations seven independent markets? Yes - and that is the
+weaker half of the question.** They are seven distinct `window_open` values,
+seven separate 15-minute markets, and `UNIQUE(window_open, candidate_id)` makes
+a duplicate impossible by construction. But all seven fall in ONE Asia session
+on ONE day, spanning 3h15m. A trend that carries five consecutive windows
+carries their outcomes with it, so seven markets here are nothing like seven
+independent observations, and the day-clustered bootstrap that every interval
+in this file uses would treat them as roughly one. Seven markets, one day.
+
+**The -0.8542 is an estimated opportunity cost, not a realised loss.** The rule
+took all seven and won all seven; +0.8542 per contract is money that settled
+INTO the account. The candidate would have stood aside and banked nothing. Its
+forward figure is forgone profit, and `/learning` now labels it as such in
+those words rather than printing a negative number next to a trading record.
+
+### Two defects found in the wiring, both invisible to the suite
+
+**`policy_line` was defined and never called.** The confidence delta had
+nowhere to go: it was computed, stored and reported in `/learning`, and the
+alert the operator actually reads never saw it. A layer that reports
+"confidence lowered" beside a header still reading HIGH has not lowered
+confidence; it has printed a sentence. The delta now enters `confidence_label`
+on the same 0-100 points scale as the regime and clock terms, clamped with
+them, so it moves the WORD - and `policy_line` renders beneath it saying why.
+
+**`verdict` was two different things in one function.** `primary_signal` binds
+the intelligence `Verdict` near the top and a plain log STRING further down on
+four branches (`"eligible"`, `"no execution client"`, ...). Reading
+`verdict.confidence_delta` at render time therefore raised `AttributeError` -
+but only on the branches that reassign, which is why it passed a full 786-test
+run before surfacing. Renamed to `intel_verdict`, with a source-level test
+pinning the separation, because the failure is a name and not a value.
+
+**And one that was there before either.** Applying a policy VETO or ADMIT to
+`rule_match` consulted the policy's own `vetoes_enabled` flag and NOTHING else.
+The two-switch design in `intel_mode` - `intelligence_mode` naming the
+authority and `intelligence_authorised` granting it - existed, was documented,
+and was never wired to the policy path. An artefact with `vetoes_enabled: true`
+would have changed live orders with no operator authorisation anywhere in the
+chain. `intelligence_policy.authorise()` now applies evidence and authority as
+two separate gates, and records both: `final_action` is what took effect,
+`evidence_action` is what the policy would have done with permission.
+
+
+### Four more defects, found only by reconciling against the broker
+
+None of these raised. Every one of them was a column that was always present,
+always populated, and never right - the failure mode this project keeps
+meeting. They were found by reading the learning loop's own output against
+Kalshi's fills, which is the check the loop exists to make.
+
+**`intelligence_decisions.ticker` was NULL on all 1,174 rows.** It was read as
+`getattr(snapshot, "ticker", None)` and `MarketSnapshot` has no `ticker` - the
+contract does. So the broker's fills and fees could never be joined to the
+decision that caused them, and the learning loop scored **every executed trade
+as a simulated one**. Now recorded from `contract.ticker`. The historical rows
+are not rewritten: `predictions` recorded the same window's ticker correctly
+throughout, so `learning_data.live_rows` resolves it at READ time through that
+bridge and the archive keeps saying what it actually said. That recovered 25
+executions from 0.
+
+**`fills.fee_cost` is the fee for the WHOLE fill, not per contract.** 0.0294 on
+two contracts at 70c is `0.07 * 2 * 0.7 * 0.3` - the published formula times
+the COUNT. Using it per contract doubles the cost of every two-contract trade,
+which is most of them under the current sizing.
+
+**`yes_price` is not what a DOWN position cost.** A DOWN position is NO and the
+fill row carries `no_price` explicitly; the first version derived it as
+`1 - yes_price`, which is a guess in a place where the exchange has stated the
+answer and is wrong wherever the pair does not sum to exactly 1. Related: a
+SELL fill is an exit and was being priced as an entry, and a single fill was
+matching BOTH sides of a window the model flipped inside - marking a decision
+nobody executed as executed. Fills are now keyed on `(ticker, our side)`,
+entries only, with exits kept apart and used for the realised figure.
+
+**`intelligence_decisions.realised_pnl` is a placeholder.** The settlement loop
+passes a literal `0.0` into `grade_intelligence`, so every graded row carries
+`realised_pnl = 0.0` and not one of them means it. Reading it as money would
+have scored **every real trade as break-even**. The realised figure for an
+early exit is now computed from the broker's two fills - entry price, exit
+price, both fees - and is `None` where no exit exists, so nothing claims a
+number it does not have.
+
+**And a gate name was stored one character at a time.** `failed_checks` is a
+comma-joined STRING on both live paths. `intelligence_verdict` tested
+`isinstance(failed_checks, list)` - a string is not one - and fell through to
+`tuple(str(x) for x in failed_checks)`, which iterates CHARACTERS. "BRTI
+distance" was archived as thirteen gates, `B, R, T, I, ...`. Nothing raised.
+The consequence is that the ADMIT path, which may only rescue a setup whose
+failing gates are exactly the one it names, **was dead by typo rather than by
+decision** - it could never have matched. Fixed in `normalise_gates`, with a
+test. Rows written before the fix keep their corrupted gate list; they fail
+safe, because a garbled multi-gate signature refuses an admission rather than
+granting one.
+
+The corrected per-contract record over the 25 reconciled executions, priced at
+the broker's fills and fees: the eight entries the current policy's feature
+contract can key come to **-0.0038/contract** net - seven winners around
++0.12 and one loser at -0.85. That is the shape the whole system has: an edge
+of about a cent against a loss that costs seventy.
+
+
+### CORRECTION, same day: confidence was sized off the wrong quantity
+
+The operator caught it: **negative profitability is not low directional
+confidence.** An 89c contract that wins 89% of the time loses money on every
+trade and is exactly as likely to win as the market says. The first version of
+this work sized the confidence delta from dollars per contract, so it would
+have shown "confidence lowered" on setups the market gets right nine times in
+ten - a statement about price, dressed as a statement about the outcome.
+
+The two arms it activated were precisely that error. `us · mid · bd<5 ·
+px<70|reject` was selected at -0.1179/ct of *profit*; its *calibration* error is
+-0.0515 with an interval of [-0.1182, +0.0174], which includes zero. The other
+was -0.0229 [-0.0825, +0.0408]. Neither cell is measurably mispriced. They are
+cheap contracts that lose money, which is a different fact.
+
+**Confidence is now the calibration error and nothing else.** On Kalshi the ask
+IS the implied probability that our side wins - paying 0.86 for a dollar payout
+is the market saying 86% - so the quantity is `observed win rate - mean ask`,
+measured per row as `won - ask` and bootstrapped by day. The structure is real
+and it is the favourite-longshot bias, measured over 6,486 rows:
+
+    ask ~0.4   n=128    wins 0.5234
+    ask ~0.5   n=632    wins 0.5032
+    ask ~0.6   n=1228   wins 0.5326
+    ask ~0.7   n=1099   wins 0.6442
+    ask ~0.8   n=2054   wins 0.8106
+    ask ~0.9   n=1323   wins 0.9025
+
+Profit still drives veto and admission, which are decisions about money.
+Calibration drives the label, which is a statement about winning. A test pins
+each: an expensive cell that wins gets no confidence change while its money
+still points to a veto, and a cell that wins 90% at a 70c price does get one.
+
+**And validation is now required for confidence too.** The earlier argument -
+that a delta is computed for every eligible cell rather than the best of k
+being picked, so there is no selection to correct - is still true and is still
+why the multiplicity widening is not applied. But the operator is right that it
+does not remove the need to validate. A confidence arm now additionally needs
+`validate n >= 40` and the calibration error to hold its sign out of sample.
+
+**THE RESULT OF THE CORRECTION: zero confidence arms.** All seven eligible
+cells have a calibration interval that includes zero. The price is not
+measurably wrong in any of them, which is exactly what FINDINGS 36 predicted -
+the ask's Brier score of 0.2112 beat every model tried. So the live policy now
+carries 128 arms, **0 confidence adjustments and 0 promoted arms**, and
+`/learning` reports "adjusting confidence: no". The loop runs, ingests,
+refits, evaluates and activates nothing. That is the honest state.
+
+### CORRECTION: executions, counted once
+
+"0 real fills became 25" in the section above was quoted from an intermediate
+build that matched any fill to any decision by ticker alone. Two things were
+wrong underneath it.
+
+**`fills.side` does not reliably name the leg we held.** This account has
+entries booked `buy/yes` AND entries booked `sell/no`, and a cash-out of a YES
+position reported as `sell/no` carrying `yes_price` 0.997. Any reading of our
+position from that field is a guess, and a guess about which side we were on
+inverts the trade.
+
+**An execution is not a fill.** 19 of this account's market-sides have two to
+four buy fills - a base order plus recovery add-ons. Folding them wrongly
+under-counts the contracts and the fees; counting each as its own trade reports
+one opportunity as three.
+
+Both are solved by reading the position from `/portfolio/settlements`, which
+states `yes_count`/`no_count`, `yes_cost`/`no_cost` and `pnl` outright - the
+same source every other money figure in this system already comes from, and the
+project's own rule: read P&L from Kalshi, never rebuild it. A cashed-out market
+shows BOTH counts, because Kalshi books an early exit as buying the opposite
+side; the leg we opened is the expensive one and the size is the netted pair,
+not their sum. The fills table is now used for exactly one thing: how many
+fills an execution took.
+
+The corrected figures, and they reconcile exactly:
+
+    executions                     25   (one per market-side, not per poll)
+    contracts                      47
+    decision rows behind them      25   (the 13:00Z market alone was 25 polls)
+    sum of per-contract P&L x size  +3.3803
+    sum of settlements.pnl          +3.3803   <- agrees to the cent
+
+### CORRECTION: a market could span two dataset splits
+
+`chronological_split` cut the row list at an index. A window the model flipped
+inside contributes an UP row and a DOWN row, so the boundary could land between
+them and put one market's outcome in both the fit and the check of the fit.
+Invisible - both slices look the right size - and it flatters exactly the cells
+that contain flipped windows. The boundary now falls between MARKETS and every
+row of a window travels with it; the slice sizes are approximate instead of
+exact, which is the correct trade.
+
+### What is live, and what is not
+
+    running                          YES  - scheduled, persisted, restart-safe
+    updating                         YES  - refits on settlements or 6h
+    adjusting confidence             NO   - 0 arms, after the calibration
+                                            correction above. Every eligible
+                                            cell's calibration interval
+                                            includes zero.
+    authorised to affect execution   NO   - 0 arms cleared the evidence bar,
+                                            and the operator's two switches
+                                            are not set either
+
+Those are four different claims and `/learning` now shows them on four lines.
+A system can be running, updating and adjusting confidence while being
+authorised to change nothing, and that is exactly the state here.
+
+**A working learning system and a proven profitable adjustment are separate
+claims.** The first is built, deployed and verified. The second is not made:
+no adjustment earned activation, and the honest reading of why is that this
+account has 44 live markets of Kalshi-native forward evidence against the
+~10,700 qualified signals FINDINGS 38 estimated a veto would need. The loop now
+accumulates that evidence by itself, which it previously could not.
+
+### Superseded, and what survives
+
+Everything in FINDINGS 1-40 computed on `cohort.db` or the `market_data.db`
+Binance columns is **superseded as a basis for the live policy** - not
+withdrawn as a measurement. Those numbers are still what they were; they simply
+describe an instrument the system no longer trades on, which disagrees with the
+official settlement on 19.4% of outcomes (FINDINGS 41). The originals are
+preserved in place, and the artefact that was fitted on them is kept as
+`runtime/intelligence_policy.binance-v1.retired.json`.
+
+What that does NOT overturn: FINDINGS 36 (no model beats the ask) and
+FINDINGS 37 (every implementable wait policy loses) were paired, same-market
+measurements where the feed error largely cancels, and nothing here contradicts
+them. FINDINGS 43's warning that thresholds do not transfer between instruments
+is the reason the BRTI bands exist at all and is reinforced, not superseded.
+FINDINGS 44-48 concern sizing, recovery and execution controls; they are
+untouched by this work and remain binding - no mode may change size, and
+`intel_mode.may_change_size` returns False for every mode with a test asserting
+it for each.

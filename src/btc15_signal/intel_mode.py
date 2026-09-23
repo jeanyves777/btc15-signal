@@ -53,6 +53,30 @@ def may_decide(mode: str) -> bool:
     return mode == LIVE
 
 
+def may_veto(mode: str) -> bool:
+    """May the layer REFUSE a setup the strategy gates accepted?
+
+    A separate function from `may_admit` on purpose. They are opposite risks
+    and there is no reason a system that is trusted to stand aside must also be
+    trusted to overrule a refusal - the first can only decline to spend money,
+    the second spends it on a trade every deployed gate rejected. Splitting
+    them means the two can be granted apart if they ever should be, and means a
+    test can assert each one separately instead of asserting "decide".
+    """
+    return mode == LIVE
+
+
+def may_admit(mode: str) -> bool:
+    """May the layer ADMIT a setup the strategy gates refused?
+
+    The stricter of the two in consequence, though they currently share a mode.
+    An admission still has to name the single gate it overrides, and it can
+    never reach a capital, exposure, loss-floor or execution protection - those
+    are not strategy opinions.
+    """
+    return mode == LIVE
+
+
 def may_change_size(mode: str) -> bool:
     """NO MODE MAY EVER CHANGE SIZE.
 

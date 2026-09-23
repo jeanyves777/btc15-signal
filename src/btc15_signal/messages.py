@@ -11,6 +11,8 @@ network client or an event loop.
 
 from html import escape
 
+from .intelligence_policy import VETO
+
 BAR_FULL = "▰"  # ▰
 BAR_EMPTY = "▱"  # ▱
 RULE = "—" * 16
@@ -1267,21 +1269,201 @@ def intel(*, head: str, gates: dict, needed: int) -> str:
     return "\n".join(lines)
 
 
-def learning(*, head: str, candidates, board: list[dict],
-             min_candidate_n: int = 60, min_promotion_n: int = 120) -> str:
-    """The forward-evaluation state, with promotion reported SEPARATELY.
+def _ago(now_ms: int, then_ms: int) -> str:
+    """How long ago, in the coarsest unit that is still honest."""
+    if not then_ms:
+        return "never"
+    seconds = max(0, (now_ms - then_ms) // 1000)
+    if seconds < 90:
+        return f"{seconds}s ago"
+    if seconds < 5400:
+        return f"{seconds // 60}m ago"
+    if seconds < 172800:
+        return f"{seconds // 3600}h ago"
+    return f"{seconds // 86400}d ago"
 
-    Two questions that are constantly conflated, so this message keeps them on
-    different lines:
 
-        watching   is this adjustment worth measuring forward?
-        promoted   may it change a live order?
+def _until(now_ms: int, then_ms: int) -> str:
+    if not then_ms:
+        return "unscheduled"
+    seconds = (then_ms - now_ms) // 1000
+    if seconds <= 0:
+        return "due now"
+    if seconds < 5400:
+        return f"in {seconds // 60}m"
+    return f"in {seconds // 3600}h"
 
-    Nothing has earned the second. Saying that plainly is the report - "no
-    adjustment has earned promotion" is a result, and dressing it up as
-    progress is how a learning loop becomes a story about one.
+
+def learning_state(state: dict) -> list[str]:
+    """The four states, on four lines, never collapsed into one.
+
+    The operator asked for these to be distinguishable, and they are genuinely
+    four different claims about four different things:
+
+        RUNNING     the loop is scheduled and alive
+        UPDATING    a fit is in progress right now
+        ADJUSTING   at least one arm is re-rating displayed confidence
+        AUTHORISED  an arm may actually change an order
+
+    A system can be running, updating and adjusting confidence while being
+    authorised to change nothing - which is exactly the normal state here, and
+    reporting it as one word would make it indistinguishable from a system with
+    a live veto.
     """
-    lines = [head, RULE, "\U0001f9ea <b>FORWARD EVALUATION</b>"]
+    def tick(flag: bool) -> str:
+        return "✅" if flag else "—"
+
+    updating = state.get("updating")
+    lines = [
+        f"  {tick(state.get('running'))} <b>Running</b> · "
+        + (
+            f"every {state.get('interval_ms', 0) // 3600000}h or "
+            f"{state.get('trigger_threshold')} new settled markets"
+            if state.get("running") else "<i>disabled</i>"
+        ),
+        f"  {tick(updating)} <b>Updating</b> · "
+        + ("training now" if updating else
+           f"last completed {_ago(state['now_ms'], state.get('last_success_ms') or 0)}"),
+        f"  {tick(state.get('adjusting_confidence'))} "
+        f"<b>Adjusting confidence</b> · "
+        + (
+            f"{state.get('confidence_arms')} arm(s) active"
+            if state.get("adjusting_confidence")
+            else (
+                f"{state.get('confidence_arms')} arm(s) carry a delta but mode "
+                f"is {escape(str(state.get('mode')))}"
+                if state.get("confidence_arms")
+                else "no arm has earned one"
+            )
+        ),
+        f"  {tick(state.get('authorised_to_execute'))} "
+        f"<b>Authorised to affect execution</b> · "
+        + (
+            f"{state.get('promoted_arms')} promoted arm(s), mode "
+            f"{escape(str(state.get('mode')))}"
+            if state.get("authorised_to_execute")
+            else (
+                f"{state.get('promoted_arms')} arm(s) cleared the evidence bar "
+                f"but the operator's switches are not set"
+                if state.get("promoted_arms")
+                else "no arm has cleared the evidence bar"
+            )
+        ),
+    ]
+    return lines
+
+
+def learning(*, head: str, state: dict | None = None, candidates=None,
+             board: list[dict] | None = None,
+             min_candidate_n: int = 60, min_promotion_n: int = 120) -> str:
+    """The learning loop: what it is doing, what it last did, what is live.
+
+    Four sections, in the order the operator asked for them - the loop's own
+    state, the training schedule, what is actually active, and the forward
+    evaluation underneath. Promotion is reported SEPARATELY from everything
+    else throughout, because "the system is learning" and "an adjustment is
+    changing orders" are different claims and only the first is usually true.
+    """
+    board = board or []
+    lines = [head]
+    if state:
+        lines.append(RULE)
+        lines.append("\U0001f9e0 <b>LEARNING LOOP</b>")
+        lines.extend(learning_state(state))
+        lines.append(RULE)
+        lines.append("\U0001f4c5 <b>TRAINING</b>")
+        last = state.get("last_complete_run") or {}
+        now = state["now_ms"]
+        if last:
+            status = str(last.get("status") or "?")
+            lines.append(
+                f"  last successful update <b>"
+                f"{_ago(now, int(last.get('finished_ms') or 0))}</b> "
+                f"({escape(status)}, trigger {escape(str(last.get('trigger')))})"
+            )
+            lines.append(
+                f"      used <b>{last.get('markets_used') or 0}</b> markets "
+                f"({last.get('rows_used') or 0} decisions · "
+                f"{last.get('corpus_markets') or 0} archive + "
+                f"{last.get('live_markets') or 0} live, "
+                f"{last.get('live_actual_fills') or 0} real fills)"
+            )
+            lines.append(
+                f"      fitted {last.get('arms_fitted') or 0} arms · "
+                f"{last.get('arms_with_confidence') or 0} confidence · "
+                f"{last.get('promoted') or 0} promoted of "
+                f"{last.get('candidates_examined') or 0} examined"
+            )
+        else:
+            lines.append("  <i>no completed training run yet</i>")
+        lines.append(
+            f"  new settled markets since then: "
+            f"<b>{state.get('new_settled_markets')}</b> of "
+            f"{state.get('trigger_threshold')} needed"
+        )
+        lines.append(
+            f"  next training <b>"
+            f"{_until(now, int(state.get('next_due_ms') or 0))}</b>"
+            + (" · <i>training now</i>" if state.get("updating") else "")
+        )
+        if state.get("last_error"):
+            lines.append(
+                f"  ⚠️ last failure "
+                f"{_ago(now, int(state.get('last_error_ms') or 0))} "
+                f"({state.get('consecutive_failures')} consecutive): "
+                f"<code>{escape(str(state['last_error'])[:160])}</code>"
+            )
+            lines.append(
+                "      <i>the last valid Kalshi policy stayed active</i>"
+            )
+        lines.append(RULE)
+        lines.append("\U0001f4e6 <b>ACTIVE POLICY</b>")
+        if state.get("policy_valid"):
+            lines.append(
+                f"  <code>{escape(str(state.get('policy_version')))}</code> · "
+                f"features <code>{escape(str(state.get('feature_version')))}</code>"
+                f" <code>{escape(str(state.get('feature_fingerprint'))[:8])}</code>"
+            )
+            lines.append(
+                f"  {state.get('arms')} arms · vetoes "
+                f"{'on' if state.get('vetoes_enabled') else 'off'} · "
+                f"admissions "
+                f"{'on' if state.get('admissions_enabled') else 'off'}"
+            )
+        else:
+            lines.append(
+                f"  ❌ <b>cannot act</b> · "
+                f"<code>{escape(str(state.get('policy_version')))}</code>"
+            )
+            lines.append(
+                f"      {escape(str(state.get('policy_invalid_reason')))}"
+            )
+        adjustments = state.get("active_adjustments") or []
+        if adjustments:
+            lines.append("  <i>active adjustments</i>")
+            for item in adjustments[:6]:
+                mark = "⚙️" if item["kind"] == "execution" else "\U0001f4ca"
+                what = (
+                    f"{item['action']}"
+                    if item["kind"] == "execution"
+                    else f"confidence {item['delta']:+d}"
+                )
+                lines.append(
+                    f"    {mark} {escape(item['context_key'])} · {what} "
+                    f"<i>(n={item['n']} over {item['markets']} markets)</i>"
+                )
+        else:
+            lines.append(
+                "  <i>no arm is adjusting anything - every decision returns "
+                "the base strategy with its evidence beside it</i>"
+            )
+        for item in (state.get("withdrawals") or [])[:2]:
+            lines.append(
+                f"  \U0001f6d1 withdrawn {escape(str(item.get('context_key')))} "
+                f"· {escape(str(item.get('reason'))[:100])}"
+            )
+    lines.append(RULE)
+    lines.append("\U0001f9ea <b>FORWARD EVALUATION</b>")
     if candidates is None or not getattr(candidates, "candidates", ()):
         lines.append("  <i>no candidates frozen - nothing is being watched</i>")
         return "\n".join(lines)
@@ -1289,12 +1471,29 @@ def learning(*, head: str, candidates, board: list[dict],
         f"  <i>artefact</i> <code>{escape(candidates.version)}</code> · "
         f"features <code>{escape(candidates.feature_version)}</code>"
     )
+    # SCORED BY CONTEXT AS WELL AS BY ID. Candidate ids used to be positional
+    # (`c01` was whichever cell had the most rows that day) and are now derived
+    # from the context, so the same cell has carried two ids across the change.
+    # The CELL is the identity that matters - it is what the forward rows are
+    # really about - so its record is accumulated across every id it has had,
+    # and no evidence is rewritten to achieve it.
     scored = {r["candidate_id"]: r for r in board}
+    by_context: dict = {}
+    for row in board:
+        bucket = by_context.setdefault(
+            row.get("context_key"),
+            {"graded": 0, "changes": 0, "incremental": 0.0, "ids": set()},
+        )
+        bucket["graded"] += row.get("graded") or 0
+        bucket["changes"] += row.get("changes") or 0
+        bucket["incremental"] += row.get("incremental") or 0.0
+        bucket["ids"].add(row.get("candidate_id"))
     for c in candidates.candidates:
-        row = scored.get(c.candidate_id, {})
-        graded = row.get("graded") or 0
-        changes = row.get("changes") or 0
-        incremental = row.get("incremental") or 0.0
+        row = scored.get(c.candidate_id) or {}
+        merged = by_context.get(c.context_key) or {}
+        graded = merged.get("graded") or row.get("graded") or 0
+        changes = merged.get("changes") or row.get("changes") or 0
+        incremental = merged.get("incremental") or row.get("incremental") or 0.0
         state = "\U0001f7e2 PROMOTED" if c.promotes else "\U0001f441 watching"
         lines.append(
             f"  {state} <b>{escape(c.candidate_id)}</b> "
@@ -1305,10 +1504,24 @@ def learning(*, head: str, candidates, board: list[dict],
             f"live {graded} graded, {changes} it would change"
         )
         if graded:
-            lines.append(
-                f"      forward <b>{incremental:+.4f}</b> against the "
-                "unchanged rule"
+            # AN OPPORTUNITY COST IS NOT A TRADING LOSS. Where the candidate
+            # would have stood aside, this figure is what the bot MADE and the
+            # candidate would have missed - money that is in the account. It is
+            # labelled so it can never be read as a drawdown.
+            label = (
+                "missed against the unchanged rule"
+                if c.proposed_action == VETO and incremental < 0
+                else "against the unchanged rule"
             )
+            lines.append(
+                f"      forward <b>{incremental:+.4f}</b> {label} "
+                f"over {changes} market(s)"
+            )
+            if c.proposed_action == VETO and incremental < 0:
+                lines.append(
+                    "      <i>estimated opportunity cost, not a realised "
+                    "loss - those markets were traded and settled</i>"
+                )
     promoted = sum(1 for c in candidates.candidates if c.promotes)
     lines.append(RULE)
     lines.append(
@@ -1322,6 +1535,48 @@ def learning(*, head: str, candidates, board: list[dict],
         "SIMULATED fill: a rejected winner is evidence about direction, not "
         "proof a fill was available.</i>"
     )
+    return "\n".join(lines)
+
+
+def learning_activated(*, policy, report: dict, comparison: dict,
+                       reason: str) -> str:
+    """Sent when a newly trained policy becomes the live artefact.
+
+    An activation is a change to how the bot decides, so it is announced the
+    way any other such change is - with what it replaced, what it is allowed to
+    do, and what the evidence behind it was. Silence here would mean the
+    decision rule could change under the operator overnight with the only
+    record in a log file.
+    """
+    promoted = int(report.get("promoted") or 0)
+    lines = [
+        "\U0001f9e0 <b>LEARNING: NEW POLICY ACTIVE</b>",
+        RULE,
+        f"  <code>{escape(str(policy.version))}</code>",
+        f"  features <code>{escape(str(policy.feature_version))}</code> "
+        f"<code>{escape(str(policy.feature_fingerprint)[:8])}</code>",
+        f"  fitted on <b>{report.get('markets', 0)}</b> markets "
+        f"({report.get('rows', 0)} decisions), train {report.get('train_n', 0)} / "
+        f"validate {report.get('validate_n', 0)} / holdout "
+        f"{report.get('holdout_n', 0)}",
+        f"  {report.get('arms_fitted', 0)} arms · "
+        f"<b>{report.get('arms_with_confidence', 0)}</b> adjust confidence · "
+        f"<b>{promoted}</b> may change an order",
+    ]
+    if comparison:
+        lines.append(
+            f"  against the previous policy on the validation slice: "
+            f"<b>{comparison.get('delta', 0):+.4f}</b> "
+            f"({comparison.get('markets', 0)} markets)"
+        )
+    lines.append(f"  <i>{escape(reason)}</i>")
+    if not promoted:
+        lines.append(RULE)
+        lines.append(
+            "  <i>No adjustment earned the right to change an order. The "
+            "policy re-rates confidence only; every entry decision remains "
+            "the strategy's.</i>"
+        )
     return "\n".join(lines)
 
 

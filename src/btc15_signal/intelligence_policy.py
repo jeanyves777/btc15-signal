@@ -84,6 +84,19 @@ class Verdict:
     # The price the approval was granted at, so repricing can tell a worse
     # fill from the one that was actually evaluated.
     decision_ask: float | None = None
+    # WHAT THE EVIDENCE SAID, before the operator's permissions were applied.
+    #
+    # `final_action` and `confidence_delta` are what actually took effect, so
+    # every existing consumer - the alert, the grading, the ledger - is reading
+    # the thing that happened. These two record what the policy WOULD have done
+    # with authority, which is the counterfactual the shadow record exists for:
+    # without it, a layer running in shadow is indistinguishable from a layer
+    # with nothing to say, and it could never earn promotion.
+    evidence_action: str = ""
+    evidence_delta: int = 0
+    # Why the two differ, named. An adjustment silently dropped for want of a
+    # permission looks exactly like an adjustment that was never proposed.
+    authority: str = ""
 
     @property
     def changed(self) -> bool:
@@ -123,6 +136,13 @@ class Policy:
     # which `compatible()` treats as incompatible.
     feature_fingerprint: str = ""
     feature_definitions: dict = field(default_factory=dict)
+    # WHERE THE EVIDENCE CAME FROM, and what the fit found. Fields on the
+    # artefact rather than a sibling file, because a provenance record that
+    # can be moved or edited apart from the thing it describes is a record of
+    # nothing. Both round-trip through `load`/`save`, so a policy recovered
+    # from disk after a restart can still say what it was built from.
+    provenance: dict = field(default_factory=dict)
+    report: dict = field(default_factory=dict)
 
     @classmethod
     def load(cls, path: str | Path) -> "Policy":
@@ -273,7 +293,12 @@ def decide(
         return _with(base, reason="no evidence for this context")
     n = int(arm.get("n") or 0)
     if n < policy.min_evidence:
-        return _with(base, reason=f"thin evidence (n={n})")
+        # CARRY THE COUNT, not just the sentence. The reason string said
+        # "thin evidence (n=53)" while `evidence_n` stayed 0, so any aggregate
+        # over the column read every below-bar cell as having no evidence at
+        # all - and "how close is this cell to the bar?" could only be answered
+        # by parsing English out of a text field.
+        return _with(base, reason=f"thin evidence (n={n})", evidence_n=n)
 
     mean = float(arm.get("mean") or 0.0)
     low, high = float(arm.get("low") or 0.0), float(arm.get("high") or 0.0)
@@ -312,6 +337,60 @@ def decide(
     )
 
 
+def authorise(verdict: Verdict, *, may_confidence: bool, may_veto: bool,
+              may_admit: bool) -> Verdict:
+    """Apply the operator's permissions to an evidence-based verdict.
+
+    TWO INDEPENDENT THINGS HAVE TO BE TRUE for an adjustment to bite, and they
+    are checked in two different places on purpose:
+
+        evidence     the policy was VALIDATED to do this, in this cell. Decided
+                     by `decide` above, from a frozen artefact.
+        authority    the OPERATOR has granted this class of change. Decided
+                     here, from two switches nothing in the code can raise.
+
+    Confidence, veto and admission are three separate permissions because they
+    are three different risks. A confidence adjustment re-rates a label; it can
+    never admit a setup a gate blocked, never refuse one a gate allowed, and
+    never change size. Granting it therefore says nothing about whether the
+    layer may touch an order, and this function is where that distinction stops
+    being a comment and becomes arithmetic.
+
+    The evidence verdict is preserved on the returned object rather than
+    overwritten, so the archive keeps the counterfactual that a shadow run is
+    entirely made of.
+    """
+    action = verdict.final_action
+    delta = verdict.confidence_delta
+    notes = []
+    if action == VETO and not may_veto:
+        action, notes = NEUTRAL, [*notes, "veto not authorised"]
+    if action == ADMIT and not may_admit:
+        action, notes = NEUTRAL, [*notes, "admission not authorised"]
+    if delta and not may_confidence:
+        delta, notes = 0, [*notes, "confidence adjustment not authorised"]
+    if action == verdict.final_action and delta == verdict.confidence_delta:
+        # Nothing was withheld. Record the evidence anyway so every row carries
+        # both columns and a query never has to guess why one is empty.
+        return _replace(verdict, evidence_action=verdict.final_action,
+                        evidence_delta=verdict.confidence_delta, authority="")
+    return _replace(
+        verdict, final_action=action, confidence_delta=delta,
+        overrides_gate=verdict.overrides_gate if action == ADMIT else None,
+        evidence_action=verdict.final_action,
+        evidence_delta=verdict.confidence_delta,
+        authority="; ".join(notes),
+    )
+
+
+def _replace(verdict: Verdict, **changes) -> Verdict:
+    data = {
+        field: getattr(verdict, field) for field in Verdict.__dataclass_fields__
+    }
+    data.update(changes)
+    return Verdict(**data)
+
+
 def reprice(verdict: Verdict, ask: float, floor: float = 0.0) -> Verdict:
     """Ask again at the price actually about to be paid.
 
@@ -343,12 +422,12 @@ def reprice(verdict: Verdict, ask: float, floor: float = 0.0) -> Verdict:
     return verdict
 
 
-def _with(base: Verdict, reason: str) -> Verdict:
+def _with(base: Verdict, reason: str, evidence_n: int = 0) -> Verdict:
     return Verdict(
         base_qualified=base.base_qualified, failed_gates=base.failed_gates,
         final_action=NEUTRAL, reason=reason, context_key=base.context_key,
         model_version=base.model_version, policy_version=base.policy_version,
-        training_cutoff_ms=base.training_cutoff_ms,
+        training_cutoff_ms=base.training_cutoff_ms, evidence_n=evidence_n,
     )
 
 
