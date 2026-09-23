@@ -30,7 +30,8 @@ RUNTIME = Path(__file__).resolve().parents[1] / "runtime"
 
 def binance_policy(**over) -> intel.Policy:
     base = {
-        "version": "v1", "model_version": "m", "feature_version": "brti-1",
+        "version": "v1", "model_version": "m",
+        "feature_version": feature_contract.CONTRACT.version,
         "arms": {"asia · low · dist3+ · px<70|reject":
                  {"n": 500, "mean": 0.05, "low": 0.01, "high": 0.09,
                   "action": intel.ADMIT, "delta": 5}},
@@ -44,7 +45,7 @@ def binance_policy(**over) -> intel.Policy:
 def test_provenance_is_read_from_the_keys_not_the_label():
     """The declared field is a claim; the arm keys are the evidence."""
     pol = binance_policy()
-    assert pol.feature_version == "brti-1"        # what it says
+    assert pol.feature_version == feature_contract.CONTRACT.version
     assert pol.keyed_feature_version == "binance-1"  # what it is
     assert pol.mislabelled
 
@@ -75,14 +76,15 @@ def test_an_honestly_labelled_binance_policy_is_also_barred():
 def test_a_brti_policy_is_not_barred_by_these_guards():
     """The guard must bar the retired instrument, not all intelligence."""
     pol = intel.Policy(
-        version="v2", model_version="m", feature_version="brti-1",
+        version="v2", model_version="m",
+        feature_version=feature_contract.CONTRACT.version,
         arms={"asia · low · bd10-15 · px<70":
               {"n": 500, "mean": 0.05, "low": 0.01, "high": 0.09,
                "action": intel.ADMIT, "gate": "target distance", "delta": 5}},
         vetoes_enabled=True, admissions_enabled=True, min_evidence=1,
         feature_fingerprint=feature_contract.FINGERPRINT,
     )
-    assert pol.keyed_feature_version == "brti-1"
+    assert pol.keyed_feature_version == feature_contract.CONTRACT.version
     assert not pol.mislabelled
     # An admission may only rescue a setup refused for the ONE gate it names,
     # so the call has to present exactly that refusal.
@@ -116,7 +118,7 @@ def test_frozen_candidates_are_keyed_on_brti():
     if not path.exists():
         return
     data = json.loads(path.read_text())
-    assert data.get("feature_version") == "brti-1"
+    assert data.get("feature_version") == feature_contract.CONTRACT.version
     for candidate in data.get("candidates", []):
         assert not any(b in candidate["context"]
                        for b in intel.BINANCE_BAND_NAMES), candidate["context"]

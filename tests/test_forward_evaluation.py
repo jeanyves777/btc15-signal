@@ -34,7 +34,8 @@ def reward(ask, won):
 
 def candidate_set(tmp_path, promotes=False) -> CandidateSet:
     artefact = {
-        "version": "cand-test-1", "feature_version": "brti-1",
+        "version": "cand-test-1",
+        "feature_version": feature_contract.CONTRACT.version,
         # The live contract. Candidates without it evaluate nothing, which is
         # the runtime guard doing its job, so the fixture declares it.
         "feature_fingerprint": feature_contract.FINGERPRINT,
@@ -208,7 +209,8 @@ def test_the_artefact_version_travels_with_every_prediction(tmp_path):
     cs = candidate_set(tmp_path)
     rows = cs.evaluate(context_key=CTX, qualified=True)
     assert all(r["candidate_version"] == "cand-test-1" for r in rows)
-    assert all(r["feature_version"] == "brti-1" for r in rows)
+    assert all(r["feature_version"] == feature_contract.CONTRACT.version
+               for r in rows)
 
 
 def test_candidates_expose_no_way_to_change_an_order():
@@ -234,35 +236,42 @@ def test_the_live_key_and_the_training_key_come_from_one_function():
     sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
     from brti_dataset import brti_context
 
-    from btc15_signal.adaptive import brti_context_of
+    from btc15_signal.adaptive import setup_context_of
 
-    row = {"session": "us", "brti_volatility_bps": 0.3,
-           "brti_normalized_distance": 7.5, "our_ask": 0.62}
-    assert brti_context(row) == str(brti_context_of(row))
-    assert str(brti_context_of(row)) == "us · low · bd5-10 · px<70"
+    # Under `brti-2` the key is the SETUP - distance, price, momentum - and
+    # session and volatility regime are recorded context rather than part of
+    # it. The parity that matters is unchanged: one function, both callers.
+    row = {"brti_normalized_distance": 7.5, "our_ask": 0.62,
+           "brti_aligned_momentum_bps": 2.0}
+    assert brti_context(row) == str(setup_context_of(row))
+    assert str(setup_context_of(row)) == "bd5-10 · px<70 · mom0-5"
 
 
 def test_a_brti_row_is_not_a_binance_row():
     """Same market, two instruments, two cells. BRTI reads ~10-20 where
     Binance reads 2-4, so a Binance number passed to the BRTI bands lands in
     `bd<5` every time - which is why the two carry different key names."""
-    from btc15_signal.adaptive import brti_context_of, context_of
+    from btc15_signal.adaptive import setup_context_of, context_of
 
     brti = {"session": "us", "brti_volatility_bps": 0.3,
             "brti_normalized_distance": 12.0, "our_ask": 0.62}
     binance = {"session": "us", "vol_regime": "low",
                "normalized_distance": 2.4, "our_ask": 0.62}
-    assert str(brti_context_of(brti)) != str(context_of(binance))
+    assert str(setup_context_of(brti)) != str(context_of(binance))
     # and the BRTI function cannot read the Binance row by accident
-    assert brti_context_of(binance).distance == "bd<5"
+    assert setup_context_of(binance).distance == "bd<5"
 
 
 # ------------------------------------------- the live context row is guarded
 
 class _F:
-    def __init__(self, target=100.0, stale=False, vol=0.4, dist=12.0):
+    def __init__(self, target=100.0, stale=False, vol=0.4, dist=12.0, mom=7.0):
         self.target, self.stale = target, stale
         self.brti_volatility_bps, self.brti_normalized_distance = vol, dist
+        # NOT ZERO. The row signs this by side, and a zero would band an UP
+        # and a DOWN setup identically while telling us nothing about whether
+        # the sign was applied at all.
+        self.brti_momentum_bps = mom
 
 
 class _S:
@@ -275,6 +284,22 @@ def test_a_good_brti_row_labels_the_cell():
     row, why = brti_context_row(_S(), 0.62, 0, _F())
     assert why == ""
     assert row["brti_normalized_distance"] == 12.0
+    # The raw momentum is recorded as measured; the ALIGNED one is signed for
+    # the side being taken, because the gate is applied to the aligned value.
+    assert row["brti_momentum_bps"] == 7.0
+    assert row["brti_aligned_momentum_bps"] == 7.0
+
+
+def test_the_aligned_momentum_is_signed_for_a_down_setup():
+    """An UP and a DOWN setup with identical raw momentum are opposite setups.
+    Keying them into one cell would average a tailwind with a headwind."""
+    from btc15_signal.main import brti_context_row
+
+    up, _ = brti_context_row(_S(), 0.62, 0, _F(), side="UP")
+    down, _ = brti_context_row(_S(), 0.62, 0, _F(), side="DOWN")
+    assert up["brti_momentum_bps"] == down["brti_momentum_bps"] == 7.0
+    assert up["brti_aligned_momentum_bps"] == 7.0
+    assert down["brti_aligned_momentum_bps"] == -7.0
 
 
 def test_missing_stale_or_foreign_brti_yields_no_context():

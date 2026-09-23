@@ -333,7 +333,14 @@ def test_maximum_profit_is_net_and_says_so():
         side="UP", ticker=TICKER, contracts=2, paid=0.84, fee=0.0189,
         remaining=540, confidence="HIGH", facts=FACTS, snapshot=SNAP)
     assert "Maximum net profit $0.30" in text
-    assert "incl. $0.0189 fees" in text
+    # THE FEE IS A MONEY FIGURE, so it prints like one. This asserted
+    # `$0.0189` - four decimals, a precision the account statement does not
+    # have - while the total beside it was already rounded to cents, so one
+    # line claimed more accuracy than the line it was explaining.
+    assert "incl. $0.02 fees" in text
+    assert "0.0189" not in text
+    # The TOTAL still uses the unrounded fee: $1.68 + $0.0189 = $1.6989.
+    assert "Cost $1.70" in text
     assert "estimated" not in text
 
 
@@ -349,7 +356,7 @@ def test_an_untraded_signal_says_no_trade_and_zero():
     text = messages.result_message(
         side="UP", ticker=TICKER, winner="UP", won=True, traded=False,
         pnl=None, snapshot=SNAP)
-    assert "No trade · realised P&amp;L $0.00" in text
+    assert "Not traded · realised P&amp;L $0.00" in text
     assert "Took" not in text
     assert "SIGNAL WON · NOT TRADED" in text
 
@@ -373,3 +380,28 @@ def test_a_price_is_not_rounded_into_a_price_that_never_traded():
 def test_money_carries_its_currency_and_sign():
     assert surface._signed_dollars(4.91) == "+$4.91"
     assert surface._signed_dollars(-0.85) == "−$0.85"
+
+
+# ------------------------------------------------ shortening without lying
+
+def test_a_short_reason_is_left_alone():
+    assert surface.clipped("policy refused on load") == "policy refused on load"
+
+
+def test_a_long_reason_stops_on_a_word_boundary():
+    """A hard slice stopped at `...(current arms-nested-1)); it w`, and a
+    reader cannot tell a truncated line from a corrupted record."""
+    text = ("policy refused on load (fitted by superseded method "
+            "arms-calibrated-2 (current arms-nested-1)); it was withdrawn")
+    out = surface.clipped(text)
+    assert out.endswith("…")
+    assert not out.rstrip("…").endswith(" ")
+    assert " w…" not in out, "still cutting mid-word"
+    assert out.rstrip("…") in text, "it must not invent characters"
+
+
+def test_a_single_long_word_is_still_shortened():
+    """No boundary to stop on is not a reason to print the whole thing."""
+    out = surface.clipped("x" * 400, limit=50)
+    assert len(out) <= 51
+    assert out.endswith("…")

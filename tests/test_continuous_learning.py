@@ -23,6 +23,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 import pytest  # noqa: E402
 
 from btc15_signal import (  # noqa: E402
+    adaptive,
     feature_contract,
     intel_mode,
     learning,
@@ -39,8 +40,27 @@ from btc15_signal.learning_store import (  # noqa: E402
 from btc15_signal.store import Store  # noqa: E402
 
 NOW = 1_790_000_000_000
-CTX = "asia · mid · bd10-15 · px70-85"
 DAY = 86_400_000
+
+# THE FIXTURE IS DERIVED FROM THE CONTRACT, NOT TYPED OUT.
+#
+# A hardcoded `12.0` meaning "bd10-15" is a number under a name: move the band
+# boundaries and the fixture keeps its number, loses its meaning, and the test
+# passes while exercising a different cell. These read the live bands and pick
+# a value inside the one they name, so the two cannot drift apart.
+def _inside(bands, name: str) -> float:
+    low, high, _ = next(b for b in bands if b[2] == name)
+    return low + min(1.0, (high - low) / 2)
+
+
+DISTANCE = _inside(adaptive.BRTI_DISTANCE_BANDS, "bd10-15")
+MOMENTUM = _inside(adaptive.BRTI_MOMENTUM_BANDS, "mom5+")
+ASK = _inside(adaptive.SETUP_PRICE_BANDS, "px70-85")
+CTX = str(adaptive.setup_context_of({
+    "brti_normalized_distance": DISTANCE,
+    "brti_aligned_momentum_bps": MOMENTUM,
+    "our_ask": ASK,
+}))
 
 
 def rows_for(context: str, n: int, *, qualified: bool, win_rate: float,
@@ -91,7 +111,10 @@ def test_training_and_live_key_the_same_cell_from_the_same_function():
     corpus_row = {
         "window_open": NOW, "our_ask": 0.80, "won": 1, "rule_match": 1,
         "session": "asia", "brti_volatility_bps": 0.9,
-        "brti_normalized_distance": 12.0,
+        "brti_normalized_distance": DISTANCE,
+        # MOMENTUM IS PART OF THE SETUP under `brti-2`: it is one of the four
+        # deployed gates, and `brti-1` left it out of the key entirely.
+        "brti_aligned_momentum_bps": MOMENTUM,
     }
     live_row = {
         "window_open": NOW, "our_ask": 0.80, "won": 1, "rule_match": 1,
@@ -104,14 +127,14 @@ def test_training_and_live_key_the_same_cell_from_the_same_function():
 def test_a_policy_from_different_definitions_is_refused_with_the_difference():
     """A fingerprint mismatch must name what differs, not just say no."""
     policy = intel.Policy(
-        version="v9", feature_version="brti-1", arms={f"{CTX}|accept": {"n": 500}},
+        version="v9", feature_version=feature_contract.CONTRACT.version, arms={f"{CTX}|accept": {"n": 500}},
         feature_fingerprint="deadbeefdeadbeef",
         feature_definitions={**feature_contract.CONTRACT.payload(),
                              "momentum_window_s": 600},
     )
     ok, why = learning.policy_is_valid(
         policy, fingerprint=feature_contract.FINGERPRINT,
-        feature_version="brti-1",
+        feature_version=feature_contract.CONTRACT.version,
     )
     assert not ok
     verdict = intel.decide(
@@ -126,14 +149,14 @@ def test_a_policy_from_different_definitions_is_refused_with_the_difference():
 def test_a_binance_keyed_artefact_can_never_activate():
     """Provenance is read off the keys, not off the label it wears."""
     policy = intel.Policy(
-        version="v1", feature_version="brti-1",
+        version="v1", feature_version=feature_contract.CONTRACT.version,
         arms={"us · high · dist3+ · px<70|reject": {"n": 500, "action": "veto"}},
         feature_fingerprint=feature_contract.FINGERPRINT,
         feature_definitions=feature_contract.CONTRACT.payload(),
     )
     ok, why = learning.policy_is_valid(
         policy, fingerprint=feature_contract.FINGERPRINT,
-        feature_version="brti-1",
+        feature_version=feature_contract.CONTRACT.version,
     )
     assert not ok
     assert "binance" in why
@@ -153,7 +176,9 @@ def test_live_rows_exclude_binance_keyed_and_unlabelled_history(tmp_path):
             "decided_ms": NOW + i * 900_000, "remaining_s": 600,
             "side": "UP", "ask": 0.8, "base_qualified": 1,
             "final_action": "neutral", "confidence_delta": 0,
-            "context_key": key, "feature_version": "brti-1",
+            "context_key": key, "feature_version": feature_contract.CONTRACT.version,
+            "brti_normalized_distance": DISTANCE,
+            "brti_aligned_momentum_bps": MOMENTUM,
         })
     store.db.execute(
         "UPDATE intelligence_decisions SET won=1, graded_ms=?", (NOW,)
@@ -183,7 +208,9 @@ def test_opposing_signals_in_one_market_are_graded_on_their_own_sides(tmp_path):
             "remaining_s": 600, "side": side, "ask": 0.8,
             "base_qualified": 1, "final_action": "neutral",
             "confidence_delta": 0, "context_key": f"{CTX}|accept",
-            "feature_version": "brti-1",
+            "feature_version": feature_contract.CONTRACT.version,
+            "brti_normalized_distance": DISTANCE,
+            "brti_aligned_momentum_bps": MOMENTUM,
         })
     store.grade_intelligence(NOW, "UP", 0.0, NOW + 1000)
     graded = store._dicts(
@@ -202,17 +229,16 @@ def test_opposing_signals_in_one_market_are_graded_on_their_own_sides(tmp_path):
 
 
 def test_repeated_polls_are_one_market_not_many(tmp_path):
-    """Forty polls of one window are one opportunity."""
+    """Forty polls of one window are one opportunity.
+
+    Built through the shared row fixture rather than a second hand-written
+    copy: two constructions of the same row drift, and the one in the test is
+    the one nobody notices has stopped matching the live path.
+    """
     store = make_store(tmp_path)
     for i in range(40):
-        store.record_intelligence({
-            "window_open": NOW, "ticker": "T1", "decided_ms": NOW + i * 10_000,
-            "remaining_s": 660 - i * 10, "side": "UP", "ask": 0.8,
-            "base_qualified": 1 if i >= 5 else 0,
-            "final_action": "neutral", "confidence_delta": 0,
-            "context_key": f"{CTX}|{'accept' if i >= 5 else 'reject'}",
-            "feature_version": "brti-1",
-        })
+        _intel_row(store, window=NOW, ticker="T1", side="UP", ask=ASK,
+                   qualified=1 if i >= 5 else 0)
     store.grade_intelligence(NOW, "UP", 0.0, NOW + 1_000_000)
     rows, prov = learning_data.live_rows(
         store.db, fingerprint=feature_contract.FINGERPRINT
@@ -235,7 +261,7 @@ def test_a_settlement_recorded_twice_does_not_double_count(tmp_path):
         "window_open": NOW, "ticker": "T1", "decided_ms": NOW,
         "remaining_s": 600, "side": "UP", "ask": 0.8, "base_qualified": 1,
         "final_action": "neutral", "confidence_delta": 0,
-        "context_key": f"{CTX}|accept", "feature_version": "brti-1",
+        "context_key": f"{CTX}|accept", "feature_version": feature_contract.CONTRACT.version,
     })
     store.grade_intelligence(NOW, "UP", 0.25, NOW + 1000)
     store.grade_intelligence(NOW, "DOWN", -0.80, NOW + 2000)
@@ -257,7 +283,9 @@ def test_a_delayed_settlement_is_excluded_until_it_resolves(tmp_path):
             "decided_ms": NOW, "remaining_s": 600, "side": "UP", "ask": 0.8,
             "base_qualified": 1, "final_action": "neutral",
             "confidence_delta": 0, "context_key": f"{CTX}|accept",
-            "feature_version": "brti-1",
+            "feature_version": feature_contract.CONTRACT.version,
+            "brti_normalized_distance": DISTANCE,
+            "brti_aligned_momentum_bps": MOMENTUM,
         })
     store.grade_intelligence(NOW, "UP", 0.2, NOW + 1000)   # only the first
     rows, prov = learning_data.live_rows(
@@ -310,7 +338,7 @@ def test_training_and_activation_are_separate_records(tmp_path):
     assert learn.last_run()["activated"] == 0
     assert learn.active_activation() is None
 
-    policy = intel.Policy(version="p1", feature_version="brti-1",
+    policy = intel.Policy(version="p1", feature_version=feature_contract.CONTRACT.version,
                           arms={f"{CTX}|accept": {"n": 200}})
     learn.record_activation(
         now_ms=NOW + 2000, policy=policy, previous_version="p0",
@@ -340,7 +368,7 @@ def test_a_confidence_arm_reaches_the_displayed_confidence():
     from btc15_signal import messages
 
     policy = intel.Policy(
-        version="p1", feature_version="brti-1",
+        version="p1", feature_version=feature_contract.CONTRACT.version,
         feature_fingerprint=feature_contract.FINGERPRINT,
         feature_definitions=feature_contract.CONTRACT.payload(),
         arms={f"{CTX}|accept": {"n": 300, "mean": -0.05, "low": -0.09,
@@ -362,7 +390,7 @@ def test_a_confidence_arm_reaches_the_displayed_confidence():
 def test_confidence_cannot_admit_a_blocked_setup_or_change_size():
     """The whole of a confidence adjustment's authority is the label."""
     policy = intel.Policy(
-        version="p1", feature_version="brti-1",
+        version="p1", feature_version=feature_contract.CONTRACT.version,
         feature_fingerprint=feature_contract.FINGERPRINT,
         feature_definitions=feature_contract.CONTRACT.payload(),
         arms={f"{CTX}|reject": {"n": 900, "mean": 0.20, "low": 0.10,
@@ -387,7 +415,7 @@ def test_confidence_cannot_admit_a_blocked_setup_or_change_size():
 def test_a_validated_veto_reaches_the_decision_only_when_authorised():
     """Evidence and authority are two switches, and both must be on."""
     policy = intel.Policy(
-        version="p1", feature_version="brti-1",
+        version="p1", feature_version=feature_contract.CONTRACT.version,
         feature_fingerprint=feature_contract.FINGERPRINT,
         feature_definitions=feature_contract.CONTRACT.payload(),
         vetoes_enabled=True,
@@ -427,7 +455,7 @@ def test_an_admission_needs_the_single_gate_it_names():
     arm = {"n": 400, "mean": 0.10, "low": 0.04, "high": 0.16, "delta": 12,
            "action": "admit", "gate": "target distance", "promoted": True}
     policy = intel.Policy(
-        version="p1", feature_version="brti-1",
+        version="p1", feature_version=feature_contract.CONTRACT.version,
         feature_fingerprint=feature_contract.FINGERPRINT,
         feature_definitions=feature_contract.CONTRACT.payload(),
         admissions_enabled=True, arms={f"{CTX}|reject": arm},
@@ -465,7 +493,7 @@ def test_training_on_nothing_fails_explicitly_and_makes_no_policy():
     result = learning.train(
         [], fingerprint=feature_contract.FINGERPRINT,
         feature_definitions=feature_contract.CONTRACT.payload(),
-        feature_version="brti-1",
+        feature_version=feature_contract.CONTRACT.version,
     )
     assert result.ok is False
     assert "nothing to fit" in result.error
@@ -477,7 +505,7 @@ def test_a_split_too_small_to_validate_refuses_rather_than_guessing():
     result = learning.train(
         rows, fingerprint=feature_contract.FINGERPRINT,
         feature_definitions=feature_contract.CONTRACT.payload(),
-        feature_version="brti-1",
+        feature_version=feature_contract.CONTRACT.version,
     )
     assert result.ok is False
     assert "validate" in result.error
@@ -491,7 +519,7 @@ def test_a_failed_run_keeps_the_last_valid_policy_and_records_the_error(tmp_path
     store = make_store(tmp_path)
     policy_path = tmp_path / "intelligence_policy.json"
     good = intel.Policy(
-        version="good-1", model_version="m", feature_version="brti-1",
+        version="good-1", model_version="m", feature_version=feature_contract.CONTRACT.version,
         training_cutoff_ms=NOW - DAY, data_end_ms=NOW,
         arms={f"{CTX}|accept": {"n": 300, "mean": 0.02, "low": 0.01,
                                 "high": 0.03, "delta": 4, "action": "neutral"}},
@@ -541,7 +569,7 @@ def test_an_unsupported_cell_is_neutral_with_a_specific_evidence_reason():
     result = learning.train(
         rows, fingerprint=feature_contract.FINGERPRINT,
         feature_definitions=feature_contract.CONTRACT.payload(),
-        feature_version="brti-1",
+        feature_version=feature_contract.CONTRACT.version,
     )
     assert result.ok
     for arm in result.arms.values():
@@ -561,7 +589,7 @@ def test_the_promotion_bar_is_not_cleared_by_a_thin_cell():
                         win_rate=0.95, start_ms=NOW + 400 * DAY),
         fingerprint=feature_contract.FINGERPRINT,
         feature_definitions=feature_contract.CONTRACT.payload(),
-        feature_version="brti-1",
+        feature_version=feature_contract.CONTRACT.version,
     )
     assert result.ok
     assert result.report.promoted == 0
@@ -583,13 +611,13 @@ def test_a_policy_that_promotes_nothing_is_still_a_valid_usable_policy():
     result = learning.train(
         rows, fingerprint=feature_contract.FINGERPRINT,
         feature_definitions=feature_contract.CONTRACT.payload(),
-        feature_version="brti-1",
+        feature_version=feature_contract.CONTRACT.version,
     )
     assert result.ok
     assert result.report.promoted == 0
     ok, why = learning.policy_is_valid(
         result.policy, fingerprint=feature_contract.FINGERPRINT,
-        feature_version="brti-1",
+        feature_version=feature_contract.CONTRACT.version,
     )
     assert ok, why
     verdict = intel.decide(
@@ -607,7 +635,7 @@ def test_a_policy_that_promotes_nothing_is_still_a_valid_usable_policy():
 
 def test_an_active_arm_is_withdrawn_when_its_forward_record_condemns_it():
     policy = intel.Policy(
-        version="p1", feature_version="brti-1",
+        version="p1", feature_version=feature_contract.CONTRACT.version,
         feature_fingerprint=feature_contract.FINGERPRINT,
         feature_definitions=feature_contract.CONTRACT.payload(),
         vetoes_enabled=True,
@@ -646,7 +674,7 @@ def test_an_invalid_running_artefact_is_replaced_without_a_horse_race():
         arms={"us · high · dist3+ · px<70|reject": {"n": 200}},
     )
     fresh = intel.Policy(
-        version="kalshi-1", feature_version="brti-1",
+        version="kalshi-1", feature_version=feature_contract.CONTRACT.version,
         arms={f"{CTX}|accept": {"n": 300}},
         feature_fingerprint=feature_contract.FINGERPRINT,
         feature_definitions=feature_contract.CONTRACT.payload(),
@@ -655,7 +683,7 @@ def test_an_invalid_running_artefact_is_replaced_without_a_horse_race():
                                      current_pnl=0.0)
     should, why = learning.activation_decision(
         fresh, retired, comparison, fingerprint=feature_contract.FINGERPRINT,
-        feature_version="brti-1",
+        feature_version=feature_contract.CONTRACT.version,
     )
     assert should is True
     assert "cannot act" in why
@@ -663,13 +691,13 @@ def test_an_invalid_running_artefact_is_replaced_without_a_horse_race():
 
 def test_a_worse_fit_does_not_replace_a_valid_running_policy():
     good = intel.Policy(
-        version="p1", feature_version="brti-1",
+        version="p1", feature_version=feature_contract.CONTRACT.version,
         arms={f"{CTX}|accept": {"n": 300}},
         feature_fingerprint=feature_contract.FINGERPRINT,
         feature_definitions=feature_contract.CONTRACT.payload(),
     )
     fresh = intel.Policy(
-        version="p2", feature_version="brti-1",
+        version="p2", feature_version=feature_contract.CONTRACT.version,
         arms={f"{CTX}|accept": {"n": 310}},
         feature_fingerprint=feature_contract.FINGERPRINT,
         feature_definitions=feature_contract.CONTRACT.payload(),
@@ -678,18 +706,18 @@ def test_a_worse_fit_does_not_replace_a_valid_running_policy():
                                      current_pnl=2.0)
     should, why = learning.activation_decision(
         fresh, good, comparison, fingerprint=feature_contract.FINGERPRINT,
-        feature_version="brti-1",
+        feature_version=feature_contract.CONTRACT.version,
     )
     assert should is False
     assert "regression" in why
 
 
 def test_an_invalid_new_fit_never_activates():
-    bad = intel.Policy(version="p2", feature_version="brti-1",
+    bad = intel.Policy(version="p2", feature_version=feature_contract.CONTRACT.version,
                        arms={f"{CTX}|accept": {"n": 10}})   # no fingerprint
     should, why = learning.activation_decision(
         bad, intel.Policy(), learning.Comparison(current_valid=False),
-        fingerprint=feature_contract.FINGERPRINT, feature_version="brti-1",
+        fingerprint=feature_contract.FINGERPRINT, feature_version=feature_contract.CONTRACT.version,
     )
     assert should is False
     assert "rejected" in why
@@ -702,7 +730,7 @@ def test_activation_is_atomic_and_keeps_a_valid_rollback(tmp_path):
     store = make_store(tmp_path)
     policy_path = tmp_path / "intelligence_policy.json"
     first = intel.Policy(
-        version="k1", feature_version="brti-1", data_end_ms=NOW,
+        version="k1", feature_version=feature_contract.CONTRACT.version, data_end_ms=NOW,
         arms={f"{CTX}|accept": {"n": 300, "delta": 0, "action": "neutral"}},
         feature_fingerprint=feature_contract.FINGERPRINT,
         feature_definitions=feature_contract.CONTRACT.payload(),
@@ -712,7 +740,7 @@ def test_activation_is_atomic_and_keeps_a_valid_rollback(tmp_path):
                         database_path=str(tmp_path / "t.db"))
     runner = LearningRunner(settings, store)
     second = intel.Policy(
-        version="k2", feature_version="brti-1", data_end_ms=NOW + DAY,
+        version="k2", feature_version=feature_contract.CONTRACT.version, data_end_ms=NOW + DAY,
         arms={f"{CTX}|accept": {"n": 400, "delta": -6, "action": "neutral"}},
         feature_fingerprint=feature_contract.FINGERPRINT,
         feature_definitions=feature_contract.CONTRACT.payload(),
@@ -741,7 +769,7 @@ def test_startup_restores_a_valid_rollback_over_a_retired_artefact(tmp_path):
     )
     retired.save(policy_path)
     good = intel.Policy(
-        version="k1", feature_version="brti-1", data_end_ms=NOW,
+        version="k1", feature_version=feature_contract.CONTRACT.version, data_end_ms=NOW,
         arms={f"{CTX}|accept": {"n": 300, "delta": 0, "action": "neutral"}},
         feature_fingerprint=feature_contract.FINGERPRINT,
         feature_definitions=feature_contract.CONTRACT.payload(),
@@ -787,7 +815,7 @@ def test_the_watermark_moves_on_a_completed_run_not_on_an_activation(tmp_path):
     store = make_store(tmp_path)
     policy_path = tmp_path / "p.json"
     intel.Policy(
-        version="k1", feature_version="brti-1", data_end_ms=NOW,
+        version="k1", feature_version=feature_contract.CONTRACT.version, data_end_ms=NOW,
         arms={f"{CTX}|accept": {"n": 300, "delta": 0, "action": "neutral"}},
         feature_fingerprint=feature_contract.FINGERPRINT,
         feature_definitions=feature_contract.CONTRACT.payload(),
@@ -812,7 +840,7 @@ def test_learning_message_distinguishes_the_four_states():
         "running": True, "updating": False, "adjusting_confidence": True,
         "authorised_to_execute": False, "confidence_arms": 1,
         "promoted_arms": 0, "mode": "assist", "policy_valid": True,
-        "policy_version": "kalshi-brti-1-123", "feature_version": "brti-1",
+        "policy_version": "kalshi-brti-1-123", "feature_version": feature_contract.CONTRACT.version,
         "feature_fingerprint": "90a70cfa994e7a08", "arms": 128,
         "vetoes_enabled": False, "admissions_enabled": False,
         "last_success_ms": NOW - 3_600_000, "new_settled_markets": 3,
@@ -882,7 +910,7 @@ def test_comparison_counts_markets_and_decisions_separately():
     rows.append(twin)
     out = learning.compare(
         intel.Policy(), intel.Policy(), rows,
-        fingerprint=feature_contract.FINGERPRINT, feature_version="brti-1",
+        fingerprint=feature_contract.FINGERPRINT, feature_version=feature_contract.CONTRACT.version,
     )
     assert out.rows == 31
     assert out.markets == len({r["window_open"] for r in rows})
@@ -926,7 +954,7 @@ def test_winners_blocked_and_losers_admitted_are_counted_separately():
     result = learning.train(
         rows, fingerprint=feature_contract.FINGERPRINT,
         feature_definitions=feature_contract.CONTRACT.payload(),
-        feature_version="brti-1",
+        feature_version=feature_contract.CONTRACT.version,
     )
     arm = result.arms[f"{CTX}|accept"]
     assert arm.winners_blocked > 0
@@ -941,7 +969,7 @@ def test_provenance_travels_with_the_artefact_and_survives_a_reload(tmp_path):
     result = learning.train(
         rows, fingerprint=feature_contract.FINGERPRINT,
         feature_definitions=feature_contract.CONTRACT.payload(),
-        feature_version="brti-1",
+        feature_version=feature_contract.CONTRACT.version,
         provenance={"sources": ["data/brti_history.db"], "markets": 300},
     )
     path = tmp_path / "p.json"
@@ -1047,7 +1075,7 @@ def test_check_withdrawals_uses_real_forward_rows_and_persists(tmp_path):
     policy_path = tmp_path / "p.json"
     key = f"{CTX}|accept"
     intel.Policy(
-        version="k1", feature_version="brti-1", data_end_ms=NOW,
+        version="k1", feature_version=feature_contract.CONTRACT.version, data_end_ms=NOW,
         arms={key: {"n": 400, "mean": -0.06, "low": -0.10, "high": -0.02,
                     "delta": -12, "action": "veto", "promoted": True}},
         vetoes_enabled=True,
@@ -1069,7 +1097,7 @@ def test_check_withdrawals_uses_real_forward_rows_and_persists(tmp_path):
             "candidate_version": "v1", "context_key": CTX,
             "proposed_action": "veto", "baseline_qualified": 1,
             "would_change": 1, "side": "UP", "ask": 0.80, "remaining_s": 600,
-            "feature_version": "brti-1",
+            "feature_version": feature_contract.CONTRACT.version,
         })
     store.record_candidate_evaluations(rows)
     for i in range(25):
@@ -1103,7 +1131,7 @@ def test_forward_record_survives_a_candidate_id_change():
     from btc15_signal.candidates import Candidate, CandidateSet
 
     new_set = CandidateSet(
-        version="brti-cand-2", feature_version="brti-1",
+        version="brti-cand-2", feature_version=feature_contract.CONTRACT.version,
         feature_fingerprint=feature_contract.FINGERPRINT,
         candidates=(Candidate(
             candidate_id="cd2200ee5", context=f"{CTX}|accept",
@@ -1203,13 +1231,32 @@ def test_poll_does_not_wait_for_the_fit(tmp_path):
 # ------------------------------------------- broker reconciliation, exactly
 
 
-def _intel_row(store, *, window, ticker, side, ask, qualified=1):
+def _intel_row(store, *, window, ticker, side, ask, qualified=1,
+               distance=DISTANCE, aligned=MOMENTUM):
+    """One live decision, with the RAW FEATURES it was keyed from.
+
+    `brti-2` rebuilds the setup key from these rather than trusting the stored
+    string, so the fixture stores both and derives the key the same way the
+    order path does - a fixture that hard-coded a key would pass while the
+    rebuild it is meant to exercise did something else.
+    """
+    from btc15_signal.adaptive import setup_context_of
+
+    key = str(setup_context_of({
+        "brti_normalized_distance": distance,
+        "brti_aligned_momentum_bps": aligned,
+        "our_ask": ask,
+    }))
     store.record_intelligence({
         "window_open": window, "ticker": ticker, "decided_ms": window,
         "remaining_s": 600, "side": side, "ask": ask,
         "base_qualified": qualified, "final_action": "neutral",
-        "confidence_delta": 0, "context_key": f"{CTX}|accept",
-        "feature_version": "brti-1",
+        "confidence_delta": 0,
+        "context_key": f"{key}|{'accept' if qualified else 'reject'}",
+        "feature_version": feature_contract.CONTRACT.version,
+        "brti_normalized_distance": distance,
+        "brti_aligned_momentum_bps": aligned,
+        "brti_momentum_bps": aligned if side == "UP" else -aligned,
     })
 
 
@@ -1416,7 +1463,7 @@ def test_a_gate_string_is_not_iterated_character_by_character():
     arm = {"n": 400, "mean": 0.10, "low": 0.04, "high": 0.16, "delta": 12,
            "action": "admit", "gate": "BRTI distance", "promoted": True}
     policy = intel.Policy(
-        version="p1", feature_version="brti-1",
+        version="p1", feature_version=feature_contract.CONTRACT.version,
         feature_fingerprint=feature_contract.FINGERPRINT,
         feature_definitions=feature_contract.CONTRACT.payload(),
         admissions_enabled=True, arms={f"{CTX}|reject": arm},
@@ -1436,7 +1483,7 @@ def test_a_thin_cell_records_the_count_it_names():
     answered by parsing English out of a text field.
     """
     policy = intel.Policy(
-        version="p1", feature_version="brti-1",
+        version="p1", feature_version=feature_contract.CONTRACT.version,
         feature_fingerprint=feature_contract.FINGERPRINT,
         feature_definitions=feature_contract.CONTRACT.payload(),
         min_evidence=120,
@@ -1459,7 +1506,7 @@ def _fit_one(rows):
     return learning.train(
         rows, fingerprint=feature_contract.FINGERPRINT,
         feature_definitions=feature_contract.CONTRACT.payload(),
-        feature_version="brti-1",
+        feature_version=feature_contract.CONTRACT.version,
     )
 
 
@@ -1516,7 +1563,7 @@ def test_confidence_must_be_CONSISTENT_across_the_nested_folds():
             ask=0.70, start_ms=NOW + block * 40 * DAY, spread_days=20,
         )
     # A second cell so the mapping is not simply this cell's own average.
-    rows += rows_for("us · low · bd5-10 · px<70|reject", 500, qualified=False,
+    rows += rows_for("bd5-10 · px<70 · mom0-5|reject", 500, qualified=False,
                      win_rate=0.70, ask=0.70, start_ms=NOW + 500_000,
                      spread_days=120)
     arm = _fit_one(rows).arms[f"{CTX}|accept"]
@@ -1644,14 +1691,14 @@ def test_a_policy_fitted_by_a_superseded_method_cannot_act(tmp_path):
     """
     stale = intel.Policy(
         version="kalshi-brti-1-old", model_version="arms-shrunk-2",
-        feature_version="brti-1", data_end_ms=NOW,
+        feature_version=feature_contract.CONTRACT.version, data_end_ms=NOW,
         arms={f"{CTX}|accept": {"n": 300, "delta": -12, "action": "neutral"}},
         feature_fingerprint=feature_contract.FINGERPRINT,
         feature_definitions=feature_contract.CONTRACT.payload(),
     )
     ok, why = learning.policy_is_valid(
         stale, fingerprint=feature_contract.FINGERPRINT,
-        feature_version="brti-1",
+        feature_version=feature_contract.CONTRACT.version,
     )
     assert not ok
     assert "superseded method" in why and "arms-shrunk-2" in why
@@ -1661,12 +1708,12 @@ def test_a_policy_fitted_by_a_superseded_method_cannot_act(tmp_path):
         rows_for(CTX, 400, qualified=True, win_rate=0.85, ask=0.80),
         fingerprint=feature_contract.FINGERPRINT,
         feature_definitions=feature_contract.CONTRACT.payload(),
-        feature_version="brti-1",
+        feature_version=feature_contract.CONTRACT.version,
     ).policy
     assert fresh.model_version == learning.MODEL_VERSION
     ok, why = learning.policy_is_valid(
         fresh, fingerprint=feature_contract.FINGERPRINT,
-        feature_version="brti-1",
+        feature_version=feature_contract.CONTRACT.version,
     )
     assert ok, why
 
@@ -1680,7 +1727,7 @@ def test_the_stale_method_triggers_an_automatic_refit(tmp_path):
     policy_path = tmp_path / "p.json"
     intel.Policy(
         version="kalshi-brti-1-old", model_version="arms-shrunk-2",
-        feature_version="brti-1", data_end_ms=NOW,
+        feature_version=feature_contract.CONTRACT.version, data_end_ms=NOW,
         arms={f"{CTX}|accept": {"n": 300, "delta": -12, "action": "neutral"}},
         feature_fingerprint=feature_contract.FINGERPRINT,
         feature_definitions=feature_contract.CONTRACT.payload(),
@@ -1819,7 +1866,7 @@ def test_confidence_follows_the_model_score_not_the_ask():
     # other, which measures the split rather than the calibration.
     strong = rows_for(CTX, 400, qualified=True, win_rate=0.80, ask=0.80,
                       model_points=45, spread_days=40)
-    weak = rows_for("us · low · bd5-10 · px<70|reject", 400, qualified=False,
+    weak = rows_for("bd5-10 · px<70 · mom0-5|reject", 400, qualified=False,
                     win_rate=0.20, ask=0.20, start_ms=NOW + 450_000,
                     model_points=45, spread_days=40)
     result = _fit_one(strong + weak)
@@ -1843,7 +1890,7 @@ def test_an_interval_spanning_zero_reports_insufficient_evidence():
     # a second cell so the pool is not simply this cell's own average.
     rows = rows_for(CTX, 300, qualified=True, win_rate=0.72, ask=0.72,
                     spread_days=30)
-    rows += rows_for("us · low · bd5-10 · px<70|reject", 300, qualified=False,
+    rows += rows_for("bd5-10 · px<70 · mom0-5|reject", 300, qualified=False,
                      win_rate=0.70, ask=0.70, start_ms=NOW + 450_000,
                      spread_days=30)
     arm = _fit_one(rows).arms[f"{CTX}|accept"]
@@ -1887,14 +1934,14 @@ def test_the_curve_is_fitted_on_train_and_applied_to_validate():
 
 def test_the_ask_based_method_is_retired_and_cannot_act():
     stale = intel.Policy(
-        version="v", model_version="arms-calibrated-1", feature_version="brti-1",
+        version="v", model_version="arms-calibrated-1", feature_version=feature_contract.CONTRACT.version,
         arms={f"{CTX}|accept": {"n": 300, "delta": -12}},
         feature_fingerprint=feature_contract.FINGERPRINT,
         feature_definitions=feature_contract.CONTRACT.payload(),
     )
     ok, why = learning.policy_is_valid(
         stale, fingerprint=feature_contract.FINGERPRINT,
-        feature_version="brti-1",
+        feature_version=feature_contract.CONTRACT.version,
     )
     assert not ok
     assert "superseded method" in why
@@ -1981,14 +2028,14 @@ def test_a_score_delta_is_never_described_as_a_probability_correction():
 def test_the_superseded_in_sample_method_cannot_act(tmp_path):
     for stale in ("arms-calibrated-1", "arms-calibrated-2"):
         policy = intel.Policy(
-            version="v", model_version=stale, feature_version="brti-1",
+            version="v", model_version=stale, feature_version=feature_contract.CONTRACT.version,
             arms={f"{CTX}|accept": {"n": 300, "delta": -9}},
             feature_fingerprint=feature_contract.FINGERPRINT,
             feature_definitions=feature_contract.CONTRACT.payload(),
         )
         ok, why = learning.policy_is_valid(
             policy, fingerprint=feature_contract.FINGERPRINT,
-            feature_version="brti-1",
+            feature_version=feature_contract.CONTRACT.version,
         )
         assert not ok and "superseded method" in why, stale
 
@@ -2003,7 +2050,7 @@ def test_an_unusable_policys_live_adjustments_are_recorded_as_withdrawn(tmp_path
     policy_path = tmp_path / "p.json"
     intel.Policy(
         version="kalshi-brti-1-old", model_version="arms-calibrated-2",
-        feature_version="brti-1", data_end_ms=NOW,
+        feature_version=feature_contract.CONTRACT.version, data_end_ms=NOW,
         arms={
             f"{CTX}|accept": {"n": 187, "delta": -9, "action": "neutral"},
             "quiet|accept": {"n": 300, "delta": 0, "action": "neutral"},

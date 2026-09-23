@@ -46,7 +46,11 @@ ADMIT = "admit"
 # Bumped when the FEATURE definitions change. A policy trained on a different
 # feature version must not be applied - the numbers would be arithmetic over
 # quantities that no longer mean the same thing.
-FEATURE_VERSION = "brti-1"
+# ONE DEFINITION, taken from the contract itself. Hardcoding it here left this
+# constant at `brti-1` when the contract moved to `brti-2`, so every freshly
+# trained policy was refused by the very guard that was supposed to protect it
+# - the artefact was correct and the comparison was stale.
+FEATURE_VERSION = feature_contract.CONTRACT.version
 
 # RETIRED. Binance is out of every active signal, intelligence, training,
 # evaluation and execution path. Records built on it stay readable as

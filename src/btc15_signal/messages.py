@@ -1512,7 +1512,7 @@ def learning(*, head: str, state: dict | None = None, candidates=None,
         for item in (state.get("withdrawals") or [])[:2]:
             lines.append(
                 f"  \U0001f6d1 withdrawn {escape(str(item.get('context_key')))} "
-                f"· {escape(str(item.get('reason'))[:100])}"
+                f"· {escape(surface.clipped(item.get('reason')))}"
             )
     lines.append(RULE)
     lines.append("\U0001f9ea <b>FORWARD EVALUATION</b>")
@@ -1705,16 +1705,23 @@ def fill_message(*, side: str, ticker: str, contracts: float, paid: float,
                  fee: float | None, remaining: int, confidence: str,
                  facts: list[dict], snapshot=None, insight: str = "",
                  band_hold: tuple[int, int] | None = None,
-                 decision_ask: float | None = None, priority=None) -> str:
+                 decision_ask: float | None = None, priority=None,
+                 size_reason: str = "") -> str:
     """An executed entry. Cost and maximum profit are both NET.
 
     The old fill report printed `Maximum profit contracts - cost` with no fee
     term while the settlement recap for the same trade subtracted the charged
     fee, so the fill promised $0.20 and the recap paid $0.19.
     """
+    size = (f"{surface.PACKAGE} {contracts:g} contract"
+            f"{'s' if contracts != 1 else ''} filled at {surface.cents(paid)}")
+    if size_reason:
+        # WHY THAT MANY, beside how many. A size that rose under a recovery
+        # rule and a size that was capped by the account limit look identical
+        # on the contract count alone, and the operator reads the count.
+        size += f" <i>({escape(surface._typography(size_reason))})</i>"
     essentials = [
-        f"{surface.PACKAGE} {contracts:g} contract"
-        f"{'s' if contracts != 1 else ''} filled at {surface.cents(paid)}",
+        size,
         surface.entry_cost(contracts, paid, fee),
         surface.max_net_profit(contracts, paid, fee),
     ]
@@ -1742,53 +1749,299 @@ def fill_message(*, side: str, ticker: str, contracts: float, paid: float,
     )
 
 
+def not_filled_message(*, ticker: str, note: str, snapshot=None,
+                       insight: str = "", priority=None) -> str:
+    """An order that went out and bought nothing.
+
+    Announcing a cost here claimed a position that does not exist, so this
+    says what was spent - nothing - rather than what was intended.
+    """
+    return surface.compose(
+        header=f"{surface.WARN} <b>ORDER NOT FILLED</b>",
+        ticker=ticker,
+        essentials=[
+            f"{surface.PRICE} No contracts bought · nothing spent",
+            f"<i>{escape(surface._typography(note))}</i>" if note else "",
+        ],
+        checks=[],
+        status="",
+        snapshot=snapshot,
+        priority=priority,
+        insight=insight,
+    )
+
+
+def automation_off_message(*, ask: float, snapshot=None,
+                           insight: str = "") -> str:
+    """Both switches must be on, and only one of them is.
+
+    strategy.json was reset to defaults with `enabled: false` on 2026-09-21 at
+    02:02 and automation went silent for four hours while 14 signals passed,
+    17 of 18 of which went on to win. The log line existed and was useless:
+    `/auto` was on, so there was nothing to notice.
+    """
+    return surface.compose(
+        header=f"{surface.WARN} <b>AUTOMATION IS OFF AT THE STRATEGY</b>",
+        ticker="",
+        essentials=[
+            f"<i>/auto is ON, but strategy.json has "
+            f"<code>enabled: false</code>, so no order will be placed — "
+            f"this one at {surface.cents(ask)} included.</i>",
+            "<i>Both switches must be on. Set enabled: true to resume.</i>",
+        ],
+        checks=[],
+        status="",
+        snapshot=snapshot,
+        insight=insight,
+    )
+
+
+def cash_out_message(*, ticker: str, side: str, paid: float, bid: float,
+                     count: float, captured: float, remaining: int,
+                     note: str, sold: bool, entry_fee: float | None = None,
+                     exit_fee: float | None = None, snapshot=None,
+                     insight: str = "", priority=None) -> str:
+    """A position banked before expiry because it had already earned its money.
+
+    States what it captured AND what it gave up, because both are real: selling
+    at 97c after paying 74c banks 23c and forgoes the last 3c. Reading only the
+    first half makes the rule look better than it is.
+
+    NET, after both fees. The gross figure made a cash-out announce `+0.27`
+    and the settlement four minutes later say `+0.25` for the same trade,
+    which reads as the running total failing to move.
+
+    THE FEES ARE READ, NOT MODELLED, whenever the exchange has said what it
+    charged. `kalshi_fee_charged` is a faithful copy of the published formula
+    and still only a copy; the account is debited by Kalshi, not by this
+    function. The model stays as the fallback for the moment between placing
+    the exit and reading its fill back.
+    """
+    from .validation import kalshi_fee_charged
+
+    fee_in = entry_fee if entry_fee is not None else kalshi_fee_charged(paid, count)
+    fee_out = exit_fee if exit_fee is not None else kalshi_fee_charged(bid, count)
+    profit = (bid - paid) * count - fee_in - fee_out
+
+    essentials = [
+        f"{surface.side_icon(side)} Held <b>{escape(side)}</b> \u00b7 "
+        f"bought {surface.cents(paid)}, "
+        f"{'sold' if sold else 'bid'} {surface.cents(bid)}",
+    ]
+    if sold:
+        essentials += [
+            f"{surface.TARGET} Banked "
+            f"<b>{surface._signed_dollars(profit)}</b> \u00b7 "
+            f"{captured:.0%} of the most this trade could make "
+            f"<i>(net of fees)</i>",
+            f"{surface.PRICE} Gave up the last "
+            f"${(1.0 - bid) * count:,.2f} rather than risk "
+            f"${bid * count:,.2f} on it",
+        ]
+    else:
+        # NOTHING MOVED. A failed cash-out still printed "Banked +0.20 - 91%
+        # of the most this trade could make" directly under "STILL HOLDING",
+        # which describes a sale that did not happen and contradicts its own
+        # headline. A miss must read as a miss.
+        essentials += [
+            f"\U0001f4a4 Nothing sold \u00b7 "
+            f"<b>{surface._signed_dollars(profit)}</b> is what it WOULD have "
+            f"banked at {surface.cents(bid)}",
+            "<i>Still fully exposed \u00b7 the position rides to "
+            "settlement</i>",
+        ]
+    if note:
+        essentials.append(f"<i>{escape(surface._typography(note))}</i>")
+
+    return surface.compose(
+        header=(f"{surface.MONEY} <b>CASHED OUT EARLY</b>" if sold else
+                f"{surface.WARN} <b>CASH-OUT FAILED \u00b7 STILL HOLDING</b>"),
+        ticker=ticker,
+        essentials=essentials,
+        checks=[],
+        status=f"{surface.CLOCK} {remaining // 60}m {remaining % 60:02d}s "
+               f"still to run",
+        snapshot=snapshot,
+        priority=priority,
+        insight=insight,
+    )
+
+
+def auto_exit_message(*, ticker: str, side: str, price: float, target: float,
+                      bid: float, remaining: int, note: str, sold: bool,
+                      snapshot=None, insight: str = "", priority=None) -> str:
+    """The reference crossed back through the strike and the bot sold."""
+    essentials = [
+        f"{surface.side_icon(side)} Held <b>{escape(side)}</b> \u00b7 "
+        f"the reference crossed back through ${target:,.2f}",
+        f"{surface.PRICE} Now ${price:,.2f} \u00b7 "
+        + (f"sold into {surface.cents(bid)}" if sold
+           else f"bid {surface.cents(bid)}"),
+    ]
+    if note:
+        essentials.append(f"<i>{escape(surface._typography(note))}</i>")
+    if not sold:
+        essentials.append(
+            "<i>Still holding \u00b7 the position rides to settlement</i>"
+        )
+    return surface.compose(
+        header=(f"{surface.EXIT} <b>AUTO EXIT \u00b7 REVERSAL</b>" if sold else
+                f"{surface.WARN} <b>EXIT FAILED \u00b7 STILL HOLDING</b>"),
+        ticker=ticker,
+        essentials=essentials,
+        checks=[],
+        status=f"{surface.CLOCK} {remaining // 60}m {remaining % 60:02d}s left "
+               f"\u00b7 {surface.ROBOT} no press was required "
+               f"(<code>/auto off</code> stops this)",
+        snapshot=snapshot,
+        priority=priority,
+        insight=insight,
+    )
+
+
+def exit_warning_message(*, ticker: str, side: str, price: float,
+                         target: float, bid: float, remaining: int,
+                         snapshot=None, insight: str = "",
+                         priority=None) -> str:
+    """The reference crossed back and NOTHING was sold.
+
+    It is advice, so it says so: a warning that looks like an execution is how
+    an operator comes to believe a position was closed when it is still open.
+    """
+    return surface.compose(
+        header=f"{surface.WARN} <b>REVERSAL \u00b7 STILL HOLDING</b>",
+        ticker=ticker,
+        essentials=[
+            f"{surface.side_icon(side)} Held <b>{escape(side)}</b> \u00b7 "
+            f"the reference crossed back through ${target:,.2f}",
+            f"{surface.PRICE} Now ${price:,.2f} \u00b7 "
+            f"bid {surface.cents(bid)}",
+            "<i>No order was placed. This is a warning, not an exit.</i>",
+        ],
+        checks=[],
+        status=f"{surface.CLOCK} {remaining // 60}m {remaining % 60:02d}s left",
+        snapshot=snapshot,
+        priority=priority,
+        insight=insight,
+    )
+
+
 def result_message(*, side: str, ticker: str, winner: str, won: bool,
                    traded: bool, pnl: float | None, contracts: float = 0.0,
-                   paid: float | None = None, exited_at: float | None = None,
+                   paid: float | None = None, fee: float | None = None,
+                   exited_at: float | None = None,
+                   called_side: str = "", qualified: bool | None = None,
                    snapshot=None, insight: str = "", priority=None) -> str:
-    """How a window closed. Direction and outcome are separate chips.
+    """How a window closed. Three facts, never collapsed into one verdict.
 
-    An untraded signal is scored on the CALL and says so in words; a traded one
-    is scored on the MONEY. A position sold at 100c on a market that later
-    settles the other way is a profit AND a wrong call, and both get a line.
+        WIN / LOSS / CLOSED       the broker's realised P&L after fees
+        Bought UP / DOWN          the side actually HELD
+        prediction correct/wrong  the recorded signal's side vs the settlement
+
+    THE MONEY WORD COMES FROM THE MONEY. Not from `held side == winner`: a
+    profitable early exit banks money on a position whose side later loses, and
+    a position held through settlement can still be under water after fees.
+
+    THE SIDE COMES FROM THE POSITION. `predictions` is written at ALERT time
+    and keyed on the window, so when the reference flips before the order fills
+    the call and the position sit on opposite sides. Reporting the call as the
+    position announced a paid-out win as a loss, twice, on real money.
+
+    "CLOSED" IS NOT A MARKET OUTCOME. The market settles UP or DOWN, always,
+    and that is its own line. Closed means the trade netted exactly zero.
     """
-    chip = surface.result_icon(pnl, traded, won)
+    call = called_side or side
+    call_right = call == winner
+    flat = pnl is not None and abs(pnl) < 0.005
+    made_money = pnl is not None and pnl > 0
+
     if not traded:
-        headline = f"SIGNAL {'WON' if won else 'LOST'} · NOT TRADED"
+        chip = surface.WON_PAPER if call_right else surface.LOST_PAPER
+        headline = f"SIGNAL {'WON' if call_right else 'LOST'} · NOT TRADED"
+    elif flat:
+        # BEFORE THE EARLY-EXIT BRANCH, because a sale that netted exactly zero
+        # reached zero through it. `SOLD EARLY - +$0.00` signs zero and offers
+        # a verdict where there is none; the sale itself is still stated in the
+        # body, which is where the route belongs.
+        chip = surface.FLAT_MONEY
+        headline = "CLOSED · $0.00 net"
     elif exited_at is not None:
-        headline = "SOLD EARLY"
+        chip = surface.result_icon(pnl, True, call_right)
+        headline = f"SOLD EARLY · {surface._signed_dollars(pnl or 0.0)}"
     else:
-        headline = "TRADE CLOSED"
+        chip = surface.result_icon(pnl, True, call_right)
+        headline = (f"{'WIN' if made_money else 'LOSS'} · "
+                    f"{surface._signed_dollars(pnl or 0.0)}")
+
     essentials = [
         f"{surface.side_icon(side)} "
-        + ("Took" if traded else "Signal:")
+        + ("Bought" if traded else "Signal:")
         + f" <b>{escape(side)}</b>"
         + (f" at {surface.cents(paid)}" if paid is not None else ""),
-        f"\U0001f3c1 Market settled <b>{escape(winner)}</b>",
     ]
     if exited_at is not None:
         essentials.append(
-            f"{surface.PRICE} Sold before expiry at "
-            f"{surface.cents(exited_at)}"
+            f"{surface.PRICE} Sold before expiry at {surface.cents(exited_at)}"
         )
+    essentials.append(
+        f"\U0001f3c1 Market{' later' if exited_at is not None else ''} "
+        f"settled <b>{escape(winner)}</b>"
+    )
+    # THE CALL, always, on its own line and in its own words.
+    essentials.append(
+        f"{surface.PASS if call_right else surface.FAIL} {escape(call)} "
+        f"prediction was {'correct' if call_right else 'wrong'}"
+    )
+    if traded and call != side:
         essentials.append(
-            f"{surface.PASS if won else surface.FAIL} {escape(side)} "
-            f"prediction was {'correct' if won else 'wrong'}"
+            f"{surface.PACKAGE} <i>Signal called {escape(call)}; the position "
+            f"held {escape(side)}</i>"
         )
     if not traded:
+        if qualified is not None:
+            essentials.append(
+                "\U0001f4a4 No order was executed \u00b7 "
+                + ("rule qualified it" if qualified else "rule declined it")
+            )
         essentials.append(surface.NO_TRADE)
     elif pnl is not None:
-        essentials.append(
-            f"{surface.PRICE} Realised "
-            f"<b>{surface._signed_dollars(pnl)}</b> <i>(net of fees)</i>"
-        )
-    status = surface.ALREADY_COUNTED if exited_at is not None else ""
+        # THE SAME COST THE FILL ANNOUNCED. The fill reports what left the
+        # account - stake plus the charged entry fee - and this reported the
+        # stake alone, so one trade showed $1.62 when it opened and $1.60 when
+        # it closed and neither message said which of them the fee was in.
+        cost = (contracts * paid + (fee or 0.0)
+                if contracts and paid is not None else None)
+        outcome = ("$0.00 net" if flat
+                   else (f"Profit ${pnl:,.2f}" if made_money
+                         else f"Lost ${abs(pnl):,.2f}"))
+        if cost is not None:
+            essentials.append(
+                f"{surface.PRICE} Cost ${cost:,.2f} \u00b7 {outcome} "
+                f"<i>(net of fees)</i>"
+            )
+        else:
+            amount = ("$0.00 net" if flat
+                      else f"<b>{surface._signed_dollars(pnl)}</b>")
+            essentials.append(
+                f"{surface.PRICE} Realised {amount} <i>(net of fees)</i>"
+            )
+    if exited_at is not None and pnl is not None:
+        if made_money and not call_right:
+            essentials.append(
+                f"{surface.PASS} Trade remained profitable because it exited "
+                f"early"
+            )
+        elif not made_money and call_right:
+            essentials.append(
+                f"{surface.FAIL} Trade still lost because it exited below cost"
+            )
+
     return surface.compose(
         header=f"{chip} <b>{escape(headline)}</b>",
         ticker=ticker,
         essentials=essentials,
         checks=[],
-        status=status,
+        status=surface.ALREADY_COUNTED if exited_at is not None else "",
         snapshot=snapshot,
         priority=priority,
         insight=insight,

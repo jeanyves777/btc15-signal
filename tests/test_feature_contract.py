@@ -24,7 +24,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 
 from btc15_signal import feature_contract as fc  # noqa: E402
 from btc15_signal import intelligence_policy as intel  # noqa: E402
-from btc15_signal.adaptive import brti_context_of  # noqa: E402
+from btc15_signal.adaptive import brti_context_of, setup_context_of  # noqa: E402
 from btc15_signal.brti import features_from_series  # noqa: E402
 
 
@@ -32,10 +32,30 @@ def series(n: int, end_ms: int = 1_000_000, start: float = 100_000.0):
     return [(end_ms - (n - 1 - i) * 1000, start + (i % 7) - 3) for i in range(n)]
 
 
+def setup_key(action: str | None = "accept", *, distance: float = 12.0,
+              ask: float = 0.80, momentum: float = 7.0) -> str:
+    """The key the live path builds, built by the live path's own function.
+
+    Typing the key as a literal is how this file came to assert against a
+    shape the keying function had already left behind: the arms moved to the
+    setup - distance, price, momentum - while four call sites went on passing
+    the session-first string, so `decide` found no arm and returned neutral
+    for a reason that had nothing to do with the guard under test.
+    """
+    ctx = setup_context_of({
+        "brti_normalized_distance": distance,
+        "our_ask": ask,
+        "brti_aligned_momentum_bps": momentum,
+    })
+    return f"{ctx}|{action}" if action else str(ctx)
+
+
+
 def brti_policy(**over) -> intel.Policy:
     base = {
-        "version": "v2", "model_version": "m", "feature_version": "brti-1",
-        "arms": {"us · mid · bd10-15 · px70-85|accept":
+        "version": "v2", "model_version": "m",
+        "feature_version": fc.CONTRACT.version,
+        "arms": {setup_key():
                  {"n": 500, "mean": -0.05, "low": -0.09, "high": -0.01,
                   "action": intel.VETO, "delta": -5}},
         "vetoes_enabled": True, "min_evidence": 1,
@@ -88,7 +108,7 @@ def test_the_contract_names_no_binance_endpoint():
 
 def test_a_policy_without_a_fingerprint_cannot_act():
     verdict = intel.decide(
-        context_key="us · mid · bd10-15 · px70-85|accept", base_qualified=True,
+        context_key=setup_key(), base_qualified=True,
         failed_gates=(), ask=0.80, policy=brti_policy(feature_fingerprint=""),
     )
     assert verdict.final_action == intel.NEUTRAL
@@ -97,7 +117,7 @@ def test_a_policy_without_a_fingerprint_cannot_act():
 
 def test_a_policy_with_a_stale_fingerprint_cannot_act():
     verdict = intel.decide(
-        context_key="us · mid · bd10-15 · px70-85|accept", base_qualified=True,
+        context_key=setup_key(), base_qualified=True,
         failed_gates=(), ask=0.80,
         policy=brti_policy(feature_fingerprint="0000000000000000"),
     )
@@ -109,7 +129,7 @@ def test_the_mismatch_reason_names_a_concrete_difference():
     """A fingerprint says no; the operator needs to know which field."""
     stale_defs = fc.FeatureContract(momentum_window_s=600).payload()
     verdict = intel.decide(
-        context_key="us · mid · bd10-15 · px70-85|accept", base_qualified=True,
+        context_key=setup_key(), base_qualified=True,
         failed_gates=(), ask=0.80,
         policy=brti_policy(feature_fingerprint="0000000000000000",
                            feature_definitions=stale_defs),
@@ -120,7 +140,7 @@ def test_the_mismatch_reason_names_a_concrete_difference():
 def test_a_matching_policy_is_allowed_to_act():
     """The guard must bar mismatches, not all intelligence."""
     verdict = intel.decide(
-        context_key="us · mid · bd10-15 · px70-85|accept", base_qualified=True,
+        context_key=setup_key(), base_qualified=True,
         failed_gates=(), ask=0.80, policy=brti_policy(),
     )
     assert verdict.final_action == intel.VETO
@@ -190,10 +210,11 @@ def test_incompatible_candidates_evaluate_nothing():
     from btc15_signal.candidates import Candidate, CandidateSet
 
     cs = CandidateSet(
-        version="v", feature_version="brti-1", feature_fingerprint="stale",
-        candidates=(Candidate(candidate_id="c01", context="us · mid · bd10-15 · px<70|accept",
+        version="v", feature_version=fc.CONTRACT.version,
+        feature_fingerprint="stale",
+        candidates=(Candidate(candidate_id="c01", context=setup_key(ask=0.50),
                               proposed_action=intel.VETO, train_n=500,
                               train_mean=-0.05, promotes=False),),
     )
     assert not cs.compatible
-    assert cs.evaluate(context_key="us · mid · bd10-15 · px<70", qualified=True) == []
+    assert cs.evaluate(context_key=setup_key(None, ask=0.50), qualified=True) == []

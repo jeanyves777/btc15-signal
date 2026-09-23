@@ -405,15 +405,22 @@ class LearningRunner:
                 policy, run_id, outcome.activation_reason, now_ms,
                 outcome.confidence_arms, outcome.promoted_arms,
             )
-            if activated and outcome.candidates:
-                # THE FORWARD SET IS REFRESHED WITH THE POLICY. A refit that
-                # leaves the candidate artefact behind freezes the forward
-                # evaluation on whatever the first run happened to find, so a
-                # cell that becomes interesting later is never watched. The
-                # ids are content-derived, so a cell keeps its name across
-                # refits and an old prediction stays attributable to the
-                # candidate that actually made it.
-                self._write_candidates(outcome.candidates, now_ms)
+        if outcome.candidates:
+            # THE FORWARD SET IS REFRESHED ON EVERY COMPLETED RUN, not only on
+            # an activation. Candidates never move an order - they are the
+            # shadow record of what a cell WOULD have done - so there is no
+            # execution reason to hold them back, and one reason not to: a run
+            # that trains but activates nothing is exactly the run after a
+            # feature-contract change, when the artefact on disk is keyed on
+            # the OLD contract. `CandidateSet.evaluate` refuses an
+            # incompatible set, so leaving it in place would stop the forward
+            # evaluation recording anything, permanently and silently, which
+            # is the failure this artefact exists to prevent.
+            #
+            # The ids are content-derived, so a cell keeps its name across
+            # refits and an old prediction stays attributable to the candidate
+            # that actually made it.
+            self._write_candidates(outcome.candidates, now_ms)
         self.learning.finish_run(
             run_id, now_ms=now_ms, status=OK if activated else SKIPPED,
             provenance=outcome.provenance, report=outcome.report,

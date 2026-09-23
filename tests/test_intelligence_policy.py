@@ -143,15 +143,25 @@ def test_an_incompatible_feature_version_is_refused():
     names BOTH so the disagreement is diagnosable rather than just fatal."""
     v = decide(policy=policy(feature_version="binance-0"))
     assert v.final_action == intel.NEUTRAL
-    assert "binance-0" in v.reason and "brti-1" in v.reason
+    assert "binance-0" in v.reason
+    assert feature_contract.CONTRACT.version in v.reason
 
 
 def test_a_consistently_labelled_but_unsupported_version_is_also_refused():
     """The pure version-mismatch path: the label and the keys agree with each
     other and both disagree with what this build computes. Nothing here is
-    mislabelled, so the mislabelling guard must NOT be what catches it."""
+    mislabelled, so the mislabelling guard must NOT be what catches it.
+
+    THE VERSION IS DERIVED, not typed. This test was written with the literal
+    `brti-2` standing in for "some future scheme"; the build then became
+    `brti-2` and the fixture quietly turned into a MATCHING policy, so the
+    guard under test stopped being reached and the failure surfaced somewhere
+    else entirely. Suffixing the live version cannot collide with it.
+    """
+    unsupported_version = feature_contract.CONTRACT.version + "-unsupported"
+    assert unsupported_version != intel.FEATURE_VERSION
     unsupported = intel.Policy(
-        version="v9", model_version="m", feature_version="brti-2",
+        version="v9", model_version="m", feature_version=unsupported_version,
         arms={"us · mid · bd10-15 · px70-85|accept":
               {"n": 500, "mean": -0.05, "low": -0.09, "high": -0.01,
                "action": intel.VETO, "delta": -5}},
@@ -160,7 +170,8 @@ def test_a_consistently_labelled_but_unsupported_version_is_also_refused():
     assert not unsupported.mislabelled
     v = decide(policy=unsupported)
     assert v.final_action == intel.NEUTRAL
-    assert "brti-2" in v.reason and intel.FEATURE_VERSION in v.reason
+    assert unsupported_version in v.reason
+    assert intel.FEATURE_VERSION in v.reason
 
 
 def test_thin_evidence_is_neutral():

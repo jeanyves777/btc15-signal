@@ -1609,7 +1609,7 @@ def active_candidates(settings) -> CandidateSet:
 
 def brti_context_row(snapshot, ask, opened, brti,
                      side: str = "UP") -> tuple[dict | None, str]:
-    """The `brti-1` context row for this decision, or (None, why-not).
+    """The BRTI context row for this decision, or (None, why-not).
 
     `brti` is the LAST reference poll's features. The reference deliberately
     polls behind the trading path - a slow feed must never delay a fill - so
@@ -2123,12 +2123,15 @@ async def primary_signal(
             last = store.get_setting("disabled_alert_ms", 0.0)
             if now_ms - last > 3_600_000:
                 store.set_setting("disabled_alert_ms", float(now_ms), now_ms)
-                await telegram.send(
-                    "⚠️ <b>AUTOMATION IS OFF AT THE STRATEGY</b>\n"
-                    f"<i>/auto is ON, but strategy.json has "
-                    f"<code>enabled: false</code>, so no order will be placed - "
-                    f"this one at {contract_ask:.0%} included.</i>\n"
-                    "<i>Both switches must be on. Set enabled: true to resume.</i>"
+                notifier = Notifier(telegram, store, settings)
+                await notifier.send_once(
+                    "automation_off", str(opened),
+                    messages.automation_off_message(
+                        ask=contract_ask,
+                        snapshot=notifier.snapshot(now_ms),
+                        insight=notifier.insight_for(opened, now_ms),
+                    ),
+                    now_ms,
                 )
         elif trader is None:
             verdict = "no execution client"
@@ -2425,37 +2428,70 @@ async def primary_signal(
                             store.save_details(
                                 claimed.id, "\n".join(detail_lines), now_ms
                             )
-                            await telegram.send(
-                                messages.order_filled(
+                            # ONE SURFACE. The fill is the second message of
+                            # the same market, so it carries the same rotating
+                            # insight and the same reconciled money footer as
+                            # the signal that preceded it, and it is claimed
+                            # before sending so a retry cannot double-report a
+                            # position.
+                            notifier = Notifier(telegram, store, settings)
+                            await notifier.send_once(
+                                "fill", f"{opened}:{claimed.id}",
+                                messages.fill_message(
                                     side=prediction.side,
                                     ticker=contract.ticker,
                                     contracts=filled_count,
                                     paid=paid,
+                                    fee=fee,
+                                    remaining=remaining,
                                     confidence=confidence_label(
                                         fill_facts, opened, blocking_level
                                     ),
                                     facts=fill_facts,
-                                    band_held=(
-                                        f"{settled_s:.0f}/"
-                                        f"{settings.entry_band_settle_s}s"
+                                    snapshot=notifier.snapshot(now_ms),
+                                    insight=notifier.insight_for(opened, now_ms),
+                                    band_hold=(
+                                        int(settled_s),
+                                        settings.entry_band_settle_s,
                                     ),
-                                    exact=exact,
-                                    remaining=remaining,
-                                    target=snapshot.target,
-                                    price=snapshot.price,
-                                    decision_ask=contract_ask,
+                                    # ONLY WHEN THE PRICE IS THE REAL ONE.
+                                    # Without per-fill confirmation `paid` is
+                                    # the order average, and comparing an
+                                    # average against the decision ask reports
+                                    # a slippage figure that was never priced.
+                                    decision_ask=(
+                                        contract_ask if exact else None
+                                    ),
+                                    priority=surface.priority_lines(
+                                        recovery=store.stored_deficit(),
+                                        partial=(
+                                            "" if exact else
+                                            "fill price is the order average, "
+                                            "not a confirmed per-fill price"
+                                        ),
+                                    ),
                                     size_reason=size_reason,
                                 ),
+                                now_ms,
                                 [("\U0001f4cb WHY THIS TRADE", f"details:{claimed.id}")],
                             )
                         else:
                             # Nothing was bought. Announcing a cost here claimed
                             # a position that does not exist.
-                            await telegram.send(
-                                f"⚠️ <b>AUTO ORDER NOT FILLED</b> "
-                                f"· {escape(contract.ticker)}\n"
-                                f"<i>{escape(result.note)}</i>\n"
-                                "<i>No contracts were bought and nothing was spent.</i>"
+                            notifier = Notifier(telegram, store, settings)
+                            await notifier.send_once(
+                                "not_filled", f"{opened}:{claimed.id}",
+                                messages.not_filled_message(
+                                    ticker=contract.ticker,
+                                    note=result.note,
+                                    snapshot=notifier.snapshot(now_ms),
+                                    insight=notifier.insight_for(
+                                        opened, now_ms),
+                                    priority=surface.priority_lines(
+                                        recovery=store.stored_deficit(),
+                                    ),
+                                ),
+                                now_ms,
                             )
                     except (httpx.HTTPError, OSError, RuntimeError, ValueError) as exc:
                         # The order stands; only the reporting failed.
@@ -2591,7 +2627,11 @@ async def primary_signal(
     # one window produced dozens of near-identical notifications, and the
     # reader who learns to swipe those away swipes away the one that matters.
     notifier = Notifier(telegram, store, settings)
-    snapshot = notifier.snapshot(now_ms)
+    # NAMED `money`, NOT `snapshot`. `snapshot` is already this function's
+    # MarketSnapshot parameter, and shadowing it made every later read of
+    # `snapshot.price` raise - the same collision that put a log string where
+    # the intelligence Verdict belonged.
+    money = notifier.snapshot(now_ms)
     insight = notifier.insight_for(opened, now_ms)
     surfaced = messages.signal_message(
         side=prediction.side,
@@ -2602,7 +2642,7 @@ async def primary_signal(
         facts=facts,
         executable=qualified,
         status_line=status if offer_button else "⚪ Paper only · no order placed",
-        snapshot=snapshot,
+        snapshot=money,
         insight=insight,
         band_hold=(int(settled_s), settings.entry_band_settle_s),
         priority=surface.priority_lines(recovery=store.stored_deficit()),
@@ -2811,6 +2851,10 @@ async def report_settlement(
         side=side,
         ticker=ticker,
         called_side=called_side,
+        qualified=bool(qualified),
+        contracts=contracts_shown or 0.0,
+        # The charged entry fee, so the recap's cost is the fill's cost.
+        fee=(trade.get("fee") if trade else None),
         winner=winner,
         won=bool(won),
         traded=traded,
@@ -2932,9 +2976,10 @@ async def cash_out_exit(
             ticker, opened, banked, banked > 0, "cash_out", now_ms,
             realised_ms=store.last_exit_fill_ms(ticker) or now_ms,
         )
-    await telegram.send(
-        messages.cash_out(
-            head=head_for(store, settings),
+    notifier = Notifier(telegram, store, settings)
+    await notifier.send_once(
+        "cash_out", f"{opened}:{ticker}",
+        messages.cash_out_message(
             ticker=ticker,
             side=side,
             paid=paid,
@@ -2946,7 +2991,11 @@ async def cash_out_exit(
             sold=sold,
             entry_fee=entry_fee,
             exit_fee=exit_fee,
-        )
+            snapshot=notifier.snapshot(now_ms),
+            insight=notifier.insight_for(opened, now_ms),
+            priority=surface.priority_lines(recovery=store.stored_deficit()),
+        ),
+        now_ms,
     )
 
 
@@ -3016,9 +3065,10 @@ async def reversal_exit(
         except (httpx.HTTPError, OSError, RuntimeError, ValueError) as exc:
             result = None
             print(f"auto-exit failed {type(exc).__name__}: {exc}", flush=True)
-        await telegram.send(
-            messages.auto_exit(
-                head=head_for(store, settings),
+        notifier = Notifier(telegram, store, settings)
+        await notifier.send_once(
+            "auto_exit", f"{opened}:{ticker}",
+            messages.auto_exit_message(
                 ticker=ticker,
                 side=side,
                 price=snapshot.price,
@@ -3027,20 +3077,30 @@ async def reversal_exit(
                 remaining=remaining,
                 note=result.note if result else "exit order failed; holding to settlement",
                 sold=bool(result and result.filled_count > 0),
-            )
+                snapshot=notifier.snapshot(now_ms),
+                insight=notifier.insight_for(opened, now_ms),
+                priority=surface.priority_lines(
+                    recovery=store.stored_deficit()),
+            ),
+            now_ms,
         )
         return
 
-    await telegram.send(
-        messages.exit_alert(
-            head=head_for(store, settings),
+    notifier = Notifier(telegram, store, settings)
+    await notifier.send_once(
+        "exit_warning", f"{opened}:{contract.ticker}",
+        messages.exit_warning_message(
             ticker=contract.ticker,
             side=side,
             price=snapshot.price,
             target=snapshot.target,
             remaining=remaining,
             bid=bid,
-        )
+            snapshot=notifier.snapshot(now_ms),
+            insight=notifier.insight_for(opened, now_ms),
+            priority=surface.priority_lines(recovery=store.stored_deficit()),
+        ),
+        now_ms,
     )
 
 

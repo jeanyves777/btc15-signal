@@ -45,7 +45,7 @@ def test_the_recap_reports_the_side_that_owned_the_money():
         snapshot=None,
     )
     assert text.startswith(surface.WON_MONEY), "a paid-out market is not a loss"
-    assert "Took <b>UP</b>" in text
+    assert "Bought <b>UP</b>" in text
     assert "DOWN" not in text.split(surface.DIVIDER)[0]
     assert "Realised <b>+$0.13</b>" in text
     assert "−$1.87" not in text and "-1.87" not in text
@@ -93,7 +93,7 @@ def test_report_settlement_prefers_the_trades_side_over_the_predictions(
         store, FakeTelegram(), pending, "yes", Settings(), now_ms=now,
     ))
     text = captured["text"]
-    assert "Took <b>UP</b>" in text, "the recap must name the side we held"
+    assert "Bought <b>UP</b>" in text, "the recap must name the side we held"
     assert text.startswith(surface.WON_MONEY), "settled YES holding UP is a win"
     # And the call is still reported, because it was genuinely wrong.
     assert "called DOWN" in text and "held UP" in text
@@ -106,7 +106,7 @@ def test_an_untraded_signal_is_still_scored_on_the_call():
         pnl=None, snapshot=None,
     )
     assert text.startswith(surface.LOST_PAPER)
-    assert "No trade · realised P&amp;L $0.00" in text
+    assert "Not traded · realised P&amp;L $0.00" in text
     assert "Cost" not in text
 
 

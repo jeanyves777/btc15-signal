@@ -74,13 +74,23 @@ _BRTI_BANDS = frozenset(name for _lo, _hi, name in BRTI_DISTANCE_BANDS)
 _BINANCE_BANDS = frozenset(BINANCE_BAND_NAMES)
 UNKNOWN_FIELD = "?"
 
-# The deployed KalshiBRTIRule gates, as the live path runs them. They are
-# arguments rather than constants so a caller can ask "what would a different
-# floor have done", but the defaults are the deployed numbers and a training
-# run that does not pass them is training against the deployed rule.
-DEPLOYED_DISTANCE_FLOOR = 10.0
-DEPLOYED_MIN_ASK = 0.70
-DEPLOYED_MAX_ASK = 0.93
+# THE GATES ARE READ FROM THE DEPLOYED RULE, NOT COPIED HERE.
+#
+# They used to be three module constants that happened to equal
+# `strategy_kalshi.json`. Nothing kept them equal. Edit the strategy file - the
+# thing the operator actually edits - and the corpus would go on scoring every
+# historical market against the OLD gates, training a policy for a rule the bot
+# no longer runs, with no error anywhere.
+#
+# Read at call time rather than at import, so a mid-session edit is picked up
+# by the next training run instead of the next restart.
+def deployed_gates(settings=None) -> tuple[float, float, float]:
+    """(distance floor, min ask, max ask) from the live strategy file."""
+    from .config import Settings
+    from .kalshi_brti import KalshiBRTIRule
+
+    rule = KalshiBRTIRule.load((settings or Settings()).kalshi_strategy_path)
+    return (rule.min_brti_normalized_distance, rule.min_ask, rule.max_ask)
 
 CORPUS = "corpus"
 LIVE = "live"
@@ -287,9 +297,9 @@ def _load(distance_floor: float, min_ask: float, max_ask: float, policy: bool,
     return rows
 
 
-def load_policy_rows(distance_floor: float = DEPLOYED_DISTANCE_FLOOR,
-                     min_ask: float = DEPLOYED_MIN_ASK,
-                     max_ask: float = DEPLOYED_MAX_ASK,
+def load_policy_rows(distance_floor: float | None = None,
+                     min_ask: float | None = None,
+                     max_ask: float | None = None,
                      **paths) -> list[dict]:
     """THE DEPLOYED POLICY: one row per market, scanned chronologically.
 
@@ -303,12 +313,18 @@ def load_policy_rows(distance_floor: float = DEPLOYED_DISTANCE_FLOOR,
     and answers it optimistically: it lets one market contribute six correlated
     outcomes. So the walk is chronological and each market contributes ONE row.
     """
-    return _load(distance_floor, min_ask, max_ask, policy=True, **paths)
+    gates = deployed_gates()
+    return _load(
+        gates[0] if distance_floor is None else distance_floor,
+        gates[1] if min_ask is None else min_ask,
+        gates[2] if max_ask is None else max_ask,
+        policy=True, **paths,
+    )
 
 
-def load_brti_rows(distance_floor: float = DEPLOYED_DISTANCE_FLOOR,
-                   min_ask: float = DEPLOYED_MIN_ASK,
-                   max_ask: float = DEPLOYED_MAX_ASK,
+def load_brti_rows(distance_floor: float | None = None,
+                   min_ask: float | None = None,
+                   max_ask: float | None = None,
                    **paths) -> list[dict]:
     """FIRST-MINUTE ANALYSIS: one row per market, judged at 660s only.
 
@@ -316,7 +332,13 @@ def load_brti_rows(distance_floor: float = DEPLOYED_DISTANCE_FLOOR,
     first looks?" - but it is NOT the deployed strategy, which re-checks every
     minute to 360s. Results computed from this must be labelled first-minute.
     """
-    return _load(distance_floor, min_ask, max_ask, policy=False, **paths)
+    gates = deployed_gates()
+    return _load(
+        gates[0] if distance_floor is None else distance_floor,
+        gates[1] if min_ask is None else min_ask,
+        gates[2] if max_ask is None else max_ask,
+        policy=False, **paths,
+    )
 
 
 def brti_context(row: dict) -> str:
@@ -352,23 +374,31 @@ def _setup_key(record: dict) -> str | None:
 
 
 def brti_keyed(context: str) -> bool:
-    """Is this key positively a well-formed `brti-1` context?
+    """Is this key positively a well-formed key of a scheme we can read?
 
     Positive identification, not absence of evidence. A key qualifies only by
-    carrying a BRTI distance band AND naming a real session and volatility
-    regime - so a malformed key, a Binance key, and a key from some future
-    scheme all fail the same way instead of one of them slipping through on a
-    technicality.
+    carrying a BRTI distance band and naming no unknown field - so a malformed
+    key, a Binance key, and a key from some future scheme all fail the same way
+    instead of one of them slipping through on a technicality.
+
+    TWO SHAPES ARE ACCEPTED because two have existed:
+
+        brti-1   session · vol · distance · price      (4 parts)
+        brti-2   distance · price · momentum           (3 parts)
+
+    A `brti-1` row still passes here and is then REBUILT into the `brti-2` key
+    from its stored raw features; where those were never stored it is excluded
+    by `_setup_key` instead. This function only rules out keys that belong to
+    another instrument entirely.
     """
     parts = [p.strip() for p in context.split("·")]
-    if len(parts) != 4:
+    if len(parts) not in (3, 4):
         return False
-    session, vol, distance, _price = parts
-    if session == UNKNOWN_FIELD or vol == UNKNOWN_FIELD:
+    if any(p == UNKNOWN_FIELD for p in parts):
         return False
-    if distance in _BINANCE_BANDS:
+    if any(p in _BINANCE_BANDS for p in parts):
         return False
-    return distance in _BRTI_BANDS
+    return any(p in _BRTI_BANDS for p in parts)
 
 
 def live_rows(db: sqlite3.Connection, *, fingerprint: str,

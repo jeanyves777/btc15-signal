@@ -133,15 +133,34 @@ class Notifier:
             self.store.update_delivered(kind, key, now_ms, text)
         return changed
 
-    RESEND_ON_AMBIGUITY = ("settlement", "recovery", "learning")
+    # MONEY EVENTS RESEND; TRANSIENT ONES DO NOT.
+    #
+    # A claim can be left unconfirmed two ways: the send never happened, or it
+    # happened and the process died before the confirmation was written.
+    # Nothing on the Telegram side distinguishes them, so each kind is
+    # resolved by which mistake is cheaper.
+    #
+    # `fill` and `not_filled` are here because a position the operator does
+    # not know about is worse than the same fill shown twice: the second is a
+    # duplicate they can read past, the first is real money held silently.
+    # They are keyed on the proposal id, so a resend reprints one specific
+    # order rather than a summary that has since moved.
+    #
+    # `cash_out` and `auto_exit` are here for the mirror-image reason: they
+    # report a position CLOSING, and believing you still hold something you
+    # sold is as expensive as the reverse. `exit_warning` is not, because it
+    # placed no order and the next poll re-raises it if it still applies.
+    RESEND_ON_AMBIGUITY = ("settlement", "recovery", "learning",
+                           "fill", "not_filled", "cash_out", "auto_exit")
 
     def resolve_crash_window(self, now_ms: int) -> list[dict]:
         """Settle every claim a previous process left unconfirmed.
 
-        Called once at startup. A market result is re-sent, because losing one
-        is worse than showing it twice when money is being reconciled against
-        it; a signal or a waiting timer is dropped, because the next poll
-        supersedes it and a stale duplicate is worse than a gap.
+        Called once at startup. A market result or a fill is re-sent, because
+        losing one is worse than showing it twice when money is being
+        reconciled against it; a signal, a waiting timer or an automation-off
+        nag is dropped, because the next poll supersedes it and a stale
+        duplicate is worse than a gap.
         """
         return self.store.resolve_pending(self.RESEND_ON_AMBIGUITY, now_ms)
 

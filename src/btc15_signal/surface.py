@@ -79,6 +79,11 @@ MONEY = "\U0001f4b0"
 TODAY = "\U0001f4c5"
 PACKAGE = "\U0001f4e6"
 WARN = "⚠️"
+# THE EXIT EVENT, which is not a direction. `auto_exit` used the DOWN
+# chip as its headline while the body said "Held UP", so one message
+# carried two contradictory direction chips - the exact collapse of the
+# two axes this vocabulary exists to prevent.
+EXIT = "🚪"
 
 DIVIDER = "━" * 18                # ━ × 18, one divider, before the money
 
@@ -198,6 +203,20 @@ def checks_block(facts: list[dict], band_hold: tuple[int, int] | None = None
         tick = PASS if held >= need else WAITING
         lines.append(f"{tick} Band held: {held}s of {need}s")
     return lines
+
+
+def clipped(text: str, limit: int = 100) -> str:
+    """Shorten on a word boundary, and say that it was shortened.
+
+    A hard slice stops mid-word, so the reader cannot tell a truncated line
+    from a corrupted record - and the lines this shortens are withdrawals and
+    failures, which are the ones that have to be trustworthy.
+    """
+    text = str(text).strip()
+    if len(text) <= limit:
+        return text
+    cut = text[:limit].rsplit(" ", 1)[0].rstrip(" ,;:-(")
+    return f"{cut or text[:limit]}\u2026"
 
 
 def checks_summary(facts: list[dict]) -> str:
@@ -382,9 +401,14 @@ def entry_cost(contracts: float, paid: float, fee: float | None) -> str:
         return (f"{PRICE} Cost ${cost:,.2f} for {contracts:g} "
                 f"contract{'s' if contracts != 1 else ''} "
                 f"<i>(before fees)</i>")
+    # TWO DECIMALS, like every other dollar figure on this surface. Four
+    # decimals printed a two-cent fee as `$0.0200`, which reads as a precision
+    # the account statement does not have. A fee that rounds to zero is shown
+    # as the sub-cent amount it is rather than as `$0.00`.
+    charged = (f"${fee:,.2f}" if fee >= 0.005 else "under 1\u00a2")
     return (f"{PRICE} Cost ${cost + fee:,.2f} for {contracts:g} "
             f"contract{'s' if contracts != 1 else ''} "
-            f"<i>(incl. ${fee:,.4f} fees)</i>")
+            f"<i>(incl. {charged} fees)</i>")
 
 
 def max_net_profit(contracts: float, paid: float, fee: float | None) -> str:
@@ -409,5 +433,5 @@ def max_net_profit(contracts: float, paid: float, fee: float | None) -> str:
     return f"{TARGET} Maximum net profit ${gross - fee:,.2f}"
 
 
-NO_TRADE = f"{PRICE} No trade · realised P&amp;L $0.00"
+NO_TRADE = f"{PRICE} Not traded \u00b7 realised P&amp;L $0.00"
 ALREADY_COUNTED = "\U0001f9fe <i>Already counted at the sale.</i>"
