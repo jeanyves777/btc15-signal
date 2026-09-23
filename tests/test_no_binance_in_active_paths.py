@@ -140,3 +140,49 @@ def test_the_brti_context_reads_only_brti_named_fields():
 def test_retired_versions_are_named_not_inferred():
     assert "binance-1" in intel.RETIRED_FEATURE_VERSIONS
     assert intel.FEATURE_VERSION not in intel.RETIRED_FEATURE_VERSIONS
+
+
+# ------------------------------- no client is CONSTRUCTED under kalshi_only
+
+def test_the_reference_recorder_does_not_build_a_binance_client():
+    """A netstat against the running service found an ESTABLISHED connection
+    to data-api.binance.vision AFTER the signal path was migrated. The
+    recorder's Binance column is archive - nothing reads it to decide
+    anything - but the client still made a live request every poll, which is
+    an active Binance dependency however the column is labelled.
+
+    The measurement it served (feed basis vs time aggregation, FINDINGS
+    41/43) is finished and its rows stay readable as history.
+    """
+    from btc15_signal.config import Settings
+    from btc15_signal.reference_shadow import ReferenceShadow
+    import inspect
+
+    source = inspect.getsource(ReferenceShadow)
+    assert "None if settings.kalshi_only" in source
+    assert 'status="disabled"' in source, "a skipped poll is recorded, not blank"
+    settings = Settings()
+    if settings.kalshi_only:
+        assert "BinanceSeconds(settings.spot_base_url" in source
+        # ...but only on the else branch of the kalshi_only test.
+        before = source.split("BinanceSeconds(")[0]
+        assert "kalshi_only" in before.rsplit("self._binance", 1)[-1] + before[-400:]
+
+
+def test_every_binance_constructor_in_src_is_guarded():
+    """Two exist: the trading client and the recorder's seconds client. Both
+    must sit behind `kalshi_only`, because a flag checked at the call site is
+    a flag someone eventually forgets."""
+    import re
+    root = Path(__file__).resolve().parents[1] / "src" / "btc15_signal"
+    found = []
+    for path in root.glob("*.py"):
+        if path.name == "binance.py":
+            continue                      # the definition itself
+        text = path.read_text(encoding="utf-8")
+        for match in re.finditer(r"Binance(Client|Seconds)\(", text):
+            window = text[max(0, match.start() - 400):match.start()]
+            found.append((path.name, "kalshi_only" in window))
+    assert found, "expected to find the constructors"
+    unguarded = [name for name, guarded in found if not guarded]
+    assert not unguarded, f"unguarded Binance construction in {unguarded}"

@@ -232,7 +232,12 @@ def test_poll_never_raises_when_everything_is_broken(tmp_path):
         raise RuntimeError("feed down")
 
     shadow._brti.latest = explode
-    shadow._binance.latest = explode
+    # None under `kalshi_only`: the recorder no longer builds a Binance
+    # client at all, because it was making a live request every poll. Break
+    # it only when it exists, so this test covers BOTH configurations rather
+    # than silently passing on one.
+    if shadow._binance is not None:
+        shadow._binance.latest = explode
     shadow._kalshi.settled = explode
 
     asyncio.run(shadow.poll(1_000, FakeContract()))     # must not raise

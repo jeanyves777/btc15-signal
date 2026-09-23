@@ -66,7 +66,17 @@ class ReferenceShadow:
         self._brti_series: list[tuple[int, float]] = []
         self._brti_event: str | None = None
         self._brti_features = None
-        self._binance = BinanceSeconds(settings.spot_base_url, settings.symbol)
+        # ARCHIVE ONLY, AND OFF UNDER KALSHI-ONLY. The Binance column existed
+        # to decompose feed basis from time aggregation (FINDINGS 41/43).
+        # That measurement is finished and its rows stay readable as history,
+        # but the client still made a live request every poll - which is an
+        # active Binance dependency however it is labelled. A netstat against
+        # the running service found the connection open, which is why this is
+        # `None` rather than merely unread.
+        self._binance = (
+            None if settings.kalshi_only
+            else BinanceSeconds(settings.spot_base_url, settings.symbol)
+        )
         self._kalshi = KalshiOfficial(settings.kalshi_base_url, settings.kalshi_series)
         self._session_id = new_session_id()
         self._last_poll_ms = 0
@@ -81,7 +91,8 @@ class ReferenceShadow:
         try:
             self._flush_gaps()
             await self._brti.close()
-            await self._binance.close()
+            if self._binance is not None:
+                await self._binance.close()
             await self._kalshi.close()
             self._store.close()
         except Exception:  # noqa: BLE001 - shutdown must never raise
@@ -147,7 +158,12 @@ class ReferenceShadow:
         remaining = int((close_ms - now_ms) / 1000) if close_ms else None
 
         brti = await self._brti_observation(now_ms, contract)
-        binance = await self._binance.latest(now_ms)
+        binance = (
+            await self._binance.latest(now_ms) if self._binance is not None
+            else Observation(source="binance", status="disabled",
+                             received_ms=now_ms,
+                             error="kalshi_only: not requested")
+        )
         # BRTI-native gate inputs, recorded beside the Binance ones so the two
         # can be compared on identical windows. They are NOT yet compared
         # against any threshold: the deployed numbers were calibrated on raw
