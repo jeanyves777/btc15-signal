@@ -67,6 +67,7 @@ safe to loop because no trading limit lives in memory — see below.
 | `/ledger` | every real trade with its running balance |
 | `/intel` | what each gate turned down, in edge per contract |
 | `/sessions` | live record by session, beside the measured figure |
+| `/learning` | frozen candidates, what each would change, and how many may touch an order (currently 0) |
 | `/id` | your Telegram user id (the only unauthenticated command) |
 
 ## What stops it losing money

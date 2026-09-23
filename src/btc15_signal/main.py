@@ -414,6 +414,17 @@ async def process_telegram(
                 )
             )
             continue
+        if command == "/learning":
+            if int(message.get("from", {}).get("id", 0)) != settings.telegram_authorized_user_id:
+                continue
+            await telegram.send(
+                messages.learning(
+                    head=head_for(store, settings),
+                    candidates=active_candidates(settings),
+                    board=store.candidate_scoreboard(),
+                )
+            )
+            continue
         if command == "/sessions":
             if int(message.get("from", {}).get("id", 0)) != settings.telegram_authorized_user_id:
                 continue

@@ -1226,6 +1226,64 @@ def intel(*, head: str, gates: dict, needed: int) -> str:
     return "\n".join(lines)
 
 
+def learning(*, head: str, candidates, board: list[dict],
+             min_candidate_n: int = 60, min_promotion_n: int = 120) -> str:
+    """The forward-evaluation state, with promotion reported SEPARATELY.
+
+    Two questions that are constantly conflated, so this message keeps them on
+    different lines:
+
+        watching   is this adjustment worth measuring forward?
+        promoted   may it change a live order?
+
+    Nothing has earned the second. Saying that plainly is the report - "no
+    adjustment has earned promotion" is a result, and dressing it up as
+    progress is how a learning loop becomes a story about one.
+    """
+    lines = [head, RULE, "\U0001f9ea <b>FORWARD EVALUATION</b>"]
+    if candidates is None or not getattr(candidates, "candidates", ()):
+        lines.append("  <i>no candidates frozen - nothing is being watched</i>")
+        return "\n".join(lines)
+    lines.append(
+        f"  <i>artefact</i> <code>{escape(candidates.version)}</code> · "
+        f"features <code>{escape(candidates.feature_version)}</code>"
+    )
+    scored = {r["candidate_id"]: r for r in board}
+    for c in candidates.candidates:
+        row = scored.get(c.candidate_id, {})
+        graded = row.get("graded") or 0
+        changes = row.get("changes") or 0
+        incremental = row.get("incremental") or 0.0
+        state = "\U0001f7e2 PROMOTED" if c.promotes else "\U0001f441 watching"
+        lines.append(
+            f"  {state} <b>{escape(c.candidate_id)}</b> "
+            f"{escape(c.proposed_action)} · {escape(c.context_key)}"
+        )
+        lines.append(
+            f"      train n={c.train_n} {c.train_mean:+.4f}/ct · "
+            f"live {graded} graded, {changes} it would change"
+        )
+        if graded:
+            lines.append(
+                f"      forward <b>{incremental:+.4f}</b> against the "
+                "unchanged rule"
+            )
+    promoted = sum(1 for c in candidates.candidates if c.promotes)
+    lines.append(RULE)
+    lines.append(
+        f"  <b>{promoted}</b> of <b>{len(candidates.candidates)}</b> may change "
+        "an order. The rest are recorded and graded only."
+    )
+    lines.append(
+        f"\U0001f4a1 <i>n≥{min_candidate_n} to be watched, "
+        f"n≥{min_promotion_n} with a validated interval clear of zero to "
+        "control an order. Where no order was placed the forward figure is a "
+        "SIMULATED fill: a rejected winner is evidence about direction, not "
+        "proof a fill was available.</i>"
+    )
+    return "\n".join(lines)
+
+
 def ledger(*, head: str, rows: list[dict]) -> str:
     """Every real trade with the running balance after it.
 

@@ -3063,21 +3063,19 @@ The full stride-1 backfill completed: **6,435 markets, 38,610 decision points,
 0 fetch failures**, yielding 6,428 usable rows - the same count as the Binance
 corpus, over the same 68 days.
 
-BRTI baseline on the training split: the rule **took +0.0128/ct over 679**
-and **refused -0.0522/ct over 2,856**. The gates remain right on average, and
-more clearly so than Binance measured them: the refused leg is twice as bad
-(-0.0522 vs -0.0244). The take figure matching Binance's +0.0128 to four
-decimals is coincidence on different samples - BRTI qualifies 1,282 markets
-where Binance qualifies 1,835.
+An earlier FIRST-MINUTE reading of the training split gave +0.0128/ct over
+679 taken and -0.0522/ct over 2,856 refused, with one `admit` candidate in
+`us · low · bd5-10 · px<70`. **Both are superseded** by the policy figures
+below - that reading judges each market once at 660s, which is not what the
+bot does. They are recorded rather than deleted because they were reported,
+and a corrected number needs the thing it corrects next to it.
 
-**One candidate frozen, zero promoted.** `c01 admit  us · low · bd5-10 · px<70`
-(reject leg): train n=61 over 22 days, +0.0166/ct shrunk, day-clustered CI
-[-0.0331, +0.1684]. The interval crosses zero and validation has only n=14, so
-it controls nothing. It is now recorded against every matching live signal.
+Under either reading the gates are right on average, and more clearly so than
+Binance measured them.
 
-That cell fires **1.35 times a day**. Forward n=60 is ~44 days away and n=120
-~89 days. The loop is real and it is slow, and saying so is the point: a
-faster answer here would mean a smaller bar, not better evidence.
+**One candidate frozen, zero promoted**, under both readings - a different
+candidate each time, which is itself evidence that the scope mattered. The
+policy-corpus candidate is described below.
 
 ### Two defects that would have faked the result
 
@@ -3115,3 +3113,138 @@ checks what that costs: features absent, stale, or belonging to another window
 (`target` != this strike) all yield **no context and no row**. There is no
 fallback to the Binance-scale numbers - a missing row is visible in the log,
 a mislabelled one is not.
+
+### The scope error: first minute is not the policy
+
+**The figures above are first-minute analysis, and are labelled as such from
+here on.** They judge each market once, at 660s remaining. The deployed
+strategy does not: it scans every poll from 660s to 360s, takes the **first**
+minute whose gates pass, alerts once and stops. A market refused at 11
+minutes and qualified at 8 is a market the bot **buys** - and first-minute
+analysis files it under "refused".
+
+It mislabels **2,213 markets** that way, and the correction moves both legs:
+
+| | rule took | rule refused | qualified |
+|---|---:|---:|---:|
+| first-minute only (660s) | +0.0128/ct over 679 | −0.0522/ct over 2,856 | 1,282 |
+| **deployed policy (660→360s)** | **+0.0173/ct over 1,841** | **−0.1204/ct over 1,694** | **3,495** |
+
+The policy reading is better on *both* sides, and it is better because the
+first-minute refused leg was diluted with 2,213 trades the bot actually
+takes. What the gates genuinely turn down is far worse than −0.0522: it is
+**−0.1204/ct**. The gates are doing more work than the earlier number
+credited them with.
+
+Entry minute of the 3,495 qualifying markets: 660s 1,282 · 600s 545 ·
+540s 564 · 480s 464 · 420s 344 · 360s 296. Only 37% are taken at first look,
+which is the size of the error.
+
+The other wrong summary is equally available and was never used: **one row
+per poll**. That lets a single market contribute six correlated copies that
+all share an outcome, inflating every sample count sixfold and every
+confidence interval with it. `choose_minute` is the one place this is
+decided, and `tests/test_policy_dataset.py` pins both failure modes.
+
+### The corpus, reconciled
+
+The baseline is quoted on the TRAINING split, which is why 1,841 + 1,694 =
+3,535 and not 6,428. The split is chronological (55/25/20), never shuffled:
+markets in one session move together, so a random split leaks the afternoon
+into the morning.
+
+| split | markets | qualified | rejected |
+|---|---:|---:|---:|
+| train | 3,535 | 1,841 | 1,694 |
+| validate | 1,607 | 897 | 710 |
+| holdout *(untouched)* | 1,286 | 757 | 529 |
+| **total** | **6,428** | **3,495** | **2,933** |
+
+Exclusions: 6,435 markets have BRTI decision points; **7** are dropped for
+having no Kalshi quote at the matching minute, giving 6,428 usable. One row
+per market, so a market cannot enter twice with six correlated copies of
+itself.
+
+### The candidate the policy corpus produced
+
+Re-fitting on the policy corpus replaced the candidate entirely, which is its
+own evidence that the scope error mattered:
+
+    c01  VETO  asia · mid · bd10-15 · px85-94  (accept leg)
+         train n=143 over 34 days, -0.0044/ct, CI [-0.0668, +0.0326]
+         validate n=38, mean -0.0652 (agrees in sign)
+
+It clears the n≥120 promotion threshold and validation agrees in direction -
+but validation has n=38 against a required 40, and the training interval
+crosses zero. **It does not promote.** Two markets short is still short, and
+moving the threshold to fit the candidate in front of it is the one thing
+that would make the bar meaningless.
+
+Worth noting what it is: a proposal to *demote* high-priced Asian-session
+contracts - the pattern the operator suspected from watching a long Asian
+winning run end badly. The corpus now says the same thing, and says it
+without enough evidence to act on yet.
+
+It is also a clean illustration of why this file reports edge and not win
+rate. That cell wins **184 of 215 - 85.6%** - and is still the candidate the
+model wants to veto, because at 85-94c a contract has to win about 90% of the
+time before fees to break even. A long run of wins there is what losing money
+slowly looks like.
+
+The cell fires **3.16 times a day**, so forward n=60 is ~19 days out and
+n=120 ~38 days - faster than the first-minute candidate's 1.35/day, but still
+weeks, not sessions.
+
+### Feature parity, measured rather than asserted
+
+Context parity means both sides call `brti_context_of`. That guarantees the
+band *labels* come from one function; it says nothing about the numbers fed
+in. A different lookback, cadence or smoothing on the live side would still
+produce labels from the agreed function, and every one could be wrong.
+
+Comparing distributions cannot settle it - live covers ~2 days against the
+corpus's 68, so any difference in medians is confounded with regime. (For the
+record it looks fine: live median volatility 1.09 bps against 0.77 historical,
+which is a two-day sample sitting inside a 68-day spread.)
+
+So `scripts/verify_feature_parity.py` recomputes instead. For each row the
+LIVE path stored, it fetches the series the way `backfill_brti.py` does,
+truncates to the same instant, calls `features_from_series` with the same
+arguments, and compares against what live recorded.
+
+**250 of 250 identical**, worst disagreement 1.3e-10 - floating-point
+reassociation, nothing more:
+
+| | max abs difference |
+|---|---:|
+| `brti_volatility_bps` | 1.7e-12 |
+| `brti_momentum_bps` | 2.2e-12 |
+| `brti_normalized_distance` | 2.8e-11 |
+| `signed_distance_bps` | 1.6e-11 |
+| `brti_value` | 1.3e-10 |
+
+Both paths call `KalshiBRTI.series()` on the same endpoint, sort, and call
+`features_from_series` with the default 300s momentum and 300s volatility
+windows. The decision seconds match the live entry window exactly
+(660/600/540/480/420/360 against `entry_from_seconds`=660,
+`entry_to_seconds`=360).
+
+One difference exists and is **immaterial, which is not the same as absent**:
+live holds a rolling 3,600-sample hour, while the backfill's truncation to
+`t <= cutoff` yields 2,941 samples at 660s remaining growing to 3,241 at
+360s. Both features read only the trailing 300 seconds at 1 sample/second, so
+the surplus never enters the arithmetic - and the 250/250 recomputation is
+what establishes that, rather than the reasoning.
+
+### A rounding note on the lifetime total
+
+The realised total is **$0.71**, and it stays $0.71. It is summed from
+unrounded rows and rounded once at the end: the legs are `43.2257` and
+`-42.5142`, which sum to `0.7115` → **$0.71**. Adding the *displayed*
+components gives `43.23 - 42.51 = 0.72`.
+
+The cent is rounding, not a missing trade. The wrong fix is to round the
+components first so the subtraction "works" - that would make the shown total
+disagree with the broker, which is the one number this system is not allowed
+to invent (see section 37). `lifetime_record` carries the same note so nobody
+reconciles it the other way round later.

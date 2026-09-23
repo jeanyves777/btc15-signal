@@ -33,7 +33,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from brti_dataset import brti_context, load_brti_rows  # noqa: E402
+from brti_dataset import brti_context, load_policy_rows  # noqa: E402
 
 from btc15_signal.config import Settings  # noqa: E402
 from btc15_signal.intelligence_policy import ADMIT, NEUTRAL, VETO, shrink  # noqa: E402
@@ -103,7 +103,7 @@ def arms_for(rows, reward):
 
 def main() -> None:
     settings = Settings()
-    rows = load_brti_rows()
+    rows = load_policy_rows()
     if not rows:
         print("no BRTI rows - run scripts/backfill_brti.py first")
         return
@@ -117,14 +117,25 @@ def main() -> None:
     n = len(rows)
     a, b = int(n * TRAIN_FRACTION), int(n * (TRAIN_FRACTION + VALIDATE_FRACTION))
     train, validate, holdout = rows[:a], rows[a:b], rows[b:]
-    print(f"BRTI rows {n}  train {len(train)}  validate {len(validate)}  "
-          f"holdout {len(holdout)} (untouched)")
+
+    # Print the split AND its composition. The baseline below is a training
+    # figure, so quoting it beside the corpus total invites the reading that
+    # 679 + 2,856 should come to 6,428. Chronological, never shuffled:
+    # markets in one session move together, so a random split leaks the
+    # afternoon into the morning.
+    print(f"{'split':<24}{'markets':>9}{'qualified':>11}{'rejected':>10}")
+    for name, part in (("train", train), ("validate", validate),
+                       ("holdout (untouched)", holdout)):
+        q = sum(r["rule_match"] for r in part)
+        print(f"{name:<24}{len(part):>9}{q:>11}{len(part) - q:>10}")
+    total_q = sum(r["rule_match"] for r in rows)
+    print(f"{'TOTAL':<24}{n:>9}{total_q:>11}{n - total_q:>10}")
 
     taken = [reward(r) for r in train if r["rule_match"]]
     refused = [reward(r) for r in train if not r["rule_match"]]
-    print(f"\nBRTI BASELINE (train): rule took {sum(taken) / len(taken):+.4f}/ct "
-          f"over {len(taken)}; refused {sum(refused) / len(refused):+.4f}/ct "
-          f"over {len(refused)}")
+    print(f"\nBRTI BASELINE (TRAIN SPLIT ONLY): rule took "
+          f"{sum(taken) / len(taken):+.4f}/ct over {len(taken)}; refused "
+          f"{sum(refused) / len(refused):+.4f}/ct over {len(refused)}")
 
     train_arms = arms_for(train, reward)
     val_arms = arms_for(validate, reward)
