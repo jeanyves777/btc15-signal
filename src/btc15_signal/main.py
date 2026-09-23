@@ -2886,6 +2886,7 @@ async def service() -> None:
     )
     kalshi = KalshiClient(settings.kalshi_base_url, settings.kalshi_series)
     store = Store(settings.database_path)
+    store.configure_recovery_exit(settings)
     telegram = Telegram(settings.telegram_bot_token, settings.telegram_chat_id, settings.dry_run)
     trader = None
     if execution_configured(settings):
@@ -2968,6 +2969,12 @@ async def service() -> None:
                             messages.recovery_armed(
                                 rstate,
                                 f"{last[0]} settled {last[1]:+.2f}" if last else "",
+                            )
+                        )
+                    elif event == "stood_down":
+                        await telegram.send(
+                            messages.recovery_stood_down(
+                                rstate, store.money_snapshot(now_ms)
                             )
                         )
                     elif event == "cleared":

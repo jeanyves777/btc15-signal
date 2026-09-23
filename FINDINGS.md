@@ -3430,3 +3430,56 @@ No candidate row: the frozen candidate speaks only to
 `asia · mid · bd10-15 · px85-94` and this market was never in that cell. An
 unmatched candidate writes nothing, because a table of non-opinions buries the
 opinions.
+
+## 48. Recovery stands down early (2026-09-23)
+
+Recovery now stops UPSIZING before the deficit reaches zero:
+
+    HALFWAY    recovered >= 50% of the peak deficit
+    PATIENCE   4 wins into the epoch and recovered >= 40%
+
+Operator instruction, stated as a requirement: *"Even after a 50% recovery of
+the initial loss, turn off recovery. That's enough, because we've seen that
+even regular size is able to recover on its own."* The reasoning is tail
+risk, not average return - late in a recovery the remaining deficit is small
+but the position is still double size, so one loss more than undoes the run
+of wins that got there, and arms recovery again deeper. Recover, lose bigger,
+recover.
+
+**Standing down never zeroes the deficit.** The money is still missing and
+`deficit` still says so; only the upsize stops. `active` now means "may
+upsize", `owes` means "money is missing", and they are different questions.
+Telegram gets its own STOOD DOWN message rather than the CLEARED one, which
+would have reported a $0.00 deficit that was not $0.00.
+
+Progress is measured against the epoch PEAK, not the opening deficit, so a
+fresh loss cannot make the percentage jump on arithmetic. Once down it stays
+down for the epoch; re-arming on the next loss would rebuild the loop.
+
+### The evidence does not support it on this record
+
+`scripts/measure_recovery_exit.py`, 153 realised events, 38 losses:
+
+| | trades armed | their net |
+|---|---:|---:|
+| recovery as it was | 149 | **+14.57** |
+| with the early stand-down | 66 | **+4.53** |
+
+The 83 trades the upsize would no longer ride netted **+10.04**: 65 wins
+(+32.13) against 18 losses (−22.09), a 78.3% win rate. On this history the
+upsize was riding winners, and standing down early would have cost money.
+
+The tail it targets is real but was not decisive here: worst single loss
+−3.28 against a best single win +5.06, mean loss −1.23 against mean win
++0.49. The loss tail is heavier per trade, which is the mechanism the rule
+describes; it simply did not outweigh 78% winners over 153 events.
+
+Three stand-downs would have fired. The third is the case the operator
+described exactly - **45 wins** into an epoch and still only 42% of a $13.32
+peak recovered, with $7.78 outstanding. A grind that long with the upsize
+riding every trade is the state where one loss hurts most, and no
+average-return measurement captures that.
+
+Deployed as instructed, with the measurement recorded beside it rather than
+instead of it. Sizes and fills are not modelled - standing down changes size,
+and a ledger of what happened cannot price what would have.

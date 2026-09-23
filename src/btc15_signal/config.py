@@ -375,6 +375,23 @@ class Settings(BaseSettings):
     # It is a plan length, not a limit: recovery ends when the money is back,
     # not when the steps run out, and the divisor floors at 1.
     recovery_steps: int = 4
+    # THE EARLY STAND-DOWN. Recovery stops UPSIZING well before the deficit
+    # reaches zero, because late in a recovery the remaining deficit is small
+    # but the position is still double size - so one loss more than undoes the
+    # run of wins that got there, and arms recovery again, deeper. Recover,
+    # lose bigger, recover.
+    #
+    # Operator instruction, 2026-09-23: "Even after a 50% recovery of the
+    # initial loss, turn off recovery. That's enough, because we've seen that
+    # even regular size is able to recover on its own." Stated as a
+    # requirement, not a proposal, and implemented as one.
+    #
+    # Standing down NEVER zeroes the deficit. The money is still missing and
+    # the ledger keeps saying so; only the upsize stops. See `recovery_exit`.
+    recovery_partial_exit_enabled: bool = True
+    recovery_exit_fraction: float = 0.50       # halfway is enough on its own
+    recovery_exit_patience_wins: int = 4       # after this many wins...
+    recovery_exit_patience_fraction: float = 0.40   # ...40% is enough
     # OFF. Recovery buys no larger BASE position; it acts only through the
     # conditional add-on, which rests ONE extra contract 2c below the actual
     # fill and only while the BRTI evidence holds. With both on they stack:

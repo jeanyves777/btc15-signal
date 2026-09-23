@@ -658,7 +658,13 @@ def test_the_profit_that_clears_the_deficit_turns_recovery_off(tmp_path):
                        Settings(recovery_upfront_upsize_enabled=True))
     _settle(store, "KXBTC15M-LOSS", 1_000, -0.88)
     _settle(store, "KXBTC15M-WIN1", 2_000, +0.50)
-    assert store.recovery_is_active() is True
+    # +0.50 against a 0.88 peak is 57% back, so the early stand-down fires
+    # here (see `recovery_exit`). The upsize stops; the 0.38 still owed does
+    # not vanish, and the assertions below - that the money coming back
+    # closes the deficit and the plan - are unchanged by it.
+    intermediate = store.recovery_state()
+    assert intermediate.stood_down and intermediate.owes
+    assert intermediate.active is False, "upsizing stops at 57% recovered"
     _settle(store, "KXBTC15M-WIN2", 3_000, +0.50)
 
     state = store.recovery_state()

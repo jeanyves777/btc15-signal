@@ -45,6 +45,23 @@ class RecoveryState:
     markets: int
     opened_ms: int
     steps: int = 0
+    # The worst this epoch reached, the wins since it opened, and whether the
+    # UPSIZE has stood down early. `stood_down` is not "cleared": the money is
+    # still owed and `deficit` still says so. See `recovery_exit`.
+    peak: float = 0.0
+    wins: int = 0
+    stood_down: bool = False
+
+    @property
+    def owes(self) -> bool:
+        """Is money still missing, regardless of whether we upsize for it?"""
+        return self.deficit > 0
+
+    @property
+    def recovered_fraction(self) -> float:
+        from .recovery_exit import recovered_fraction
+
+        return recovered_fraction(self.peak, self.deficit)
 
     def required_per_trade(self) -> float:
         """Dollars one upsized trade has to be able to win, net of fees.
@@ -159,6 +176,7 @@ def _capital(row: dict):
     )
 
 
+from . import recovery_exit  # noqa: E402
 from .sessions import breakdown as session_breakdown  # noqa: E402
 
 ACCOUNTED_SQL = "('filled','protected','unprotected','exited')"
@@ -226,6 +244,11 @@ class Store:
 
     def __init__(self, path: str) -> None:
         self.db = sqlite3.connect(path)
+        # The early stand-down thresholds. Defaults come from `recovery_exit`
+        # so a Store built in a test behaves like the live one; the service
+        # overrides them from Settings at startup via `configure_recovery_exit`
+        # - a setting that silently does nothing is worse than no setting.
+        self.recovery_exit_policy: dict = {}
         self.db.execute("""
             CREATE TABLE IF NOT EXISTS predictions (
                 window_open INTEGER PRIMARY KEY, created_at INTEGER NOT NULL,
@@ -374,7 +397,20 @@ class Store:
                 steps INTEGER NOT NULL DEFAULT 0
             )
         """)
-        self._add_columns("recovery_deficit", {"steps": "INTEGER NOT NULL DEFAULT 0"})
+        self._add_columns("recovery_deficit", {
+            "steps": "INTEGER NOT NULL DEFAULT 0",
+            # The WORST the deficit reached this epoch. Progress is measured
+            # against this, not the opening figure: a fresh loss deepens the
+            # hole, and judging recovery against the old number would let the
+            # percentage move on arithmetic rather than on money won back.
+            "peak": "REAL NOT NULL DEFAULT 0",
+            # Realised WINS since the epoch opened. A long grind of small wins
+            # is exactly the state in which the next loss hurts most.
+            "wins": "INTEGER NOT NULL DEFAULT 0",
+            # Recovery sizing is off although money is still owed. NOT the
+            # same as cleared, and never written by zeroing the deficit.
+            "stood_down": "INTEGER NOT NULL DEFAULT 0",
+        })
         # WHAT HAS ALREADY BEEN APPLIED, per market, so no market can move the
         # deficit twice. It holds the realised figure that was folded in, not a
         # flag, so a row the exchange later revises moves the deficit by the
@@ -869,6 +905,27 @@ class Store:
             "fill_rate": (row[1] / row[0]) if row[0] else None,
             "avg_decision_to_submit_ms": row[2],
             "avg_round_trip_ms": row[3],
+        }
+
+    def configure_recovery_exit(self, settings) -> None:
+        """Take the stand-down thresholds from the deployed configuration.
+
+        Called once at startup. Without it the module defaults apply, which
+        are the same numbers - but the settings would then be decorative, and
+        a knob that does nothing is how an operator ends up believing they
+        turned something off.
+        """
+        self.recovery_exit_policy = {
+            "enabled": bool(getattr(settings, "recovery_partial_exit_enabled", True)),
+            "exit_fraction": float(
+                getattr(settings, "recovery_exit_fraction",
+                        recovery_exit.EXIT_FRACTION)),
+            "patience_wins": int(
+                getattr(settings, "recovery_exit_patience_wins",
+                        recovery_exit.PATIENCE_WINS)),
+            "patience_fraction": float(
+                getattr(settings, "recovery_exit_patience_fraction",
+                        recovery_exit.PATIENCE_FRACTION)),
         }
 
     def _relax_prediction_model_columns(self) -> None:
@@ -1525,25 +1582,30 @@ class Store:
     def stored_deficit(self) -> RecoveryState:
         """The persisted deficit, exactly as it was last written."""
         row = self.db.execute(
-            "SELECT deficit, markets, opened_ms, steps FROM recovery_deficit "
-            "WHERE id=1"
+            "SELECT deficit, markets, opened_ms, steps, peak, wins, stood_down "
+            "FROM recovery_deficit WHERE id=1"
         ).fetchone()
         if row is None:
             return RecoveryState(0.0, False, 0, 0, 0)
         deficit = float(row[0] or 0.0)
+        stood_down = bool(row[6])
         return RecoveryState(
-            deficit, deficit > 0, int(row[1] or 0), int(row[2] or 0),
-            int(row[3] or 0),
+            deficit, deficit > 0 and not stood_down, int(row[1] or 0),
+            int(row[2] or 0), int(row[3] or 0), float(row[4] or 0.0),
+            int(row[5] or 0), stood_down,
         )
 
     def _write_deficit(self, state: RecoveryState, now_ms: int) -> RecoveryState:
         self.db.execute(
             "INSERT INTO recovery_deficit (id, deficit, markets, opened_ms, "
-            "updated_ms, steps) VALUES (1,?,?,?,?,?) ON CONFLICT(id) DO UPDATE "
+            "updated_ms, steps, peak, wins, stood_down) "
+            "VALUES (1,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE "
             "SET deficit=excluded.deficit, markets=excluded.markets, "
             "opened_ms=excluded.opened_ms, updated_ms=excluded.updated_ms, "
-            "steps=excluded.steps",
-            (state.deficit, state.markets, state.opened_ms, now_ms, state.steps),
+            "steps=excluded.steps, peak=excluded.peak, wins=excluded.wins, "
+            "stood_down=excluded.stood_down",
+            (state.deficit, state.markets, state.opened_ms, now_ms, state.steps,
+             state.peak, state.wins, int(state.stood_down)),
         )
         self.db.commit()
         return state
@@ -1577,6 +1639,12 @@ class Store:
         state = self.stored_deficit()
         deficit, markets = state.deficit, state.markets
         opened_ms, steps = state.opened_ms, state.steps
+        peak, wins, stood_down = state.peak, state.wins, state.stood_down
+        # An epoch that predates these columns has no peak recorded. Seed it
+        # from the deficit in hand rather than from zero: zero would read as
+        # "100% recovered" and stand recovery down on its first fold, which is
+        # the opposite of measuring anything.
+        peak = max(peak, deficit)
         # FOLDED FROM `realised_events`, IN BROKER REALISATION ORDER.
         #
         # The deficit is path-dependent because profit stops reducing it at
@@ -1619,11 +1687,19 @@ class Store:
                 continue
             if deficit > 0:
                 markets += 1
+                if delta > 0:
+                    wins += 1            # a realised win inside this epoch
             deficit = max(0.0, deficit - delta)
             if delta < 0:
                 steps = int(plan_steps)      # a fresh loss, a fresh plan
+            # The high-water mark, so progress is judged against the deepest
+            # hole actually dug rather than the first one.
+            peak = max(peak, deficit)
             if deficit < DEFICIT_CLEARED:
+                # Genuinely repaid. The epoch ends and the stand-down resets,
+                # so a future loss arms recovery again normally.
                 deficit, markets, opened_ms, steps = 0.0, 0, 0, 0
+                peak, wins, stood_down = 0.0, 0, False
             elif not opened_ms:
                 opened_ms = now_ms
             self.db.execute(
@@ -1635,8 +1711,31 @@ class Store:
                 "UPDATE daily_ledger SET recovery_applied=pnl WHERE ticker=?",
                 (ticker,),
             )
+        # THE EARLY STAND-DOWN. Evaluated after every fold, so it fires on the
+        # settlement that crosses the threshold rather than on the next signal.
+        # Once down it stays down for the epoch: re-arming on the next loss
+        # would rebuild the recover-lose-bigger-recover loop this prevents.
+        if deficit > 0 and not stood_down:
+            decision = recovery_exit.decide(
+                peak, deficit, wins, **self.recovery_exit_policy
+            )
+            if decision.stand_down:
+                stood_down = True
+                print(
+                    f"recovery STANDS DOWN: {decision.reason}. "
+                    f"{deficit:.4f} still owed and still tracked; "
+                    f"base size from here.",
+                    flush=True,
+                )
         return self._write_deficit(
-            RecoveryState(deficit, deficit > 0, markets, opened_ms, steps), now_ms
+            RecoveryState(
+                deficit,
+                # ACTIVE means "may upsize", not "owes money". A stood-down
+                # epoch still owes `deficit` and still reports it.
+                deficit > 0 and not stood_down,
+                markets, opened_ms, steps, peak, wins, stood_down,
+            ),
+            now_ms,
         )
 
     def consume_recovery_step(
@@ -2771,13 +2870,25 @@ class Store:
         row = self.db.execute(
             "SELECT text_value FROM settings_text WHERE key='recovery_announced'"
         ).fetchone()
-        was_active = bool(row and row[0] == "active")
-        if state.active == was_active:
+        previous = (row[0] if row else "clear") or "clear"
+        # THREE STATES, NOT TWO. `active` going False used to mean one thing;
+        # it now means either "repaid" or "stood down with money still owed",
+        # and announcing CLEARED for the second would report a $0.00 deficit
+        # that is not $0.00.
+        if state.active:
+            current = "active"
+        elif state.stood_down and state.owes:
+            current = "stood_down"
+        else:
+            current = "clear"
+        if current == previous:
             return None, state
-        self.set_setting_text(
-            "recovery_announced", "active" if state.active else "clear", now_ms
-        )
-        return ("armed" if state.active else "cleared"), state
+        self.set_setting_text("recovery_announced", current, now_ms)
+        return {
+            "active": "armed",
+            "stood_down": "stood_down",
+            "clear": "cleared",
+        }[current], state
 
     def last_realised_loss(self) -> tuple[str, float] | None:
         """The most recent losing market, to name what armed recovery."""
