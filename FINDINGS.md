@@ -4600,11 +4600,139 @@ four-wins rule (section 48) fired correctly at 91% and 4 wins; the deficit,
 the transition machine and the money were right throughout. This was the
 report.
 
-### Left open, not fixed here: the crossing gate is refusing almost everything
 
-Every add since 09-23 06:07 UTC bar one was refused for `crossing history
-unavailable for this window` - 25 of the 46 lifetime skips, and all but one
-of today's. That is a data-availability failure being spent as a strategy
-refusal, and it means the add has been effectively off all day. It is a
-separate question from the reporting, and wants measuring before it is
-touched.
+### The cause behind the report: every add that day was refused by a 1s lag
+
+The reason string on that row was not incidental. **Every recovery add on
+2026-09-23 was refused for `crossing history unavailable for this window` -
+25 of 25** - and not one of them was a decision about a market.
+
+`crossed_since(entry_ms, side)` answers "has BRTI been on the wrong side of
+the strike since we bought?" and returns None when it cannot see far enough
+back. The add is evaluated on the SAME poll that creates the entry. No broker
+fill has synced yet, so `position_entry_ms` falls back to the proposal's own
+timestamp - and BRTI's `live_data` timeseries is quantised to whole seconds
+and trails real time by a second or two. So there is no sample at or after the
+entry instant, the window is empty, and the honest answer is "unknown".
+
+Measured on all 25, newest BRTI sample against the entry timestamp:
+
+    lag 0.0s to 1.9s        25 of 25 had NO sample at or after entry
+
+**The margin is sub-second, in both directions.** The first entry after the
+deploy was covered - newest BRTI sample 1.7s AHEAD of the entry instant, and
+the crossing answered `False` normally. So this is not a feed that is broken
+or permanently behind; it is a check standing on a ±2s boundary, which is
+exactly why the fix belongs in how an unknown is HANDLED rather than in the
+feed or the gate.
+
+`crossed_since` was right. What was wrong sat above it: **the position gets
+ONE evaluation.** `_step` returns on any existing row, so the terminal skip
+that an unknown produced was permanent for that market - the question was
+never asked again, though it became answerable a second later.
+
+### Unknown is still not a pass. It is no longer a verdict either
+
+The distinction that was missing is between a DECISION and a QUESTION THAT
+COULD NOT BE ASKED YET.
+
+* The conservative assumption stands: the add is evaluated as though it DID
+  cross, which vetoes, and nothing acts on the other branch. **Unknown never
+  places.** The gate was not relaxed, no observation is fabricated, and the
+  history requirement is not bypassed.
+* A second evaluation decides only whether that veto is TERMINAL. If the
+  unanswerable question is the only thing in the way, the row is written
+  `RECOVERY ADD DEFERRED` and the next poll asks again. If the add would have
+  been refused anyway, that refusal is real, is independent of the crossing,
+  and is recorded **under its own reason** - so "recovery is not active" and
+  "distance collapsed to 7.7x" stop being mislabelled as a feed problem.
+* A deferred row resolves by itself: it places, or a real refusal replaces it,
+  or the add deadline passes and `evaluate` refuses on the clock.
+
+`record_or_advance_add` advances a row **only while it is DEFERRED**, in SQL.
+Every terminal state still refuses exactly as the bare insert did, so the
+one-add-per-position guarantee and the deterministic `client_order_id` are
+untouched and no second contract can be opened.
+
+### What it cost, replayed against the rows themselves
+
+The 26 refusals were replayed through the REAL `evaluate` with the REAL
+recorded inputs - distance, momentum, side, staleness, remaining seconds,
+deficit and fill, read back from `conditions_at_placement` - and the crossing
+answered the way the next poll would have answered it:
+
+    would have rested an add     9
+    recovery was not active     16
+    economics refused it         1
+
+So the cost of the defect is **nine adds the rule wanted and did not get**,
+not twenty-six. A rested bid 2c under the fill is not a fill, so this counts
+decisions, not money.
+
+**The other sixteen are the second harm.** Those markets had no deficit at
+all - the honest reason was "recovery is not active" - but the old override
+replaced whatever `evaluate` had decided, so a routine non-event was filed
+under a data fault. Sixteen of the day's twenty-six "crossing history
+unavailable" rows were never about crossing history. Reasons are now taken
+from the branch that actually refused.
+
+**This changes live behaviour.** `RECOVERY_ADD_ENABLED=true`: adds are real
+money, $30 test budget, one contract per position. Adds will now be placed on
+markets where the gate was silently vetoing every one of them. That is the
+rule working as designed, not a new rule - but it is a real change and the
+first cycles should be read as such.
+
+**Still deliberate, and now reachable for the first time:** `_maintain`
+cancels a RESTING add when the crossing cannot be verified. That is the safe
+direction - a bid whose justification cannot be checked should come off - and
+it is left alone. It was almost unreachable while nothing ever rested; a brief
+feed gap will now cost an add, which is the correct trade.
+
+### Not introduced here, found while verifying
+
+Seven `RECOVERY ADD EXECUTED` rows have `settled = 0` long after their markets
+closed, so `unsettled_filled_adds` never drains. The ledger and the money are
+read from `/portfolio/settlements` and are unaffected - this is the add's own
+per-leg P&L bookkeeping, which reports rather than decides. Unmeasured, and
+untouched here.
+
+### Deployed and watched, 2026-09-23 21:50Z
+
+Revision `59bb6ba`, restarted through the watchdog at 21:50:45Z; the service
+prints its own revision on startup, which is how the running code was
+confirmed rather than assumed:
+
+    BTC15 signal started; revision 59bb6ba (main, clean)
+
+The log shows the change on the first evaluation after the deploy. Before:
+
+    17:36:54  recovery add SKIPPED [...231745-45]: crossing history unavailable
+    17:51:54  recovery add SKIPPED [...231800-00]: recovery is not active
+
+The second market had no deficit. Under the old code that row would have been
+filed under a data fault too; the reason now comes from the branch that
+actually refused. Its `conditions_at_placement` recorded `crossed: false` -
+the question was answerable that time - with the newest BRTI sample 1.7s
+AHEAD of the entry instant.
+
+One complete market was watched end to end (21:45-22:00Z): entry filled 2 @
+78c, add evaluated and refused honestly, sold early at 99.6c, settled, and the
+recap sent to Telegram read
+
+    🔧 No recovery add · recovery is not active
+
+where the old code would have said "Recovery add: pending · rested at 76c".
+
+The following 15-minute window (22:00-22:15Z) was watched complete and traded
+nothing - ask 69c against a 70-93c band, BRTI distance 5.5x against 10x - so
+the add path was not exercised there. Poll, BRTI recording and settlement sync
+stayed fresh throughout (123 BRTI rows, poll ~10s, sync ~60s), with one 110s
+observation gap at the window boundary that the log accounts for as "between
+windows; waiting for the next market".
+
+**NOT YET OBSERVED LIVE: the deferral itself.** Reaching it needs an active
+deficit at the moment an entry fills AND the crossing unanswerable on that
+poll. The deficit cleared to $0.00 at 21:49Z, so no add has been evaluated
+under an active cycle since the deploy. It is covered by tests, not by
+evidence from the live system, and should be confirmed on the next cycle: a
+`RECOVERY ADD DEFERRED` row that resolves within a poll or two.

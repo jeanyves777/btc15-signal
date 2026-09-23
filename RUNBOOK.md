@@ -55,6 +55,58 @@ It restarts the service if it dies, messages Telegram when it does, and gives up
 after 6 restarts in an hour rather than hiding a real fault behind a loop. It is
 safe to loop because no trading limit lives in memory — see below.
 
+### Deploying a change, and getting back
+
+**The restart budget is spent silently.** The watchdog counts restarts in
+memory, not in a file, so the count cannot be read back — assume every restart
+in the last hour counts against 6. Batch the work and deploy ONCE; a live
+trading service is not somewhere to iterate.
+
+Before touching anything:
+
+```powershell
+# 1. Where we are now - this is the rollback point.
+git rev-parse HEAD
+# 2. The watchdog MUST be alive, or a kill leaves nothing running.
+Get-CimInstance Win32_Process -Filter "Name='pythonw.exe'" |
+  Where-Object { $_.CommandLine -like '*watchdog.py*' }
+# 3. Flat is the moment to do it: no open position, nothing resting.
+```
+
+Deploy by killing the service **tree** and letting the watchdog bring it back.
+Kill the tree, not the child: killing only the child can leave the venv stub
+holding the lock, and the relaunch then returns immediately against a lock held
+by nothing, which reads as success while old code keeps trading.
+
+```powershell
+taskkill /PID <parent-pid> /T /F    # the watchdog relaunches within ~5s
+```
+
+Then verify by **timestamp and revision**, never by grepping the log for a
+started line — a stale line from the previous restart matches and reports
+success. The service prints its revision on startup:
+
+```
+BTC15 signal started; revision <sha> (main, clean) ...
+```
+
+Check that line's timestamp is from this restart, that `runtime/service.pid`
+matches a process whose `CreationDate` is after the kill, and that exactly one
+service tree exists.
+
+**Rolling back** is the same move against the old revision. Nothing here
+migrates: `btc15.db`, `runtime/` and `.env` are untouched by a checkout and are
+all gitignored.
+
+```powershell
+git checkout <rollback-sha>
+taskkill /PID <parent-pid> /T /F
+```
+
+If a deploy check fails and the cause is not obvious, `/auto off` in Telegram
+stops trading within one poll and does not depend on the service being healthy.
+That is the safe place to stand while working out what happened.
+
 ## Telegram commands
 
 | Command | Effect |
@@ -482,9 +534,21 @@ doubling - see [sizing](FINDINGS.md) section 45.
 | state | meaning |
 |---|---|
 | `RECOVERY ADD SKIPPED` | never placed - the conditions did not hold |
+| `RECOVERY ADD DEFERRED` | **not a verdict.** The crossing could not be established yet; the next poll asks again |
 | `RECOVERY ADD PENDING` | resting at the broker, **not a position** |
 | `RECOVERY ADD EXECUTED` | filled; `filled_count`, `fill_price`, `fee_paid` are the broker's |
 | `RECOVERY ADD CANCELLED` | pulled before filling |
+
+**`placed_ms` is what says whether an order ever existed**, not the state
+string. NULL means nothing was sent, so there is no resting price to quote -
+`limit_price` on such a row is the price it WOULD have rested at. Reading the
+state string instead is how a recap came to say "Recovery add: pending -
+rested at 82c" over an add that was never placed (FINDINGS 51).
+
+**DEFERRED is the only state the runner will re-enter.** Every other state is
+terminal for that position, which is what keeps one add per position. A row
+left DEFERRED when its window closed means the crossing never became
+answerable before the add deadline; it never placed anything.
 
 **A cancel can lose the race to a fill.** The runner therefore re-reads the
 order before cancelling and banks a fill if it finds one. Until 2026-09-23

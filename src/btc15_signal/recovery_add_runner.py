@@ -234,8 +234,12 @@ class RecoveryAddRunner:
             base["state"] = AddState.DEFERRED if deferred else AddState.SKIPPED
             base["cancel_reason"] = decision.reason
             self._store.record_or_advance_add(base)
+            # The state strings are "RECOVERY ADD SKIPPED"/"...DEFERRED", so
+            # print the last word - "recovery add RECOVERY ADD SKIPPED" is how
+            # the first deploy of this read in the operator's log.
             print(
-                f"recovery add {base['state']} [{ticker}]: {decision.reason}",
+                f"recovery add {str(base['state']).rsplit(' ', 1)[-1]} "
+                f"[{ticker}]: {decision.reason}",
                 flush=True,
             )
             return
