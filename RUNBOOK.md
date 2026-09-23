@@ -546,9 +546,50 @@ state string instead is how a recap came to say "Recovery add: pending -
 rested at 82c" over an add that was never placed (FINDINGS 51).
 
 **DEFERRED is the only state the runner will re-enter.** Every other state is
-terminal for that position, which is what keeps one add per position. A row
-left DEFERRED when its window closed means the crossing never became
-answerable before the add deadline; it never placed anything.
+terminal for that position, which is what keeps one add per position. A
+deferred row is swept to SKIPPED by `close_stale_deferred_adds` once it can no
+longer be answered — the window has closed, or the base position is gone — so
+a DEFERRED row you see in the table is one still being asked.
+
+**`order_id IS NULL` on a PENDING row means the placement response was lost**,
+not that nothing was sent. `placed_ms` says we tried. Such a row is resolved by
+asking Kalshi which order carries our `client_order_id`:
+
+```bash
+.venv/Scripts/python.exe -c "
+import sqlite3
+db=sqlite3.connect('file:btc15.db?mode=ro',uri=True); db.row_factory=sqlite3.Row
+q=('SELECT ticker, client_order_id, placed_ms FROM recovery_adds '
+   \"WHERE state='RECOVERY ADD PENDING' AND order_id IS NULL\")
+for r in db.execute(q): print(dict(r))
+"
+```
+
+Anything printed is an order that may be resting at Kalshi unwatched. The
+service resolves these itself on the next poll and at startup
+(`resolve_order_id`); if one persists, the order listing could not be read.
+**Never mark such a row cancelled by hand** — that is exactly what created the
+orphan this replaced.
+
+### What the add-on actually earned
+
+`settled`/`realised_pnl` are closed from `/portfolio/settlements` by
+`settle_filled_adds`, on the broker's record and never on a clock. This is the
+add's OWN leg, kept apart from the account: `daily_ledger` already holds the
+whole position and the deficit is already credited from it, so nothing here
+moves money.
+
+```bash
+.venv/Scripts/python.exe -c "
+import sys; sys.path.insert(0,'src')
+from btc15_signal.config import Settings
+from btc15_signal.store import Store
+print(Store(Settings().database_path).add_pnl_summary())
+"
+```
+
+`pnl` of exactly 0 with `filled` above 0 means the settlement step is not
+running — that was the state until 2026-09-23, when it had never run at all.
 
 **A cancel can lose the race to a fill.** The runner therefore re-reads the
 order before cancelling and banks a fill if it finds one. Until 2026-09-23
