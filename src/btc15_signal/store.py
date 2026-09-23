@@ -2821,13 +2821,39 @@ class Store:
         self.db.commit()
 
     def intelligence_summary(self) -> dict:
-        """Did it help? Counts by action, with outcomes where known."""
+        """Did it help? Counts by action, ONE PER MARKET, outcomes where known.
+
+        `intelligence_decisions` holds one row per POLL - deliberately, so a
+        decision that changed mid-window is not lost. That makes raw COUNT(*)
+        a poll count, and 2 settled markets have appeared here as "39 rows,
+        39 won, 100%". Every figure this returns therefore counts DISTINCT
+        windows: a market is one opportunity however many times it was
+        examined, and the same correction the training corpus needed applies
+        to the live table.
+
+        `wins` counts windows whose LAST graded decision won, because that is
+        the decision the window ended on.
+        """
         rows = self._dicts(
             "SELECT final_action, COUNT(*) AS n, "
             "COALESCE(SUM(won), 0) AS wins, "
-            "COALESCE(SUM(realised_pnl), 0) AS pnl, "
-            "COALESCE(SUM(graded_ms IS NOT NULL), 0) AS graded "
-            "FROM intelligence_decisions GROUP BY final_action"
+            "COALESCE(SUM(pnl), 0) AS pnl, "
+            "COALESCE(SUM(graded), 0) AS graded FROM ("
+            "  SELECT window_open, final_action, "
+            "         MAX(decided_ms) AS last_ms, "
+            "         (SELECT d2.won FROM intelligence_decisions d2 "
+            "          WHERE d2.window_open = d.window_open "
+            "            AND d2.final_action = d.final_action "
+            "          ORDER BY d2.decided_ms DESC LIMIT 1) AS won, "
+            "         (SELECT COALESCE(d3.realised_pnl, 0) "
+            "          FROM intelligence_decisions d3 "
+            "          WHERE d3.window_open = d.window_open "
+            "            AND d3.final_action = d.final_action "
+            "          ORDER BY d3.decided_ms DESC LIMIT 1) AS pnl, "
+            "         MAX(graded_ms IS NOT NULL) AS graded "
+            "  FROM intelligence_decisions d "
+            "  GROUP BY window_open, final_action"
+            ") GROUP BY final_action"
         )
         return {r["final_action"]: r for r in rows}
 

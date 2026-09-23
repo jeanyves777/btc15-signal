@@ -283,3 +283,38 @@ def test_missing_stale_or_foreign_brti_yields_no_context():
     # the window rolled between the reference poll and this decision
     row, why = brti_context_row(_S(), 0.62, 0, _F(target=101.0))
     assert row is None and "another window" in why
+
+
+# ------------------------------- one market is one opportunity, not six polls
+
+def test_the_intelligence_summary_counts_markets_not_polls(tmp_path):
+    """`intelligence_decisions` holds one row per POLL, on purpose, so a
+    decision that changed mid-window is not lost. Any SUMMARY over it must
+    still count markets: 2 settled markets once appeared as "39 rows, 39 won,
+    100%", which is the live twin of the corpus scope error."""
+    store = Store(str(tmp_path / "s.db"))
+    for poll in range(6):
+        store.record_intelligence({
+            "window_open": 500, "decided_ms": NOW + poll, "base_qualified": 1,
+            "final_action": "neutral", "confidence_delta": 0, "side": "UP",
+        })
+    store.grade_intelligence(500, "UP", 0.0, NOW + 10)
+    summary = store.intelligence_summary()["neutral"]
+    assert summary["n"] == 1, "six polls of one window are one opportunity"
+    assert summary["wins"] == 1
+    assert summary["graded"] == 1
+
+
+def test_the_summary_separates_genuinely_distinct_markets(tmp_path):
+    store = Store(str(tmp_path / "s.db"))
+    for window, side in ((600, "UP"), (601, "DOWN")):
+        for poll in range(3):
+            store.record_intelligence({
+                "window_open": window, "decided_ms": NOW + poll,
+                "base_qualified": 1, "final_action": "neutral",
+                "confidence_delta": 0, "side": side,
+            })
+        store.grade_intelligence(window, "UP", 0.0, NOW + 10)
+    summary = store.intelligence_summary()["neutral"]
+    assert summary["n"] == 2, "two windows are two opportunities"
+    assert summary["wins"] == 1, "only the UP window won"
