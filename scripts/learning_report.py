@@ -31,7 +31,12 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from btc15_signal import feature_contract, learning, learning_data  # noqa: E402
+from btc15_signal import (  # noqa: E402
+    feature_contract,
+    learning,
+    learning_data,
+    revision,
+)
 from btc15_signal import intelligence_policy as intel  # noqa: E402
 from btc15_signal.config import Settings  # noqa: E402
 from btc15_signal.learning_runner import LearningRunner  # noqa: E402
@@ -297,6 +302,11 @@ def main() -> None:
 
     out: list[str] = []
     out.append(f"generated {when(now_ms)}")
+    rev = revision.REVISION
+    out.append(f"running revision: {rev['short']} ({rev['branch']}, "
+               f"{'DIRTY' if rev['dirty'] else 'clean'})  "
+               f"source fingerprint {rev['fingerprint']}")
+    out.append(f"  {rev['subject']}")
     out.append(f"feature contract: {feature_contract.describe()}")
     out.append(f"promotion bar: train n>={learning.MIN_PROMOTION_N}, "
                f"validate n>={learning.MIN_VALIDATE_N}, widened interval clear "

@@ -10,7 +10,7 @@ from uuid import NAMESPACE_URL, uuid4, uuid5
 
 import httpx
 
-from . import autotrade, intel_mode, messages
+from . import autotrade, intel_mode, messages, revision
 from . import brain as brain_mod
 from . import intelligence_policy as intel
 from . import kalshi_signal
@@ -3093,7 +3093,13 @@ async def service() -> None:
             f"from Kalshi either way]",
             flush=True,
         )
-    print("BTC15 signal started; execution requires Telegram approval", flush=True)
+    # WHAT SOURCE IS RUNNING, from the process itself. A deployed trading
+    # service has to answer "what code is this?" from its own runtime
+    # state, not from whatever the working tree looks like when asked.
+    print(f"BTC15 signal started; {revision.line()}; execution requires "
+          "Telegram approval", flush=True)
+    store.set_setting_text("running_revision",
+                           json.dumps(revision.REVISION), int(time.time() * 1000))
     last_ticker = None
     try:
         while True:

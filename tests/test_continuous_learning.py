@@ -1544,3 +1544,55 @@ def test_the_split_is_still_roughly_the_configured_proportions():
     total = len(rows)
     assert 0.50 < len(train) / total < 0.60
     assert 0.20 < len(validate) / total < 0.30
+
+
+# ---------------------------------------------- what source is running
+
+
+def test_the_running_revision_identifies_itself_two_ways():
+    """"432c388 plus fifteen changed files" is not a release identifier.
+
+    Either answer alone can lie: `git rev-parse` reports a clean commit for a
+    tree edited after it, and a content hash means nothing to someone holding
+    the repository. So the process reports both.
+    """
+    from btc15_signal import revision
+
+    rev = revision.REVISION
+    assert set(rev) >= {"commit", "short", "branch", "dirty", "fingerprint"}
+    assert len(rev["fingerprint"]) == 12
+    assert isinstance(rev["dirty"], bool)
+    # Resolved at import from the files the interpreter loaded, so it is stable
+    # within the process even if the working tree moves underneath it.
+    assert revision.REVISION is rev
+    assert rev["fingerprint"] in revision.line()
+    assert rev["short"] in revision.line()
+
+
+def test_the_source_fingerprint_changes_with_the_source(tmp_path, monkeypatch):
+    """A commit hash cannot catch an edit made after the commit. This can."""
+    from btc15_signal import revision
+
+    package = tmp_path / "pkg"
+    package.mkdir()
+    (package / "a.py").write_text("x = 1", encoding="utf-8")
+    monkeypatch.setattr(revision, "PACKAGE", package)
+    first = revision.source_fingerprint()
+    (package / "a.py").write_text("x = 2", encoding="utf-8")
+    assert revision.source_fingerprint() != first
+    # ...and is stable when nothing changed.
+    assert revision.source_fingerprint() == revision.source_fingerprint()
+
+
+def test_the_learning_snapshot_carries_the_revision(tmp_path):
+    from btc15_signal.config import Settings
+    from btc15_signal.learning_runner import LearningRunner
+
+    store = make_store(tmp_path)
+    policy_path = tmp_path / "p.json"
+    intel.Policy().save(policy_path)
+    settings = Settings(intelligence_policy_path=str(policy_path),
+                        database_path=str(tmp_path / "t.db"))
+    snap = LearningRunner(settings, store).snapshot(NOW)
+    assert "revision" in snap
+    assert snap["revision"]["fingerprint"]

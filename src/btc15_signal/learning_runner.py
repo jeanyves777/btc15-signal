@@ -583,7 +583,10 @@ class LearningRunner:
         promoted = _promoted_arms(policy)
         next_due = int(state.get(NEXT_DUE) or 0)
         new_settled = self.new_settlements()
+        from . import revision
+
         return {
+            "revision": revision.REVISION,
             "enabled": bool(self.settings.learning_enabled),
             "running": bool(self.settings.learning_enabled),
             "updating": self._busy,
