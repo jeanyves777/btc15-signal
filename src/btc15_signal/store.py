@@ -53,6 +53,10 @@ class RecoveryState:
     cycle_id: str = ""
     wins: int = 0
     base_only: bool = False
+    # True when `initial` was adopted from an in-flight deficit at migration
+    # rather than observed as a loss. Not the original loss, and reports must
+    # not present it as one.
+    seeded: bool = False
 
     @property
     def owes(self) -> bool:
@@ -423,6 +427,11 @@ class Store:
             # Recovery sizing has ended while money is still owed. NOT the
             # same as cleared, and never written by zeroing the deficit.
             "base_only": "INTEGER NOT NULL DEFAULT 0",
+            # `initial` was ADOPTED from a deficit already in flight when this
+            # code first ran, not observed as a loss. The percentage is then
+            # measured against a migration starting point rather than the
+            # original hole, and any report of it has to say so.
+            "seeded": "INTEGER NOT NULL DEFAULT 0",
         })
         # WHAT HAS ALREADY BEEN APPLIED, per market, so no market can move the
         # deficit twice. It holds the realised figure that was folded in, not a
@@ -1593,7 +1602,7 @@ class Store:
         """The persisted deficit, exactly as it was last written."""
         row = self.db.execute(
             "SELECT deficit, markets, opened_ms, steps, initial, cycle_id, "
-            "wins, base_only FROM recovery_deficit WHERE id=1"
+            "wins, base_only, seeded FROM recovery_deficit WHERE id=1"
         ).fetchone()
         if row is None:
             return RecoveryState(0.0, False, 0, 0, 0)
@@ -1602,21 +1611,22 @@ class Store:
         return RecoveryState(
             deficit, deficit > 0 and not base_only, int(row[1] or 0),
             int(row[2] or 0), int(row[3] or 0), float(row[4] or 0.0),
-            str(row[5] or ""), int(row[6] or 0), base_only,
+            str(row[5] or ""), int(row[6] or 0), base_only, bool(row[8]),
         )
 
     def _write_deficit(self, state: RecoveryState, now_ms: int) -> RecoveryState:
         self.db.execute(
             "INSERT INTO recovery_deficit (id, deficit, markets, opened_ms, "
-            "updated_ms, steps, initial, cycle_id, wins, base_only) "
-            "VALUES (1,?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE "
+            "updated_ms, steps, initial, cycle_id, wins, base_only, seeded) "
+            "VALUES (1,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE "
             "SET deficit=excluded.deficit, markets=excluded.markets, "
             "opened_ms=excluded.opened_ms, updated_ms=excluded.updated_ms, "
             "steps=excluded.steps, initial=excluded.initial, "
             "cycle_id=excluded.cycle_id, wins=excluded.wins, "
-            "base_only=excluded.base_only",
+            "base_only=excluded.base_only, seeded=excluded.seeded",
             (state.deficit, state.markets, state.opened_ms, now_ms, state.steps,
-             state.initial, state.cycle_id, state.wins, int(state.base_only)),
+             state.initial, state.cycle_id, state.wins, int(state.base_only),
+             int(state.seeded)),
         )
         self.db.commit()
         return state
@@ -1651,14 +1661,19 @@ class Store:
         deficit, markets = state.deficit, state.markets
         opened_ms, steps = state.opened_ms, state.steps
         initial, cycle_id = state.initial, state.cycle_id
-        wins, base_only = state.wins, state.base_only
+        wins, base_only, seeded = state.wins, state.base_only, state.seeded
         # A cycle that predates these columns has no opening figure recorded.
         # Seed it from the deficit in hand, never from zero: zero would read
         # as "100% recovered" and end sizing on the first fold, which is the
         # opposite of measuring anything.
         if deficit > 0 and initial <= 0:
+            # ADOPTED, NOT OBSERVED. This deficit was already in flight when
+            # the cycle columns arrived, so `initial` is a migration starting
+            # point and the percentage measured against it is NOT progress
+            # against the original loss. Flagged so no report can imply it is.
             initial = deficit
             cycle_id = cycle_id or f"rc-{now_ms}"
+            seeded = True
         # WINNING MARKETS, COUNTED ONCE EACH, FOR THIS CYCLE ONLY. Base and
         # add-on fills on one ticker are one position with one outcome, and
         # the ticker is the identity - counting realised EVENTS would reach
@@ -1734,8 +1749,11 @@ class Store:
             # reset the win counter, and in the base-only phase it does not
             # reactivate sizing - reactivating is the loop this prevents.
             if deficit > 0 and initial <= 0:
+                # Opened by an observed loss inside the fold, so this IS the
+                # original hole for the cycle.
                 initial = deficit
                 cycle_id = cycle_id or f"rc-{now_ms}-{event_id[:8]}"
+                seeded = False
             if deficit < DEFICIT_CLEARED:
                 # Genuinely repaid. The CYCLE CLOSES: counters reset and a
                 # later loss opens a fresh one. Full recovery ends sizing
@@ -1746,7 +1764,7 @@ class Store:
                         (cycle_id,),
                     )
                 deficit, markets, opened_ms, steps = 0.0, 0, 0, 0
-                initial, cycle_id, base_only = 0.0, "", False
+                initial, cycle_id, base_only, seeded = 0.0, "", False, False
                 won_tickers = set()
             elif not opened_ms:
                 opened_ms = now_ms
@@ -1782,7 +1800,8 @@ class Store:
                 # ACTIVE means "may upsize", not "owes money". A base-only
                 # cycle still owes `deficit` and still reports it.
                 deficit > 0 and not base_only,
-                markets, opened_ms, steps, initial, cycle_id, wins, base_only,
+                markets, opened_ms, steps, initial, cycle_id, wins,
+                base_only, seeded,
             ),
             now_ms,
         )

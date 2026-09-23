@@ -3,16 +3,23 @@
 The rule is the operator's and is deployed either way. This exists so the
 decision has evidence beside it rather than instead of it.
 
-WHAT CAN AND CANNOT BE MEASURED HERE. Standing down changes SIZE, and size
-changes fills, so the true counterfactual P&L is not recoverable from a
-ledger that only records what actually happened. What IS recoverable, and is
-the thing the rule is actually about:
+THIS IS A HYPOTHETICAL REPLAY. Nothing it prints is realised improvement.
+Ending sizing changes the QUANTITY on the order, quantity changes the fill
+and the fee, and a ledger of what happened cannot price what would have: the
+extra contract might not have filled at all, and the fee on a different size
+is a different fee. Every figure below is therefore the P&L OF TRADES AS
+THEY WERE, partitioned by whether the rule would have upsized them - not an
+estimate of what the account would have made.
 
-  * how often recovery would have stood down, and where
+Supporting that estimate would need quantity-adjusted fills and fees, which
+this does not attempt.
+
+What IS recoverable, and is the thing the rule is actually about:
+
+  * how often sizing would have ended, and where
   * how many trades would have run at base instead of upsized
-  * what those trades DID - because the rule's whole claim is that a loss
-    arriving late in a recovery, at double size, costs more than the upsize
-    ever won
+  * what those trades DID at the size they actually ran - because the rule's
+    claim is about a loss arriving while the upsize is still on
 
 A trade that lost while upsized is the case the rule is designed to avoid. A
 trade that won while upsized is what it costs. Both are counted.
@@ -84,16 +91,18 @@ def main() -> None:
 
     avoided = [e for e in without if e not in with_exit]
     print(f"{'':<34}{'trades armed':>14}{'their net':>12}")
+    print("  (net is the P&L of those trades AS THEY RAN - not a")
+    print("   counterfactual, since quantity, fills and fees would differ)\n")
     for label, group in (("recovery as it was", without),
-                         ("with the early stand-down", with_exit)):
+                         ("with the early end", with_exit)):
         total = sum(a for _, a in group)
         print(f"  {label:<32}{len(group):>14}{total:>+12.4f}")
 
-    print(f"\nstand-downs that would have fired: {len(stand_downs)}")
-    for ticker, deficit, peak, wins in stand_downs[:10]:
-        fraction = recovery_exit.recovered_fraction(peak, deficit)
-        print(f"   {ticker:<32} {fraction:.0%} of {peak:.2f} back "
-              f"after {wins} win(s), {deficit:.2f} left")
+    print(f"\nsize-ends that would have fired: {len(stand_downs)}")
+    for ticker, deficit, initial, wins in stand_downs[:10]:
+        fraction = recovery_exit.recovered_fraction(initial, deficit)
+        print(f"   {ticker:<32} {wins} winning markets, {fraction:.0%} of "
+              f"{initial:.2f} back, {deficit:.2f} left")
 
     if avoided:
         losses = [a for _, a in avoided if a < 0]
@@ -102,10 +111,13 @@ def main() -> None:
         print(f"   of which losses {len(losses):>3}  totalling {sum(losses):+.4f}")
         print(f"   of which wins   {len(gains):>3}  totalling {sum(gains):+.4f}")
         print(f"   net on those trades          {sum(losses) + sum(gains):+.4f}")
-        print("\n   A NEGATIVE net here is the case FOR the rule: those are")
-        print("   the trades the upsize was riding, and the extra contract")
-        print("   would have doubled that figure rather than the winning one.")
-        print("   Sizes are not modelled - see the module docstring.")
+        print("\n   HYPOTHETICAL, NOT REALISED IMPROVEMENT. These are the")
+        print("   trades the upsize was riding, at the size they ACTUALLY")
+        print("   ran. What the extra contract would have added or saved is")
+        print("   not computed: it might not have filled, and the fee on a")
+        print("   different quantity is a different fee. A realised-")
+        print("   improvement claim needs quantity-adjusted fills and fees,")
+        print("   which this does not attempt.")
     else:
         print("\nno trade would have changed size on this record.")
 

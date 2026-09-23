@@ -401,3 +401,99 @@ def test_the_deployed_default_is_fifty_percent_and_four_wins():
     assert settings.recovery_exit_fraction == 0.50
     assert settings.recovery_exit_required_wins == 4
     assert settings.recovery_partial_exit_enabled is True
+
+
+# ------------------------------------- four is a floor, not a maximum
+
+def test_sizing_continues_past_four_wins_while_under_half():
+    """No four-win cap. Both conditions must hold, so a long run that has
+    not moved the money keeps the upsize on - past the fourth win, past the
+    fortieth. Requiring BOTH therefore stops sizing LESS often than either
+    alone: more restrictive about stopping, not about exposure."""
+    for wins in (4, 10, 40, 89):
+        assert not recovery_exit.decide(initial=8.68, deficit=6.00, wins=wins)
+    assert recovery_exit.decide(initial=8.68, deficit=4.00, wins=89)
+
+
+def test_a_long_grind_under_half_keeps_sizing_on(tmp_path):
+    store = Store(str(tmp_path / "t.db"))
+    rows = [("LOSS", -4.00)] + [(f"M{i}", 0.10) for i in range(12)]
+    state = realise(store, rows)
+    assert state.wins == 12, "twelve winning markets"
+    assert abs(state.recovered_fraction - 0.3) < 1e-9
+    assert not state.base_only and state.active, "still under half"
+
+
+# ----------------------------------- a migrated baseline is not the loss
+
+def test_a_deficit_already_in_flight_is_flagged_as_seeded(tmp_path):
+    """`initial` adopted at migration is a STARTING POINT, not the original
+    loss, and the percentage measured against it is not progress against
+    that loss. The distinction has to survive in the data."""
+    store = Store(str(tmp_path / "t.db"))
+    # A deficit written before the cycle columns existed: no initial, no id.
+    store.db.execute(
+        "INSERT INTO recovery_deficit (id, deficit, markets, opened_ms, "
+        "updated_ms, steps) VALUES (1, 1.40, 3, ?, ?, 4)", (NOW, NOW),
+    )
+    store.db.commit()
+    state = store.apply_realised_to_deficit(NOW + 1000)
+    assert state.seeded, "adopted, not observed"
+    assert state.initial == 1.40
+    assert state.cycle_id
+
+
+def test_a_cycle_opened_by_an_observed_loss_is_not_seeded(tmp_path):
+    store = Store(str(tmp_path / "t.db"))
+    state = realise(store, [("LOSS", -2.00)])
+    assert not state.seeded, "this IS the original hole"
+
+
+def test_the_seeded_flag_survives_a_restart(tmp_path):
+    path = str(tmp_path / "t.db")
+    store = Store(path)
+    store.db.execute(
+        "INSERT INTO recovery_deficit (id, deficit, markets, opened_ms, "
+        "updated_ms, steps) VALUES (1, 1.40, 3, ?, ?, 4)", (NOW, NOW),
+    )
+    store.db.commit()
+    store.apply_realised_to_deficit(NOW + 1000)
+    store.db.close()
+    assert Store(path).stored_deficit().seeded
+
+
+def test_a_seeded_cycle_says_so_in_the_message(tmp_path):
+    """Printing the percentage bare would claim more than it knows."""
+    store = Store(str(tmp_path / "t.db"))
+    store.db.execute(
+        "INSERT INTO recovery_deficit (id, deficit, markets, opened_ms, "
+        "updated_ms, steps) VALUES (1, 2.00, 0, ?, ?, 4)", (NOW, NOW),
+    )
+    store.db.commit()
+    store.apply_realised_to_deficit(NOW + 1000)
+    state = realise(store, wins4(each=0.25), start_ms=NOW + 10_000)
+    assert state.seeded and state.base_only
+    text = messages.recovery_size_ended(state)
+    assert "carried-over balance" in text
+
+
+def test_a_genuine_cycle_does_not_carry_the_caveat(tmp_path):
+    store = Store(str(tmp_path / "t.db"))
+    state = realise(store, [("LOSS", -2.00), *wins4(each=0.25)])
+    assert not state.seeded
+    assert "carried-over" not in messages.recovery_size_ended(state)
+
+
+def test_clearing_resets_the_seeded_flag(tmp_path):
+    """A fresh cycle opened by a real loss is not a migration artefact."""
+    store = Store(str(tmp_path / "t.db"))
+    store.db.execute(
+        "INSERT INTO recovery_deficit (id, deficit, markets, opened_ms, "
+        "updated_ms, steps) VALUES (1, 1.00, 0, ?, ?, 4)", (NOW, NOW),
+    )
+    store.db.commit()
+    store.apply_realised_to_deficit(NOW + 1000)
+    assert store.stored_deficit().seeded
+    realise(store, [("A", 1.50)], start_ms=NOW + 10_000)
+    fresh = realise(store, [("LOSS", -1.00)], start_ms=NOW + 20_000)
+    assert not fresh.seeded

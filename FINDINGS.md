@@ -3445,6 +3445,14 @@ about whether the run is stable. 50% is the default, tunable within the
 operator's 40-60% range - a value outside it raises rather than clamps,
 because a threshold nobody intended is worse than an error.
 
+**FOUR IS A FLOOR, NOT A CAP.** While recovery is under 50%, sizing continues
+past the fourth win - past the fortieth. And because both conditions must
+hold, this stops sizing LESS often than either alone would: it is more
+restrictive about STOPPING, and therefore leaves the upsize on for LONGER.
+An earlier version of this section called the AND "more conservative", which
+is backwards on the thing that matters - time at exposure. "Both conditions"
+reads like extra caution and does the opposite here.
+
 **It is an exposure-reduction rule, not a prediction.** Nothing in
 `recovery_exit` forecasts anything; it caps how long the account carries
 doubled size.
@@ -3477,24 +3485,46 @@ The denominator is the cycle's **initial** deficit, not its peak. A later
 loss raises what is outstanding and so lowers the percentage, which is what
 "net of subsequent realised losses" means.
 
-### What it would have done
+### What it would have touched — a HYPOTHETICAL replay, not realised P&L
 
-`scripts/measure_recovery_exit.py`, 153 realised events, 38 losses:
+`scripts/measure_recovery_exit.py`, 154 realised events, 38 losses:
 
-| | trades armed | their net |
+| | trades armed | net of those trades **as they ran** |
 |---|---:|---:|
-| recovery as it was | 149 | +14.57 |
+| recovery as it was | 150 | +14.89 |
 | with the early end | 142 | +13.48 |
 
-Only **7** trades would have changed size, netting +1.09 (6 wins +2.79, one
-loss −1.70). Requiring both conditions makes the rule far more conservative
-than a 50%-alone trigger, which would have moved 83 trades.
+**Nothing here is realised improvement.** Ending sizing changes the QUANTITY
+on the order; quantity changes the fill and the fee. The extra contract might
+not have filled at all, and the fee on a different size is a different fee.
+These figures are the P&L of trades as they actually ran, partitioned by
+whether the rule would have upsized them. Supporting an estimate of what the
+account would have made needs quantity-adjusted fills and fees, which this
+does not attempt.
+
+**8** trades would have changed size; their net as they ran was +1.42. That
+says what those trades did — not what the rule would have earned or saved.
 
 Two size-ends would have fired. The second is the operator's case exactly:
 `KXBTC15M-26SEP230300-00` - **89 winning markets**, 54% of an $8.68 opening
 deficit back, $3.97 still outstanding. An upsize riding 89 markets is the
 exposure the rule is about, and no average-return measurement captures what
-that costs when it breaks.
+that costs when it breaks. It also shows the floor at work: the fourth win
+did nothing, because the money condition was not met until the 89th.
+
+### A migrated baseline is not the original loss
+
+The cycle live at deployment opened with `initial = $0.1091`, which is a
+deficit that was already in flight when the cycle columns arrived - a
+**migration starting point**, not the loss that dug the hole. Seeding from
+zero would have read as "100% recovered" and ended sizing on the first fold,
+so the deficit in hand is adopted instead; but a percentage measured against
+it is not progress against the original loss.
+
+That distinction is recorded rather than remembered: `recovery_deficit.seeded`
+marks an adopted baseline, it survives restarts, it resets when the cycle
+clears, and the transition message appends "of the carried-over balance" so
+the figure cannot be read as something it is not.
 
 Deployed as instructed, with the measurement recorded beside it rather than
 instead of it. Sizes and fills are not modelled - ending sizing changes size,

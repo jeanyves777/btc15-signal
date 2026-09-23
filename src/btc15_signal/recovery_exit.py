@@ -11,6 +11,14 @@ Both, not either. Four wins that have barely moved the deficit leave real
 ground to make up; half the money back after one lucky market says nothing
 about whether the run is stable. The rule fires where the two agree.
 
+FOUR IS A FLOOR, NOT A CAP. If recovery is still under 50%, sizing continues
+past the fourth win - past the tenth, past the fiftieth - until the money
+condition is also met. Requiring both therefore stops sizing LESS often than
+either alone would, so it is more restrictive about STOPPING and leaves the
+upsize on for longer. That is a deliberate consequence of the AND and worth
+stating plainly, because "both conditions" reads like extra caution and does
+the opposite to time-at-exposure.
+
     "This is an exposure-reduction rule - not a claim that a loss becomes
      more likely after four wins."
 

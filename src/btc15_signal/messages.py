@@ -198,9 +198,16 @@ def recovery_size_ended(state) -> str:
     met: "4 winning trades - 50% recovered" printed on a cycle that reached
     five wins and 63% would be a template, not a report.
     """
+    recovered = f"{state.recovered_fraction:.0%} recovered"
+    if getattr(state, "seeded", False):
+        # The baseline was ADOPTED from a deficit already in flight, so the
+        # percentage measures progress against a migration starting point -
+        # not against the loss that originally opened the hole. Printing it
+        # bare would claim more than the number knows.
+        recovered += " of the carried-over balance"
     return "\n".join([
         "\U0001f527 <b>RECOVERY SIZE ENDED</b>",
-        f"{state.wins} winning trades · {state.recovered_fraction:.0%} recovered",
+        f"{state.wins} winning trades · {recovered}",
         f"Remaining deficit: ${state.deficit:,.2f}",
         "Continuing at normal base size.",
     ])
