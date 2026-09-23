@@ -1463,9 +1463,18 @@ def intelligence_verdict(
             snapshot is not None
             and getattr(snapshot, "volatility_5m_bps", None) is not None
         )
+        # THE LIVE SNAPSHOT IS NOT THE HISTORICAL ONE. `MarketSnapshot` has no
+        # `session` or `vol_regime` - those live on the backtest `Snapshot` -
+        # so reading them off it yields "?" for both, and a context key of
+        # "? . ? . ..." can never match anything the policy was trained on.
+        # The first live decision showed exactly that. Derive them the same
+        # way the corpus does, from the same functions, or replay and live are
+        # not speaking about the same cells.
+        from .features import _session
+        vol = getattr(snapshot, "volatility_5m_bps", None) or 0.0
         row = {
-            "session": getattr(snapshot, "session", None) or "?",
-            "vol_regime": getattr(snapshot, "vol_regime", None) or "?",
+            "session": _session(opened),
+            "vol_regime": ("high" if vol >= 12 else "low" if vol < 5 else "mid"),
             "normalized_distance": getattr(prediction, "distance_bps", 0.0)
             / max(getattr(snapshot, "volatility_5m_bps", 1.0) or 1.0, 1.0),
             "our_ask": ask,

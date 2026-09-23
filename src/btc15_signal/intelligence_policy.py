@@ -92,6 +92,11 @@ class Policy:
     model_version: str = "none"
     feature_version: str = FEATURE_VERSION
     training_cutoff_ms: int = 0
+    # The last observation in the whole dataset. Freshness is judged on
+    # this, not on `training_cutoff_ms`: the cutoff exists to prove no
+    # hindsight entered the fit, while staleness asks whether the market
+    # has moved since the evidence ENDS.
+    data_end_ms: int = 0
     # context key -> {"n","mean","low","high","action","gate","delta"}
     arms: dict = field(default_factory=dict)
     vetoes_enabled: bool = False
@@ -164,10 +169,8 @@ def decide(
             reason=f"policy feature version {policy.feature_version} != "
                    f"{FEATURE_VERSION}",
         )
-    if (
-        max_age_ms and now_ms and policy.training_cutoff_ms
-        and now_ms - policy.training_cutoff_ms > max_age_ms
-    ):
+    freshness_ms = policy.data_end_ms or policy.training_cutoff_ms
+    if max_age_ms and now_ms and freshness_ms and now_ms - freshness_ms > max_age_ms:
         return _with(base, reason="policy is stale")
     arm = policy.arms.get(context_key)
     if not arm:

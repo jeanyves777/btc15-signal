@@ -147,6 +147,7 @@ def main() -> None:
         version="v1", model_version="arms-shrunk-1",
         feature_version=FEATURE_VERSION, training_cutoff_ms=int(cutoff),
         min_evidence=MIN_EVIDENCE,
+        data_end_ms=int(rows[-1]["window_open"]),
     )
     passed, examined = [], 0
     for key, stats in sorted(candidates.items(), key=lambda kv: -kv[1]["n"]):
