@@ -37,8 +37,9 @@ from dataclasses import asdict, dataclass, field
 
 from .adaptive import (
     BRTI_DISTANCE_BANDS,
+    BRTI_MOMENTUM_BANDS,
     BRTI_VOL_BANDS,
-    PRICE_BANDS,
+    SETUP_PRICE_BANDS,
 )
 
 
@@ -46,7 +47,7 @@ from .adaptive import (
 class FeatureContract:
     """Frozen. Changing any field changes the fingerprint, by design."""
 
-    version: str = "brti-1"
+    version: str = "brti-2"
     family: str = "brti"
     # Kalshi only. No Binance endpoint appears here, and none may be added:
     # a fallback that silently re-bases onto another exchange is the failure
@@ -66,14 +67,28 @@ class FeatureContract:
     cutoff_rule: str = "t <= decision_ms"
     distance_bands: tuple = field(default=BRTI_DISTANCE_BANDS)
     vol_bands: tuple = field(default=BRTI_VOL_BANDS)
-    price_bands: tuple = field(default=PRICE_BANDS)
+    # Cut where the RULE cuts: 0.70 and 0.93, not 0.94.
+    price_bands: tuple = field(default=SETUP_PRICE_BANDS)
+    # MOMENTUM IS PART OF THE SETUP. It is one of the four deployed gates and
+    # `brti-1` left it out of the key entirely, so a cell mixed aligned and
+    # unaligned setups and the layer could not see the difference.
+    momentum_bands: tuple = field(default=BRTI_MOMENTUM_BANDS)
+    # What the key is BUILT FROM. Session and volatility regime are recorded
+    # against every decision as context and are deliberately NOT here: keying
+    # on them fragmented the evidence into cells too small to speak.
+    key_dimensions: tuple = ("distance", "price", "momentum")
+    context_recorded: tuple = ("session", "vol_regime", "band_hold_s",
+                               "remaining_s")
 
     def payload(self) -> dict:
         data = asdict(self)
         # Tuples of tuples round-trip through JSON as lists; normalise so the
         # hash does not depend on which side computed it.
-        for key in ("distance_bands", "vol_bands", "price_bands"):
+        for key in ("distance_bands", "vol_bands", "price_bands",
+                    "momentum_bands"):
             data[key] = [list(b) for b in data[key]]
+        for key in ("key_dimensions", "context_recorded"):
+            data[key] = list(data[key])
         return data
 
     def fingerprint(self) -> str:

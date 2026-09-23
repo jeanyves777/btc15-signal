@@ -13,7 +13,7 @@ import httpx
 from . import autotrade, intel_mode, kalshi_signal, messages, revision
 from . import brain as brain_mod
 from . import intelligence_policy as intel
-from .adaptive import brti_context_of, context_of
+from .adaptive import brti_vol_regime, context_of, setup_context_of
 from .binance import BinanceClient, MarketSnapshot
 from .candidates import CandidateSet
 from .capital import CapitalController, ny_day
@@ -1606,7 +1606,8 @@ def active_candidates(settings) -> CandidateSet:
     return _CANDIDATES["loaded"]
 
 
-def brti_context_row(snapshot, ask, opened, brti) -> tuple[dict | None, str]:
+def brti_context_row(snapshot, ask, opened, brti,
+                     side: str = "UP") -> tuple[dict | None, str]:
     """The `brti-1` context row for this decision, or (None, why-not).
 
     `brti` is the LAST reference poll's features. The reference deliberately
@@ -1634,12 +1635,25 @@ def brti_context_row(snapshot, ask, opened, brti) -> tuple[dict | None, str]:
         return None, "no strike"
     if abs(brti.target - target) > 1e-6:
         return None, "brti belongs to another window"
+    # THE SETUP, plus the context recorded beside it. `side` signs the
+    # momentum, because the gate is applied to the aligned value and an UP and
+    # a DOWN setup with identical raw momentum are opposite setups.
+    direction = 1 if side == "UP" else -1
     return {
-        "session": _session(opened),
-        "brti_volatility_bps": brti.brti_volatility_bps,
         "brti_normalized_distance": brti.brti_normalized_distance,
+        "brti_momentum_bps": brti.brti_momentum_bps,
+        "brti_aligned_momentum_bps": direction * brti.brti_momentum_bps,
+        "brti_volatility_bps": brti.brti_volatility_bps,
         "our_ask": ask,
+        # Context: recorded on every decision, never part of the key.
+        "session": _session(opened),
+        "vol_regime": brti_vol_regime(brti.brti_volatility_bps),
     }, ""
+
+
+def _feature(brti, name: str):
+    """One recorded BRTI quantity, or None when no reference was in hand."""
+    return None if brti is None else getattr(brti, name, None)
 
 
 def normalise_gates(failed_checks) -> tuple[str, ...]:
@@ -1678,6 +1692,7 @@ def normalise_gates(failed_checks) -> tuple[str, ...]:
 def intelligence_verdict(
     settings, store, prediction, snapshot, ask, rule_match, failed_checks,
     opened, remaining, now_ms, brti=None, ticker=None, model_points=None,
+    band_hold_s=None,
 ):
     """Ask the shared decision function, record the answer, return it.
 
@@ -1723,14 +1738,17 @@ def intelligence_verdict(
         # survives only for the legacy path, and the Binance-trained policy
         # is separately retired and cannot act whatever key it is handed.
         if settings.kalshi_only:
-            brti_row, why_not = brti_context_row(snapshot, ask, opened, brti)
+            brti_row, why_not = brti_context_row(
+                snapshot, ask, opened, brti,
+                getattr(prediction, "side", "UP"),
+            )
             if brti_row is None:
                 return intel.Verdict(
                     base_qualified=bool(rule_match), failed_gates=(),
                     final_action=intel.NEUTRAL,
                     reason=f"no {intel.FEATURE_VERSION} context ({why_not})",
                 )
-            context = brti_context_of(brti_row)
+            context = setup_context_of(brti_row)
         else:
             context = context_of(row)
         key = f"{context}|{'accept' if rule_match else 'reject'}"
@@ -1791,6 +1809,23 @@ def intelligence_verdict(
             "evidence_delta": verdict.evidence_delta,
             "authority": verdict.authority or None,
             "model_points": model_points,
+            # THE RAW FEATURES, so a future re-keying never orphans this row
+            # the way `brti-1` orphaned every row written before `brti-2`.
+            "brti_normalized_distance": _feature(brti, "brti_normalized_distance"),
+            "brti_momentum_bps": _feature(brti, "brti_momentum_bps"),
+            "brti_aligned_momentum_bps": (
+                None if brti is None else
+                (1 if getattr(prediction, "side", "UP") == "UP" else -1)
+                * (getattr(brti, "brti_momentum_bps", 0.0) or 0.0)
+            ),
+            "brti_volatility_bps": _feature(brti, "brti_volatility_bps"),
+            # CONTEXT, recorded and not keyed on.
+            "session": _session(opened),
+            "vol_regime": (
+                None if brti is None else
+                brti_vol_regime(getattr(brti, "brti_volatility_bps", 0.0) or 0.0)
+            ),
+            "band_hold_s": band_hold_s,
         })
         # FORWARD EVALUATION, alongside. Every frozen candidate that speaks to
         # this context records what it WOULD have changed, beside what the
@@ -1799,7 +1834,10 @@ def intelligence_verdict(
         # fitted to.
         try:
             candidates = active_candidates(settings)
-            brti_row, why_not = brti_context_row(snapshot, ask, opened, brti)
+            brti_row, why_not = brti_context_row(
+                snapshot, ask, opened, brti,
+                getattr(prediction, "side", "UP"),
+            )
             if brti_row is None:
                 # Say so once per window rather than per poll - and say it at
                 # all. A forward evaluation that records nothing looks exactly
@@ -1813,7 +1851,7 @@ def intelligence_verdict(
                     )
                 return verdict
             evaluations = candidates.evaluate(
-                context_key=str(brti_context_of(brti_row)),
+                context_key=str(setup_context_of(brti_row)),
                 qualified=bool(rule_match),
             )
             for item in evaluations:
@@ -1917,6 +1955,12 @@ async def primary_signal(
         settings, store, prediction, snapshot, contract_ask,
         rule_match, failed_checks, opened, remaining, now_ms, brti,
         ticker=getattr(contract, "ticker", None),
+        # BAND-HOLD STATE, recorded as context. It is order-eligibility
+        # rather than a qualification check - the price must have SETTLED in
+        # the band, not merely touched it - and it is the condition most often
+        # standing between a qualified signal and an order, so a decision row
+        # that omits it cannot explain why nothing was bought. Read from the
+        # archive, the same call the auto path makes further down.
         # The score the model produced for THIS decision, before the
         # layer touched it. This is the prediction a calibration compares
         # against the outcome.
@@ -1927,6 +1971,11 @@ async def primary_signal(
         # non-BRTI rows anyway, so a None here costs nothing.
         model_points=(
             model_confidence_points(facts, opened, blocking_level)
+            if settings.kalshi_only else None
+        ),
+        band_hold_s=(
+            int(store.band_streak_seconds(
+                opened, kalshi_rule.min_ask, kalshi_rule.max_ask, now_ms))
             if settings.kalshi_only else None
         ),
     )

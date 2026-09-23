@@ -48,9 +48,9 @@ from dataclasses import dataclass, field
 
 from .adaptive import (
     BRTI_DISTANCE_BANDS,
-    BRTI_FEATURE_VERSION,
-    brti_context_of,
+    SETUP_FEATURE_VERSION,
     brti_vol_regime,
+    setup_context_of,
 )
 from .intelligence_policy import BINANCE_BAND_NAMES
 from .levels import confidence_points as level_points
@@ -114,7 +114,7 @@ class Provenance:
     excluded_unattributed: int = 0
     data_start_ms: int = 0
     data_end_ms: int = 0
-    feature_version: str = BRTI_FEATURE_VERSION
+    feature_version: str = SETUP_FEATURE_VERSION
     feature_fingerprint: str = ""
     notes: tuple[str, ...] = field(default_factory=tuple)
 
@@ -210,7 +210,8 @@ def _minute_row(point: dict, quote: tuple, distance_floor: float,
         "brti_normalized_distance": distance,
         "brti_momentum_bps": momentum,
         "side": side, "remaining_s": point["remaining_s"],
-        "feature_version": BRTI_FEATURE_VERSION,
+        "brti_aligned_momentum_bps": direction * momentum,
+        "feature_version": SETUP_FEATURE_VERSION,
         "model_points": points,
         "origin": CORPUS,
         "fill_kind": SIMULATED_FILL,
@@ -319,8 +320,8 @@ def load_brti_rows(distance_floor: float = DEPLOYED_DISTANCE_FLOOR,
 
 
 def brti_context(row: dict) -> str:
-    """The context key, from the SAME function the live path calls."""
-    return str(brti_context_of(row))
+    """The setup key, from the SAME function the live path calls."""
+    return str(setup_context_of(row))
 
 
 # ----------------------------------------------------------------- live
@@ -335,6 +336,19 @@ def _split_key(context_key: str) -> tuple[str, str]:
         context, action = context_key.rsplit("|", 1)
         return context, action
     return context_key, "accept"
+
+
+def _setup_key(record: dict) -> str | None:
+    """The `brti-2` setup key from a decision's stored features, or None."""
+    distance = record.get("brti_normalized_distance")
+    aligned = record.get("brti_aligned_momentum_bps")
+    if distance is None or aligned is None or record.get("ask") is None:
+        return None
+    return str(setup_context_of({
+        "brti_normalized_distance": distance,
+        "brti_aligned_momentum_bps": aligned,
+        "our_ask": record.get("ask"),
+    }))
 
 
 def brti_keyed(context: str) -> bool:
@@ -466,7 +480,7 @@ def live_rows(db: sqlite3.Connection, *, fingerprint: str,
     chosen: dict[tuple, dict] = {}
     seen_polls = 0
     for record in records:
-        if record.get("feature_version") != BRTI_FEATURE_VERSION:
+        if record.get("feature_version") != SETUP_FEATURE_VERSION:
             prov.excluded_incompatible += 1
             continue
         context_key = record.get("context_key") or ""
@@ -481,6 +495,19 @@ def live_rows(db: sqlite3.Connection, *, fingerprint: str,
         if not brti_keyed(context):
             prov.excluded_incompatible += 1
             continue
+        # THE KEY IS REBUILT FROM THE STORED FEATURES, not read verbatim.
+        #
+        # The recorded key is whatever scheme was live when the decision was
+        # taken. Under `brti-2` that is the setup key and rebuilding is a
+        # no-op; rows written under `brti-1` carry a session-first key whose
+        # momentum band was never stored, so they cannot be expressed in the
+        # new one and are excluded rather than guessed at. Rows written from
+        # here on store the raw features, so the next re-keying costs nothing.
+        rebuilt = _setup_key(record)
+        if rebuilt is None:
+            prov.excluded_incompatible += 1
+            continue
+        context = rebuilt
         if settled_only and record.get("graded_ms") is None:
             prov.excluded_unresolved += 1
             continue

@@ -617,6 +617,22 @@ class Store:
             # reconstructing it afterwards measures today's code, not the
             # decision that was taken.
             "model_points": "INTEGER",
+            # THE RAW FEATURES, not only the key built from them.
+            #
+            # `brti-1` stored the context key and nothing else, so when the key
+            # scheme changed every historical row became unreadable under the
+            # new one - the momentum band could not be recovered because
+            # momentum had never been stored. Storing the quantities means a
+            # re-keying is always possible and never orphans the archive again.
+            "brti_normalized_distance": "REAL",
+            "brti_momentum_bps": "REAL",
+            "brti_aligned_momentum_bps": "REAL",
+            "brti_volatility_bps": "REAL",
+            # CONTEXT, recorded and not keyed on: available to slice by hand,
+            # but it does not partition the evidence.
+            "session": "TEXT",
+            "vol_regime": "TEXT",
+            "band_hold_s": "INTEGER",
         })
         # FORWARD EVALUATION. What each frozen candidate WOULD have changed on
         # a live signal, recorded beside what the unchanged strategy actually

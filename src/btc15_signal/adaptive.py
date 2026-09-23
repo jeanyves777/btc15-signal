@@ -317,3 +317,91 @@ def score_blocking(rows: list[dict], predicate, reward) -> Scorecard:
                 card.forgone += -value
                 card.forgone_n += 1
     return card
+
+
+# ---------------------------------------------------------------- brti-2
+#
+# THE SETUP, KEYED ON WHAT THE RULE ACTUALLY GATES ON.
+#
+# `brti-1` keyed `session · vol_regime · distance · price`: context first,
+# setup last, and momentum - one of the four deployed gates - absent entirely.
+# Measured over the assembled training dataset that produced 139 cells of which
+# 18 reached n>=120, covering 58% of it. Session and volatility regime were
+# consuming the evidence while being supporting context.
+#
+# The operator's framing is the correct one: the layer exists to learn which
+# matching SETUPS deserve more confidence, which lose, and which refusals
+# should have qualified. So the key is the quantities the deployed rule gates
+# on, which are also exactly the rejection reasons:
+#
+#     Decision ask    -> price band       cut where the rule cuts, 0.70 / 0.93
+#     BRTI distance   -> distance band    cut at the 10x floor
+#     BRTI momentum   -> momentum band    cut at the gate (0) and the median
+#     Reference       -> never reaches a decision row; a stale reference
+#                        produces no signal at all, so there is nothing to key
+#
+# A reject cell therefore SAYS why it was refused - `bd<5` failed distance,
+# `px<70` failed the band, `mom<=0` failed momentum - which is what makes
+# "should this refusal have qualified" a question the table can answer, and
+# what lets an admission name the single gate it overrides.
+#
+# Session, volatility regime and the band-hold timer are recorded beside every
+# decision as CONTEXT. They are available to read and to slice by hand; they do
+# not partition the evidence by default.
+#
+# The momentum cuts are declared from the FEATURE distribution before any
+# outcome was consulted: the gate sits at 0, 6.9% of aligned momentum is at or
+# below it, and the median of the rest is 5.4 bps.
+BRTI_MOMENTUM_BANDS = ((-9e9, 0.0, "mom<=0"), (0.0, 5.0, "mom0-5"),
+                       (5.0, 9e9, "mom5+"))
+
+# Cut where the RULE cuts. `brti-1` used 0.94 for the top band while the rule
+# admits up to 0.93, so eleven corpus rows keyed as an accept in a band whose
+# name said they were above it.
+SETUP_PRICE_BANDS = ((0.0, 0.70, "px<70"), (0.70, 0.85, "px70-85"),
+                     (0.85, 0.9301, "px85-93"), (0.9301, 1.0, "px93+"))
+
+SETUP_FEATURE_VERSION = "brti-2"
+
+
+def brti_momentum_band(aligned_bps: float) -> str:
+    """Band the momentum ALREADY SIGNED for our side.
+
+    The caller signs it, because the sign depends on which side we are taking
+    and this module does not know that. Passing the raw value would band an UP
+    setup and a DOWN setup with identical momentum into the same cell while the
+    rule treats one as aligned and the other as against.
+    """
+    return _band(aligned_bps, BRTI_MOMENTUM_BANDS)
+
+
+@dataclass(frozen=True)
+class SetupContext:
+    """What was being traded. Hashable, so it keys the arms."""
+
+    distance: str
+    price: str
+    momentum: str
+
+    def __str__(self) -> str:
+        return f"{self.distance} · {self.price} · {self.momentum}"
+
+
+def setup_context_of(row: dict) -> SetupContext:
+    """The canonical `brti-2` setup key. ONE function, both callers.
+
+    `row` carries the aligned momentum under `brti_aligned_momentum_bps` - the
+    value the gate is applied to - or the raw `brti_momentum_bps` plus a
+    `side`, from which it is signed here.
+    """
+    aligned = row.get("brti_aligned_momentum_bps")
+    if aligned is None:
+        direction = 1 if row.get("side") == "UP" else -1
+        aligned = direction * (row.get("brti_momentum_bps") or 0.0)
+    return SetupContext(
+        distance=_band(
+            abs(row.get("brti_normalized_distance") or 0.0), BRTI_DISTANCE_BANDS
+        ),
+        price=_band(row.get("our_ask") or 0.0, SETUP_PRICE_BANDS),
+        momentum=brti_momentum_band(aligned),
+    )

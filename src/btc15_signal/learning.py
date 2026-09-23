@@ -171,6 +171,64 @@ def cluster_ci(values: list[float], groups: list, draws: int = 2000,
     return means[int(0.025 * draws)], means[int(0.975 * draws) - 1]
 
 
+def cluster_p(values: list[float], groups: list, draws: int = 4000,
+              seed: int = 11) -> float:
+    """Two-sided day-clustered bootstrap p-value for mean != 0.
+
+    The interval and the p-value come from the same resampling, so a cell
+    cannot clear one and fail the other for arithmetic reasons.
+    """
+    if len(values) < 2:
+        return 1.0
+    buckets = defaultdict(list)
+    for value, group in zip(values, groups, strict=True):
+        buckets[group].append(value)
+    keys = list(buckets)
+    if len(keys) < 2:
+        return 1.0
+    rng = random.Random(seed)
+    means = []
+    for _ in range(draws):
+        pool = []
+        for _ in keys:
+            pool.extend(buckets[rng.choice(keys)])
+        means.append(sum(pool) / len(pool))
+    below = sum(1 for m in means if m <= 0) / draws
+    above = sum(1 for m in means if m >= 0) / draws
+    return max(1.0 / draws, min(1.0, 2 * min(below, above)))
+
+
+def holm_bonferroni(pvalues: dict, alpha: float = 0.05) -> dict:
+    """Which cells survive, controlling the FAMILY-WISE error rate.
+
+    WHY THIS AND NOT sqrt(k). An earlier version widened each interval by
+    sqrt(k) and reported "none survives" as though that settled significance.
+    It does not: sqrt(k) widening of a bootstrap interval is ad hoc, has no
+    stated coverage, and is not a test. It was also far more conservative than
+    it looked - sqrt(7) is roughly a 99.6% interval - so it suppressed a cell
+    that a stated method does support.
+
+    Holm-Bonferroni controls the probability of ANY false positive across the
+    family, which is the right guarantee here: a single false positive puts a
+    wrong number on the operator's screen, and there is no portfolio of
+    discoveries across which a false-discovery RATE would be the natural thing
+    to bound.
+
+    It is uniformly more powerful than plain Bonferroni and needs no
+    independence assumption, which matters because these cells share a corpus.
+    """
+    ordered = sorted(pvalues.items(), key=lambda kv: kv[1])
+    k = len(ordered)
+    out, still_rejecting = {}, True
+    for i, (key, p) in enumerate(ordered):
+        if still_rejecting and p <= alpha / (k - i):
+            out[key] = True
+        else:
+            still_rejecting = False
+            out[key] = False
+    return out
+
+
 def excludes_zero(low: float, high: float) -> bool:
     """A degenerate interval excludes nothing."""
     if low == 0.0 and high == 0.0:
@@ -312,6 +370,7 @@ def nested_calibration(rows: list[dict], folds: int = NESTED_FOLDS) -> dict:
             "mean": round(sum(values) / len(values), 6),
             "low": round(low, 6),
             "high": round(high, 6),
+            "p": round(cluster_p(values, days[key]), 6),
         }
     return {
         "cells": cells, "tested_folds": tested,
@@ -510,18 +569,22 @@ def fit_arms(rows: list[dict], reward, min_n: int = 1,
 
 
 def context_key_of(row: dict) -> str:
-    """`"<context>|accept"` or `"<context>|reject"`, from whichever the row has.
+    """`"<setup>|accept"` or `"<setup>|reject"`, from whichever the row has.
 
-    A live row already carries the key the order path computed, verbatim. A
-    corpus row carries the BRTI feature columns and the key is derived from the
-    SAME function the order path calls. Two routes to one definition, never two
-    definitions.
+    A live row carries the key the order path computed, verbatim. A corpus row
+    carries the BRTI feature columns and the key comes from the SAME function
+    the order path calls. Two routes to one definition, never two definitions.
+
+    The leg matters as much as the setup. `|accept` is a setup the rule took
+    and asks "did it deserve the confidence"; `|reject` is one it refused and
+    asks "should this have qualified" - and under `brti-2` the bands say WHY it
+    was refused, because they are cut where the gates are.
     """
     context = row.get("context_key")
     if not context:
-        from .adaptive import brti_context_of
+        from .adaptive import setup_context_of
 
-        context = str(brti_context_of(row))
+        context = str(setup_context_of(row))
     leg = "accept" if row.get("rule_match") else "reject"
     return f"{context}|{leg}"
 
@@ -577,6 +640,7 @@ class TrainingReport:
     arms_fitted: int = 0
     arms_eligible_for_confidence: int = 0
     nested_eligible_cells: int = 0
+    nested_survivors: int = 0
     nested_folds: int = 0
     nested_rows: int = 0
     arms_with_confidence: int = 0
@@ -680,11 +744,17 @@ def train(
     # How many cells the nested test could speak to at all. This is k
     # for the multiplicity correction: the pool a significant cell was
     # selected out of.
-    eligible_cells = sum(
-        1 for c in nested.get("cells", {}).values()
+    eligible = {
+        key: c for key, c in nested.get("cells", {}).items()
         if c["n"] >= MIN_CONFIDENCE_N and c["days"] >= 2
-    )
+    }
+    eligible_cells = len(eligible)
     report.nested_eligible_cells = eligible_cells
+    # HOLM-BONFERRONI across exactly the cells that were testable. This is the
+    # family: every cell with enough nested out-of-sample evidence to have been
+    # a candidate, whether or not it looked promising.
+    survives = holm_bonferroni({key: c["p"] for key, c in eligible.items()})
+    report.nested_survivors = sum(1 for v in survives.values() if v)
     report.nested_folds = nested.get("tested_folds", 0)
     report.nested_rows = nested.get("rows", 0)
     arms = fit_arms(train_rows, reward, curve=curve)
@@ -710,7 +780,7 @@ def train(
         arm.validate_mean = round(val.mean, 6) if val else None
         arm.shrunk = shrink(arm.mean, arm.n, priors[arm.applies_to])
         _calibrate_confidence(arm, validate_arms, nested,
-                              eligible_cells)
+                              eligible_cells, survives)
         _propose_execution(arm, priors, validate_arms, widening,
                            forward or {}, min_evidence)
         _count_error_directions(arm, train_rows, validate_rows)
@@ -778,7 +848,8 @@ def _proposed_action(arm: ArmFit, priors: dict) -> str:
 
 def _calibrate_confidence(arm: ArmFit, validate_arms: dict,
                           nested: dict | None = None,
-                          eligible_cells: int = 1) -> None:
+                          eligible_cells: int = 1,
+                          survives: dict | None = None) -> None:
     """May this cell re-rate what the operator is shown, and by how much?
 
     CONFIDENCE IS ABOUT WINNING, NOT ABOUT PROFIT. Those come apart, and
@@ -839,28 +910,28 @@ def _calibrate_confidence(arm: ArmFit, validate_arms: dict,
             f"nested evidence spans {cell['days']} day; no interval"
         )
         return
-    # MULTIPLICITY APPLIES TO CONFIDENCE TOO.
+    # MULTIPLICITY APPLIES TO CONFIDENCE, and it is corrected with a stated
+    # method rather than an ad hoc widening.
     #
-    # An earlier version of this argued it did not: a delta is computed for
-    # every eligible cell rather than the best of k being picked, so there was
-    # said to be no selection to correct. That was wrong, and the corrected
-    # method is what exposed it. A significance test decides WHICH cells get a
-    # non-zero delta, and keeping whichever of k cells clears an interval is
-    # k chances to be fooled however many cells were looked at. On this corpus
-    # 7 cells had nested evidence and 2 cleared at 95% - against 0.35 expected
-    # by chance, suggestive but not enough - and NEITHER survived the widening.
+    # An earlier version argued confidence was exempt because a delta is
+    # computed for every cell rather than the best of k being picked. That was
+    # wrong: a significance test decides WHICH cells get a non-zero delta, and
+    # keeping whichever of k clears is k chances to be fooled. It then used
+    # sqrt(k) widening, which is not a correction at all - no coverage
+    # guarantee, and in practice about a 99.6% interval, so it suppressed a
+    # result a stated method supports.
     #
-    # The widening is the same sqrt(k) the execution bar uses, for the same
-    # reason. It was added on discovering the selection, which makes the bar
-    # stricter; relaxing a bar after seeing a result would be the other thing.
-    widening = max(1.0, math.sqrt(max(1, eligible_cells)))
-    if not _survives_widening(cell["low"], cell["high"], widening):
+    # Holm-Bonferroni at FWER 0.05 across every testable cell. Family-wise
+    # rather than false-discovery, because one false positive is one wrong
+    # number on the operator's screen and there is no portfolio to average over.
+    if not (survives or {}).get(arm.key):
         raw = "clears" if excludes_zero(cell["low"], cell["high"]) else "spans"
         arm.delta, arm.delta_reason = 0, (
             f"nested residual {cell['mean']:+.4f} "
-            f"[{cell['low']:+.4f},{cell['high']:+.4f}] {raw} zero raw but does "
-            f"NOT survive multiplicity widening across {eligible_cells} "
-            f"examined cells: INSUFFICIENT EVIDENCE"
+            f"[{cell['low']:+.4f},{cell['high']:+.4f}] p={cell['p']:.4f} "
+            f"{raw} zero on its own but does not survive Holm-Bonferroni "
+            f"(FWER 0.05) across {eligible_cells} testable cells: "
+            f"INSUFFICIENT EVIDENCE"
         )
         return
     if not excludes_zero(cell["low"], cell["high"]):
@@ -901,8 +972,10 @@ def _calibrate_confidence(arm: ArmFit, validate_arms: dict,
             f"SCORE adjustment (not a probability correction): nested "
             f"out-of-sample residual {cell['mean']:+.4f} "
             f"[{cell['low']:+.4f},{cell['high']:+.4f}] over n={cell['n']} in "
-            f"{cell['days']} days, clear of zero across "
-            f"{(nested or {}).get('tested_folds', 0)} chronological folds. "
+            f"{cell['days']} days, p={cell['p']:.4f}, surviving "
+            f"Holm-Bonferroni at FWER 0.05 across {eligible_cells} testable "
+            f"cells and {(nested or {}).get('tested_folds', 0)} chronological "
+            f"folds. "
             f"[in-sample gap {arm.calibration:+.4f}; market, not applied: "
             f"{arm.market_calibration:+.4f}]"
         )
