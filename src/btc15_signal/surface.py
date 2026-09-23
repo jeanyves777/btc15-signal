@@ -1,0 +1,413 @@
+"""ONE format for every trading and learning message.
+
+Before this, forty-one builders each chose their own icons, their own field
+order and their own typography - two rules spelled the same gate `75¢ · needs
+70–93¢` and `75c - needs 70-93c`, the same band-hold number was worded four
+different ways, and the fill report and the settlement recap disagreed about
+whether a figure was net. A reader cannot learn a surface that changes shape
+between messages, so they stop reading it, and the one message that mattered
+goes past with the rest.
+
+THE ORDER IS FIXED, and it is fixed because it is a reading order: what
+happened, to which market, at what price, on what evidence, what the system did
+about it, and only then the money and one rotating extra.
+
+    1  direction and event
+    2  market ticker, in full, for traceability
+    3  the essential price, position or result
+    4  the checks - on signals and on executions, always
+    5  what actually happened, or what happens next
+    6  ---- divider ----
+    7  the money footer, from ONE reconciled snapshot
+    8  one rotating insight
+
+DIRECTION AND OUTCOME ARE DIFFERENT AXES. A profitable DOWN trade is 🔴⬇️ for
+the direction it took and ✅💰 for what it made. Collapsing them is how a
+losing UP trade and a winning DOWN trade end up wearing the same chip.
+
+CONFIDENCE IS NOT ELIGIBILITY, and that is not the bug. A refused signal can
+legitimately read MEDIUM or HIGH: the confidence word describes how good the
+setup looks, the checks describe whether it may be traded, and one failed gate
+does not make a good-looking setup a bad-looking one. The layout keeps them on
+separate lines because they are separate facts, not because one should suppress
+the other.
+
+THE ACTUAL DEFECT IS TWO CALCULATIONS. The header scores `confidence_label`
+over the passing `check_facts`, while the DETAILS body scores a different four
+terms of its own - a Binance-scale distance band that is never true on BRTI and
+a model probability that does not exist on this path - so one message says HIGH
+and its own detail says `base MEDIUM (2/4)`. One Kalshi-native confidence
+result is computed once and rendered everywhere.
+
+AND THIS MODULE DOES NOT CHANGE THE SCORE. The reference check passes by
+construction, which does flatter the count - but removing it from scoring
+changes the model, so it belongs in a versioned learning release and not in a
+formatter. Shortening how that check READS (below) is presentation and leaves
+`agreeing` exactly as it was.
+
+MONEY IS NET AND IT COMES FROM ONE SNAPSHOT. Every figure on a message is taken
+from a single `MoneySnapshot` captured once, because two snapshots taken
+milliseconds apart are two different instants and the reader cannot tell which
+line belongs to which.
+"""
+
+from __future__ import annotations
+
+from html import escape
+
+# ------------------------------------------------------------------ icons
+#
+# The whole vocabulary, in one place. A message may not invent one.
+UP = "\U0001f7e2⬆️"          # 🟢⬆️
+DOWN = "\U0001f534⬇️"        # 🔴⬇️
+WON_MONEY = "✅\U0001f4b0"         # ✅💰 executed and profitable
+LOST_MONEY = "❌\U0001f4b8"        # ❌💸 executed and losing
+FLAT_MONEY = "⚪"                  # ⚪ executed, break-even
+WON_PAPER = "✅\U0001f4c4"         # ✅📄 right call, not traded
+LOST_PAPER = "❌\U0001f4c4"        # ❌📄 wrong call, not traded
+WAITING = "⏳"                     # ⏳
+LEARNING = "\U0001f9e0"                # 🧠
+RECOVERY = "\U0001f527"                # 🔧
+
+PASS = "✅"
+FAIL = "❌"
+PRICE = "\U0001f4b5"
+CLOCK = "⏱"
+TARGET = "\U0001f3af"
+ROBOT = "\U0001f916"
+MONEY = "\U0001f4b0"
+TODAY = "\U0001f4c5"
+PACKAGE = "\U0001f4e6"
+WARN = "⚠️"
+
+DIVIDER = "━" * 18                # ━ × 18, one divider, before the money
+
+
+def side_icon(side: str) -> str:
+    """The DIRECTION chip. Never carries an outcome."""
+    return UP if str(side).upper() == "UP" else DOWN
+
+
+def result_icon(pnl: float | None, traded: bool, won: bool | None) -> str:
+    """The OUTCOME chip. Never carries a direction.
+
+    An untraded signal is scored on the CALL (📄); a traded one on the MONEY
+    (💰/💸). They come apart constantly - a DOWN position sold at 100c on a
+    market that later settles UP made money on a wrong call - and this is the
+    axis that decides which chip is correct.
+    """
+    if not traded:
+        return WON_PAPER if won else LOST_PAPER
+    if pnl is None:
+        return FLAT_MONEY
+    if abs(pnl) < 0.005:
+        return FLAT_MONEY
+    return WON_MONEY if pnl > 0 else LOST_MONEY
+
+
+# ------------------------------------------------------------------ checks
+
+
+# The DISPLAY name for each gate. The rules name their facts after the feature
+# they read - `BRTI distance`, `Decision ask` - which is the right name in a
+# log and the wrong one on a phone. The internal names stay in DETAILS and in
+# the archive; the face of the message says what the number IS.
+CHECK_NAMES = {
+    "decision ask": "Price",
+    "brti distance": "Distance",
+    "distance": "Distance",
+    "brti momentum": "Momentum",
+    "momentum": "Momentum",
+    "model": "Model",
+    "level": "Level",
+}
+
+
+def _typography(text: str) -> str:
+    """One spelling for the units. PRESENTATION ONLY - no number changes.
+
+    The two rules disagree: one writes `75¢ · needs 70–93¢`, the other
+    `75c - needs 70-93c`. Same gate, same arithmetic, two appearances, and a
+    reader cannot tell whether they are looking at the same check. This
+    normalises the glyphs and the connective; it never touches a value, and it
+    only rewrites a unit that is attached to a digit.
+    """
+    import re
+
+    text = re.sub(r"(?<=\d)c(?![a-z])", "¢", text)
+    text = re.sub(r"(?<=\d)x(?![a-z])", "×", text)
+    text = re.sub(r"(?<=\d)-(?=\d)", "–", text)
+    text = text.replace(" - needs ", " · minimum ")
+    text = text.replace(" · needs ", " · minimum ")
+    text = text.replace(" within ", " · range ")
+    return text
+
+
+def display_name(name: str) -> str:
+    return CHECK_NAMES.get(str(name).strip().lower(), str(name))
+
+
+def check_line(fact: dict) -> str:
+    """One check, with its measured value AND what was required.
+
+    A refusal that lists only the gate's NAME says a setup was rejected without
+    saying how close it came - the operator went to the database to find two
+    refusals that missed by fractions. Both rules' `check_facts` already carry
+    the value and the threshold in `pass_text`/`fail_text`; this renders them
+    and adds nothing, so the word in the header and the ticks beneath it cannot
+    disagree.
+    """
+    tick = PASS if fact.get("passed") else FAIL
+    text = fact.get("pass_text") if fact.get("passed") else fact.get("fail_text")
+    return (f"{tick} {escape(display_name(fact.get('name')))}: "
+            f"{escape(_typography(str(text)))}")
+
+
+def reference_line(fact: dict) -> str:
+    """The reference check, shortened once freshness has been verified.
+
+    Its pass text is a value-and-sample statement - `Kalshi BRTI, 900 pts,
+    $85,946.05 vs target $85,906.05` - which is detail, not a check result. The
+    sample count and the raw values belong in DETAILS. What the reader needs on
+    the face of the message is that the reference was fresh.
+    """
+    if fact.get("passed"):
+        return f"{PASS} Kalshi reference fresh"
+    return f"{FAIL} Kalshi reference: {escape(str(fact.get('fail_text')))}"
+
+
+def checks_block(facts: list[dict], band_hold: tuple[int, int] | None = None
+                 ) -> list[str]:
+    """Every check, passing and failing, plus band-hold progress.
+
+    ALWAYS RENDERED - on signals, on executions, on refusals. They are the
+    decision. Band-hold is appended because it is order ELIGIBILITY rather than
+    a qualification check, and it is the condition most often standing between
+    a qualified signal and an order: a message that omits it cannot explain why
+    nothing was bought.
+    """
+    lines = []
+    for fact in facts or []:
+        name = str(fact.get("name", ""))
+        lines.append(
+            reference_line(fact) if name.lower().startswith("reference")
+            else check_line(fact)
+        )
+    if band_hold is not None:
+        held, need = band_hold
+        tick = PASS if held >= need else WAITING
+        lines.append(f"{tick} Band held: {held}s of {need}s")
+    return lines
+
+
+def checks_summary(facts: list[dict]) -> str:
+    passed = sum(1 for f in facts or [] if f.get("passed"))
+    return f"{passed}/{len(facts or [])}"
+
+
+# ------------------------------------------------------------- money footer
+
+
+def cents(price: float) -> str:
+    """A contract price, without rounding away a price that was really paid.
+
+    `0.997` printed as `100¢` claims a fill at a price the book does not offer.
+    Whole cents render whole; anything finer keeps the decimal it traded at.
+    """
+    value = price * 100
+    if abs(value - round(value)) < 0.05:
+        return f"{value:.0f}\u00a2"
+    return f"{value:.1f}\u00a2"
+
+
+def _signed_dollars(amount: float) -> str:
+    """`+$4.91` / `−$0.85`. The sign leads, the currency is never implied."""
+    sign = "+" if amount >= 0 else "−"
+    return f"{sign}${abs(amount):,.2f}"
+
+
+def money_footer(snapshot) -> list[str]:
+    """The permanent footer, from ONE snapshot. Executed trades only.
+
+    `markets`/`winners` here are SETTLED MARKETS WE HELD A POSITION IN, read
+    from the broker-backed ledger. Signal statistics are a different
+    population and never stand in for these - the rotating insight is where a
+    signal figure may appear, clearly labelled as one.
+
+    The daily line is labelled simply "Today". It is the exchange's own day
+    boundary and saying so twice on every message earned nothing.
+    """
+    if snapshot is None:
+        return [f"{MONEY} <b>Live: nothing settled yet</b>"]
+    lifetime = getattr(snapshot, "lifetime", None)
+    lines = []
+    if lifetime is not None and getattr(lifetime, "markets", 0):
+        lines.append(
+            f"{MONEY} <b>{escape(lifetime.label())}: "
+            f"{_signed_dollars(lifetime.dollars)}</b>"
+        )
+        lines.append(
+            f"   {lifetime.markets} closed · "
+            f"{lifetime.winners}W–{lifetime.markets - lifetime.winners}L"
+        )
+    else:
+        lines.append(f"{MONEY} <b>Live: nothing settled yet</b>")
+    lines.append(
+        f"{TODAY} <b>Today: {_signed_dollars(snapshot.headline)}</b> · "
+        f"{snapshot.markets} closed · "
+        f"{snapshot.winners}W–{snapshot.losers}L"
+    )
+    return lines
+
+
+# ---------------------------------------------------------------- insights
+#
+# One extra line, rotating. It is PRESENTATION: it never changes a decision and
+# it never invents a figure. A variant with no data is skipped rather than
+# filled in.
+INSIGHTS = ("signals", "paper", "sessions", "qualified")
+
+
+def insight_line(kind: str, data: dict | None) -> str:
+    """One rotating insight, or "" when the data is not there.
+
+    Skipping is deliberate. A rotation that must always produce a line ends up
+    producing commentary, and commentary about a number nobody measured is the
+    thing this system is least allowed to do.
+    """
+    if not data:
+        return ""
+    if kind == "signals":
+        settled, wins = data.get("settled", 0), data.get("wins", 0)
+        if not settled:
+            return ""
+        return (f"{TARGET} Signals: {wins / settled:.0%} · "
+                f"{wins}W–{settled - wins}L over {settled} settled")
+    if kind == "paper":
+        settled = data.get("settled", 0)
+        if not settled:
+            return ""
+        return (f"\U0001f4c4 Paper: {_signed_dollars(data.get('net', 0.0))} "
+                f"on {escape(str(data.get('basis', '1 contract')))}")
+    if kind == "sessions":
+        text = data.get("line") or ""
+        return f"\U0001f30d Sessions: {escape(text)}" if text else ""
+    if kind == "qualified":
+        settled, wins = data.get("settled", 0), data.get("wins", 0)
+        if not settled:
+            return ""
+        return (f"\U0001f4cc Qualified: {wins / settled:.0%} · "
+                f"{wins}/{settled} · paper "
+                f"{_signed_dollars(data.get('net', 0.0))}")
+    return ""
+
+
+# ------------------------------------------------------------ priority rows
+#
+# These outrank the rotating insight and are never displaced by it.
+
+
+def priority_lines(*, recovery=None, pending: str = "", partial: str = "",
+                   slippage: str = "", failure: str = "") -> list[str]:
+    """Anything the operator must see regardless of what is rotating."""
+    lines = []
+    if failure:
+        lines.append(f"{WARN} <b>{escape(_typography(failure))}</b>")
+    if partial:
+        lines.append(f"{PACKAGE} {escape(_typography(partial))}")
+    if pending:
+        lines.append(f"{WAITING} {escape(_typography(pending))}")
+    if slippage:
+        lines.append(f"{WARN} {escape(_typography(slippage))}")
+    if recovery:
+        lines.append(recovery_line(recovery))
+    return [line for line in lines if line]
+
+
+def recovery_line(state) -> str:
+    """Recovery in ONE line: what is owed, and whether size may rise.
+
+    Two facts, because either alone misleads. A deficit with no word on sizing
+    reads as "still broken"; a sizing note with no deficit reads as "fixed".
+    """
+    if state is None or not getattr(state, "owes", False):
+        return ""
+    allowed = not getattr(state, "base_only", False)
+    permission = ("extra sizing allowed" if allowed
+                  else "base size only")
+    return (f"{RECOVERY} Recovery: ${state.deficit:,.2f} outstanding · "
+            f"{permission}")
+
+
+# ------------------------------------------------------------ the assembler
+
+
+def compose(*, header: str, ticker: str, essentials: list[str],
+            checks: list[str], status: str, snapshot=None,
+            priority: list[str] | None = None, insight: str = "") -> str:
+    """Assemble one message in the fixed order. The only assembler.
+
+    Every trading message goes through here so the order, the spacing and the
+    single divider cannot drift apart between builders.
+    """
+    lines = [header]
+    if ticker:
+        lines.append(f"<code>{escape(ticker)}</code>")
+    lines.extend(line for line in (essentials or []) if line)
+    lines.extend(line for line in (checks or []) if line)
+    lines.extend(line for line in (priority or []) if line)
+    if status:
+        lines.append(status)
+    lines.append(DIVIDER)
+    lines.extend(money_footer(snapshot))
+    if insight:
+        lines.append(insight)
+    return "\n".join(lines)
+
+
+# ----------------------------------------------------------- money wording
+
+
+def entry_cost(contracts: float, paid: float, fee: float | None) -> str:
+    """What was actually spent, and whether the figure includes fees.
+
+    `order_filled` used to print `Maximum profit $X` computed as
+    `contracts - cost` with no fee term, while the settlement recap for the
+    same trade subtracted the Kalshi fee - so the fill promised $0.20 and the
+    recap paid $0.19. Every money figure on this surface is net, and this one
+    says so rather than leaving the reader to discover it at settlement.
+    """
+    cost = contracts * paid
+    if fee is None:
+        return (f"{PRICE} Cost ${cost:,.2f} for {contracts:g} "
+                f"contract{'s' if contracts != 1 else ''} "
+                f"<i>(before fees)</i>")
+    return (f"{PRICE} Cost ${cost + fee:,.2f} for {contracts:g} "
+            f"contract{'s' if contracts != 1 else ''} "
+            f"<i>(incl. ${fee:,.4f} fees)</i>")
+
+
+def max_net_profit(contracts: float, paid: float, fee: float | None) -> str:
+    """The most this can make, NET, from the real quantity and fill price.
+
+    Computed from the unrounded fill price and the charged fee, never from the
+    rounded cents the line above displays.
+
+    WHERE THE FEE HAS NOT LANDED YET the figure is labelled ESTIMATED rather
+    than printed bare. The broker's fee arrives with the fill record and the
+    message often goes out first; an unlabelled estimate that later disagrees
+    with the settlement is the same defect as the gross figure this replaces,
+    just smaller.
+    """
+    gross = contracts * (1.0 - paid)
+    if fee is None:
+        from .validation import kalshi_fee_charged
+
+        estimated = gross - kalshi_fee_charged(paid, contracts)
+        return (f"{TARGET} Maximum net profit ~${estimated:,.2f} "
+                f"<i>(estimated · fee not yet reported)</i>")
+    return f"{TARGET} Maximum net profit ${gross - fee:,.2f}"
+
+
+NO_TRADE = f"{PRICE} No trade · realised P&amp;L $0.00"
+ALREADY_COUNTED = "\U0001f9fe <i>Already counted at the sale.</i>"

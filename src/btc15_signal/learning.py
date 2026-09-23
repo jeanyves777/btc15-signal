@@ -216,6 +216,18 @@ def holm_bonferroni(pvalues: dict, alpha: float = 0.05) -> dict:
 
     It is uniformly more powerful than plain Bonferroni and needs no
     independence assumption, which matters because these cells share a corpus.
+
+    THE INTERVALS ARE NOT ADJUSTED BY THIS. Holm operates on the p-values
+    alone; the reported `[low, high]` stays the raw 95% day-clustered
+    percentile interval for that one cell. They must therefore not be read as
+    simultaneous coverage across the family, and every place one is printed
+    beside a Holm verdict says "unadjusted" for that reason.
+
+    AND THE FAMILY IS ONLY THE CELLS. Holm corrects for the cells tested under
+    the keying in force. It does not account for the keying SCHEMES that were
+    explored before one was chosen - four of them were - and that outer
+    selection stays uncorrected. It is the reason the keying was declared in
+    advance rather than picked on which partition lit up.
     """
     ordered = sorted(pvalues.items(), key=lambda kv: kv[1])
     k = len(ordered)
@@ -928,7 +940,8 @@ def _calibrate_confidence(arm: ArmFit, validate_arms: dict,
         raw = "clears" if excludes_zero(cell["low"], cell["high"]) else "spans"
         arm.delta, arm.delta_reason = 0, (
             f"nested residual {cell['mean']:+.4f} "
-            f"[{cell['low']:+.4f},{cell['high']:+.4f}] p={cell['p']:.4f} "
+            f"[{cell['low']:+.4f},{cell['high']:+.4f} UNADJUSTED] "
+            f"p={cell['p']:.4f} "
             f"{raw} zero on its own but does not survive Holm-Bonferroni "
             f"(FWER 0.05) across {eligible_cells} testable cells: "
             f"INSUFFICIENT EVIDENCE"
@@ -971,7 +984,8 @@ def _calibrate_confidence(arm: ArmFit, validate_arms: dict,
         arm.delta_reason = (
             f"SCORE adjustment (not a probability correction): nested "
             f"out-of-sample residual {cell['mean']:+.4f} "
-            f"[{cell['low']:+.4f},{cell['high']:+.4f}] over n={cell['n']} in "
+            f"[{cell['low']:+.4f},{cell['high']:+.4f} UNADJUSTED] over "
+            f"n={cell['n']} in "
             f"{cell['days']} days, p={cell['p']:.4f}, surviving "
             f"Holm-Bonferroni at FWER 0.05 across {eligible_cells} testable "
             f"cells and {(nested or {}).get('tested_folds', 0)} chronological "

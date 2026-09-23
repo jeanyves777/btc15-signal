@@ -687,6 +687,23 @@ class Store:
         # `settings` holds REAL only. The open mark has to be carried per
         # ticker, not as one total, so a position that has already been banked
         # can be excluded from it - which is the whole fix.
+        # DELIVERY IDENTITY. One row per event that has actually been sent.
+        #
+        # The guards this replaces were per-process dicts and per-window alert
+        # rows; neither could say "this exact event already went out" after a
+        # restart, and neither held the message id needed to EDIT a message in
+        # place rather than send another one.
+        self.db.execute("""
+            CREATE TABLE IF NOT EXISTS notifications (
+                kind TEXT NOT NULL,
+                event_key TEXT NOT NULL,
+                message_id INTEGER,
+                body TEXT,
+                first_ms INTEGER NOT NULL,
+                updated_ms INTEGER NOT NULL,
+                PRIMARY KEY (kind, event_key)
+            )
+        """)
         self.db.execute("""
             CREATE TABLE IF NOT EXISTS settings_text (
                 key TEXT PRIMARY KEY, text_value TEXT, updated_at INTEGER
@@ -2759,6 +2776,96 @@ class Store:
             "fills = fills + 1, updated_ms = excluded.updated_ms",
             (round(dollars, 6), now_ms, now_ms),
         )
+
+    # ---------------------------------------------------- notifications
+    def get_setting_text(self, key: str, default: str = "") -> str:
+        """Read a TEXT setting. There was no generic reader before this.
+
+        Every previous reader was raw SQL at the call site, which is why five
+        of them exist with five slightly different fallbacks.
+        """
+        if not self._has_settings_text():
+            return default
+        row = self.db.execute(
+            "SELECT text_value FROM settings_text WHERE key = ?", (key,)
+        ).fetchone()
+        return default if row is None or row[0] is None else str(row[0])
+
+    def delivered(self, kind: str, key: str) -> dict | None:
+        """The delivery record for this event, or None if it never went out.
+
+        PERSISTED, so a restart cannot re-send what the operator has already
+        read. The in-memory guards this replaces reset with the process: after
+        the 13:54 restart the session-close report for the window that closed
+        during the downtime was silently dropped, because the only thing that
+        knew was a module-level dict.
+        """
+        rows = self._dicts(
+            "SELECT * FROM notifications WHERE kind = ? AND event_key = ?",
+            (kind, key),
+        )
+        return rows[0] if rows else None
+
+    def mark_delivered(self, kind: str, key: str, now_ms: int,
+                       message_id: int | None = None,
+                       body: str = "") -> bool:
+        """Record a successful send. True the first time, False afterwards.
+
+        `INSERT OR IGNORE` on the composite primary key, so the uniqueness is
+        the database's and not a read-then-write race in the poll loop.
+        """
+        cursor = self.db.execute(
+            "INSERT OR IGNORE INTO notifications "
+            "(kind, event_key, message_id, body, first_ms, updated_ms) "
+            "VALUES (?,?,?,?,?,?)",
+            (kind, key, message_id, body, now_ms, now_ms),
+        )
+        self.db.commit()
+        return (cursor.rowcount or 0) == 1
+
+    def update_delivered(self, kind: str, key: str, now_ms: int,
+                         body: str) -> None:
+        """Remember the text a message currently shows, after an edit."""
+        self.db.execute(
+            "UPDATE notifications SET body = ?, updated_ms = ? "
+            "WHERE kind = ? AND event_key = ?",
+            (body, now_ms, kind, key),
+        )
+        self.db.commit()
+
+    # --------------------------------------------------------- rotation
+    def insight_for(self, window_open: int, variants: tuple) -> str:
+        """Which insight this market shows. Stable for the whole market.
+
+        Every message about one window - the signal, the fill, the recap -
+        carries the SAME variant, so a reader following a market does not see
+        the extra line change underneath them while the market is still open.
+        The index only moves when a market result has actually been delivered.
+        """
+        if not variants:
+            return ""
+        assigned = self.get_setting_text(f"insight_market:{window_open}")
+        if assigned in variants:
+            return assigned
+        index = int(self.get_setting("insight_index", 0.0))
+        return variants[index % len(variants)]
+
+    def assign_insight(self, window_open: int, variant: str,
+                       now_ms: int) -> None:
+        self.set_setting_text(f"insight_market:{window_open}", variant, now_ms)
+
+    def advance_insight(self, variants: tuple, now_ms: int) -> None:
+        """Move the rotation on. Called ONLY after a delivered result.
+
+        Advancing on composition rather than on delivery would rotate on
+        messages that failed to send, so the operator would never see the
+        variant that was skipped.
+        """
+        if not variants:
+            return
+        index = int(self.get_setting("insight_index", 0.0))
+        self.set_setting("insight_index", float((index + 1) % len(variants)),
+                         now_ms)
 
     def _dicts(self, sql: str, args: tuple = ()) -> list[dict]:
         """Rows as dicts, via a cursor-local factory.

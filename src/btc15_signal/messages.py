@@ -11,6 +11,7 @@ network client or an event loop.
 
 from html import escape
 
+from . import surface
 from .intelligence_policy import VETO
 
 BAR_FULL = "▰"  # ▰
@@ -1600,4 +1601,170 @@ def ledger(*, head: str, rows: list[dict]) -> str:
             f"· running <code>{row['running']:+.2f}</code>"
         )
     lines.append(f"\U0001f4b5 <b>Total {rows[-1]['running']:+,.2f}</b>")
+    return "\n".join(lines)
+
+
+# ===================================================================== v2
+#
+# THE SHARED SURFACE. Every trading and learning message below is assembled by
+# `surface.compose` in the one fixed order, from the one icon vocabulary, with
+# one money snapshot and at most one rotating insight. The older builders above
+# remain for the paths that have not moved and for the tests that pin them.
+
+
+def signal_message(*, side: str, ticker: str, ask: float, remaining: int,
+                   confidence: str, facts: list[dict], executable: bool,
+                   status_line: str, snapshot=None, insight: str = "",
+                   band_hold: tuple[int, int] | None = None,
+                   distance_text: str = "", priority=None,
+                   verdict: str = "") -> str:
+    """A signal, executed or not. The checks are always visible.
+
+    `confidence` is the ONE Kalshi-native confidence result, computed once by
+    `main.model_confidence_points` and passed in - never recomputed here, and
+    never recomputed differently in a details body. It describes how good the
+    setup looks and says nothing about whether it may be traded; a refused
+    signal reading MEDIUM is correct and not a contradiction.
+    """
+    label = verdict or ("ENTRY READY" if executable else "NOT EXECUTED")
+    essentials = [
+        f"{surface.PRICE} Ask {surface.cents(ask)} · "
+        f"{surface.CLOCK} {remaining // 60}m {remaining % 60:02d}s",
+    ]
+    if distance_text:
+        essentials.append(f"{surface.TARGET} {escape(distance_text)}")
+    essentials.append(
+        f"{surface.LEARNING} Confidence {escape(confidence)} · "
+        f"Entry checks {surface.checks_summary(facts)}"
+    )
+    return surface.compose(
+        header=f"{surface.side_icon(side)} <b>{escape(side)} SIGNAL · "
+               f"{escape(label)}</b>",
+        ticker=ticker,
+        essentials=essentials,
+        checks=surface.checks_block(facts, band_hold),
+        status=status_line,
+        snapshot=snapshot,
+        priority=priority,
+        insight=insight,
+    )
+
+
+def fill_message(*, side: str, ticker: str, contracts: float, paid: float,
+                 fee: float | None, remaining: int, confidence: str,
+                 facts: list[dict], snapshot=None, insight: str = "",
+                 band_hold: tuple[int, int] | None = None,
+                 decision_ask: float | None = None, priority=None) -> str:
+    """An executed entry. Cost and maximum profit are both NET.
+
+    The old fill report printed `Maximum profit contracts - cost` with no fee
+    term while the settlement recap for the same trade subtracted the charged
+    fee, so the fill promised $0.20 and the recap paid $0.19.
+    """
+    essentials = [
+        f"{surface.PACKAGE} {contracts:g} contract"
+        f"{'s' if contracts != 1 else ''} filled at {surface.cents(paid)}",
+        surface.entry_cost(contracts, paid, fee),
+        surface.max_net_profit(contracts, paid, fee),
+    ]
+    if decision_ask is not None:
+        better = decision_ask - paid
+        essentials.append(
+            f"\U0001f9fe Decision ask {surface.cents(decision_ask)} · "
+            f"filled {surface.cents(paid)} "
+            f"({abs(better) * 100:.1f}¢ {'better' if better > 0 else 'worse'})"
+        )
+    essentials.append(
+        f"{surface.LEARNING} Confidence {escape(confidence)} · "
+        f"Entry checks {surface.checks_summary(facts)}"
+    )
+    return surface.compose(
+        header=f"{surface.side_icon(side)} <b>{escape(side)} FILLED</b>",
+        ticker=ticker,
+        essentials=essentials,
+        checks=surface.checks_block(facts, band_hold),
+        status=f"{surface.CLOCK} {remaining // 60}m {remaining % 60:02d}s "
+               f"to expiry",
+        snapshot=snapshot,
+        priority=priority,
+        insight=insight,
+    )
+
+
+def result_message(*, side: str, ticker: str, winner: str, won: bool,
+                   traded: bool, pnl: float | None, contracts: float = 0.0,
+                   paid: float | None = None, exited_at: float | None = None,
+                   snapshot=None, insight: str = "", priority=None) -> str:
+    """How a window closed. Direction and outcome are separate chips.
+
+    An untraded signal is scored on the CALL and says so in words; a traded one
+    is scored on the MONEY. A position sold at 100c on a market that later
+    settles the other way is a profit AND a wrong call, and both get a line.
+    """
+    chip = surface.result_icon(pnl, traded, won)
+    if not traded:
+        headline = f"SIGNAL {'WON' if won else 'LOST'} · NOT TRADED"
+    elif exited_at is not None:
+        headline = "SOLD EARLY"
+    else:
+        headline = "TRADE CLOSED"
+    essentials = [
+        f"{surface.side_icon(side)} "
+        + ("Took" if traded else "Signal:")
+        + f" <b>{escape(side)}</b>"
+        + (f" at {surface.cents(paid)}" if paid is not None else ""),
+        f"\U0001f3c1 Market settled <b>{escape(winner)}</b>",
+    ]
+    if exited_at is not None:
+        essentials.append(
+            f"{surface.PRICE} Sold before expiry at "
+            f"{surface.cents(exited_at)}"
+        )
+        essentials.append(
+            f"{surface.PASS if won else surface.FAIL} {escape(side)} "
+            f"prediction was {'correct' if won else 'wrong'}"
+        )
+    if not traded:
+        essentials.append(surface.NO_TRADE)
+    elif pnl is not None:
+        essentials.append(
+            f"{surface.PRICE} Realised "
+            f"<b>{surface._signed_dollars(pnl)}</b> <i>(net of fees)</i>"
+        )
+    status = surface.ALREADY_COUNTED if exited_at is not None else ""
+    return surface.compose(
+        header=f"{chip} <b>{escape(headline)}</b>",
+        ticker=ticker,
+        essentials=essentials,
+        checks=[],
+        status=status,
+        snapshot=snapshot,
+        priority=priority,
+        insight=insight,
+    )
+
+
+def learning_update(*, markets: int, confidence_changes: int,
+                    entry_changes: int, detail: str = "") -> str:
+    """The learning notification. Plain language, no policy identifiers.
+
+    Policy ids, fingerprints, retired methods and training splits stay in the
+    log and in `/learning` details. This message answers one question: did the
+    rules the bot trades by change?
+    """
+    lines = [
+        f"{surface.LEARNING} <b>LEARNING UPDATE</b>",
+        "",
+        f"\U0001f4da Reviewed: {markets:,} markets",
+        f"{surface.TARGET} Confidence changes: "
+        + (f"{confidence_changes}" if confidence_changes else "None"),
+        "\u2699\ufe0f Entry-rule changes: "
+        + (f"{entry_changes}" if entry_changes else "None"),
+        "",
+    ]
+    if detail:
+        lines.append(detail)
+    elif not confidence_changes and not entry_changes:
+        lines.append(f"{surface.PASS} Current trading rules remain unchanged.")
+    lines.append("\U0001f504 Automatic learning continues.")
     return "\n".join(lines)
