@@ -186,3 +186,19 @@ def test_every_binance_constructor_in_src_is_guarded():
     assert found, "expected to find the constructors"
     unguarded = [name for name, guarded in found if not guarded]
     assert not unguarded, f"unguarded Binance construction in {unguarded}"
+
+
+def test_no_binance_attribute_is_used_without_a_none_check():
+    """Three call sites had to be found one at a time - `latest`, `close` and
+    `seconds` - and the last only surfaced in a live log line because it was
+    caught and logged rather than raised. This walks the source instead."""
+    import re
+    path = (Path(__file__).resolve().parents[1] / "src" / "btc15_signal"
+            / "reference_shadow.py")
+    text = path.read_text(encoding="utf-8")
+    for match in re.finditer(r"self\._binance\.(\w+)", text):
+        # Look BOTH ways: `x.y() if x is not None else z` guards after the
+        # call, `if x is not None: x.y()` guards before it.
+        window = text[max(0, match.start() - 300):match.end() + 200]
+        assert "self._binance is not None" in window, (
+            f"self._binance.{match.group(1)} is unguarded")

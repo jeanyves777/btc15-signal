@@ -403,7 +403,7 @@ class ReferenceShadow:
         # Binance per-second over the SAME sixty seconds. Cached so a rerun is
         # free and a rate limit cannot half-write a row.
         bars = self._store.second_bars("binance_spot", start, close_ms)
-        if len(bars) < 30:
+        if len(bars) < 30 and self._binance is not None:
             try:
                 bars = await self._binance.seconds(start, close_ms)
                 if bars:
@@ -411,6 +411,11 @@ class ReferenceShadow:
             except Exception as exc:  # noqa: BLE001
                 print(f"reference: 1s fetch failed for {ticker}: {exc!r}", flush=True)
                 bars = []
+        # Under kalshi_only there is no client, so the decomposition columns
+        # below stay NULL for new rows. Already-cached bars are still used -
+        # they are history, and history is kept. The reconciliation of our
+        # computed BRTI mean against Kalshi's own `expiration_value` does not
+        # involve Binance at all and continues unaffected.
 
         binance_mean = sum(p for _, p in bars) / len(bars) if bars else None
         binance_last = bars[-1][1] if bars else None
