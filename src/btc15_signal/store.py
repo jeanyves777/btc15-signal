@@ -1211,15 +1211,21 @@ class Store:
             key = "no_price" if add["side"] == "DOWN" else "yes_price"
             cost = sum(float(f["count"] or 0) * float(f[key] or 0) for f in fills)
             fee = sum(float(f["fee_cost"] or 0) for f in fills)
+            # THROUGH `record_add_fill`, not around it. That method also
+            # charges the lifetime add budget; writing the row directly would
+            # restore the record while leaving the budget believing the money
+            # had never been spent. It is guarded on `filled_count = 0`, so
+            # the idempotence comes with it.
+            self.record_add_fill(
+                add["client_order_id"], count, round(cost / count, 6), fee,
+                int(fills[0]["filled_ms"] or 0),
+                is_taker=fills[0]["is_taker"],
+            )
             self.db.execute(
-                "UPDATE recovery_adds SET state = ?, filled_count = ?, "
-                "fill_price = ?, fill_ms = ?, fee_paid = ?, is_taker = ?, "
-                "cancel_reason = ?, updated_ms = ? WHERE client_order_id = ?",
-                ("RECOVERY ADD EXECUTED", count, round(cost / count, 6),
-                 fills[0]["filled_ms"], fee, fills[0]["is_taker"],
-                 f"reconciled from broker fills; previously recorded as "
-                 f"{add['state']}"[:200],
-                 fills[0]["filled_ms"], add["client_order_id"]),
+                "UPDATE recovery_adds SET cancel_reason = ? "
+                "WHERE client_order_id = ?",
+                (f"reconciled from broker fills; previously recorded as "
+                 f"{add['state']}"[:200], add["client_order_id"]),
             )
             fixed += 1
         if fixed:

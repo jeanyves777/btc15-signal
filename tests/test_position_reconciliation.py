@@ -301,3 +301,35 @@ def test_rows_keyed_on_the_old_contract_are_excluded_not_rekeyed():
         "ask": 0.8, "brti_normalized_distance": 12.0,
         "brti_aligned_momentum_bps": 7.0,
     }) is not None
+
+
+def test_the_repair_charges_the_add_budget(tmp_path):
+    """`record_add_fill` charges `_bump_add_budget`. A repair that wrote the
+    row directly would restore the record while leaving the lifetime budget
+    believing the money had never been spent - and seven of these needed
+    repairing."""
+    store = build(tmp_path)
+
+    def committed():
+        row = store._dicts("SELECT committed, fills FROM recovery_add_budget")
+        return (row[0]["committed"], row[0]["fills"]) if row else (0.0, 0)
+
+    before = committed()
+    store.reconcile_recovery_adds(W)
+    after = committed()
+    assert after[0] > before[0], "the repaired fill must consume budget"
+    assert round(after[0] - before[0], 4) == 0.83
+    assert after[1] == before[1] + 1
+
+
+def test_the_repair_charges_the_budget_only_once(tmp_path):
+    store = build(tmp_path)
+
+    def committed():
+        row = store._dicts("SELECT committed FROM recovery_add_budget")
+        return row[0]["committed"] if row else 0.0
+
+    store.reconcile_recovery_adds(W)
+    once = committed()
+    store.reconcile_recovery_adds(W)
+    assert committed() == once
