@@ -533,6 +533,14 @@ print(sum(st.reconcile_recovery_adds(w) for w in ws), 'repaired')
 
 ## Reading a money message
 
+One command prints everything a market's message should reconcile
+against - local records, every broker order and fill by ID, and the
+settlement:
+
+```bash
+.venv/Scripts/python.exe scripts/trace_market.py KXBTC15M-26SEP231615-15
+```
+
 **Check it against itself.** Entry price, quantity and exit must produce the
 stated P&L. On 2026-09-23 a recap read "Bought DOWN at 85c / Cost $1.72 /
 Profit +$0.45" - and 2 x (99.7c - 85c) is 29.4c, so it could not. The
