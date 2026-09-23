@@ -3851,6 +3851,59 @@ that contain flipped windows. The boundary now falls between MARKETS and every
 row of a window travels with it; the slice sizes are approximate instead of
 exact, which is the correct trade.
 
+
+### The method needed a version too, and the guard paid for itself immediately
+
+Correcting confidence from profit to calibration left a live artefact whose
+two deltas had been fitted by the superseded method. Nothing would have caught
+it: `feature_version` still said `brti-1`, the fingerprint still matched, and
+the deltas were integers in the same field they had always been in. The
+corrected build would have gone on applying the old method's numbers to live
+decisions until the next scheduled refit hours later.
+
+So the METHOD is versioned like the features. `feature_version` says what the
+numbers ARE; `model_version` says what was DONE to them, and they fail the same
+way - by looking applied.
+
+    arms-shrunk-2      confidence sized from profit
+    arms-calibrated-1  confidence sized from the calibration error, validated
+                       out of sample
+
+`policy_is_valid` now refuses a superseded artefact beside the retirement guard
+and the feature check, and the refusal makes a rebuild due. On the next start
+it did exactly that, unprompted:
+
+    learning: active policy CANNOT ACT - fitted by superseded method
+              arms-shrunk-2 (current arms-calibrated-1)
+    learning: training run 2 started [bootstrap] over 43 settled markets
+    learning: run 2 ACTIVATED - 6471 markets, 128 arms, 0 with confidence,
+              0 promoted
+
+### AN OUTAGE I CAUSED: 2026-09-23 13:54:28Z to 13:57:01Z
+
+Verifying the corrections took seven service restarts inside one hour.
+`watchdog.py` has `MAX_RESTARTS_PER_HOUR = 6`, and on the seventh it did
+exactly what it is built to do: stopped, sent `WATCHDOG STOPPED`, and left
+nothing running. **The service was down for two and a half minutes with no
+supervisor.** Only the recorder survived; the watchdog had to be started by
+hand, and it brought the service back up itself.
+
+Nothing was lost - no signal qualified in that window and the open position
+lives at Kalshi and settles regardless of whether this process is up - but
+that is luck, not design.
+
+**The lesson is about deployment, not about the watchdog.** The cap is correct
+and it protected the account from a restart loop. What was wrong was treating a
+live trading service as somewhere to iterate: each fix was small, each restart
+looked free, and the sixth was indistinguishable from the first. A restart
+budget is a real resource and it is spent silently.
+
+**How to apply:** batch changes and deploy once. Before any restart, count the
+restarts already made in the last hour - `runtime/watchdog.log` and the process
+creation times both show them - and if the count is near six, stop and wait out
+the hour rather than spending the last one. If the watchdog is gone, start THE
+WATCHDOG, not the service: it takes the lock and brings the service up itself.
+
 ### What is live, and what is not
 
     running                          YES  - scheduled, persisted, restart-safe
