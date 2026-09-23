@@ -3904,14 +3904,106 @@ creation times both show them - and if the count is near six, stop and wait out
 the hour rather than spending the last one. If the watchdog is gone, start THE
 WATCHDOG, not the service: it takes the lock and brings the service up itself.
 
+
+### CORRECTION: attribution, through the broker's own fill and order ids
+
+Matching an aggregate is not attribution. The +$3.3803 total agreed with
+`SUM(settlements.pnl)` while the rule deciding WHICH DECISION each trade
+belonged to was a heuristic: "the leg that cost more is the one we opened".
+
+It fails in the worst place. Buy YES at 0.80, watch it fall, cash out by buying
+NO at 0.85, and the NO leg is the expensive one - so the heuristic reports the
+position we exited INTO as the position we took. Measured over this account's
+**60 closed pairs it misattributes 6**, including a -$1.75 loser whose side it
+inverts.
+
+Attribution now runs off the fills, in time order, and is CHECKED:
+
+    first fill chronologically   the entry; its leg is our side
+    later fills on that leg      adds (the recovery add-ons)
+    fills on the opposite leg    the exit - Kalshi books a close as buying
+                                 the other side
+    fill_id / order_id           carried onto the row, so any figure traces
+                                 back to the executions behind it
+
+Rebuilding `yes_count`/`no_count`/`yes_cost`/`no_cost` from the fills must
+reproduce the settlement row. **That check is what makes this attribution
+rather than another guess**, and it settled the convention empirically rather
+than by reading: every fill acquires `count` contracts of its named `side` at
+that side's price, whatever `action` says - which reproduces the exchange's
+totals on **154 of 154** settled tickers, against 61 of 154 for reading
+`action` as a signed direction.
+
+Where the reconstruction does not reconcile the market is UNRESOLVED and is
+**excluded from execution-based learning entirely** - not quietly demoted to a
+counterfactual, because something really did happen there.
+
+    executions            26  (was 25; one more resolved by fill order)
+    contracts             49
+    multi-fill executions  2  (one with 2 adds, one with 1)
+    unresolved             0
+    net per-contract x size  +3.7196  ==  SUM(settlements.pnl)
+
+### CORRECTION: confidence calibrates OUR model, not Kalshi's price
+
+The previous pass compared the observed win rate with the ASK. The ask is the
+MARKET's prediction, so that measures whether Kalshi is priced correctly - a
+real question, and not the one a confidence label answers.
+
+`confidence_label` scores a setup out of 100 from its passing gates and the
+time of day. That score is the prediction we display, so it is the prediction
+that has to be compared with outcomes. It is now **recorded on every decision**
+(`intelligence_decisions.model_points`) before any learned adjustment touches
+it, and reconstructed for the corpus through the SAME function the live path
+calls - `regime.model_points`, one definition, both callers.
+
+That parity is not decorative. The first attempt passed `0` for the protective
+level term, where the live path calls `level_points(False)` and gets **-6**, so
+every historical row scored six points above the live one and the "calibration"
+was a comparison between two implementations. A test now pins the two
+expressions equal.
+
+**The model's score is informative, and unevenly so** - the reliability curve
+over the training slice, which is published on the artefact:
+
+    points 0-69    0.54 - 0.63      essentially flat: no information
+    points 70-79   0.77
+    points 80-89   0.79
+    points 90-100  0.86
+
+So the upper half of the score carries real signal and the lower half carries
+almost none. That is worth knowing and is invisible if the only thing ever
+compared with outcomes is the price.
+
+**The two calibrations disagree, which is the point.** For
+`us · mid · bd10-15 · px85-94|accept`:
+
+    model  : predicted 0.840, observed 0.893, gap +0.0529 [+0.0061,+0.0979]
+    market : ask       0.885, observed 0.893, gap +0.0076 [-0.0404,+0.0538]
+
+Kalshi has this cell priced about right. OUR confidence score understates it by
+five points, out of sample as well (validate n=59, +0.1462, same sign). So this
+build carries **one validated confidence adjustment: +5 points** in that cell -
+earned against the model's own prediction, with the market comparison recorded
+beside it and never applied.
+
+**An interval spanning zero is insufficient evidence, not a finding.** The
+wording now says so explicitly: "INSUFFICIENT EVIDENCE at n=..., not a finding
+that the score is correct". The earlier text claimed the price "is not
+measurably wrong here", which reads as a result and is not one.
+
+`arms-calibrated-1` is retired with the rest: an artefact whose deltas were
+sized against the ask cannot act.
+
 ### What is live, and what is not
 
     running                          YES  - scheduled, persisted, restart-safe
     updating                         YES  - refits on settlements or 6h
-    adjusting confidence             NO   - 0 arms, after the calibration
-                                            correction above. Every eligible
-                                            cell's calibration interval
-                                            includes zero.
+    adjusting confidence             YES  - 1 arm, +5 points, earned against
+                                            the MODEL's own recorded score and
+                                            validated out of sample. Label
+                                            only; it reaches no gate and no
+                                            size.
     authorised to affect execution   NO   - 0 arms cleared the evidence bar,
                                             and the operator's two switches
                                             are not set either
