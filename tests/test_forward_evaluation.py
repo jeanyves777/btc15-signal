@@ -318,3 +318,56 @@ def test_the_summary_separates_genuinely_distinct_markets(tmp_path):
     summary = store.intelligence_summary()["neutral"]
     assert summary["n"] == 2, "two windows are two opportunities"
     assert summary["wins"] == 1, "only the UP window won"
+
+
+def test_a_flipped_window_keeps_both_sides_with_their_own_outcomes(tmp_path):
+    """One market can hold UP and DOWN decisions that settle OPPOSITELY.
+    Collapsing to one row per window discards a real decision and hands the
+    survivor's outcome to both - which is how 01:15Z would have read as a
+    clean win when one of its two sides lost."""
+    store = Store(str(tmp_path / "s.db"))
+    for side in ("UP", "DOWN"):
+        for poll in range(3):
+            store.record_intelligence({
+                "window_open": 700, "decided_ms": NOW + poll,
+                "base_qualified": 0, "final_action": "neutral",
+                "confidence_delta": 0, "side": side,
+            })
+    store.grade_intelligence(700, "DOWN", 0.0, NOW + 9)
+    summary = store.intelligence_summary()["neutral"]
+    assert summary["n"] == 2, "two sides are two decisions, not one window"
+    assert summary["wins"] == 1, "only DOWN won; UP must not inherit its result"
+
+
+def test_the_selected_decision_is_the_first_qualifying_poll(tmp_path):
+    """A defined rule, not an arbitrary row: the bot acts on the first poll
+    that qualifies, so that is the decision the scoreboard scores."""
+    store = Store(str(tmp_path / "s.db"))
+    for poll, qualified in enumerate((0, 0, 1, 1)):
+        store.record_intelligence({
+            "window_open": 800, "decided_ms": NOW + poll, "ask": 0.70 + poll / 100,
+            "base_qualified": qualified, "final_action": "neutral",
+            "confidence_delta": 0, "side": "UP",
+        })
+    store.grade_intelligence(800, "UP", 0.0, NOW + 9)
+    rows = store._dicts(
+        "SELECT * FROM intelligence_decisions WHERE base_qualified=1 "
+        "ORDER BY decided_ms LIMIT 1"
+    )
+    assert rows[0]["ask"] == 0.72, "the FIRST qualifying poll, not the last"
+    assert store.intelligence_summary()["neutral"]["n"] == 1
+
+
+def test_graded_and_pending_are_different_denominators(tmp_path):
+    """'3 wins of 4' is ambiguous when one is unsettled: wins are out of
+    GRADED, and a pending market is not a loss."""
+    store = Store(str(tmp_path / "s.db"))
+    for window in (900, 901):
+        store.record_intelligence({
+            "window_open": window, "decided_ms": NOW, "base_qualified": 1,
+            "final_action": "neutral", "confidence_delta": 0, "side": "UP",
+        })
+    store.grade_intelligence(900, "UP", 0.0, NOW + 1)   # 901 left unsettled
+    summary = store.intelligence_summary()["neutral"]
+    assert summary["n"] == 2 and summary["graded"] == 1
+    assert summary["wins"] == 1, "1 of 1 graded, not 1 of 2 seen"

@@ -3114,14 +3114,61 @@ checks what that costs: features absent, stale, or belonging to another window
 fallback to the Binance-scale numbers - a missing row is visible in the log,
 a mislabelled one is not.
 
-### The scope error: first minute is not the policy
+### What the replay actually models - and what it does not
+
+**Correction, and it matters more than the one below it.** I called the
+chronological replay "the deployed policy". It is not. It is a **proposed
+BRTI-calibrated entry rule**, replayed in the order the bot sees minutes.
+Qualification in this corpus is **not a confirmed trade and not a fill**.
+
+| | deployed | replay |
+|---|---|---|
+| contract price band 70-93c | yes | **yes** |
+| normalized distance | Binance, `>= 1.5` | **BRTI, `>= 10.0`** |
+| momentum alignment | **not required** | **required** |
+| model confidence `>= 0.50` | yes | **not modelled** |
+| max spread 2.0 bps | yes | **not modelled** |
+| **band-hold `entry_band_settle_s` = 60s** | yes | **not modelled** |
+| one open position at a time | yes | **not modelled** |
+| retries (`auto_retry_limit` 3, drift 0) | yes | **not modelled** |
+| daily loss floor / trades per day | yes | **not modelled** |
+| an actual fill | required | **assumed at the recorded ask** |
+
+The band-hold is the one that bites hardest, and the config already says so:
+entering on the FIRST qualifying minute measures **+0.0080/ct, CI [-0.0019,
++0.0180] - which does not clear zero**, while requiring time in the band
+gives +0.0149 [+0.0032, +0.0260]. The replay does the first of those.
+
+The live log from 2026-09-22 22:00Z shows it refusing five qualifying minutes
+in one window on exactly that rule:
+
+    21:50:34 auto[...DOWN@0.72 568s]: eligible
+    21:50:34 auto: declined - price has only held the band 0s, waiting for 60s
+    21:52:43 auto[...DOWN@0.80 438s]: eligible
+    21:52:43 auto: declined - price has only held the band 0s, waiting for 60s
+    21:52:56 ... held the band 14s, waiting for 60s
+    21:53:10 ... held the band 27s, waiting for 60s
+    21:53:52 ... held the band 0s, waiting for 60s
+
+Five qualifying minutes, no trade. Earlier the same evening: `declined - 1
+position(s) already open`. So the 3,495 "qualified" markets are an **upper
+bound on opportunities**, materially larger than the set the bot would have
+traded, and every per-contract figure computed from them describes a rule
+that could be deployed, not the one that is.
+
+That does not invalidate the comparison below - both legs are computed the
+same way, so the *relative* first-minute-versus-chronological point stands -
+but the absolute numbers are not the shipped strategy's P&L and must not be
+quoted as it.
+
+### The scope error: first minute is not chronological replay
 
 **The figures above are first-minute analysis, and are labelled as such from
-here on.** They judge each market once, at 660s remaining. The deployed
-strategy does not: it scans every poll from 660s to 360s, takes the **first**
-minute whose gates pass, alerts once and stops. A market refused at 11
-minutes and qualified at 8 is a market the bot **buys** - and first-minute
-analysis files it under "refused".
+here on.** They judge each market once, at 660s remaining. The scanning rule
+does not: it walks every poll from 660s to 360s, takes the **first** minute
+whose gates pass, and stops. A market refused at 11 minutes and qualified at
+8 is one the rule **selects** - and first-minute analysis files it under
+"refused".
 
 It mislabels **2,213 markets** that way, and the correction moves both legs:
 
@@ -3180,20 +3227,40 @@ crosses zero. **It does not promote.** Two markets short is still short, and
 moving the threshold to fit the candidate in front of it is the one thing
 that would make the bar meaningless.
 
-Worth noting what it is: a proposal to *demote* high-priced Asian-session
-contracts - the pattern the operator suspected from watching a long Asian
-winning run end badly. The corpus now says the same thing, and says it
-without enough evidence to act on yet.
+**It is NOT the rejected-winner hypothesis.** I claimed it confirmed the
+operator's earlier suspicion about demoting high-confidence signals. It does
+not. That hypothesis was about *rejected winners* and about the model's own
+confidence; this candidate is about a different group entirely - contracts
+the rule **accepts**, selected by their **price** (85-94c), in one session.
+Two different claims that happen to share the word "high". The rejected-
+winner question remains open and this says nothing about it.
 
-It is also a clean illustration of why this file reports edge and not win
-rate. That cell wins **184 of 215 - 85.6%** - and is still the candidate the
-model wants to veto, because at 85-94c a contract has to win about 90% of the
-time before fees to break even. A long run of wins there is what losing money
+It is a clean illustration of why this file reports edge and not win rate.
+The cell wins **126 of 143 on the training split - 88.1%** - and is still the
+candidate the model wants to veto, because at 85-94c a contract needs about
+90% before fees to break even. A long run of wins there is what losing money
 slowly looks like.
 
-The cell fires **3.16 times a day**, so forward n=60 is ~19 days out and
-n=120 ~38 days - faster than the first-minute candidate's 1.35/day, but still
-weeks, not sessions.
+**Holdout disclosure.** I first quoted this as "184 of 215 (85.6%)". That
+figure spans train + validate + **holdout**:
+
+| split | n | won | |
+|---|---:|---:|---|
+| train | 143 | 126 | 88.1% |
+| validate | 38 | 31 | 81.6% |
+| holdout | 34 | 27 | **79.4%** |
+
+Candidate *selection* never read the holdout - the code fits on `train` and
+tests `promotes` against `validate` only, and that is verifiable in
+`train_brti_candidates.py`. But **I read it, and reported it**, so the
+holdout is no longer clean *for this candidate*: any future argument I make
+about c01 that leans on those 34 markets is circular. The train figure is the
+one to quote, and the promotion evidence has to come from forward data the
+model has never seen. Which is what forward evaluation is for.
+
+The cell fires **3.16 times a day** across the corpus, so forward n=60 is ~19
+days out and n=120 ~38 - faster than the first-minute candidate's 1.35/day,
+but still weeks, not sessions.
 
 ### Feature parity, measured rather than asserted
 

@@ -2831,28 +2831,46 @@ class Store:
         examined, and the same correction the training corpus needed applies
         to the live table.
 
-        `wins` counts windows whose LAST graded decision won, because that is
-        the decision the window ended on.
+        THREE THINGS THAT ARE NOT THE SAME, and this counts only the first:
+
+            signal decision    the rule qualified at this poll
+            order eligibility  AND the price has held the band 60s, no
+                               position is open, the daily limits allow it
+            execution          AND an order was submitted, and filled
+
+        The row selected per (window, side, action) is the first poll whose
+        SIGNAL qualified. That is not "what the bot acts on" - an earlier
+        version of this docstring said so and it was wrong. On 2026-09-22 the
+        22:00Z window qualified at 568s, 438s, 425s, 411s and 369s and traded
+        none of them, because the price had held the band 0-27s against a
+        required 60. Order eligibility lives in `trade_proposals`; fills and
+        fees live in the broker ledger.
+
+        Side is part of the key on purpose. A window the model flips inside
+        holds UP and DOWN decisions that settle OPPOSITELY, and collapsing
+        them to one row per window would discard a real decision and give the
+        survivor's outcome to both.
+
+        `n` counts DECISIONS, not independent samples. Two decisions in one
+        window share a market, a price path and an outcome, so callers that
+        need a denominator for statistics want `markets`, reported beside it.
         """
         rows = self._dicts(
             "SELECT final_action, COUNT(*) AS n, "
+            "COUNT(DISTINCT window_open) AS markets, "
             "COALESCE(SUM(won), 0) AS wins, "
-            "COALESCE(SUM(pnl), 0) AS pnl, "
-            "COALESCE(SUM(graded), 0) AS graded FROM ("
-            "  SELECT window_open, final_action, "
-            "         MAX(decided_ms) AS last_ms, "
-            "         (SELECT d2.won FROM intelligence_decisions d2 "
-            "          WHERE d2.window_open = d.window_open "
-            "            AND d2.final_action = d.final_action "
-            "          ORDER BY d2.decided_ms DESC LIMIT 1) AS won, "
-            "         (SELECT COALESCE(d3.realised_pnl, 0) "
-            "          FROM intelligence_decisions d3 "
-            "          WHERE d3.window_open = d.window_open "
-            "            AND d3.final_action = d.final_action "
-            "          ORDER BY d3.decided_ms DESC LIMIT 1) AS pnl, "
-            "         MAX(graded_ms IS NOT NULL) AS graded "
+            "COALESCE(SUM(won IS NOT NULL), 0) AS graded, "
+            "COALESCE(SUM(pnl), 0) AS pnl FROM ("
+            "  SELECT d.window_open, d.side, d.final_action, d.won, "
+            "         COALESCE(d.realised_pnl, 0) AS pnl "
             "  FROM intelligence_decisions d "
-            "  GROUP BY window_open, final_action"
+            "  WHERE d.id = ("
+            "    SELECT d2.id FROM intelligence_decisions d2 "
+            "    WHERE d2.window_open = d.window_open "
+            "      AND IFNULL(d2.side,'') = IFNULL(d.side,'') "
+            "      AND d2.final_action = d.final_action "
+            "    ORDER BY d2.base_qualified DESC, d2.decided_ms ASC LIMIT 1"
+            "  )"
             ") GROUP BY final_action"
         )
         return {r["final_action"]: r for r in rows}
