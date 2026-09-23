@@ -4253,8 +4253,10 @@ setup last. Measured over 6,491 decisions on 6,475 markets:
     vol · distance · price              41     15     5,882  (91%)
     distance · price  (setup only)      16      8     6,352  (98%)
 
-**Session and regime fragment the corpus and leave 42% of every decision the
-system has ever taken in a cell too small to speak.** The largest deployed cell
+**Session and regime fragment the ASSEMBLED TRAINING DATASET and leave 42% of
+its decisions in a cell too small to speak.** That dataset is 99.3% backfilled
+archive; the live system's own record is 1,376 decisions over 56 markets. See
+the population correction below. The largest deployed cell
 holds 345 decisions; the largest setup-only cell holds 1,798. That is the
 symptom this file has been circling - almost nothing clears any bar - and a
 large part of it is the partition, not the market.
@@ -4269,8 +4271,9 @@ about why:
     session · distance · price    11         4              0
 
 Five of seven setup-only cells clear zero raw against two under the deployed
-key, so the extra evidence is real. None survives the multiplicity widening
-under any scheme. The binding constraint is **independent DAYS, not markets**:
+key, so the extra evidence is real. The `survive multiplicity` column used
+sqrt(k), which is NOT a valid correction - see the correction below, where a
+proper Holm-Bonferroni test rejects one cell under the deployed keying. The binding constraint is **independent DAYS, not markets**:
 the interval is bootstrapped by day, so a cell with 1,798 decisions spread over
 the same ~70 days is barely narrower than one with 345. More markets per cell
 does not buy what it looks like it buys.
@@ -4298,6 +4301,82 @@ So the change is declared here, before it is evaluated:
 Not shipped in this release. The current build is safe - zero adjustments, and
 nothing is being acted on - so it goes out after the pending scheduled-training
 proof rather than resetting that clock for a third time.
+
+
+### CORRECTION: sqrt(k) is not a multiple-comparison correction, and it hid a result
+
+The previous two entries reported "neither survives the sqrt(k) widening" and
+"none survives any scheme" as though that settled significance. It does not.
+**sqrt(k) widening of a bootstrap interval is ad hoc** - it has no stated
+coverage guarantee, it is not a test, and reporting its verdict as a finding
+overstates what was established.
+
+Replaced with two established corrections on a two-sided day-clustered
+bootstrap p-value (4,000 draws, resampling days):
+
+    Holm-Bonferroni     controls the family-wise error rate - any false
+                        positive at all. The conservative choice, and the right
+                        one when a single false positive puts a wrong number on
+                        the operator's screen.
+    Benjamini-Hochberg  controls the false discovery rate. Reported beside it
+                        because it is the usual choice for screening many
+                        cells.
+
+The seven cells with nested out-of-sample evidence, worst p first:
+
+    cell                                      n     mean       p   Holm   BH
+    us · mid · bd10-15 · px70-85|accept     185  -0.0777  0.0055   YES   YES
+    us · mid · bd10-15 · px85-94|accept     142  +0.0625  0.0225    no    no
+    us · mid · bd<5 · px<70|reject          209  -0.0504  0.1230    no    no
+    asia · mid · bd<5 · px<70|reject        168  -0.0431  0.3035    no    no
+    europe · mid · bd10-15 · px70-85|accept 154  -0.0325  0.3250    no    no
+    europe · mid · bd<5 · px<70|reject      146  -0.0215  0.5515    no    no
+    asia · mid · bd10-15 · px70-85|accept   216  -0.0119  0.6920    no    no
+
+**ONE CELL SURVIVES A PROPER FAMILY-WISE CORRECTION.**
+`us · mid · bd10-15 · px70-85|accept` at p = 0.0055 against a Holm threshold of
+0.05/7 = 0.0071, over 185 nested out-of-sample observations across 38 days. The
+second candidate fails both corrections (Holm threshold 0.0083, BH threshold
+0.0143, against p = 0.0225).
+
+sqrt(7) = 2.65 rejected both, which is roughly a 99.6% interval - so the ad hoc
+rule was not merely unjustified, it was far more conservative than the
+correction it stood in for, and it suppressed a result that a stated method
+supports. That is the same class of error as an unjustified activation, in the
+other direction, and it is worse for being reported as though it were rigorous.
+
+**What this does and does not establish.** It is evidence that the confidence
+SCORE deviates in that cell - it wins about 7.8 points less often than the
+de-biased mapping predicts. It is not a probability correction, the mapping's
+level is still only validated as a ranking, and Holm accounts for the seven
+cells but NOT for the four keying schemes that have now been examined. That
+outer layer of selection is uncorrected, which is a further reason the
+setup-first keying had to be declared before evaluation rather than chosen
+after it.
+
+Nothing is activated on this. The next release evaluates the declared
+setup-first keying under Holm, and whatever clears there is what gets decided
+about.
+
+### CORRECTION: two populations, and they are not the same
+
+The coverage table said "42% of every decision the live system has taken" sits
+in cells too small to speak. Wrong twice: it describes the ASSEMBLED TRAINING
+DATASET, and that dataset is 99.3% backfilled archive.
+
+    POPULATION 1 - the live system's own record
+      intelligence_decisions   1,376 rows over 56 markets (all policies)
+      of which BRTI-keyed      1,207 rows over 48 markets
+
+    POPULATION 2 - the assembled training dataset
+      archive (backfilled BRTI, priced on Kalshi candles)   6,428 markets
+      live (one row per market-side, settled)                  48 markets
+      TOTAL                                    6,476 markets / 6,493 rows
+
+The coverage figures are about Population 2. The live system has taken
+1,376 decisions, not 6,493, and the fragmentation finding is a statement about
+what the fitter can learn from the assembled corpus - which is the right thing
+to say, but it has to be said in those words.
 
 ### What is live, and what is not
 
