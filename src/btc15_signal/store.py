@@ -2842,11 +2842,16 @@ class Store:
         deposits, withdrawals and unrealised marks never enter here.
 
         ROUNDING. The total is summed from UNROUNDED rows and rounded once, at
-        the end. Adding up displayed components instead gives a different
-        answer: the realised legs are 43.2257 and -42.5142, which sum to
-        0.7115 -> $0.71, while 43.23 - 42.51 reads $0.72. The cent is rounding,
-        not a missing trade, and the fix is never to round the components first
-        - that would make the displayed total disagree with the broker.
+        the end. Adding up displayed components instead moves the answer by a
+        cent, in either direction:
+
+            43.2257 - 42.5142 = 0.7115 -> $0.71   but 43.23 - 42.51 = 0.72
+            49.8343 - 49.5277 = 0.3066 -> $0.31   but 49.83 - 49.53 = 0.30
+
+        The cent is rounding, not a missing trade. Never round the components
+        first to make the subtraction "work" - that would make the displayed
+        total disagree with the broker, which is the number this system is not
+        allowed to invent.
         """
         row = self.db.execute(
             "SELECT COUNT(*), COALESCE(SUM(pnl > 0), 0), COALESCE(SUM(pnl), 0), "

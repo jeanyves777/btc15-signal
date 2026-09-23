@@ -3238,13 +3238,23 @@ what establishes that, rather than the reasoning.
 
 ### A rounding note on the lifetime total
 
-The realised total is **$0.71**, and it stays $0.71. It is summed from
-unrounded rows and rounded once at the end: the legs are `43.2257` and
-`-42.5142`, which sum to `0.7115` → **$0.71**. Adding the *displayed*
-components gives `43.23 - 42.51 = 0.72`.
+The total is summed from **unrounded** rows and rounded once at the end.
+Adding up *displayed* components instead moves the answer by a cent, and the
+cent is rounding, not a missing trade:
 
-The cent is rounding, not a missing trade. The wrong fix is to round the
-components first so the subtraction "works" - that would make the shown total
-disagree with the broker, which is the one number this system is not allowed
-to invent (see section 37). `lifetime_record` carries the same note so nobody
-reconciles it the other way round later.
+| as of | gross wins | gross losses | unrounded | shown | from rounded parts |
+|---|---:|---:|---:|---:|---:|
+| earlier this session (~112 mkts) | 43.2257 | −42.5142 | 0.7115 | **$0.71** | 43.23 − 42.51 = 0.72 |
+| now (127 markets) | 49.8343 | −49.5277 | 0.3066 | **$0.31** | 49.83 − 49.53 = 0.30 |
+
+Both rows are correct for their instant. **$0.71 was right when it was
+computed and is not the current lifetime** - 15 further markets have settled
+since, and the running total is now **$0.31**. Quoting the older figure as
+today's would be the more damaging error of the two, so both are dated here.
+
+Note the discrepancy flips sign between the rows: rounding components first
+can round either way. The wrong fix is to round them so the subtraction
+"works" - that would make the shown total disagree with the broker, which is
+the one number this system is not allowed to invent (section 37).
+`lifetime_record` carries the same note so nobody reconciles it backwards
+later.
