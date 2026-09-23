@@ -70,8 +70,24 @@ git rev-parse HEAD
 # 2. The watchdog MUST be alive, or a kill leaves nothing running.
 Get-CimInstance Win32_Process -Filter "Name='pythonw.exe'" |
   Where-Object { $_.CommandLine -like '*watchdog.py*' }
-# 3. Flat is the moment to do it: no open position, nothing resting.
 ```
+
+Then check the book is flat **against the broker**, not against local state:
+
+```powershell
+.venv\Scripts\python.exe scripts\preflight_restart.py   # 0 flat, 1 live, 2 unreadable
+```
+
+It asks Kalshi for open positions and resting orders, and reconciles any
+ambiguous add submission first. **Do not gate a restart on
+`trade_proposals.status`** - that column does not reliably reach a terminal
+value (71 rows sat at `pending` on 2026-09-21), and on 2026-09-23 a stale
+`filled` row for a closed market blocked a deploy for ten minutes while the
+account was flat. **`open_mark` alone is not evidence either**: it is written
+by the 60-second sweep and says nothing about working orders.
+
+Exit 2 is not flat - it means the broker could not be read, and an unreadable
+account is not an empty one.
 
 Deploy by killing the service **tree** and letting the watchdog bring it back.
 Kill the tree, not the child: killing only the child can leave the venv stub

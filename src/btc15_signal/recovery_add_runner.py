@@ -97,7 +97,9 @@ class RecoveryAddRunner:
             self._reconciled = True
 
         existing = self._store.open_add(opened)
-        if existing is not None and existing["state"] == AddState.PENDING:
+        if existing is not None and existing["state"] in (
+            AddState.PENDING, AddState.PARTIAL
+        ):
             await self._maintain(
                 trader, existing, features, crossed, remaining_s, now_ms, opened
             )
@@ -135,8 +137,35 @@ class RecoveryAddRunner:
             _orders, resting = await trader.resting_exposure()
             balance = await trader.balance_dollars()
         held = self._store.get_setting("open_mark", 0.0)
+        # THE MARK MUST BE FRESH, AND ITS AGE IS THE ONLY WAY TO KNOW.
+        # `open_mark` is written by the 60-second settlement sweep, so reading
+        # it bare meant the exposure check could pass on a figure taken before
+        # the current position existed, or one that still counted a position
+        # already exited. The CAP AND THE ARITHMETIC ARE UNCHANGED - this
+        # decides only whether the inputs are good enough to apply them to.
+        exposure_unverified = ""
+        age_ms = self._store.setting_age_ms("open_mark", now_ms)
+        max_age = self._settings.recovery_add_exposure_max_age_ms
+        if trader is not None:
+            if resting < 0:
+                exposure_unverified = "resting exposure could not be read"
+            elif balance < 0:
+                exposure_unverified = "account balance could not be read"
+            elif age_ms is None:
+                exposure_unverified = "the open position mark has never been read"
+            elif age_ms > max_age:
+                exposure_unverified = (
+                    f"the open position mark is {age_ms / 1000:.0f}s old "
+                    f"(limit {max_age / 1000:.0f}s)"
+                )
+        # SUBMISSIONS AWAITING RECONCILIATION COUNT AS COMMITTED. An order
+        # accepted moments ago, or one whose response was lost, may not be in
+        # the broker's resting list yet; leaving it out makes exposure too
+        # small in exactly the moment another add could be considered.
+        unreconciled = self._store.unreconciled_add_commitment()
         exposure = (
-            -1.0 if resting < 0 else round(max(0.0, resting) + max(0.0, held), 6)
+            -1.0 if (resting < 0 or exposure_unverified)
+            else round(max(0.0, resting) + max(0.0, held) + unreconciled, 6)
         )
         room = self._store.account_room(
             self._settings.recovery_add_test_budget, balance, exposure
@@ -155,7 +184,7 @@ class RecoveryAddRunner:
             except (AttributeError, ValueError):
                 current_ask = None
 
-        def judge(crossed_since_entry: bool):
+        def judge(crossed_since_entry: bool, exposure: float | None = None):
             return evaluate(
                 features=features,
                 entry_side=side,
@@ -166,7 +195,7 @@ class RecoveryAddRunner:
                 required_per_trade=state.required_per_trade(),
                 recovery_active=state.active,
                 already_added=False,
-                open_exposure=spent,
+                open_exposure=spent if exposure is None else exposure,
                 limits=self._limits,
                 fee=kalshi_fee_charged,
             )
@@ -188,8 +217,38 @@ class RecoveryAddRunner:
         # been refused anyway, that refusal is real, is independent of the
         # crossing, and is recorded under its own reason rather than mislabelled
         # as a data problem.
+        # DATA THAT COULD NOT BE ESTABLISHED, gathered in one place. Each of
+        # these is a question we failed to ask, not an answer - and the add is
+        # never placed on any of them. What they decide is whether the refusal
+        # is terminal for this market or asked again next poll.
+        unknowns = []
+        if exposure_unverified:
+            unknowns.append(exposure_unverified)
+
         deferred = False
         decision = judge(bool(crossed) if crossed is not None else True)
+        if exposure_unverified and crossed is not None:
+            # The crossing is known; the exposure is not. Same treatment: the
+            # conservative value stands (-1 refuses), and the only question is
+            # whether to keep asking. `judge` is re-run with the exposure
+            # resolved purely to CLASSIFY - nothing acts on that branch.
+            clean = judge(bool(crossed), exposure=0.0)
+            if clean.place:
+                deferred = True
+                decision = type(decision)(
+                    False,
+                    f"data unavailable: {exposure_unverified}; "
+                    f"re-asking next poll",
+                    clean.price, decision.failed,
+                )
+            elif remaining_s < self._limits.min_seconds_remaining:
+                decision = type(decision)(
+                    False,
+                    f"{clean.reason}; still waiting on {exposure_unverified}",
+                    clean.price, clean.failed,
+                )
+            else:
+                decision = clean
         if crossed is None:
             # THE REASON COMES FROM THE COVERAGE CHECK, not from a fixed
             # sentence. "BRTI is 1.4s behind the entry" and "there is no series
@@ -198,7 +257,9 @@ class RecoveryAddRunner:
             detail = crossing_reason or "crossing history unavailable"
             if crossing_short_by_ms:
                 detail += f" (short by {crossing_short_by_ms / 1000:.1f}s)"
-            without_crossing = judge(False)
+            if unknowns:
+                detail += "; " + "; ".join(unknowns)
+            without_crossing = judge(False, exposure=0.0 if unknowns else None)
             if without_crossing.place:
                 # ELIGIBILITY IS THE BOUND. `evaluate` refuses below
                 # `min_seconds_remaining`, so this can only repeat while the
@@ -435,9 +496,10 @@ class RecoveryAddRunner:
             return False
         filled, price = detail["count"], detail["price"]
         fee = detail["fee"]
+        remaining = detail.get("remaining")
         self._store.record_add_fill(
             existing["client_order_id"], filled, price, fee, now_ms,
-            is_taker=detail["is_taker"],
+            is_taker=detail["is_taker"], remaining=remaining,
             conditions=json.dumps({
                 "side": getattr(features, "side", None),
                 "distance": getattr(features, "brti_normalized_distance", None),
@@ -445,10 +507,14 @@ class RecoveryAddRunner:
                 "crossed": crossed,
             }),
         )
-        # Filled: the money is position exposure now, not a pending claim.
-        self._store.release_funds(
-            f"add:{existing['window_open_ms']}", reason="filled"
-        )
+        # RELEASED ONLY WHEN NOTHING IS WORKING. On a partial fill the
+        # remainder is still committed at the broker, and freeing the whole
+        # claim here would hand the next order money this one still holds.
+        done = remaining is not None and remaining <= 0
+        if done:
+            self._store.release_funds(
+                f"add:{existing['window_open_ms']}", reason="filled"
+            )
         # `maker` was never a name here - the parser returns `is_taker`. This
         # raised NameError on EVERY successful fill, after the fill had been
         # banked and the funds released, so from `_maintain` it aborted the
@@ -458,12 +524,16 @@ class RecoveryAddRunner:
         # was never executed. Fixing that route made it reachable; adds that
         # actually rest make it certain.
         print(
-            f"recovery add EXECUTED [{existing['ticker']}] {filled:g} at "
-            f"{price:.4f}, fee {fee:.4f}, "
-            f"{'taker' if detail['is_taker'] else 'maker'}",
+            f"recovery add {'EXECUTED' if done else 'PARTIAL'} "
+            f"[{existing['ticker']}] {filled:g} at {price:.4f}, fee "
+            f"{fee:.4f}, {'taker' if detail['is_taker'] else 'maker'}"
+            + ("" if done else f", {remaining:g} still working"),
             flush=True,
         )
-        return True
+        # A PARTIAL IS NOT A FINISHED ORDER. Returning True here would tell
+        # `_maintain` the lifecycle had ended and stop the remainder being
+        # cancelled on the deadline or under the crossing rule.
+        return done
 
     async def _cancel(
         self, trader, existing, reason, now_ms, crossed=None, features=None
@@ -522,8 +592,19 @@ class RecoveryAddRunner:
                     flush=True,
                 )
                 return
+        # WHAT WE CANCELLED WAS THE REMAINDER. A partially filled order that
+        # is then pulled leaves us HOLDING the part that filled, so the row is
+        # finished, not cancelled - writing CANCELLED over it would report a
+        # contract we own as never placed, and would hide it from the add's own
+        # P&L. The cancel reason is kept either way, as the record of why the
+        # rest never came.
+        held = float(
+            self._store.open_add(existing["window_open_ms"])
+            .get("filled_count") or 0
+        )
+        final = AddState.EXECUTED if held > 0 else AddState.CANCELLED
         self._store.update_add(existing["client_order_id"], {
-            "state": AddState.CANCELLED,
+            "state": final,
             "cancel_reason": f"{reason} ({note})",
             "cancelled_ms": now_ms,
             "updated_ms": now_ms,
@@ -532,7 +613,8 @@ class RecoveryAddRunner:
             f"add:{existing['window_open_ms']}", reason="cancel confirmed"
         )
         print(
-            f"recovery add CANCELLED [{existing['ticker']}]: {reason} ({note})",
+            f"recovery add {final} [{existing['ticker']}]: {reason} ({note})"
+            + (f"; holding {held:g} that filled first" if held else ""),
             flush=True,
         )
 

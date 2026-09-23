@@ -55,6 +55,13 @@ class AddState(StrEnum):
     # on the next poll. DEFERRED records that the question is still open and is
     # the one state `_step` will re-enter.
     DEFERRED = "RECOVERY ADD DEFERRED"
+    # ALSO NOT TERMINAL. Quantities are fixed-point, so an order for 1.00 can
+    # fill 0.40 and leave 0.60 working. Writing EXECUTED there stopped `_step`
+    # from ever looking again: the remainder was never maintained, never
+    # cancelled at the deadline, never pulled under the crossing rule, and a
+    # later fill of it was refused by the old `filled_count = 0` guard. The
+    # row becomes EXECUTED only when the broker reports nothing remaining.
+    PARTIAL = "RECOVERY ADD PARTIAL"
 
 
 def client_order_id(ticker: str, side: str, window_open_ms: int) -> str:

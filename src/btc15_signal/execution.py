@@ -74,6 +74,24 @@ def parse_fill(order: dict | None, side: str) -> dict | None:
         # other one.
         price = num("no_price_dollars" if side == "DOWN"
                     else "yes_price_dollars")
+    # WHAT IS STILL WORKING, from the broker rather than assumed. Quantities
+    # are fixed-point (`count` is sent as `%.2f` and every count field ends
+    # `_fp`), so an order for 1.00 can fill 0.40 and leave 0.60 resting. The
+    # caller may not mark the order terminal until this is 0.
+    #
+    # ABSENT IS UNKNOWN, NOT ZERO. Reading a missing field as 0 would report
+    # "nothing is working" about an order we know nothing about, which is the
+    # same mistake as treating an unreadable crossing as "did not cross".
+    # And `remaining_count_fp` is AUTHORITATIVE when present: a cancelled
+    # order that filled 0.40 of 1.00 reports 0 remaining, and deriving it from
+    # `initial - filled` instead would resurrect a 0.60 that is no longer
+    # working anywhere.
+    if order.get("remaining_count_fp") is not None:
+        remaining = max(0.0, num("remaining_count_fp"))
+    elif order.get("initial_count_fp") is not None:
+        remaining = max(0.0, num("initial_count_fp") - count)
+    else:
+        remaining = None
     return {
         "count": count,
         "price": round(price, 6),
@@ -81,6 +99,7 @@ def parse_fill(order: dict | None, side: str) -> dict | None:
         "is_taker": 1 if taker_cost > 0 else 0,
         "status": order.get("status"),
         "order_id": order.get("order_id"),
+        "remaining": None if remaining is None else round(remaining, 6),
     }
 
 

@@ -1246,6 +1246,11 @@ class Store:
                 add["client_order_id"], count, round(cost / count, 6), fee,
                 int(fills[0]["filled_ms"] or 0),
                 is_taker=fills[0]["is_taker"],
+                # THIS IS A HISTORICAL REPAIR. It runs at recap time, after
+                # the market has closed, and a closed market has no working
+                # orders - the add also carries its own `expiration_ts`. So
+                # nothing is resting, and the row may be made terminal.
+                remaining=0.0,
             )
             self.db.execute(
                 "UPDATE recovery_adds SET cancel_reason = ? "
@@ -3268,26 +3273,60 @@ class Store:
     def record_add_fill(
         self, client_order_id: str, count: float, price: float, fee: float,
         now_ms: int, is_taker: int | None = None, conditions: str | None = None,
+        remaining: float | None = None,
     ) -> None:
-        """Bank a fill once, and charge it to the lifetime budget once.
+        """Bank CUMULATIVE fill progress, charging the budget only the delta.
 
-        Guarded on `filled_count = 0` so a fill reported twice - by the order
-        poll and again by the fills sync - cannot charge the budget twice.
+        `count`, `price` and `fee` are the broker's running totals for the
+        order, not one increment - which is what Kalshi reports, and what makes
+        this safe to call from the order poll, the cancel path and the fills
+        sync without any of them double-charging.
+
+        THE ORDER IS NOT TERMINAL UNTIL THE BROKER SAYS NOTHING IS WORKING.
+        Quantities are fixed-point, so an order for 1.00 can fill 0.40 and
+        leave 0.60 resting. This used to write EXECUTED for any count above
+        zero, and `_step` then returned on every later poll: the remainder was
+        never maintained, never cancelled at the deadline, never pulled under
+        the crossing rule, and a later fill of it was blocked by the old
+        `filled_count = 0` guard. `remaining` is the broker's own figure;
+        `None` means it could not be established, which is not a confirmation
+        that nothing is working, so the row stays PARTIAL and is asked again.
         """
         row = self.db.execute(
-            "SELECT filled_count FROM recovery_adds WHERE client_order_id = ?",
+            "SELECT filled_count, fill_price, fee_paid FROM recovery_adds "
+            "WHERE client_order_id = ?",
             (client_order_id,),
         ).fetchone()
-        if row is None or float(row[0] or 0) > 0:
+        if row is None:
             return
+        prior_count = float(row[0] or 0)
+        prior_cost = prior_count * float(row[1] or 0)
+        prior_fee = float(row[2] or 0)
+        settled = remaining is not None and remaining <= 0
+        if count <= prior_count:
+            # Nothing new filled. The only thing that can still change is
+            # whether the order is finished, so record that and charge nothing.
+            if settled and prior_count > 0:
+                self.db.execute(
+                    "UPDATE recovery_adds SET state = ?, updated_ms = ? "
+                    "WHERE client_order_id = ? AND filled_count > 0",
+                    ("RECOVERY ADD EXECUTED", now_ms, client_order_id),
+                )
+                self.db.commit()
+            return
+        state = "RECOVERY ADD EXECUTED" if settled else "RECOVERY ADD PARTIAL"
         self.db.execute(
             "UPDATE recovery_adds SET state = ?, filled_count = ?, fill_price = ?, "
             "fill_ms = ?, fee_paid = ?, is_taker = ?, conditions_at_fill = ?, "
             "updated_ms = ? WHERE client_order_id = ?",
-            ("RECOVERY ADD EXECUTED", count, price, now_ms, fee, is_taker,
+            (state, count, price, now_ms, fee, is_taker,
              conditions, now_ms, client_order_id),
         )
-        self._bump_add_budget(count * price + (fee or 0.0), now_ms)
+        # ONLY WHAT IS NEW. Charging `count * price` again on a second
+        # increment would bill the whole order twice over.
+        delta = (count * price - prior_cost) + ((fee or 0.0) - prior_fee)
+        if delta > 0:
+            self._bump_add_budget(round(delta, 6), now_ms)
         self.db.commit()
 
     def add_pnl_summary(self) -> dict:
@@ -3328,7 +3367,8 @@ class Store:
         the broker by `client_order_id`.
         """
         return self._dicts(
-            "SELECT * FROM recovery_adds WHERE state = 'RECOVERY ADD PENDING' "
+            "SELECT * FROM recovery_adds WHERE state IN "
+            "('RECOVERY ADD PENDING', 'RECOVERY ADD PARTIAL') "
             "AND placed_ms IS NOT NULL"
         )
 
@@ -3983,6 +4023,46 @@ class Store:
         """A setting changeable at runtime, so sizing needs no restart."""
         row = self.db.execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()
         return float(row[0]) if row else default
+
+    def setting_age_ms(self, key: str, now_ms: int) -> int | None:
+        """How old a stored broker figure is, or None if it was never written.
+
+        `open_mark` is written only by the 60-second settlement sweep, and it
+        feeds the add-on's exposure gate. Reading it without its age is how a
+        value from before the last fill - or from before an exit - gets used
+        as though it were current, which is an exposure check passing on a
+        number nobody verified.
+        """
+        row = self.db.execute(
+            "SELECT updated_at FROM settings WHERE key = ?", (key,)
+        ).fetchone()
+        if row is None or row[0] is None:
+            return None
+        return int(now_ms) - int(row[0])
+
+    def unreconciled_add_commitment(self) -> float:
+        """Dollars an add may already have committed that the broker's own
+        resting-order list might not yet show.
+
+        A row that is PENDING or PARTIAL with `placed_ms` set is a submission
+        we made. If its `order_id` is missing the response was lost, so we do
+        not even know whether it is working; if it is present the order may
+        have been accepted a moment ago and not yet appear in a listing. Either
+        way the money may be committed, and exposure that ignores it is too
+        small. Counted at the worst case - the full limit price for whatever
+        has not filled - because an unknown commitment is not a zero one.
+        """
+        total = 0.0
+        for row in self._dicts(
+            "SELECT limit_price, count, filled_count FROM recovery_adds "
+            "WHERE state IN ('RECOVERY ADD PENDING', 'RECOVERY ADD PARTIAL') "
+            "AND placed_ms IS NOT NULL"
+        ):
+            working = max(
+                0.0, float(row["count"] or 0) - float(row["filled_count"] or 0)
+            )
+            total += working * float(row["limit_price"] or 0)
+        return round(total, 6)
 
     def set_setting(self, key: str, value: float, now_ms: int) -> None:
         self.db.execute(

@@ -107,6 +107,11 @@ def build(tmp_path, *, deficit_loss=-0.80, fill_price=0.72):
         (TICKER, fill_price, 1 - fill_price, NOW, WINDOW, NOW),
     )
     store.db.commit()
+    # The broker's position mark, freshly written: the exposure check
+    # requires a recent one, and an absent mark is an unverified input
+    # that defers rather than places.
+    store.set_setting("open_mark", 0.0, NOW)
+
     return settings, store
 
 

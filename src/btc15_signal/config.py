@@ -418,6 +418,13 @@ class Settings(BaseSettings):
     recovery_add_min_seconds: int = 120  # add-entry deadline before close
     recovery_add_distance_floor: float = 10.0  # BRTI normalized distance
     recovery_add_max_contracts: int = 1  # per position, on top of the base
+    # HOW OLD THE BROKER'S POSITION MARK MAY BE when the add-on checks
+    # exposure. Not an exposure limit - the cap and the arithmetic are
+    # unchanged - but a bound on the FRESHNESS of one of its inputs.
+    # `open_mark` is written by the 60-second settlement sweep, so anything
+    # under one full sweep is normal and this allows one and a half. Past it
+    # the exposure is treated as unverified, which defers rather than places.
+    recovery_add_exposure_max_age_ms: int = 90_000
 
     # THE DAILY SIZING CONTROLLER (capital.py). One authority for base entries
     # and recovery adds alike.

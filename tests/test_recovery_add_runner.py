@@ -107,6 +107,12 @@ def make(tmp_path, **overrides):
         "('p1','primary',?,?,'DOWN',0.77,0,1,?,?,'filled',?,0.77)",
         (WINDOW, TICKER, NOW + 60_000, WINDOW + 900_000, NOW),
     )
+    # THE BROKER'S POSITION MARK, freshly written. The add-on's exposure check
+    # requires it to be recent - a mark older than the settlement sweep, or one
+    # never read at all, is an unverified input and defers rather than places.
+    # Leaving it unset here would have every fixture exercise that path instead
+    # of the normal one.
+    store.set_setting("open_mark", 0.0, NOW)
     store.db.commit()
     return settings, store
 
@@ -271,11 +277,18 @@ def test_lifetime_spend_alone_does_not_block(tmp_path):
 
 
 def test_unreadable_exposure_blocks_the_add(tmp_path):
+    """Still never placed - and now asked again rather than written off.
+
+    An exposure that could not be READ is a question we failed to ask, like
+    the crossing, so it defers inside the eligibility period instead of
+    burning the position's one evaluation on a transient broker error."""
     settings, store = make(tmp_path)
     trader = FakeTrader(resting=-1.0)
     run(RecoveryAddRunner(settings, store), trader)
     assert trader.placed == []
-    assert "unknown" in (store.open_add(WINDOW)["cancel_reason"] or "")
+    row = store.open_add(WINDOW)
+    assert row["state"] == AddState.DEFERRED
+    assert "resting exposure could not be read" in (row["cancel_reason"] or "")
 
 
 # --------------------------------------------------------------- shadow
