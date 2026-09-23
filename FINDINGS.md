@@ -4068,17 +4068,85 @@ answering.
 predictions remain three separate claims.** The first is deployed. The second
 is now weaker than the previous entry stated. The third is not claimed at all.
 
+
+### And the -9 does not survive a correct out-of-sample treatment
+
+The previous section established that the points -> frequency mapping
+over-predicts out of sample, and that the active arm lives in the band where it
+over-predicts most. That raised the obvious question, so it was measured: does
+the cell deviate from the mapping's OWN behaviour in its band, once the
+mapping's level error is removed?
+
+Three slices, used once each and in order, so nothing grades its own homework:
+
+    TRAIN     fit the points -> frequency mapping        (3,560 rows)
+    VALIDATE  measure the mapping's per-bucket BIAS      (1,619 rows)
+    HOLDOUT   measure each cell's RESIDUAL gap against
+              the de-biased mapping                      (1,311 rows)
+
+**The mapping over-predicts in every single bucket**, by a mean of -0.0516:
+
+    bucket 10-19  -0.1015     bucket 60-69  -0.0685
+    bucket 20-29  -0.0656     bucket 70-79  -0.0439
+    bucket 30-39  -0.0417     bucket 80-89  -0.0133
+    bucket 40-49  -0.0534     bucket 90-99  -0.0157
+    bucket 50-59  -0.0609
+
+**Drift is only part of it.** The base rate fell 0.7199 -> 0.6998 -> 0.7109
+across the three slices (accepted leg 0.8584 -> 0.8282 -> 0.8357), so about one
+to two points of the bias is the market moving, which periodic refitting
+tracks. The remaining three to four points is in-sample optimism: each bucket
+is fitted to its own noise and pays for it out of sample.
+
+**With the bias removed, NO cell clears zero on the holdout** - including the
+active one:
+
+    -0.0483 [-0.1427,+0.0470] n=71   us · mid · bd<5 · px<70|reject   <== active
+    -0.0265 [-0.1355,+0.0965] n=65   asia · mid · bd<5 · px<70|reject
+    -0.0081 [-0.0731,+0.0651] n=58   us · mid · bd10-15 · px70-85|accept
+    +0.0026 [-0.1109,+0.0935] n=45   asia · low · bd10-15 · px70-85|accept
+    +0.0145 [-0.0776,+0.1118] n=46   us · mid · bd10-15 · px85-94|accept
+    +0.0362 [-0.0676,+0.1312] n=59   europe · mid · bd<5 · px<70|reject
+    +0.0370 [-0.0565,+0.1229] n=73   asia · mid · bd10-15 · px70-85|accept
+    +0.0414 [-0.0747,+0.1399] n=57   europe · mid · bd10-15 · px70-85|accept
+
+So the arm's -0.0902 decomposes into roughly -0.05 of mapping bias and -0.05 of
+cell residual, and **the residual is not distinguishable from zero** at holdout
+sample sizes (n=71, interval spanning zero by a wide margin).
+
+**THE ONE ACTIVE CONFIDENCE ADJUSTMENT IS THEREFORE NOT WELL FOUNDED.** It is
+live, it is label-only, it cannot reach a gate, an order or a size, and the
+worst it does is render a refused signal LOW where it would have read MEDIUM.
+But it should not be described as evidence of anything, and the next scheduled
+run will re-derive something like it under the same method - so a scheduled run
+producing an adjustment is the LOOP working, not the adjustment being
+validated. Those must not be read as one event.
+
+**The fix, for the next release** (the service is deliberately being left
+alone):
+
+  * de-bias the mapping against held-out data instead of trusting a fitted
+    level, and
+  * require a cell's gap to clear zero as a RESIDUAL on a slice that
+    contributed to neither the mapping nor the bias estimate.
+
+On today's corpus that bar admits nothing, which is the correct outcome: eight
+cells have enough holdout evidence to be tested and none of them deviates from
+the mapping. The honest position is that the confidence layer has no validated
+adjustment, and the previous two entries each claimed one on a weaker test than
+this.
+
 ### What is live, and what is not
 
     running                          YES  - scheduled, persisted, restart-safe
     updating                         YES  - refits on settlements or 6h
-    adjusting confidence             YES  - 1 arm, -9 SCORE POINTS on the
-                                            0-100 confidence scale. NOT a
-                                            demonstrated 9-point probability
-                                            correction: see the correction
-                                            above - most of it is the learned
-                                            mapping's own out-of-sample bias
-                                            in the 30-69 band. Label only.
+    adjusting confidence             YES, BUT NOT WELL FOUNDED - 1 arm, -9
+                                            SCORE POINTS on the 0-100 scale.
+                                            About half is the mapping's own
+                                            out-of-sample bias; the residual
+                                            does not clear zero on the
+                                            holdout. Label only: it reaches no
+                                            gate, no order and no size.
     authorised to affect execution   NO   - 0 arms cleared the evidence bar,
                                             and the operator's two switches
                                             are not set either
