@@ -3995,15 +3995,90 @@ measurably wrong here", which reads as a result and is not one.
 `arms-calibrated-1` is retired with the rest: an artefact whose deltas were
 sized against the ask cannot act.
 
+
+### CORRECTION: a 61-point score is not a 61% prediction
+
+The previous entry described the active arm as "our score is overconfident
+about those setups by nine points", which reads as a nine-percentage-point
+probability correction. It is not one, and the operator was right to stop it.
+
+`confidence_label` produces a HEURISTIC SCORE out of 100 - passing gates, time
+of day, protective level. The mapping from that score to a win frequency is
+LEARNED, from the training slice, and everything downstream treats its output
+as a probability. That is an empirical claim, and it had never been checked on
+data the mapping did not see.
+
+**So it was checked.** Fit on train, applied unchanged to the validation slice
+and to the holdout, which no fitting has ever touched:
+
+                          VALIDATE (1,618)   HOLDOUT (1,250)
+    Brier, curve               0.1896            0.1839
+    Brier, base rate           0.2103            0.2058
+    ordering preserved         6/8 buckets       5/7 buckets
+    mean |predicted-observed|  0.0358            0.0360
+
+**The score RANKS out of sample and its LEVEL does not.** Beating the base rate
+on both slices is a real result: the heuristic carries genuine information
+about winning, which is worth knowing and was not previously established. But
+the average calibration error is ~3.6 points and the bias is one-directional -
+nine of ten validation buckets and eight of ten holdout buckets came in BELOW
+their prediction. The mapping over-predicts.
+
+**And that is most of the active arm.** `us · mid · bd<5 · px<70|reject` has a
+gap of -0.0902. Its rows sit almost entirely in score buckets 30-69, and the
+curve's own out-of-sample error IN THOSE BUCKETS is:
+
+    bucket 30-39   validate -0.0417   holdout +0.0034
+    bucket 40-49   validate -0.0534   holdout -0.0986
+    bucket 60-69   validate -0.0685   holdout -0.1147
+
+So a cell living in the 30-69 band should show a gap of roughly -0.04 to -0.11
+whether or not anything is special about it. Against the seven cells with
+n>=120 the weighted mean gap is -0.0220 and this one is -0.0682 below that -
+but measured against the curve's bias in its OWN buckets it is not clearly
+distinguishable from the mapping's systematic over-prediction.
+
+**The arm's out-of-sample check does not rescue this**, because it applies the
+same train-fitted curve to the validation slice. The curve's bias is present
+identically in both, so "validate agrees" confirms the bias reproduces, not
+that the cell is special.
+
+**What the -9 therefore is, stated correctly:** a CONFIDENCE-SCORE ADJUSTMENT
+of nine points on the 0-100 scale, applied to a cell that sits in a score band
+the learned mapping over-predicts. It is not a demonstrated nine-percentage-
+point probability correction for that cell. It is label-only, it reaches no
+gate, no order and no size, and the worst it can do is render a refused signal
+LOW where it would have read MEDIUM.
+
+**What would fix the method** (next release, not this one - the service is
+deliberately being left alone):
+
+  * de-bias the mapping against held-out data rather than fitting it in-sample
+    and trusting the level, or
+  * measure each cell's gap as a RESIDUAL against a curve calibrated on data
+    the cell's own validation slice did not contribute to, so the global bias
+    cancels instead of being attributed to whichever cells occupy the biased
+    band.
+
+Either way the bar should then be "this cell deviates from the mapping's own
+behaviour in its band", which is the question the adjustment is supposed to be
+answering.
+
+**A working learning system, a validated adjustment and an improvement in
+predictions remain three separate claims.** The first is deployed. The second
+is now weaker than the previous entry stated. The third is not claimed at all.
+
 ### What is live, and what is not
 
     running                          YES  - scheduled, persisted, restart-safe
     updating                         YES  - refits on settlements or 6h
-    adjusting confidence             YES  - 1 arm, +5 points, earned against
-                                            the MODEL's own recorded score and
-                                            validated out of sample. Label
-                                            only; it reaches no gate and no
-                                            size.
+    adjusting confidence             YES  - 1 arm, -9 SCORE POINTS on the
+                                            0-100 confidence scale. NOT a
+                                            demonstrated 9-point probability
+                                            correction: see the correction
+                                            above - most of it is the learned
+                                            mapping's own out-of-sample bias
+                                            in the 30-69 band. Label only.
     authorised to affect execution   NO   - 0 arms cleared the evidence bar,
                                             and the operator's two switches
                                             are not set either
