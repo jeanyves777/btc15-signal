@@ -699,6 +699,10 @@ class Store:
                 event_key TEXT NOT NULL,
                 message_id INTEGER,
                 body TEXT,
+                -- 'pending' once claimed, 'sent' once the API returned. A row
+                -- stuck at 'pending' across a restart is the crash window and
+                -- is resolved by an explicit per-kind policy, never silently.
+                status TEXT NOT NULL DEFAULT 'sent',
                 first_ms INTEGER NOT NULL,
                 updated_ms INTEGER NOT NULL,
                 PRIMARY KEY (kind, event_key)
@@ -2790,6 +2794,97 @@ class Store:
             "SELECT text_value FROM settings_text WHERE key = ?", (key,)
         ).fetchone()
         return default if row is None or row[0] is None else str(row[0])
+
+    def begin_delivery(self, kind: str, key: str, now_ms: int) -> bool:
+        """Claim this event BEFORE sending. True if the claim is ours.
+
+        THE CRASH WINDOW. A delivery table written after the send cannot make
+        a Telegram message exactly-once: if the process dies between the API
+        call returning and the row being written, the message is on the
+        operator's phone and nothing here knows it. Writing the row first
+        moves the ambiguity rather than removing it - now a crash can leave a
+        claim for a message that never went out.
+
+        Exactly-once is not achievable against an API with no idempotency key,
+        so the ambiguity is made EXPLICIT instead: a claimed-but-unconfirmed
+        row survives the restart as `pending`, and `resolve_pending` applies a
+        per-kind policy to it rather than guessing silently.
+        """
+        cursor = self.db.execute(
+            "INSERT OR IGNORE INTO notifications "
+            "(kind, event_key, status, first_ms, updated_ms) "
+            "VALUES (?,?,'pending',?,?)",
+            (kind, key, now_ms, now_ms),
+        )
+        self.db.commit()
+        return (cursor.rowcount or 0) == 1
+
+    def confirm_delivery(self, kind: str, key: str, now_ms: int,
+                         message_id: int | None, body: str) -> None:
+        """Record that the send returned. The claim becomes a delivery."""
+        self.db.execute(
+            "UPDATE notifications SET status='sent', message_id=?, body=?, "
+            "updated_ms=? WHERE kind=? AND event_key=?",
+            (message_id, body, now_ms, kind, key),
+        )
+        self.db.commit()
+
+    def abandon_delivery(self, kind: str, key: str) -> None:
+        """Release a claim whose send raised before reaching Telegram.
+
+        Only safe where the exception happened before the request went out -
+        a timeout is NOT this, because a timed-out request may still have been
+        delivered.
+        """
+        self.db.execute(
+            "DELETE FROM notifications WHERE kind=? AND event_key=? "
+            "AND status='pending'",
+            (kind, key),
+        )
+        self.db.commit()
+
+    def pending_deliveries(self) -> list[dict]:
+        """Claims that never confirmed. Each one is genuinely ambiguous."""
+        return self._dicts(
+            "SELECT * FROM notifications WHERE status='pending' "
+            "ORDER BY first_ms"
+        )
+
+    def resolve_pending(self, resend_kinds: tuple, now_ms: int) -> list[dict]:
+        """Decide what an ambiguous claim means, per kind, out loud.
+
+        There is no correct universal answer, so the choice is made per message
+        and stated:
+
+          RESEND (`resend_kinds`) - a market result, a settlement, a recovery
+              transition. Losing one is worse than showing it twice, because
+              the operator is reconciling money against it. The claim is
+              cleared so the next poll re-sends, and the row is marked so a
+              duplicate is explicable afterwards rather than mysterious.
+
+          DROP (everything else) - a signal alert, a waiting timer. These are
+              superseded by the next poll anyway, and a duplicate alert on a
+              market that has already moved is worse than a missing one.
+        """
+        resolved = []
+        for row in self.pending_deliveries():
+            kind = row["kind"]
+            if kind in resend_kinds:
+                self.db.execute(
+                    "DELETE FROM notifications WHERE kind=? AND event_key=?",
+                    (kind, row["event_key"]),
+                )
+                row["resolution"] = "resend"
+            else:
+                self.db.execute(
+                    "UPDATE notifications SET status='sent', updated_ms=? "
+                    "WHERE kind=? AND event_key=?",
+                    (now_ms, kind, row["event_key"]),
+                )
+                row["resolution"] = "drop"
+            resolved.append(row)
+        self.db.commit()
+        return resolved
 
     def delivered(self, kind: str, key: str) -> dict | None:
         """The delivery record for this event, or None if it never went out.

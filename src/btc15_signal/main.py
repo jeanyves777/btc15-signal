@@ -10,7 +10,7 @@ from uuid import NAMESPACE_URL, uuid4, uuid5
 
 import httpx
 
-from . import autotrade, intel_mode, kalshi_signal, messages, revision
+from . import autotrade, intel_mode, kalshi_signal, messages, revision, surface
 from . import brain as brain_mod
 from . import intelligence_policy as intel
 from .adaptive import brti_vol_regime, context_of, setup_context_of
@@ -28,6 +28,7 @@ from .learning_runner import LearningRunner
 from .levels import LevelTracker
 from .levels import confidence_points as level_points
 from .model import predict
+from .notify import Notifier
 from .recovery_add_runner import RecoveryAddRunner
 from .reference_shadow import ReferenceShadow
 from .regime import base_points as regime_base_points
@@ -2570,42 +2571,52 @@ async def primary_signal(
         missing = missing_for_execution(settings)
         if missing:
             status += f"\n⚙️ A press will be refused — still needed: {missing}"
-        text = messages.signal_alert(
-            side=prediction.side,
-            ticker=contract.ticker,
-            ask=contract_ask,
-            price=snapshot.price,
-            target=snapshot.target,
-            remaining=remaining,
-            confidence=confidence,
-            facts=facts,
-            executable=qualified,
-            status_line=status,
-            record=record_block(store, settings),
-        )
+        # The message itself is assembled once, below, through the shared
+        # surface. This branch only decides the status line and the buttons.
         store.save_details(proposal.id, detail_body, now_ms)
         buttons = messages.signal_buttons(
             prediction.side, proposal.id, proposal.id, override=not rule_match
         )
     else:
         key = f"w{opened}"
-        text = messages.signal_alert(
-            side=prediction.side,
-            ticker=contract.ticker,
-            ask=contract_ask,
-            price=snapshot.price,
-            target=snapshot.target,
-            remaining=remaining,
-            confidence=confidence,
-            facts=facts,
-            executable=False,
-            verdict="NO ENTRY",
-            status_line="⚪ Paper only · no order placed",
-            record=record_block(store, settings),
-        )
+        status = ""
         store.save_details(key, detail_body, now_ms)
         buttons = messages.signal_buttons(prediction.side, None, key)
-    await telegram.send(text, buttons)
+    # THE SHARED SURFACE. One reconciled snapshot for the whole message, the
+    # market's own rotating insight, and a delivery record so a restart cannot
+    # replay an alert the operator has already read.
+    #
+    # A signal that is merely WAITING on the band-hold timer edits the message
+    # already on the screen rather than sending another: at a ten-second poll
+    # one window produced dozens of near-identical notifications, and the
+    # reader who learns to swipe those away swipes away the one that matters.
+    notifier = Notifier(telegram, store, settings)
+    snapshot = notifier.snapshot(now_ms)
+    insight = notifier.insight_for(opened, now_ms)
+    surfaced = messages.signal_message(
+        side=prediction.side,
+        ticker=contract.ticker,
+        ask=contract_ask,
+        remaining=remaining,
+        confidence=confidence,
+        facts=facts,
+        executable=qualified,
+        status_line=status if offer_button else "⚪ Paper only · no order placed",
+        snapshot=snapshot,
+        insight=insight,
+        band_hold=(int(settled_s), settings.entry_band_settle_s),
+        priority=surface.priority_lines(recovery=store.stored_deficit()),
+        verdict=None if offer_button else "NO ENTRY",
+    )
+    waiting = bool(offer_button and auto_blocked)
+    if waiting:
+        await notifier.update_status(
+            "signal", str(opened), surfaced, now_ms, buttons
+        )
+    else:
+        await notifier.send_once(
+            "signal", str(opened), surfaced, now_ms, buttons
+        )
 
     schedule_commentary(
         settings, store, telegram, contract, snapshot, prediction, rule,
@@ -2714,6 +2725,7 @@ async def report_settlement(
     settings: Settings,
     sizing: dict | None = None,
     basis: str = "1 contract",
+    now_ms: int | None = None,
 ) -> None:
     """Tell Telegram how the market closed and whether our setup was right.
 
@@ -2732,11 +2744,28 @@ async def report_settlement(
       one, because nothing was spent.
     """
     sizing = sizing or {"contracts": 1.0}
-    window_open, side, ticker, contract_price, qualified, target = pending
+    now_ms = int(time.time() * 1000) if now_ms is None else now_ms
+    window_open, called_side, ticker, contract_price, qualified, target = pending
     winner = "UP" if result == "yes" else "DOWN"
-    won = side == winner
 
     trade = store.trade_for_window(window_open)
+    # THE SIDE THAT OWNS THE MONEY IS THE SIDE WE HELD, NOT THE SIDE WE CALLED.
+    #
+    # `predictions` is keyed on `window_open` with INSERT OR IGNORE and is
+    # written at ALERT time, so it holds the FIRST side the reference named. If
+    # the reference flips before the order fills, the row keeps the old side
+    # while the position is on the other one - and this recap then computed
+    # `won = called_side == winner`, inverting the verdict.
+    #
+    # It happened twice on real money. On 2026-09-23 the 12:15 market filled 2
+    # contracts of UP at 93.2c, settled YES, and Kalshi paid out $2.00 for a
+    # profit of $0.1271 - and the message said "Bought DOWN ... LOSS -$1.87".
+    # The ledger was right throughout because it syncs from the broker; only
+    # the sentence was wrong, which is the harder kind to notice.
+    #
+    # `trade_for_window` already returns the side actually held. Use it.
+    side = (trade.get("side") or called_side) if trade else called_side
+    won = side == winner
     if trade:
         # One accounting call, the same one the daily loss floor uses, so the
         # message and the safety limit can never state different money for the
@@ -2764,41 +2793,40 @@ async def report_settlement(
         pnl = None  # nothing was bought, so there is no money to report
         contracts_shown, price_shown = None, contract_price
 
-    # settle() has already run, so this outcome is inside the scoreboard.
-    text = messages.settlement(
-        head=head_for(store, settings),
-        ticker=ticker or "",
+    # TRADED is "did money move", not "was there a proposal". `trade` is the
+    # reconciled position; without one nothing was bought and the recap must
+    # say so rather than printing a cost nobody paid.
+    traded = bool(trade)
+    exited_at = trade["exit_price"] if trade and trade.get("exit_count") else None
+
+    notifier = Notifier(store=store, telegram=telegram, settings=settings)
+    snapshot = notifier.snapshot(now_ms)
+    surfaced = messages.result_message(
         side=side,
+        ticker=ticker,
         winner=winner,
-        won=won,
-        target=target,
-        contract_price=price_shown,
+        won=bool(won),
+        traded=traded,
         pnl=pnl,
-        qualified=bool(qualified),
-        basis=basis,
-        contracts=contracts_shown,
-        exited_at=trade["exit_price"] if trade and trade["exit_price"] else None,
-        paper=trade is None,
-        exact=trade["confirmed"] if trade else True,
-        # The compact money line, from the broker-backed record. The full
-        # scoreboard header no longer leads a result message: what the account
-        # did is the point, and three lines of paper statistics above it is
-        # what made the real figure the easiest thing on screen to miss.
-        record=record_block(store, settings),
+        paid=contract_price,
+        exited_at=exited_at,
+        snapshot=snapshot,
+        insight=notifier.insight_for(window_open, now_ms),
+        priority=surface.priority_lines(
+            recovery=store.stored_deficit(),
+            # MONEY AND CALL SEPARATED, as everywhere else on this surface. A
+            # market whose signal said one side and whose position took the
+            # other has two verdicts, and hiding the disagreement is what let
+            # the inverted recap look ordinary for two days.
+            partial=(
+                f"Signal called {called_side}; the position held {side}"
+                if trade and called_side != side else ""
+            ),
+        ),
     )
-    # "Qualified" means the rule liked the setup, NOT that an order was placed:
-    # it is `int(rule_match)` recorded at alert time, and most of these were
-    # never bought. Labelled paper so it cannot be read as the trading record -
-    # that one is the Live line in the header.
-    qualified_n, qualified_wins, qualified_pnl = store.scoreboard(
-        **sizing, qualified_only=True
+    await notifier.deliver_result(
+        window_open, "settlement", str(window_open), surfaced, now_ms
     )
-    if qualified_n:
-        text += (
-            f"\n\U0001f4cc <i>Rule-qualified signals: {qualified_wins}/{qualified_n} "
-            f"({qualified_wins / qualified_n:.0%}) · paper {qualified_pnl:+,.2f}</i>"
-        )
-    await telegram.send(text)
 
 
 async def cash_out_exit(

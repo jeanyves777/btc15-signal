@@ -83,16 +83,29 @@ class Notifier:
     # --------------------------------------------------------- delivery
     async def send_once(self, kind: str, key: str, text: str, now_ms: int,
                         buttons=None) -> bool:
-        """Send this event exactly once, ever. True if it went out now.
+        """Send this event once. True if it went out on this call.
 
-        The delivery row is written only AFTER the send returns, so a failed
-        send is retried on the next poll rather than being recorded as
-        delivered and lost.
+        NOT "exactly once", and the difference matters. Telegram offers no
+        idempotency key, so no amount of bookkeeping here can make a network
+        call exactly-once: the process can die after the API returns and
+        before anything is written, or after a claim is written and before the
+        call is made. Both orderings have a window.
+
+        The claim is therefore taken BEFORE the send. That converts "might
+        send twice, silently" into "might leave a claim that is visibly
+        unresolved", and `resolve_crash_window` then applies a stated per-kind
+        policy to it at startup rather than any path here guessing.
         """
-        if self.store.delivered(kind, key) is not None:
+        if not self.store.begin_delivery(kind, key, now_ms):
             return False
-        message_id = await self.telegram.send(text, buttons)
-        self.store.mark_delivered(kind, key, now_ms, message_id, text)
+        try:
+            message_id = await self.telegram.send(text, buttons)
+        except Exception:
+            # The request may or may not have reached Telegram. Leaving the
+            # claim as `pending` is the honest record: startup resolves it by
+            # policy instead of this path guessing.
+            raise
+        self.store.confirm_delivery(kind, key, now_ms, message_id, text)
         return True
 
     async def update_status(self, kind: str, key: str, text: str, now_ms: int,
@@ -119,6 +132,18 @@ class Notifier:
         if changed:
             self.store.update_delivered(kind, key, now_ms, text)
         return changed
+
+    RESEND_ON_AMBIGUITY = ("settlement", "recovery", "learning")
+
+    def resolve_crash_window(self, now_ms: int) -> list[dict]:
+        """Settle every claim a previous process left unconfirmed.
+
+        Called once at startup. A market result is re-sent, because losing one
+        is worse than showing it twice when money is being reconciled against
+        it; a signal or a waiting timer is dropped, because the next poll
+        supersedes it and a stale duplicate is worse than a gap.
+        """
+        return self.store.resolve_pending(self.RESEND_ON_AMBIGUITY, now_ms)
 
     async def deliver_result(self, window_open: int, kind: str, key: str,
                              text: str, now_ms: int) -> bool:
