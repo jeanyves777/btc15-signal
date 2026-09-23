@@ -1238,6 +1238,7 @@ def decision_record(
     fee: float | None,
     action: str = "ENTERED",
     blocked_reason: str | None = None,
+    brti_features=None,
 ) -> list[tuple[str, str]]:
     """Everything that supported this order, recorded AND returned for display.
 
@@ -1258,10 +1259,27 @@ def decision_record(
         net = (edge - fee_charged) if edge is not None else None
         distance = abs(snapshot.price - snapshot.target)
         normalized = prediction.distance_bps / max(snapshot.volatility_5m_bps, 1.0)
-        gates = rule.check_detail(
-            prediction, snapshot, ask,
-            blocking_level=blocking_level, levels_ready=True,
-        )
+        # The Binance rule's `check_detail` compares `prediction.
+        # raw_probability >= min_raw_probability`, and that is None on the
+        # Kalshi path - no Kalshi-native model exists. It raised a TypeError
+        # that `decision_record` caught and logged, so every decision record
+        # was silently lost while the signal itself looked healthy.
+        if settings.kalshi_only:
+            # `(name, passed, detail)` triples, the same shape `check_detail`
+            # returns, because the consumer unpacks three.
+            gates = [
+                (fact["name"], fact["passed"],
+                 fact["pass_text"] if fact["passed"] else fact["fail_text"])
+                for fact in kalshi_signal.evaluate(
+                    KalshiBRTIRule.load(settings.kalshi_strategy_path),
+                    brti_features, ask, remaining,
+                )[1]
+            ] if brti_features is not None else []
+        else:
+            gates = rule.check_detail(
+                prediction, snapshot, ask,
+                blocking_level=blocking_level, levels_ready=True,
+            )
         read = None
         if COHORTS.ok:
             read = COHORTS.read(
@@ -2172,6 +2190,7 @@ async def primary_signal(
                                 snapshot, prediction, contract_ask,
                                 opened, remaining, now_ms, settled_s,
                                 blocking_level, paid, fee,
+                                brti_features=brti,
                             )
                             # RENDER IT. `decision_record` returns a list of
                             # (label, value) pairs, and handing that straight
@@ -2250,7 +2269,7 @@ async def primary_signal(
             store, settings, None, contract, snapshot, prediction,
             contract_ask, opened, remaining, now_ms, settled_s,
             blocking_level, contract_ask, None, action="DECLINED",
-            blocked_reason=declined_reason,
+            blocked_reason=declined_reason, brti_features=brti,
         )
     if not alerting:
         # Already alerted this window. Trading was evaluated above; there is
@@ -2864,7 +2883,13 @@ async def service() -> None:
             )
         except (OSError, ValueError) as exc:
             print(f"Kalshi execution disabled: {exc}", flush=True)
-    hourly = HourlyShadow(settings) if settings.hourly_enabled else None
+    # The hourly ladder takes its OWN Binance reading (see HourlyShadow.poll),
+    # so although it never trades it IS an active Binance request. Under
+    # Kalshi-only it does not run. Its archive stays readable as history.
+    hourly = (
+        HourlyShadow(settings)
+        if settings.hourly_enabled and not settings.kalshi_only else None
+    )
     reference = ReferenceShadow(settings) if settings.reference_enabled else None
     recovery_add = RecoveryAddRunner(settings, store, telegram)
     capital = CapitalController(settings, store)
@@ -3249,8 +3274,10 @@ async def service() -> None:
                         )
                 # Same reasoning as the hourly shadow: a second Binance request
                 # for a day of bars must never sit in front of an order. It
-                # self-throttles and swallows its own errors.
-                await levels.maybe_refresh(market, now_ms)
+                # self-throttles and swallows its own errors. Under
+                # Kalshi-only neither the tracker nor the client exists.
+                if levels is not None and market is not None:
+                    await levels.maybe_refresh(market, now_ms)
                 await reversal_exit(
                     settings, store, telegram, contract, snapshot, opened, remaining,
                     now_ms, trader,
@@ -3263,7 +3290,8 @@ async def service() -> None:
                 print(f"cycle error: {type(exc).__name__}: {exc}", flush=True)
             await asyncio.sleep(settings.poll_seconds)
     finally:
-        await market.close()
+        if market is not None:
+            await market.close()
         await kalshi.close()
         if hourly:
             await hourly.close()

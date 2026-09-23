@@ -202,3 +202,44 @@ def test_kalshi_only_requires_the_reference_to_be_enabled():
     source = inspect.getsource(m.service)
     assert "kalshi_only requires reference_enabled" in source
     assert "raise SystemExit" in source
+
+
+# ------------------------------------------- nothing may touch the client
+
+def test_no_component_that_needs_binance_is_constructed_under_kalshi_only():
+    """The 23:00 deploy died here. `market` is None under kalshi_only, and
+    three call sites still used it unconditionally: two `hourly.poll(now_ms,
+    market)` and `await market.close()`. The hourly ladder takes its OWN
+    Binance reading, so although it never trades it IS an active Binance
+    request and must not run either.
+
+    Read from the source because constructing the real service needs network
+    and credentials; what matters is that every use is guarded.
+    """
+    import inspect
+    import re
+
+    source = inspect.getsource(m.service)
+    # The client itself
+    assert "None if settings.kalshi_only" in source
+    # Its shutdown
+    assert "if market is not None:" in source
+    # Everything that consumes it
+    for line in source.splitlines():
+        stripped = line.strip()
+        if re.search(r"\bmarket\.", stripped) and "live_market" not in stripped:
+            assert "if market is not None" in source, stripped
+        if "hourly.poll(now_ms, market)" in stripped:
+            assert "if hourly:" in source, "hourly.poll must be guarded"
+    # And the ladder is not built at all
+    assert "settings.hourly_enabled and not settings.kalshi_only" in source
+
+
+def test_the_crash_handler_reports_where_not_only_the_type():
+    """"Service stopped: AttributeError" cost a diagnosis. The traceback
+    carries no credentials - only the exception MESSAGE might - so frames are
+    logged and the message is still withheld."""
+    handler = Path(__file__).resolve().parents[1] / "scripts" / "run_service.py"
+    source = handler.read_text()
+    assert "extract_tb" in source
+    assert "Service stopped: %s at %s" in source
