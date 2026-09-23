@@ -60,8 +60,23 @@ def main() -> None:
         try:
             run()
         except Exception as exc:
-            # Exception messages may include request URLs with credentials.
-            logger.error("Service stopped: %s", type(exc).__name__)
+            # Exception MESSAGES may include request URLs with credentials, so
+            # the message is still withheld - but the type alone is not
+            # diagnosable. "Service stopped: AttributeError" on 2026-09-22
+            # said nothing about which attribute, on which object, or where,
+            # and the bug had to be found by reading code instead.
+            #
+            # The TRACEBACK is safe: file, line and function names carry no
+            # credentials. Only the final message line is dropped.
+            import traceback
+
+            frames = traceback.extract_tb(exc.__traceback__)
+            where = " <- ".join(
+                f"{f.filename.rsplit('/', 1)[-1].rsplit(chr(92), 1)[-1]}"
+                f":{f.lineno} {f.name}"
+                for f in reversed(frames[-6:])
+            )
+            logger.error("Service stopped: %s at %s", type(exc).__name__, where)
             raise SystemExit(1) from None
 
 

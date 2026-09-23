@@ -186,3 +186,20 @@ def adjust(agreeing: int, weight: RegimeWeight) -> dict:
         "adjusted_points": adjusted,
         "adjusted_label": label_for(adjusted),
     }
+
+
+def model_points(agreeing: int, opened_ms: int, level_points: int = 0) -> int:
+    """THE MODEL'S OWN CONFIDENCE SCORE, before any learned adjustment.
+
+    One definition, called by the live path and by the training corpus, because
+    a calibration is a comparison between a PREDICTION and an OUTCOME - and if
+    the prediction is recomputed differently on the two sides, the comparison
+    measures the difference between the two implementations instead.
+
+    The level term is passed in rather than imported so this module stays free
+    of `levels`; under Kalshi-only it is zero, because no protective level is
+    computed at all.
+    """
+    return max(0, min(100, base_points(agreeing)
+                      + confidence_points(weight_at(opened_ms))
+                      + level_points))

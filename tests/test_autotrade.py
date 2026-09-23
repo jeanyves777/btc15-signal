@@ -375,11 +375,25 @@ def test_a_disabled_strategy_under_live_auto_is_announced_not_just_logged():
     rule-qualified signals won. The log line existed; nobody was reading it."""
     from pathlib import Path
 
+    import sys
+
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+    from btc15_signal import messages
+
     source = Path("src/btc15_signal/main.py").read_text(encoding="utf-8")
     block = source[source.index('verdict = "strategy.json enabled=false"'):]
     block = block[: block.index("elif trader is None:")]
-    assert "telegram.send(" in block
-    assert "AUTOMATION IS OFF" in block
+    # IT IS SENT, and through the shared surface rather than as a string typed
+    # at the call site - so it carries the money footer and the duplicate
+    # suppression that an inline string could not.
+    assert "notifier.send_once(" in block
+    assert "messages.automation_off_message(" in block
+    announced = messages.automation_off_message(ask=0.80, snapshot=None)
+    assert "AUTOMATION IS OFF" in announced
+    # Both switches are named, because `/auto` being ON is what made four
+    # silent hours look fine.
+    assert "/auto is ON" in announced
+    assert "enabled: false" in announced
     # rate limited, so a long outage nags rather than floods
     assert "disabled_alert_ms" in block
     assert "3_600_000" in block

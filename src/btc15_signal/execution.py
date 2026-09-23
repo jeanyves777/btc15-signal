@@ -175,6 +175,141 @@ class KalshiExecutionClient:
             f"Filled {filled:g}; take-profit order resting",
         )
 
+    async def place_resting_buy(
+        self,
+        ticker: str,
+        side: str,
+        price: float,
+        count: int,
+        expiration_ts: int,
+        client_order_id: str,
+    ) -> dict:
+        """A GTC limit BUY that waits at a price, with its own deadline.
+
+        Used by the recovery add-on. Three things here are safety, not taste:
+
+        * `client_order_id` is DETERMINISTIC, supplied by the caller. Kalshi
+          rejects a duplicate, so a retry after a timeout - or a restart that
+          re-evaluates the same position - cannot open a second contract. A
+          random uuid4, which every other order path here uses, would make the
+          ambiguous case (request sent, response lost) a duplicate order.
+        * `expiration_ts` is explicit. Kalshi cancels resting orders shortly
+          after close, but a cancel REQUEST is rejected once the market has
+          closed, so an order without its own expiry can neither be relied on
+          to die nor be killed by hand.
+        * `post_only` is False deliberately. The add is allowed to cross if the
+          book has already moved through the limit; refusing to be a taker
+          would silently skip exactly the fast moves worth measuring.
+        """
+        # `/portfolio/events/orders` (CreateOrderV2), NOT `/portfolio/orders`.
+        # The legacy path now answers 410 Gone, and the add-on used it: every
+        # placement failed and no order ever reached the exchange, while the
+        # record showed a local PENDING that was later cancelled on its
+        # deadline. The V2 shape carries direction in `side` (bid buys, ask
+        # sells) with fixed-point dollar prices - there is no `action` or
+        # `type` field, and sending them is how the wrong shape went unnoticed.
+        order_side, yes_price = event_order(side, price)
+        return await self._post(
+            "/portfolio/events/orders",
+            {
+                "ticker": ticker,
+                "client_order_id": client_order_id,
+                "side": order_side,
+                "count": f"{count:.2f}",
+                "price": f"{yes_price:.4f}",
+                "time_in_force": "good_till_canceled",
+                "expiration_time": expiration_ts,
+                "self_trade_prevention_type": "taker_at_cross",
+                "post_only": False,
+                "cancel_order_on_pause": True,
+            },
+        )
+
+    async def cancel_order(self, order_id: str) -> tuple[bool, str]:
+        """(cancelled, note). Never raises.
+
+        A cancel that loses the race to a fill is NOT an error - the order
+        filled, which is a state the caller has to reconcile rather than a
+        failure to report. A cancel after the market closed is rejected by
+        Kalshi outright, which is why the order carries its own expiry.
+        """
+        # CancelOrderV2. The legacy `/portfolio/orders/{id}` is the same dead
+        # family as the legacy create path.
+        path = f"/portfolio/events/orders/{order_id}"
+        try:
+            response = await self.client.delete(
+                self.base_url + path, headers=self._headers("DELETE", path)
+            )
+            if response.status_code in (200, 204):
+                return True, "cancelled"
+            if response.status_code == 404:
+                return False, "order not found (already filled, expired or cancelled)"
+            return False, f"HTTP {response.status_code}: {response.text[:120]}"
+        except (httpx.HTTPError, OSError) as exc:
+            return False, f"{type(exc).__name__}: {exc}"[:160]
+
+    async def order_status(self, order_id: str) -> dict | None:
+        """The order as Kalshi sees it, for reconciling a cancel/fill race."""
+        path = f"/portfolio/events/orders/{order_id}"
+        try:
+            response = await self.client.get(
+                self.base_url + path, headers=self._headers("GET", path)
+            )
+            response.raise_for_status()
+            return response.json().get("order")
+        except (httpx.HTTPError, ValueError, KeyError):
+            return None
+
+    async def balance_dollars(self) -> float:
+        """Cash on hand. Negative when it could not be read.
+
+        An order is sized against what the account HAS, checked now - not
+        against a running total of what it has spent. Money that settled back
+        is spendable again, and a cap that cannot see that stops trading for
+        lack of a number rather than lack of funds.
+        """
+        path = "/portfolio/balance"
+        try:
+            response = await self.client.get(
+                self.base_url + path, headers=self._headers("GET", path)
+            )
+            response.raise_for_status()
+            body = response.json()
+            if "balance_dollars" in body:
+                return float(body["balance_dollars"])
+            return round(float(body.get("balance") or 0) / 100.0, 4)
+        except (httpx.HTTPError, ValueError, KeyError, TypeError):
+            return -1.0
+
+    async def resting_exposure(self) -> tuple[int, float]:
+        """(orders, dollars) committed to resting buys that have not filled.
+
+        Exposure is filled positions PLUS working orders. Counting only fills
+        is how a cap gets exceeded by the amount of whatever is resting.
+        """
+        path = "/portfolio/orders"
+        try:
+            response = await self.client.get(
+                self.base_url + path, params={"status": "resting", "limit": 200},
+                headers=self._headers("GET", path),
+            )
+            response.raise_for_status()
+            orders = response.json().get("orders") or []
+        except (httpx.HTTPError, ValueError, KeyError):
+            # Unknown exposure is not zero exposure. Report it as a failure so
+            # the caller can refuse to add rather than assume room.
+            return -1, -1.0
+        total = 0.0
+        for order in orders:
+            if order.get("action") != "buy":
+                continue
+            remaining = float(order.get("remaining_count") or 0)
+            price = float(order.get("yes_price_dollars") or order.get("price") or 0)
+            if order.get("side") == "no":
+                price = 1 - price
+            total += remaining * price
+        return len(orders), round(total, 4)
+
     async def close_position(
         self, ticker: str, side: str, count: float, limit_price: float,
         floor: float | None = None,
@@ -283,8 +418,14 @@ class KalshiExecutionClient:
             if not cursor or not rows:
                 return out
 
-    async def open_mark(self) -> tuple[int, float]:
-        """(open positions, unrealised dollars) marked at the live bid.
+    async def open_mark(self) -> tuple[int, float, dict[str, float]]:
+        """(open positions, unrealised dollars, per-ticker marks) at the bid.
+
+        The per-ticker breakdown exists so a position that has already been
+        banked can be dropped from the mark. One total cannot do that, and
+        adding a stale total to a ledger that has already counted the sale is
+        what made $0.55 appear, vanish and reappear across three messages on
+        2026-09-22.
 
         The app's headline figure is TODAY'S realised P&L PLUS the open
         position marked to market - that is how "+$4.05 (+14.67%)" is built,
@@ -300,6 +441,7 @@ class KalshiExecutionClient:
         positions = response.json().get("market_positions") or []
         count = 0
         total = 0.0
+        per_ticker: dict[str, float] = {}
         for position in positions:
             size = float(position.get("position_fp") or 0)
             if not size:
@@ -318,9 +460,12 @@ class KalshiExecutionClient:
             bid = float(market.get(field) or 0)
             cost = float(position.get("market_exposure_dollars") or 0)
             fees = float(position.get("fees_paid_dollars") or 0)
-            total += abs(size) * bid - cost - fees
+            mark = abs(size) * bid - cost - fees
+            total += mark
             count += 1
-        return count, total
+            if ticker:
+                per_ticker[ticker] = mark
+        return count, total, per_ticker
 
     @staticmethod
     def market_open_ms(ticker: str) -> int | None:

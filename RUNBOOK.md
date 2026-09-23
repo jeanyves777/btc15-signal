@@ -67,6 +67,7 @@ safe to loop because no trading limit lives in memory — see below.
 | `/ledger` | every real trade with its running balance |
 | `/intel` | what each gate turned down, in edge per contract |
 | `/sessions` | live record by session, beside the measured figure |
+| `/learning` | frozen candidates, what each would change, and how many may touch an order (currently 0) |
 | `/id` | your Telegram user id (the only unauthenticated command) |
 
 ## What stops it losing money
@@ -212,6 +213,127 @@ whole reply.
 Commentary is once per window, fire-and-forget, and can never gate or delay a
 trade.
 
+## Continuous learning — running, and mostly activating nothing
+
+The learning loop is **part of the service**, not a script. It refits the
+intelligence policy on Kalshi-native features, evaluates the new fit against
+the running one, and activates only what clears a bar that was fixed in
+advance. Nothing about it needs a person, and nothing about it can place,
+resize or block an order without one.
+
+### What it does, and when
+
+Driven off the service poll, immediately after the settlement sweep:
+
+| trigger | when |
+|---|---|
+| `bootstrap` | no valid policy is active — nothing else matters |
+| `settlements` | `learning_min_new_settlements` (24) new settled markets |
+| `interval` | `learning_interval_ms` (6h) regardless |
+
+The due-check is throttled to `learning_check_ms` (5 min) and the fit itself
+runs in a worker thread with its own read-only connection, so neither the poll
+loop nor an order ever waits on it.
+
+### Reading it
+
+    /learning                              in Telegram
+    python scripts/learning_report.py      state + end-to-end traces
+    python scripts/learning_report.py --window <window_open>   one market
+
+`/learning` reports **four states, and they are four different claims**:
+
+| state | means |
+|---|---|
+| Running | the loop is scheduled and alive |
+| Updating | a fit is in progress right now |
+| Adjusting confidence | at least one arm re-rates the displayed confidence |
+| Authorised to affect execution | an arm may actually change an order |
+
+A system can be running, updating and adjusting confidence while being
+authorised to change nothing. **That is the normal state**, and reading those
+four as one word is how "the learning loop is live" gets heard as "an
+adjustment is trading".
+
+### The tables — three records, deliberately not one
+
+| table | answers |
+|---|---|
+| `learning_runs` | when training ran, and **what data it used** |
+| `policy_activations` | when a policy **became active**, and what it replaced |
+| `policy_withdrawals` | when an active arm was **taken back**, and what condemned it |
+| `learning_state` | watermark, next due, last error — survives restarts |
+
+They disagree on purpose. Most runs fit a policy that is never activated; that
+is the loop working, not failing.
+
+### The bar, which is not negotiable downward
+
+    confidence    n >= 120, >= 2 days, day-clustered interval clear of zero
+    execution     all of the above, PLUS validate n >= 40, train/validate sign
+                  agreement, and a validation interval WIDENED by
+                  sqrt(candidates examined) still clear of zero, and forward
+                  evidence that does not contradict it
+
+Confidence is not held to the multiplicity widening because it is not
+*chosen*: a delta is computed for every eligible cell and which one is
+consulted is decided by where the market puts the next signal. Execution IS
+chosen — the policy keeps whichever cell points hardest — so it is corrected
+for having been picked. Each run reports how many confidence arms would have
+survived the stronger bar anyway.
+
+### Two switches for execution, and neither is in the code
+
+An execution change needs **evidence** (a promoted arm, from the bar above)
+AND **authority** (`intelligence_mode` + `intelligence_authorised`, both set by
+a person). `intelligence_policy.authorise()` applies them as separate gates and
+records both outcomes: `final_action` is what took effect, `evidence_action` is
+what the policy would have done with permission. Nothing in the code raises the
+mode.
+
+**Confidence rides on `intelligence_enabled`, not on the mode.** It moves a
+label and is arithmetically incapable of admitting, refusing or resizing
+anything; requiring the execution switch to see a calibration would mean
+granting the power to trade on one in order to read it.
+
+**No mode may ever change size.** `intel_mode.may_change_size` returns False
+for every mode and a test asserts it for each.
+
+### Failure, and what it does not touch
+
+A failed run leaves the active policy exactly where it was, writes the error to
+`learning_state`, and backs off exponentially from `learning_retry_ms` up to
+the normal interval — it never becomes a hot loop and never becomes a
+permanent stop. `/learning` shows the failure and says the last valid Kalshi
+policy stayed active.
+
+On startup the runner closes out any run a killed process left `running`, and
+if the artefact on disk cannot act it **restores a valid rollback immediately**
+rather than waiting for the next scheduled fit.
+
+### Artefacts
+
+    runtime/intelligence_policy.json              the live artefact
+    runtime/intelligence_policy.rollback.json     the last valid one
+    runtime/policies/<version>.json               every version ever live
+    runtime/intelligence_candidates.json          the forward-evaluation set
+    runtime/learning_report.txt                   the regenerated report
+
+Activation is an `os.replace` over a fsynced temporary file, so a crash
+mid-write cannot leave a truncated artefact live — `Policy.load` answers a
+malformed file with an empty policy, which is an artefact that refuses every
+decision, deployed by a power cut.
+
+### The trap this replaced
+
+Before 2026-09-23 the deployed artefact was Binance-trained and correctly
+refused by the retirement guard, so **928 of 1,097 live decisions returned
+neutral for the same reason** while everything downstream looked healthy. A
+state report can read fine while every decision is a refusal. That is why
+`scripts/learning_report.py` follows real decisions end to end — signal,
+baseline, intelligence, final, execution, settlement, evaluation — rather than
+only printing counters.
+
 ## The hourly ladder (KXBTCD) — shadow only
 
 A second instrument, recording since 2026-09-21. **It does not trade and there
@@ -285,6 +407,69 @@ the grid-search failure in FINDINGS.md §7 with a new face: the best of 11,365
 searched rules scored below the *median* best rule on shuffled data. Strike
 selection must be a pre-registered rule measured in advance — "the rung nearest
 N volatility units from spot", say — and never an argmax over the live chain.
+
+## The settlement reference (BRTI) — shadow only
+
+### Why it exists
+
+The bot decides on Binance spot. The contract settles on **the average of sixty
+CF Benchmarks BRTI prices in the final minute**, and its strike is the same
+statistic at the window open — confirmed from Kalshi's own `rules_primary`, not
+assumed. FINDINGS 41 measures the gap: a median **6.2 bps feed basis**, and
+**0.7 bps** from the 60-second averaging. Almost all of it is the feed.
+
+### What it does
+
+Records, and nothing else. No entry, exit or sizing path reads any of it, and
+there is deliberately no config flag that changes that — promoting it has to be
+a code change someone makes on purpose.
+
+- Every `reference_poll_seconds` (5s), one row per source: raw price, event and
+  receipt timestamps, age, staleness, signed distance to the strike, that
+  source's own trailing 60-second mean with its sample count.
+- Every `reference_reconcile_seconds` (5 min), one row per newly settled market
+  comparing computed averages against Kalshi's official `expiration_value`.
+- It runs **behind** the trading path and swallows every error, the same
+  contract as the hourly ladder. A dead feed cannot delay a fill.
+
+### Where it lives
+
+    runtime/settlement_reference.db      its own file, its own locks
+      reference_observations             per poll, per source
+      settlement_reconciliation          per settled market, with the split
+      feed_gaps                          every missing/stale run, with reasons
+      second_bars                        cached 1s bars, so reruns are free
+
+Schema is versioned with `PRAGMA user_version`; every insert names its columns,
+because a positional insert is what put 93 shadow rows into permanent
+quarantine.
+
+### Turning the real feed on
+
+CF Benchmarks gates index values behind an entitlement. Without a key the
+recorder writes a `missing` row every poll naming the reason, and the basis
+column stays NULL — **it never substitutes Coinbase, Kraken or Binance for the
+reference**. The official 60-second averages still arrive from Kalshi either
+way, so the reconciliation keeps working.
+
+    CFB_API_KEY=...        # in .env; CFB_INDEX_ID defaults to BRTI
+
+### Reading it
+
+    python scripts/reconcile_settlement.py --limit 400    # backfill + decompose
+    python scripts/reconcile_settlement.py --report-only
+
+`computed_brti_error_bps` is the gate on everything downstream. **The HOLD/EXIT
+shadow model does not start until the recorder reproduces official settlements
+from its own BRTI ticks.** Today that column is empty because the feed is not
+entitled, so the model has not been started. That is the intended state, not a
+bug.
+
+### The one number to watch
+
+A walk-forward trailing-20 basis correction cuts outcome disagreement from
+19.4% to **4.0%** (FINDINGS 41). It is stored as evidence and read by nothing.
+Do not wire it into a decision without measuring it as a decision first.
 
 ## Known limits
 

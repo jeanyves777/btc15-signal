@@ -21,6 +21,7 @@ counted 47 of 88 settled markets. Four separate reasons, each enough on its own:
 """
 
 import asyncio
+import json
 import sys
 from pathlib import Path
 
@@ -52,9 +53,11 @@ async def main() -> None:
                   f"{store.record_fills(fills, now)} fills.")
             # The app's headline adds the open position marked to the bid, so
             # a verification run that skipped it would never match the screen.
-            open_n, open_mark = await client.open_mark()
+            open_n, open_mark, per_ticker = await client.open_mark()
             store.set_setting("open_mark", open_mark, now)
             store.set_setting("open_positions", open_n, now)
+            store.set_setting_text("open_mark_detail", json.dumps(per_ticker), now)
+            store.sync_ledger_from_settlements(now)
             print(f"open positions: {open_n}, marked at {open_mark:+.4f}")
 
         live = sum(KalshiExecutionClient.settlement_pnl(r) for r in rows)

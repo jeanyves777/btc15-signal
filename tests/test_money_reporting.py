@@ -470,7 +470,11 @@ def test_a_reporting_failure_cannot_erase_a_real_position():
     # call itself rather than its first argument.
     order_call = auto.index("await trader.execute_with_take_profit(")
     mark_failed = auto.index('"failed"')
-    send = auto.index("messages.order_filled(")
+    # THE REPORTING CALL, whatever it is currently called. The fill report
+    # moved from `order_filled` to `fill_message` on the shared surface; what
+    # this test is about is that it happens AFTER the failure handler, so the
+    # handler cannot be reached by a reporting error.
+    send = auto.index("messages.fill_message(")
     # The failure handler sits between the order and the reporting, so only the
     # order call can reach it.
     assert order_call < mark_failed < send
@@ -480,9 +484,22 @@ def test_a_reporting_failure_cannot_erase_a_real_position():
 def test_an_unfilled_order_is_never_announced_as_a_purchase():
     from pathlib import Path
 
+    import sys
+
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+    from btc15_signal import messages
+
     source = Path("src/btc15_signal/main.py").read_text(encoding="utf-8")
-    assert "AUTO ORDER NOT FILLED" in source
-    assert "nothing was spent" in source
+    # THE BRANCH STILL EXISTS and still reports nothing bought - it is now a
+    # builder on the shared surface rather than a string typed at the call
+    # site, so the assertion follows it there.
+    assert "messages.not_filled_message(" in source
+    announced = messages.not_filled_message(ticker="T", note="", snapshot=None)
+    assert "nothing spent" in announced
+    assert "No contracts bought" in announced
+    # Nothing on it may read as a position: no cost, no size, no holding.
+    for claim in ("Cost $", "contracts filled", "Held "):
+        assert claim not in announced
     # and the count is no longer faked up from the requested size
     assert "result.filled_count or count" not in source
 

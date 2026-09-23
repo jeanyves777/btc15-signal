@@ -237,6 +237,65 @@ class Settings(BaseSettings):
     # records and does not trade. `hourly_trading_enabled` is read by nothing:
     # it exists so that turning hourly trading on is a code change someone has
     # to make deliberately, not a config flag someone can flip by accident.
+    # SETTLEMENT REFERENCE RECORDER (FINDINGS 40). Shadow only.
+    #
+    # The contract settles on the average of sixty CF Benchmarks BRTI prices in
+    # the final minute - confirmed from Kalshi's own `rules_primary`, not
+    # assumed - while every decision this bot makes reads Binance spot. Section
+    # 40 measured the combined gap at a median 6 bps and a 40.5% outcome flip
+    # inside 5 bps of the strike, but compared one Binance minute-close against
+    # a 60-second average and so could not say how much was the FEED and how
+    # much was the AVERAGING. This recorder separates them.
+    #
+    # It records and nothing else. There is deliberately no flag here that
+    # turns any of it into a trading input: promoting it has to be a code
+    # change someone makes on purpose, the same reasoning as
+    # `hourly_trading_enabled`.
+    reference_enabled: bool = True
+    reference_database_path: str = "runtime/settlement_reference.db"
+    # Fast enough that a 60-second mean has real samples in it, slow enough to
+    # stay off the 10-second trading beat.
+    reference_poll_seconds: float = 5.0
+    # Beyond this the value describes a market that has already moved, so the
+    # row is marked stale rather than averaged in as if it were current.
+    #
+    # 3,000 ms was wrong and the live smoke test caught it: Kalshi's BRTI
+    # series runs 2-3 seconds behind wall clock by nature, so a 3-second
+    # threshold marks perfectly good official data stale and discards its
+    # price. A recorder that throws away the reference it exists to record is
+    # worse than one that records it late. 15,000 ms flags a feed that has
+    # genuinely stopped while leaving normal publication lag alone.
+    reference_stale_ms: int = 15_000
+    # KALSHI ONLY. Quotes, books, executions, settlements and BRTI all come
+    # from Kalshi; the Binance client is not constructed, the Binance-weighted
+    # `predict()` does not run, and there is NO fallback - a missing or stale
+    # reference is recorded as such and produces no signal.
+    #
+    # It is a setting rather than a deletion so the old path stays runnable
+    # for the historical comparison in `scripts/`, not so it can be switched
+    # back on in production. The Binance-trained policy is separately retired
+    # and cannot act whatever this says.
+    kalshi_only: bool = True
+    # The BRTI-native entry rule. Its distance floor is the MEASURED 10x
+    # (FINDINGS 43), not the 1.5 that belongs to Binance raw volatility.
+    kalshi_strategy_path: str = "strategy_kalshi.json"
+    # Contract spread, in CENTS. `max_spread_bps = 2.0` gated Binance SPOT
+    # spread, whose 99th percentile over 10,094 archived observations is
+    # 0.001 bps - it never rejected anything. Reusing it on a Kalshi book
+    # would reject EVERYTHING (a 2c spread on a 79c mid is 253 bps). Measured
+    # contract spreads: median 0.4c, p75 3c, p90 7c, p95 10c, p99 19c, so
+    # this sits at ~p99 and keeps catching only a pathological book.
+    max_contract_spread_cents: float = 20.0
+    reference_reconcile_seconds: float = 300.0
+    reference_debug: bool = False
+    # CF Benchmarks gates index values behind an entitlement; with no key the
+    # values endpoint answers "Unknown id" for every ticker. Absent a key the
+    # recorder writes `missing` rows with the reason and keeps the official
+    # 60-second averages coming from Kalshi. It never substitutes an exchange.
+    cfb_base_url: str = "https://www.cfbenchmarks.com/api/v1"
+    cfb_index_id: str = "BRTI"
+    cfb_api_key: str = ""
+
     hourly_enabled: bool = True
     hourly_trading_enabled: bool = False
     hourly_series: str = "KXBTCD"
@@ -290,7 +349,152 @@ class Settings(BaseSettings):
     # So size up where the edge is 2.4x, and only there. Above 4x the edge
     # fades (5x+ measures +0.0064), which is why this is a BAND and not a
     # floor - the old ">= 3x is better" reading had it backwards.
+    #
+    # OFF since 2026-09-22, by the operator's decision. Intelligence must not
+    # change size: the band doubled exposure on
+    # KXBTC15M-26SEP221330-30 ("3.0x vol is inside the measured 2-4x edge
+    # band", 2 contracts at 81c) and the market settled against us for -$1.64
+    # instead of about -$0.82. The measurement above is not withdrawn, but the
+    # distance it was measured on is Binance-derived, and FINDINGS 41/43 show
+    # that quantity disagrees with Kalshi's official BRTI reference on about
+    # 20% of markets - so the evidence behind the band is itself in question.
+    # Sizing returns to one contract until it has independent evidence.
+    #
+    # This flag gates the BAND ONLY. `high_confidence_contracts` is left alone
+    # because the loss-recovery path reads it too, and recovery is the
+    # operator's separate decision.
+    confidence_sizing_enabled: bool = False
     high_confidence_contracts: int = 2
+    # LOSS RECOVERY, the operator's 2026-09-22 rule. The deficit is realised
+    # net dollars still missing; it is divided across this many upsized trades
+    # to get the share one trade has to be able to win before the upsize is
+    # allowed to apply at all. Four is the operator's own worked example:
+    # $1.64 over 4 trades is $0.41 a trade, which 2 contracts at 75c can cover
+    # and 2 at 90c cannot.
+    #
+    # It is a plan length, not a limit: recovery ends when the money is back,
+    # not when the steps run out, and the divisor floors at 1.
+    recovery_steps: int = 4
+    # THE EARLY STAND-DOWN. Recovery stops UPSIZING well before the deficit
+    # reaches zero, because late in a recovery the remaining deficit is small
+    # but the position is still double size - so one loss more than undoes the
+    # run of wins that got there, and arms recovery again, deeper. Recover,
+    # lose bigger, recover.
+    #
+    # Operator instruction, 2026-09-23: "Even after a 50% recovery of the
+    # initial loss, turn off recovery. That's enough, because we've seen that
+    # even regular size is able to recover on its own." Stated as a
+    # requirement, not a proposal, and implemented as one.
+    #
+    # Standing down NEVER zeroes the deficit. The money is still missing and
+    # the ledger keeps saying so; only the upsize stops. See `recovery_exit`.
+    recovery_partial_exit_enabled: bool = True
+    # BOTH must hold. Four wins that barely moved the deficit leave real
+    # ground to make up; half the money back after one lucky market says
+    # nothing about whether the run is stable.
+    recovery_exit_fraction: float = 0.50       # of the cycle's INITIAL deficit
+    recovery_exit_required_wins: int = 4       # distinct profitable MARKETS
+    # OFF. Recovery buys no larger BASE position; it acts only through the
+    # conditional add-on, which rests ONE extra contract 2c below the actual
+    # fill and only while the BRTI evidence holds. With both on they stack:
+    # two contracts upfront plus a third resting behind them, for a deficit
+    # that justified one. The base entry is one contract whether or not a
+    # deficit is outstanding.
+    recovery_upfront_upsize_enabled: bool = False
+
+    # THE CONDITIONAL RECOVERY ADD-ON (recovery_add.py).
+    #
+    # Live-test authorisation: $30 total, and `recovery_test_budget` is a
+    # CUMULATIVE spend ceiling, not a concurrent-exposure one. It counts every
+    # dollar the add-on has ever committed and does not reset on a loss, a new
+    # day or a restart - a cap that resets is not a cap, it is a per-episode
+    # allowance that can be spent repeatedly.
+    recovery_add_enabled: bool = False
+    # The TESTING ACCOUNT size, not a lifetime spend cap: what the add-on may
+    # have committed at any one moment, checked against live cash and live
+    # exposure before every order.
+    recovery_add_test_budget: float = 30.0
+    recovery_add_dip: float = 0.02  # rest this far below the ACTUAL fill
+    recovery_add_min_seconds: int = 120  # add-entry deadline before close
+    recovery_add_distance_floor: float = 10.0  # BRTI normalized distance
+    recovery_add_max_contracts: int = 1  # per position, on top of the base
+
+    # THE DAILY SIZING CONTROLLER (capital.py). One authority for base entries
+    # and recovery adds alike.
+    #
+    # The base tier changes ONLY at the daily review, from reconciled settled
+    # cash - never from an open position's mark, because sizing on unrealised
+    # gains compounds exposure exactly when a position is most likely to give
+    # them back. $30 of capital per contract matches the authorised test
+    # account: one contract now, two if the account doubles, and never more
+    # than `max_base_contracts` whatever the balance says.
+    #
+    # The day is NEW YORK because that is the exchange's own reset - Kalshi
+    # documents its utilisation caps resetting at midnight New York time - and
+    # a system keeping books on a different day from its venue will file trades
+    # in the wrong one twice a year at the DST boundaries.
+    # THE ADAPTIVE INTELLIGENCE LAYER. Learns from the outcomes of executed,
+    # rejected and vetoed signals and feeds that evidence back into the live
+    # decision. It may re-rate confidence always; it may change a decision
+    # only where `runtime/intelligence_policy.json` was validated to, and that
+    # artefact is written by `scripts/train_intelligence.py` and never by the
+    # running service.
+    #
+    # It can NEVER change position size - that authority is the capital
+    # controller's alone - and an exception it grants overrides ONE strategy
+    # gate, never a capital, exposure, loss or execution protection.
+    intelligence_enabled: bool = True
+    intelligence_policy_path: str = "runtime/intelligence_policy.json"
+    # Frozen candidates, evaluated forward on every eligible signal.
+    # They control nothing - this is how one earns the right to.
+    intelligence_candidates_path: str = "runtime/intelligence_candidates.json"
+    # A policy older than this stops being applied. Stale evidence quietly
+    # describing a market that has moved on is the failure mode here.
+    intelligence_max_policy_age_ms: int = 30 * 86_400_000
+
+    # ---------------------------------------------------- continuous learning
+    #
+    # The learning loop runs INSIDE the service. It ingests every settled
+    # signal - accepted and rejected - reconciles the executed ones against
+    # Kalshi fills and fees, refits on Kalshi-native features, evaluates the
+    # new fit against the running one on a chronological validation slice, and
+    # activates only what clears the promotion bar.
+    #
+    # TRAINING RUNNING AND AN ADJUSTMENT BEING LIVE ARE DIFFERENT THINGS. Most
+    # runs will activate nothing; that is the loop working. `/learning` reports
+    # them separately and so do the tables.
+    learning_enabled: bool = True
+    # Retrain once this many NEW settled markets have accumulated since the
+    # last completed run. A 15-minute series produces 96 a day, so 24 is about
+    # six hours of fresh evidence - enough to move a cell, short enough that a
+    # regime change is not waited out.
+    learning_min_new_settlements: int = 24
+    # ...and on this schedule regardless, so a quiet market still refreshes.
+    learning_interval_ms: int = 6 * 3_600_000
+    # How often the cheap due-check runs. The poll is every 10s; checking a
+    # file and a watermark 8,640 times a day to make an hourly decision is
+    # waste, and it is waste on the same thread that places orders.
+    learning_check_ms: int = 5 * 60_000
+    # After a failed run, retry on this base delay with exponential backoff up
+    # to the normal interval. A failure must not become a hot loop, and must
+    # not become a permanent stop either.
+    learning_retry_ms: int = 15 * 60_000
+    # Evidence floor for an arm to be consulted at all, live. Matches the
+    # promotion bar in `learning.MIN_PROMOTION_N`; stated here too because it
+    # is the number the running policy is written with.
+    learning_min_evidence: int = 120
+    # How much worse, in dollars per contract over the validation slice, a new
+    # fit may score than the running one and still activate. Zero: a fresher
+    # fit is not automatically a better one.
+    learning_regression_tolerance: float = 0.0
+    # Forward changes an ACTIVE execution arm must have made before its record
+    # can withdraw it. Below this a bad run is indistinguishable from bad luck.
+    learning_min_withdrawal_n: int = 20
+
+    capital_sizing_enabled: bool = True
+    capital_per_contract: float = 30.0
+    max_base_contracts: int = 2
+
     high_confidence_distance_min: float = 2.0
     high_confidence_distance_max: float = 4.0
     dry_run: bool = True

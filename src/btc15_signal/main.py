@@ -10,24 +10,40 @@ from uuid import NAMESPACE_URL, uuid4, uuid5
 
 import httpx
 
-from . import autotrade, messages
+from . import autotrade, intel_mode, kalshi_signal, messages, revision, surface
 from . import brain as brain_mod
+from . import intelligence_policy as intel
+from .adaptive import brti_vol_regime, context_of, setup_context_of
 from .binance import BinanceClient, MarketSnapshot
+from .candidates import CandidateSet
+from .capital import CapitalController, ny_day
 from .config import Settings
 from .decision import decision_facts
 from .execution import KalshiExecutionClient
 from .features import _session
 from .hourly_shadow import HourlyShadow
 from .kalshi import KalshiClient, KalshiMarket
+from .kalshi_brti import KalshiBRTIRule
+from .learning_runner import LearningRunner
 from .levels import LevelTracker
 from .levels import confidence_points as level_points
 from .model import predict
+from .notify import Notifier
+from .recovery_add_runner import RecoveryAddRunner
+from .reference_shadow import ReferenceShadow
 from .regime import base_points as regime_base_points
 from .regime import confidence_points as regime_confidence_points
 from .regime import label_for as regime_label
+from .regime import model_points as regime_model_points
 from .regime import weight_at, weight_for_hour
+from .sessions import (
+    breakdown as session_breakdown,
+)
+from .sessions import (
+    closes_between,
+)
 from .similar import Cohorts, Fingerprint
-from .store import Store, TradeProposal
+from .store import RecoveryState, Store, TradeProposal
 from .store import position_pnl as store_position_pnl
 from .strategy import EntryRule, ReversionRule, ReversionSetup
 from .telegram import Telegram
@@ -115,7 +131,8 @@ def samples_needed(store: Store, effect: float = 0.01) -> int:
     return int((1.96 * (variance ** 0.5) / effect) ** 2) if variance else 0
 
 
-def confidence_label(facts: list[dict], opened: int, blocking_level: float | None) -> str:
+def confidence_label(facts: list[dict], opened: int, blocking_level: float | None,
+                     intelligence_delta: int = 0) -> str:
     """HIGH / MEDIUM / LOW for the signal header.
 
     Scored from the SAME facts the checks are rendered from, so the word and
@@ -127,12 +144,35 @@ def confidence_label(facts: list[dict], opened: int, blocking_level: float | Non
     tried as gates and both measured as noise (FINDINGS 23, p=0.090 and
     p=0.542). The operator's standing rule is that time of day may raise or
     lower confidence but can never stop the 15-minute system.
+
+    `intelligence_delta` is the learned calibration, and it enters HERE rather
+    than being rendered as a separate line beside an unchanged word. A layer
+    that reports "confidence lowered" next to a header still reading HIGH has
+    not lowered confidence; it has printed a sentence. The delta is on the same
+    0-100 points scale the rest of this function works in, it is clamped with
+    everything else, and it can only move the LABEL - it reaches no gate, no
+    order and no size, which is the whole of a confidence adjustment's
+    authority.
+    """
+    return regime_label(
+        max(0, min(100, model_confidence_points(facts, opened, blocking_level)
+                   + int(intelligence_delta or 0)))
+    )
+
+
+def model_confidence_points(facts: list[dict], opened: int,
+                            blocking_level: float | None) -> int:
+    """The model's own score, BEFORE any learned adjustment.
+
+    Recorded on every decision so the confidence it produced can later be
+    compared with what actually happened. A calibration needs the prediction
+    the model made at the time; reconstructing it afterwards from a label is
+    guessing, and reconstructing it from today's code measures today's code.
     """
     agreeing = sum(1 for fact in facts if fact["passed"])
-    base = regime_base_points(agreeing)
-    clock = regime_confidence_points(weight_at(opened))
-    level = level_points(blocking_level is not None)
-    return regime_label(max(0, min(100, base + clock + level)))
+    return regime_model_points(
+        agreeing, opened, level_points(blocking_level is not None)
+    )
 
 
 def record_block(store: Store, settings: Settings) -> str:
@@ -162,7 +202,7 @@ def head_for(store: Store, settings: Settings) -> str:
     # "per contract" whatever report_basis actually was, so a payout basis
     # labelled a ten-contract figure as a one-contract one.
     return messages.scoreboard(
-        *store.scoreboard(**sizing), basis=basis, live=store.realised_record()
+        *store.scoreboard(**sizing), basis=basis, live=store.money_snapshot()
     )
 
 
@@ -399,6 +439,25 @@ async def process_telegram(
                     head=head_for(store, settings),
                     gates=store.gate_study(),
                     needed=samples_needed(store),
+                )
+            )
+            continue
+        if command == "/learning":
+            if int(message.get("from", {}).get("id", 0)) != settings.telegram_authorized_user_id:
+                continue
+            # The RUNNING learner, not a fresh one. A second runner built here
+            # would read the same files and report a plausible snapshot while
+            # knowing nothing about whether a fit is in progress - which is one
+            # of the four states this message exists to distinguish.
+            runner = LEARNING.get("runner")
+            if runner is None:
+                runner = LearningRunner(settings, store)
+            await telegram.send(
+                messages.learning(
+                    head=head_for(store, settings),
+                    state=runner.snapshot(int(time.time() * 1000)),
+                    candidates=active_candidates(settings),
+                    board=store.candidate_scoreboard(),
                 )
             )
             continue
@@ -896,31 +955,104 @@ def archive_observation(
         print(f"archive failed: {type(exc).__name__}: {exc}", flush=True)
 
 
-def recovery_size(store: Store, settings: Settings, base: int) -> tuple[int, str]:
-    """Size up to the recovery count while a loss is still outstanding.
+def max_net_profit(count: int, ask: float) -> float:
+    """What this order can win at most, net of fees, if it settles in the money.
 
-    THE OPERATOR'S RULE, implemented as stated: after a loss, trade the
-    recovery size until that loss is repaid, then reset. It never escalates -
-    the cap is `high_confidence_contracts`, whatever the loss was - so this is
-    not a martingale and cannot compound. The $10 martingale measured -15.74 on
-    a day the base system made +4.41 (section 32) and is not what this is.
-
-    Checked BEFORE the confidence band, and it wins, because a loss is a fact
-    about the account while the band is an opinion about the setup.
-
-    Measured cost, recorded rather than argued: on the 94 settled markets to
-    2026-09-22 this sits at the recovery size for 57% of windows and completes
-    11 recoveries. The band-based sizing it now overrides measured +0.48 over
-    flat $1 on the operator's 18 trades of 2026-09-21, and flat $2 measured
-    better than both. The operator has asked for loss-triggered recovery and
-    that is what this does.
+    Settlement pays the dollar with no second fee, so only the entry fee comes
+    off. The fee is the deployed `kalshi_fee_charged` and is never modelled
+    here: a sizing rule that disagreed with the fee schedule would be deciding
+    on money the account does not have.
     """
-    debt, since = store.outstanding_loss()
-    if debt <= 0:
+    return count * (1.0 - ask) - kalshi_fee_charged(ask, count)
+
+
+def recovery_size(
+    store: Store, settings: Settings, base: int, ask: float,
+    state: RecoveryState | None = None,
+) -> tuple[int, str]:
+    """Size up while a realised deficit is outstanding AND this trade can dent it.
+
+    THE OPERATOR'S RULE, 2026-09-22, in two parts.
+
+    The deficit: recovery activates on a realised net loss, tracks what is
+    still missing after fees, and turns off the moment realised profit has
+    covered it - see `Store.recovery_state`. A further loss increases it.
+
+    The eligibility, which is this function: recovery NEVER creates a trade.
+    The strategy's own gates have already passed by the time this is called;
+    all this decides is the size of a trade that is happening anyway. The
+    deficit is divided across the remaining planned steps, and the upsize
+    applies only if this trade's maximum net profit covers that share.
+    Otherwise the trade goes out at BASE size and recovery stays ACTIVE - a
+    base-size win still pays the deficit down.
+
+        deficit 1.64 over 4 steps -> 0.41 a trade
+        2 @ 0.90 -> 0.1874 net     -> not eligible, base size
+        2 @ 0.75 -> 0.4737 net     -> eligible
+
+    That gate exists because 2 contracts at 90c risk $1.80 to win 19c: at the
+    top of the price band the upsize adds exposure it cannot recover with.
+
+    It never escalates - the cap is `high_confidence_contracts`, whatever the
+    deficit is - so this is not a martingale. The $10 martingale measured
+    -15.74 on a day the base system made +4.41 (section 32) and is not this.
+
+    `state` is passed in by the order path so the ledger is folded once per
+    decision; it reads it itself everywhere else.
+
+    THE UPFRONT UPSIZE IS OFF (operator, 2026-09-22). Recovery no longer buys
+    a larger BASE position; it acts only through the conditional add-on in
+    `recovery_add.py`, which rests a second contract 2c below the actual fill
+    and only while the BRTI evidence still holds.
+
+    Leaving both on would stack: two contracts bought upfront and a third
+    rested behind them, on a deficit that justified one extra. The base entry
+    is one contract whether or not a deficit is outstanding.
+
+    The eligibility arithmetic below is kept and still exercised by the
+    add-on's own gate, so turning this back on is a one-line change rather
+    than a rewrite.
+    """
+    state = (
+        store.recovery_state(settings.recovery_steps) if state is None else state
+    )
+    if not state.active or not settings.recovery_upfront_upsize_enabled:
         return base, ""
-    return max(base, settings.high_confidence_contracts), (
-        f"recovering {debt:.2f} outstanding"
-        + (f" after {since} market(s)" if since else " from the last loss")
+    count = max(base, settings.high_confidence_contracts)
+    required = state.required_per_trade()
+    profit = max_net_profit(count, ask)
+    if profit < required:
+        # Base size, and an EMPTY reason: the caller only overrides the size
+        # when there is one, and a line saying "recovering" beside a base-size
+        # order would describe something that is not happening.
+        return base, ""
+    return count, (
+        f"recovering {state.deficit:.2f} outstanding - {profit:.2f} max net "
+        f"covers the {required:.2f} share of {max(1, state.steps)} step(s)"
+    )
+
+
+def partial_exit_pnl(
+    *, paid: float, bid: float, filled: float, held: float,
+    entry_fee: float | None, exit_fee: float | None,
+) -> float:
+    """Realised P&L for the portion actually sold, fees allocated to it.
+
+    Selling one of two contracts realises one contract's gain and carries ONE
+    contract's share of the entry fee. Charging the whole entry fee against
+    the part sold overstates that cash flow and leaves the remaining contract
+    owing nothing, so the settlement of the remainder is overstated in turn -
+    and the deficit, which is folded from these amounts in order, inherits
+    both errors.
+
+    `held` is the size the entry fee was charged on. A full exit allocates all
+    of it, which is the previous behaviour and the common case.
+    """
+    share = (filled / held) if held else 1.0
+    return (
+        (bid - paid) * filled
+        - (entry_fee or 0.0) * share
+        - (exit_fee or 0.0)
     )
 
 
@@ -938,7 +1070,24 @@ def confidence_size(
     Momentum is required because it is the one condition that separates on its
     own: aligned measures +0.0197, against measures -0.0701 with an interval
     clear of zero.
+
+    OFF SINCE 2026-09-22, by the operator's decision, and the measurement above
+    is recorded rather than deleted because it is still what was measured. The
+    band doubled exposure on KXBTC15M-26SEP221330-30 - "3.0x vol is inside the
+    measured 2-4x edge band", 2 contracts at 81c - and the market settled
+    against us for -$1.64 where one contract would have been about -$0.82.
+    Intelligence must not change size. Beyond the operator's rule, the evidence
+    itself is now in question: `normalized_distance` here is computed from the
+    Binance feed, and FINDINGS 41/43 measured that the Binance view disagrees
+    with Kalshi's official BRTI reference on about 20% of markets. Sizing
+    returns to one contract until it has independent evidence.
+
+    The gate is a flag and not a deletion so that re-enabling it is a
+    deliberate act with a number behind it. It returns `(base, "")` when off:
+    an empty reason, so no size line appears claiming a band nothing acted on.
     """
+    if not settings.confidence_sizing_enabled:
+        return base, ""
     normalized = prediction.distance_bps / max(snapshot.volatility_5m_bps, 1.0)
     direction = 1 if prediction.side == "UP" else -1
     aligned = direction * snapshot.momentum_5m_bps > 0
@@ -1123,6 +1272,7 @@ def decision_record(
     fee: float | None,
     action: str = "ENTERED",
     blocked_reason: str | None = None,
+    brti_features=None,
 ) -> list[tuple[str, str]]:
     """Everything that supported this order, recorded AND returned for display.
 
@@ -1143,10 +1293,27 @@ def decision_record(
         net = (edge - fee_charged) if edge is not None else None
         distance = abs(snapshot.price - snapshot.target)
         normalized = prediction.distance_bps / max(snapshot.volatility_5m_bps, 1.0)
-        gates = rule.check_detail(
-            prediction, snapshot, ask,
-            blocking_level=blocking_level, levels_ready=True,
-        )
+        # The Binance rule's `check_detail` compares `prediction.
+        # raw_probability >= min_raw_probability`, and that is None on the
+        # Kalshi path - no Kalshi-native model exists. It raised a TypeError
+        # that `decision_record` caught and logged, so every decision record
+        # was silently lost while the signal itself looked healthy.
+        if settings.kalshi_only:
+            # `(name, passed, detail)` triples, the same shape `check_detail`
+            # returns, because the consumer unpacks three.
+            gates = [
+                (fact["name"], fact["passed"],
+                 fact["pass_text"] if fact["passed"] else fact["fail_text"])
+                for fact in kalshi_signal.evaluate(
+                    KalshiBRTIRule.load(settings.kalshi_strategy_path),
+                    brti_features, ask, remaining,
+                )[1]
+            ] if brti_features is not None else []
+        else:
+            gates = rule.check_detail(
+                prediction, snapshot, ask,
+                blocking_level=blocking_level, levels_ready=True,
+            )
         read = None
         if COHORTS.ok:
             read = COHORTS.read(
@@ -1328,6 +1495,386 @@ def shadow_read(
         return ""
 
 
+# One policy object per process, loaded once. Reloaded only by a restart, so
+# candidate training can never change what is running.
+_POLICY: dict = {"loaded": None}
+_CANDIDATES: dict = {"loaded": None}
+# The running learner, so `/learning` can report the live loop rather than
+# constructing a second one that shares none of its state.
+LEARNING: dict = {"runner": None}
+# Last window we complained about a missing BRTI context, so the log
+# carries one line a window rather than one a poll.
+BRTI_CONTEXT_GAP: dict = {"window": None}
+# Last (window, reason) we logged a missing Kalshi input for, so a feed outage
+# prints once per cause per window rather than once per poll.
+KALSHI_GAP: dict = {"window": None}
+
+
+def kalshi_snapshot(features, contract, opened: int, now_ms: int):
+    """A `MarketSnapshot` whose every number comes from Kalshi.
+
+    Same shape as the Binance one so the archive, the messages and the order
+    path are unchanged - but price and target are the official reference and
+    the strike, momentum and volatility are BRTI's, and the spread is the
+    Kalshi book's.
+
+    The three Binance-only microstructure fields are ZERO and nothing gates on
+    them: `predict()` does not run on this path (see `kalshi_signal`), and the
+    BRTI rule never referenced them. They stay on the dataclass rather than
+    being removed so the historical archive keeps one schema, and zero is
+    honest here - it means "this instrument does not publish it", which is
+    why the value is never read rather than merely never gated.
+    """
+    from .binance import MarketSnapshot
+
+    yes_bid = getattr(contract, "yes_bid", 0.0) or 0.0
+    yes_ask = getattr(contract, "yes_ask", 0.0) or 0.0
+    mid = (yes_bid + yes_ask) / 2 if yes_bid and yes_ask else 0.0
+    spread_bps = ((yes_ask - yes_bid) / mid * 10_000) if mid else 0.0
+    return MarketSnapshot(
+        price=features.value,
+        target=features.target,
+        bid_imbalance=0.0,
+        taker_imbalance=0.0,
+        momentum_5m_bps=features.brti_momentum_bps,
+        volatility_5m_bps=features.brti_volatility_bps,
+        futures_basis_bps=0.0,
+        spread_bps=spread_bps,
+        window_high=0.0,
+        window_low=0.0,
+        elapsed_minutes=max(0, (now_ms - opened) // 60_000),
+    )
+
+
+def active_policy(settings) -> intel.Policy:
+    if _POLICY["loaded"] is None:
+        _POLICY["loaded"] = intel.Policy.load(settings.intelligence_policy_path)
+        pol = _POLICY["loaded"]
+        print(
+            f"intelligence policy: version={pol.version} "
+            f"model={pol.model_version} arms={len(pol.arms)} "
+            f"vetoes={pol.vetoes_enabled} admissions={pol.admissions_enabled}",
+            flush=True,
+        )
+    return _POLICY["loaded"]
+
+
+def reload_policy(settings=None) -> None:
+    """Drop the cached policy so the next decision reads the new artefact.
+
+    The cache exists so a decision does not hit the disk, and it is correct for
+    a policy that only ever changes between processes - which stopped being
+    true the moment training moved inside the service. A runner that writes a
+    new artefact and leaves the process deciding from the old one in memory has
+    trained nothing anybody can observe.
+    """
+    _POLICY["loaded"] = None
+    # THE CANDIDATES RELOAD WITH IT. They were frozen for the life of the
+    # process because a candidate refitted between making a prediction and its
+    # grading would make the record meaningless - which was right while the
+    # ids were positional (`c01` meant a different cell after every refit, and
+    # `candidate_evaluations` is keyed on the id). The ids are now derived from
+    # the context and every row carries the version that wrote it, so a cell
+    # keeps its name and an old prediction stays attributable. Holding the old
+    # set instead would freeze the forward evaluation on whatever the first run
+    # happened to find.
+    _CANDIDATES["loaded"] = None
+    if settings is not None:
+        pol = active_policy(settings)
+        print(
+            f"intelligence policy reloaded: version={pol.version} "
+            f"arms={len(pol.arms)} vetoes={pol.vetoes_enabled} "
+            f"admissions={pol.admissions_enabled}",
+            flush=True,
+        )
+
+
+def active_candidates(settings) -> CandidateSet:
+    """Loaded once per process. A candidate that changed between making a
+    prediction and its grading would make the record meaningless, so the
+    artefact is frozen for the life of the run."""
+    if _CANDIDATES["loaded"] is None:
+        _CANDIDATES["loaded"] = CandidateSet.load(
+            settings.intelligence_candidates_path
+        )
+        cs = _CANDIDATES["loaded"]
+        print(
+            f"intelligence candidates: version={cs.version} "
+            f"features={cs.feature_version} n={len(cs.candidates)} "
+            f"(forward evaluation only - they control nothing)",
+            flush=True,
+        )
+    return _CANDIDATES["loaded"]
+
+
+def brti_context_row(snapshot, ask, opened, brti,
+                     side: str = "UP") -> tuple[dict | None, str]:
+    """The BRTI context row for this decision, or (None, why-not).
+
+    `brti` is the LAST reference poll's features. The reference deliberately
+    polls behind the trading path - a slow feed must never delay a fill - so
+    these are one poll old, and two things have to be checked before they can
+    label a cell:
+
+      * the features must not be stale, and
+      * they must belong to THIS market. `target` is the window's strike, so
+        a mismatch means the window rolled between the reference poll and
+        this decision and the numbers describe the market before it.
+
+    When either fails, this returns None and the caller records no context
+    rather than falling back to the Binance-scale numbers. That fallback is
+    the trap: the key would still format, it would just name a pocket nothing
+    was ever trained on, and the table would look healthy while measuring
+    noise. A missing row is visible; a mislabelled one is not.
+    """
+    if brti is None:
+        return None, "no brti features"
+    if getattr(brti, "stale", False):
+        return None, "brti stale"
+    target = getattr(snapshot, "target", None)
+    if not target or not getattr(brti, "target", None):
+        return None, "no strike"
+    if abs(brti.target - target) > 1e-6:
+        return None, "brti belongs to another window"
+    # THE SETUP, plus the context recorded beside it. `side` signs the
+    # momentum, because the gate is applied to the aligned value and an UP and
+    # a DOWN setup with identical raw momentum are opposite setups.
+    direction = 1 if side == "UP" else -1
+    return {
+        "brti_normalized_distance": brti.brti_normalized_distance,
+        "brti_momentum_bps": brti.brti_momentum_bps,
+        "brti_aligned_momentum_bps": direction * brti.brti_momentum_bps,
+        "brti_volatility_bps": brti.brti_volatility_bps,
+        "our_ask": ask,
+        # Context: recorded on every decision, never part of the key.
+        "session": _session(opened),
+        "vol_regime": brti_vol_regime(brti.brti_volatility_bps),
+    }, ""
+
+
+def _feature(brti, name: str):
+    """One recorded BRTI quantity, or None when no reference was in hand."""
+    return None if brti is None else getattr(brti, name, None)
+
+
+def normalise_gates(failed_checks) -> tuple[str, ...]:
+    """The failing gate NAMES, whatever shape the caller had them in.
+
+    Both live callers hand this a comma-joined STRING - `", ".join(...)` on the
+    Kalshi path, and `rule.matches` returns one on the legacy path. The
+    previous expression tested `isinstance(failed_checks, list)`, which a
+    string is not, and fell through to `tuple(str(x) for x in failed_checks)`:
+    iterating a string yields its CHARACTERS, so "BRTI distance" was stored as
+    thirteen separate gates, `B, R, T, I, ...`.
+
+    Nothing raised. The archive simply filled with per-character gate names,
+    and an admission - which may only rescue a setup whose failing gates are
+    exactly the one it names - could never match, so that path was dead by
+    typo rather than by decision.
+    """
+    if not failed_checks:
+        return ()
+    if isinstance(failed_checks, str):
+        return tuple(part.strip() for part in failed_checks.split(",")
+                     if part.strip())
+    if isinstance(failed_checks, dict):
+        failed_checks = [failed_checks]
+    out = []
+    for item in failed_checks:
+        if isinstance(item, dict):
+            name = item.get("name")
+            if name:
+                out.append(str(name))
+        elif item is not None:
+            out.append(str(item))
+    return tuple(out)
+
+
+def intelligence_verdict(
+    settings, store, prediction, snapshot, ask, rule_match, failed_checks,
+    opened, remaining, now_ms, brti=None, ticker=None, model_points=None,
+    band_hold_s=None,
+):
+    """Ask the shared decision function, record the answer, return it.
+
+    Never raises: a failure here falls back to the base strategy explicitly,
+    because a layer that can stop trading by breaking is worse than one that
+    is switched off.
+
+    `ticker` IS THE CONTRACT'S, NOT THE SNAPSHOT'S. This used to read
+    `getattr(snapshot, "ticker", None)` - and `MarketSnapshot` has no `ticker`,
+    so every one of the first 1,174 rows stored NULL. Nothing broke: the column
+    was simply always empty, which meant the broker's fills and fees could
+    never be joined to the decision that caused them, and the learning loop saw
+    every executed trade as a simulated one. A field that is silently always
+    None is the same failure as a number under the wrong name.
+    """
+    try:
+        policy = active_policy(settings)
+        features_ok = (
+            snapshot is not None
+            and getattr(snapshot, "volatility_5m_bps", None) is not None
+        )
+        # THE LIVE SNAPSHOT IS NOT THE HISTORICAL ONE. `MarketSnapshot` has no
+        # `session` or `vol_regime` - those live on the backtest `Snapshot` -
+        # so reading them off it yields "?" for both, and a context key of
+        # "? . ? . ..." can never match anything the policy was trained on.
+        # The first live decision showed exactly that. Derive them the same
+        # way the corpus does, from the same functions, or replay and live are
+        # not speaking about the same cells.
+        from .features import _session
+        vol = getattr(snapshot, "volatility_5m_bps", None) or 0.0
+        row = {
+            "session": _session(opened),
+            "vol_regime": ("high" if vol >= 12 else "low" if vol < 5 else "mid"),
+            "normalized_distance": getattr(prediction, "distance_bps", 0.0)
+            / max(getattr(snapshot, "volatility_5m_bps", 1.0) or 1.0, 1.0),
+            "our_ask": ask,
+        }
+        # ONE CONTEXT, KEYED ON THE INSTRUMENT ACTUALLY IN USE.
+        #
+        # Under Kalshi-only there is one feature family, so the policy and
+        # the candidates share `brti_context_of` and a mismatch is impossible
+        # by construction rather than by convention. The Binance context
+        # survives only for the legacy path, and the Binance-trained policy
+        # is separately retired and cannot act whatever key it is handed.
+        if settings.kalshi_only:
+            brti_row, why_not = brti_context_row(
+                snapshot, ask, opened, brti,
+                getattr(prediction, "side", "UP"),
+            )
+            if brti_row is None:
+                return intel.Verdict(
+                    base_qualified=bool(rule_match), failed_gates=(),
+                    final_action=intel.NEUTRAL,
+                    reason=f"no {intel.FEATURE_VERSION} context ({why_not})",
+                )
+            context = setup_context_of(brti_row)
+        else:
+            context = context_of(row)
+        key = f"{context}|{'accept' if rule_match else 'reject'}"
+        gates = normalise_gates(failed_checks)
+        verdict = intel.decide(
+            context_key=key, base_qualified=bool(rule_match),
+            failed_gates=gates, ask=ask, policy=policy,
+            enabled=settings.intelligence_enabled, features_ok=features_ok,
+            now_ms=now_ms, max_age_ms=settings.intelligence_max_policy_age_ms,
+        )
+        # THE SECOND GATE, and the one the operator holds. `decide` answered
+        # "was this validated?"; this answers "am I allowed to?", from two
+        # switches no code path can raise. Confidence, veto and admission are
+        # asked for separately, because they are separate risks - a layer
+        # trusted to re-rate a label is not thereby trusted to spend money on a
+        # trade every deployed gate refused.
+        mode, _mode_why = intel_mode.resolve(
+            settings.intelligence_mode, settings.intelligence_authorised
+        )
+        verdict = intel.authorise(
+            verdict,
+            # CONFIDENCE RIDES ON `intelligence_enabled`, NOT ON THE MODE.
+            #
+            # The mode ladder governs the retrieval layer, which returns a
+            # recommendation and needs authority before it is read as one. A
+            # policy confidence delta is not a recommendation: it re-rates the
+            # header on a decision the gates have already made, and it is
+            # arithmetically incapable of admitting, refusing or resizing
+            # anything. Requiring the execution switch for it would mean the
+            # only way to see a calibration is to grant the power to trade on
+            # one, which is precisely backwards.
+            may_confidence=settings.intelligence_enabled,
+            may_veto=intel_mode.may_veto(mode),
+            may_admit=intel_mode.may_admit(mode),
+        )
+        store.record_intelligence({
+            "window_open": opened,
+            "ticker": ticker or getattr(snapshot, "ticker", None),
+            "decided_ms": now_ms, "remaining_s": remaining,
+            "side": getattr(prediction, "side", None), "ask": ask,
+            "base_qualified": int(bool(rule_match)),
+            "failed_gates": ", ".join(gates) or None,
+            "final_action": verdict.final_action,
+            "overrides_gate": verdict.overrides_gate,
+            "reason": verdict.reason,
+            "confidence_delta": verdict.confidence_delta,
+            "calibrated_probability": verdict.calibrated_probability,
+            "expected_net": verdict.expected_net,
+            "evidence_n": verdict.evidence_n,
+            "uncertainty": verdict.uncertainty,
+            "context_key": verdict.context_key,
+            "model_version": verdict.model_version,
+            "policy_version": verdict.policy_version,
+            "feature_version": verdict.feature_version,
+            "training_cutoff_ms": verdict.training_cutoff_ms,
+            "features_ok": int(features_ok),
+            "evidence_action": verdict.evidence_action or verdict.final_action,
+            "evidence_delta": verdict.evidence_delta,
+            "authority": verdict.authority or None,
+            "model_points": model_points,
+            # THE RAW FEATURES, so a future re-keying never orphans this row
+            # the way `brti-1` orphaned every row written before `brti-2`.
+            "brti_normalized_distance": _feature(brti, "brti_normalized_distance"),
+            "brti_momentum_bps": _feature(brti, "brti_momentum_bps"),
+            "brti_aligned_momentum_bps": (
+                None if brti is None else
+                (1 if getattr(prediction, "side", "UP") == "UP" else -1)
+                * (getattr(brti, "brti_momentum_bps", 0.0) or 0.0)
+            ),
+            "brti_volatility_bps": _feature(brti, "brti_volatility_bps"),
+            # CONTEXT, recorded and not keyed on.
+            "session": _session(opened),
+            "vol_regime": (
+                None if brti is None else
+                brti_vol_regime(getattr(brti, "brti_volatility_bps", 0.0) or 0.0)
+            ),
+            "band_hold_s": band_hold_s,
+        })
+        # FORWARD EVALUATION, alongside. Every frozen candidate that speaks to
+        # this context records what it WOULD have changed, beside what the
+        # unchanged strategy actually decided. None of them can alter the
+        # order; this is how one earns the right to, on data it was never
+        # fitted to.
+        try:
+            candidates = active_candidates(settings)
+            brti_row, why_not = brti_context_row(
+                snapshot, ask, opened, brti,
+                getattr(prediction, "side", "UP"),
+            )
+            if brti_row is None:
+                # Say so once per window rather than per poll - and say it at
+                # all. A forward evaluation that records nothing looks exactly
+                # like one where no candidate had an opinion.
+                if candidates.candidates and BRTI_CONTEXT_GAP["window"] != opened:
+                    BRTI_CONTEXT_GAP["window"] = opened
+                    print(
+                        f"candidate evaluation skipped [{why_not}] - no "
+                        f"{candidates.feature_version} context for this window",
+                        flush=True,
+                    )
+                return verdict
+            evaluations = candidates.evaluate(
+                context_key=str(setup_context_of(brti_row)),
+                qualified=bool(rule_match),
+            )
+            for item in evaluations:
+                item.update({
+                    "window_open": opened, "decided_ms": now_ms,
+                    "ticker": ticker or getattr(snapshot, "ticker", None),
+                    "side": getattr(prediction, "side", None), "ask": ask,
+                    "remaining_s": remaining,
+                })
+            if evaluations:
+                store.record_candidate_evaluations(evaluations)
+        except Exception as exc:  # noqa: BLE001 - evaluation is never fatal
+            print(f"candidate evaluation failed: {exc!r}", flush=True)
+        return verdict
+    except Exception as exc:  # noqa: BLE001 - never stop trading
+        print(f"intelligence failed, falling back to strategy: {exc!r}", flush=True)
+        return intel.Verdict(
+            base_qualified=bool(rule_match), failed_gates=(),
+            final_action=intel.NEUTRAL, reason="intelligence error; base strategy",
+        )
+
+
 async def primary_signal(
     settings: Settings,
     store: Store,
@@ -1339,6 +1886,8 @@ async def primary_signal(
     now_ms: int,
     trader: KalshiExecutionClient | None = None,
     levels: LevelTracker | None = None,
+    capital=None,
+    brti=None,
 ) -> None:
     rule = EntryRule.load(settings.strategy_path)
     # Read from the cache only. The tracker refreshes on its own slow clock
@@ -1354,15 +1903,87 @@ async def primary_signal(
     # never saw the minutes where the measured edge actually lives.
     if not settings.entry_to_seconds <= remaining <= settings.entry_from_seconds:
         return
-    if snapshot.spread_bps > settings.max_spread_bps:
+    # The spread gate lives in `kalshi_signal.signal_inputs` on the Kalshi
+    # path, measured in CENTS of the contract. `max_spread_bps` describes
+    # Binance SPOT spread and applying it to a Kalshi book rejects every
+    # signal - a 2c spread on a 79c mid is 253 bps against a threshold of 2.
+    if not settings.kalshi_only and snapshot.spread_bps > settings.max_spread_bps:
         return
-    prediction = predict(snapshot)
-    calibration = store.calibration(prediction.bucket)
-    contract_ask = contract.ask(prediction.side)
-    rule_match, failed_checks = rule.matches(
-        prediction, snapshot, contract_ask,
-        blocking_level=blocking_level, levels_ready=levels_ready,
+    if settings.kalshi_only:
+        # THE ACTIVE RULE IS THE BRTI ONE. The deployed `EntryRule` gates on
+        # `min_normalized_distance = 1.5`, measured against Binance RAW
+        # volatility; BRTI reads 10-20 on the identical market, so reusing it
+        # here would pass the distance gate on everything while still drawing
+        # a tick beside it. Different quantity, different rule, and the floor
+        # below is the measured 10x (FINDINGS 43).
+        #
+        # `predict()` does not run: three of its five terms are Binance-only
+        # and the two that are not are on the wrong scale. There is no
+        # Kalshi-native probability model, so none is reported - see
+        # `kalshi_signal`.
+        kalshi_rule = KalshiBRTIRule.load(settings.kalshi_strategy_path)
+        prediction = kalshi_signal.prediction_from(brti)
+        calibration = None
+        contract_ask = contract.ask(prediction.side)
+        rule_match, facts, failed_names = kalshi_signal.evaluate(
+            kalshi_rule, brti, contract_ask, remaining,
+        )
+        rule_match = rule_match and kalshi_rule.enabled
+        failed_checks = ", ".join(failed_names)
+    else:
+        prediction = predict(snapshot)
+        calibration = store.calibration(prediction.bucket)
+        contract_ask = contract.ask(prediction.side)
+        rule_match, failed_checks = rule.matches(
+            prediction, snapshot, contract_ask,
+            blocking_level=blocking_level, levels_ready=levels_ready,
+        )
+    # THE INTELLIGENCE LAYER, on the real decision path. One shared function,
+    # the same one historical replay calls, so an evaluation can never
+    # describe behaviour the bot does not have.
+    #
+    # It is recorded whatever it says - including NEUTRAL, and including when
+    # no order follows. The interesting cases for "did it help?" are exactly
+    # the ones where nothing traded, so they cannot be reconstructed from the
+    # orders afterwards.
+    # NAMED `intel_verdict`, NOT `verdict`. There is already a local `verdict`
+    # further down this function holding the auto-trade log string, and it is
+    # assigned on several branches - so binding the intelligence Verdict to the
+    # same name meant that by the time the alert was rendered it was sometimes
+    # a `str`. The collision is invisible on the branches that do not reassign,
+    # which is exactly the kind that survives a test run.
+    intel_verdict = intelligence_verdict(
+        settings, store, prediction, snapshot, contract_ask,
+        rule_match, failed_checks, opened, remaining, now_ms, brti,
+        ticker=getattr(contract, "ticker", None),
+        # BAND-HOLD STATE, recorded as context. It is order-eligibility
+        # rather than a qualification check - the price must have SETTLED in
+        # the band, not merely touched it - and it is the condition most often
+        # standing between a qualified signal and an order, so a decision row
+        # that omits it cannot explain why nothing was bought. Read from the
+        # archive, the same call the auto path makes further down.
+        # The score the model produced for THIS decision, before the
+        # layer touched it. This is the prediction a calibration compares
+        # against the outcome.
+        #
+        # Only on the Kalshi path: `facts` is assembled there and not in the
+        # legacy branch until much further down, and a score reconstructed
+        # later is a score from a different moment. The learner excludes
+        # non-BRTI rows anyway, so a None here costs nothing.
+        model_points=(
+            model_confidence_points(facts, opened, blocking_level)
+            if settings.kalshi_only else None
+        ),
+        band_hold_s=(
+            int(store.band_streak_seconds(
+                opened, kalshi_rule.min_ask, kalshi_rule.max_ask, now_ms))
+            if settings.kalshi_only else None
+        ),
     )
+    if intel_verdict.final_action == intel.VETO:
+        rule_match = False
+    elif intel_verdict.final_action == intel.ADMIT:
+        rule_match = True
     qualified = rule.enabled and rule_match and settings.entry_alerts_enabled
 
     # Three states, not two. The rule's verdict informs the decision without
@@ -1502,12 +2123,15 @@ async def primary_signal(
             last = store.get_setting("disabled_alert_ms", 0.0)
             if now_ms - last > 3_600_000:
                 store.set_setting("disabled_alert_ms", float(now_ms), now_ms)
-                await telegram.send(
-                    "⚠️ <b>AUTOMATION IS OFF AT THE STRATEGY</b>\n"
-                    f"<i>/auto is ON, but strategy.json has "
-                    f"<code>enabled: false</code>, so no order will be placed - "
-                    f"this one at {contract_ask:.0%} included.</i>\n"
-                    "<i>Both switches must be on. Set enabled: true to resume.</i>"
+                notifier = Notifier(telegram, store, settings)
+                await notifier.send_once(
+                    "automation_off", str(opened),
+                    messages.automation_off_message(
+                        ask=contract_ask,
+                        snapshot=notifier.snapshot(now_ms),
+                        insight=notifier.insight_for(opened, now_ms),
+                    ),
+                    now_ms,
                 )
         elif trader is None:
             verdict = "no execution client"
@@ -1515,10 +2139,24 @@ async def primary_signal(
             # The numbers, not just the label: "target distance" alone hides
             # whether it missed by a hair or by a mile, and overnight that is
             # the difference between a rule to tune and a rule that is working.
-            detail = rule.check_detail(
-                prediction, snapshot, contract_ask,
-                blocking_level=blocking_level, levels_ready=levels_ready,
-            )
+            # The KALSHI facts under kalshi_only. This was the fifth call site
+            # into the Binance rule, and it crashed the service every window
+            # from 00:21 to 05:04: `check_facts` compares
+            # `raw_probability >= min_raw_probability`, and that is None here.
+            # It is reached only on the auto path when a market is eligible
+            # and the rule then refuses it, which is why the first twenty
+            # minutes after the deploy looked clean.
+            if settings.kalshi_only:
+                detail = [
+                    (f["name"], f["passed"],
+                     f["pass_text"] if f["passed"] else f["fail_text"])
+                    for f in facts
+                ]
+            else:
+                detail = rule.check_detail(
+                    prediction, snapshot, contract_ask,
+                    blocking_level=blocking_level, levels_ready=levels_ready,
+                )
             verdict = "rule: " + "; ".join(
                 f"{name}({value})" for name, passed, value in detail if not passed
             )
@@ -1606,19 +2244,66 @@ async def primary_signal(
             # shown in the alert and archived for measurement - and it must not
             # scale, throttle or otherwise touch what gets ordered. The budget
             # comes from settings and nothing else.
-            count = contracts_for_budget(limits.budget, contract_ask)
+            # THE SINGLE SIZING AUTHORITY. The base tier comes from the daily
+            # capital review - reconciled capital on the New York day - and is
+            # the same object the recovery add-on asks. Two independent rules
+            # that both change size is how a cap gets exceeded by the sum of
+            # two things that each looked bounded.
+            #
+            # THE BUDGET MUST NOT SILENTLY CAP THE TIER. `auto_budget` is a
+            # per-CONTRACT allowance, so the money available to an order scales
+            # with the tier; treating it as a per-ORDER total would pin the size
+            # at one contract for ever, and the growth controller would look
+            # like it was working while changing nothing. When the operator's
+            # budget really is the binding constraint, it is printed rather
+            # than applied quietly.
+            if capital is not None and settings.capital_sizing_enabled:
+                tier = capital.base_contracts(now_ms)
+                count = contracts_for_budget(limits.budget * tier, contract_ask)
+                if count < tier:
+                    print(
+                        f"auto: budget caps the tier - {limits.budget:.2f}/contract "
+                        f"x {tier} affords {count} at {contract_ask:.2f}",
+                        flush=True,
+                    )
+                count = min(count, tier)
+            else:
+                count = contracts_for_budget(limits.budget, contract_ask)
             # Size up ONLY inside the measured edge band. Everywhere else the
             # deployed size is unchanged, so this can never trade bigger on a
             # setup the data does not support.
             count, size_reason = confidence_size(
                 settings, snapshot, prediction, count
             )
-            # RECOVERY WINS OVER THE BAND. An outstanding loss is a fact about
+            # RECOVERY WINS OVER THE BAND. A realised deficit is a fact about
             # the account; the confidence band is an opinion about the setup.
             # Checked second so its reason is the one reported when both apply.
-            recovered, recovery_reason = recovery_size(store, settings, count)
+            #
+            # NOTHING HERE CAN CAUSE A TRADE. Every gate above has already
+            # passed - this block only decides the size of an order that is
+            # going out anyway, and a deficit is never a reason to enter.
+            #
+            # The state is read ONCE and carried to the step below, so the plan
+            # that is charged for this order is the plan its size was chosen
+            # from.
+            recovery = store.recovery_state(settings.recovery_steps)
+            recovered, recovery_reason = recovery_size(
+                store, settings, count, contract_ask, state=recovery
+            )
             if recovery_reason:
                 count, size_reason = recovered, recovery_reason
+            elif recovery.active:
+                # Said out loud, because a silent non-upsize during recovery
+                # looks exactly like recovery not working - which is how the
+                # last sizing defect stayed invisible for a day.
+                upsized = max(count, settings.high_confidence_contracts)
+                print(
+                    f"auto: recovery holding at base - "
+                    f"{max_net_profit(upsized, contract_ask):.2f} max net does "
+                    f"not cover {recovery.required_per_trade():.2f} of "
+                    f"{recovery.deficit:.2f} outstanding",
+                    flush=True,
+                )
             if count > 1:
                 print(f"auto: sizing {count} contracts - {size_reason}", flush=True)
             proposal = create_proposal(
@@ -1656,6 +2341,16 @@ async def primary_signal(
                     attempt=attempts + 1,
                     entry_slippage=settings.entry_slippage,
                 )
+                # ONE STEP OF THE RECOVERY PLAN IS NOW ON THE BOOK. Only a
+                # trade that actually took the upsize spends one, and only on a
+                # FILL: an order that bought nothing changed no plan.
+                #
+                # Here, on the post-order path, for the same reason
+                # `log_execution` is here - the contracts are already at the
+                # exchange, so this write cannot cost a fill, and
+                # `consume_recovery_step` cannot raise.
+                if recovery_reason and getattr(result, "filled_count", 0) > 0:
+                    store.consume_recovery_step(now_ms, settings.recovery_steps)
                 # The shadow row for a window we actually TRADED. `shadow_read`
                 # ran only where the entry alert is built, and this branch
                 # returns long before that, so `shadow_decisions` held rows for
@@ -1696,16 +2391,24 @@ async def primary_signal(
                             # Re-deriving them at report time would describe a
                             # market that has already moved, and the point of
                             # showing them on a fill is the audit trail.
-                            fill_facts = rule.check_facts(
-                                prediction, snapshot, contract_ask,
-                                blocking_level=blocking_level,
-                                levels_ready=levels_ready,
+                            fill_facts = (
+                                kalshi_signal.evaluate(
+                                    KalshiBRTIRule.load(
+                                        settings.kalshi_strategy_path),
+                                    brti, contract_ask, remaining)[1]
+                                if settings.kalshi_only
+                                else rule.check_facts(
+                                    prediction, snapshot, contract_ask,
+                                    blocking_level=blocking_level,
+                                    levels_ready=levels_ready,
+                                )
                             )
                             why = decision_record(
                                 store, settings, claimed, contract,
                                 snapshot, prediction, contract_ask,
                                 opened, remaining, now_ms, settled_s,
                                 blocking_level, paid, fee,
+                                brti_features=brti,
                             )
                             # RENDER IT. `decision_record` returns a list of
                             # (label, value) pairs, and handing that straight
@@ -1725,35 +2428,70 @@ async def primary_signal(
                             store.save_details(
                                 claimed.id, "\n".join(detail_lines), now_ms
                             )
-                            await telegram.send(
-                                messages.order_filled(
+                            # ONE SURFACE. The fill is the second message of
+                            # the same market, so it carries the same rotating
+                            # insight and the same reconciled money footer as
+                            # the signal that preceded it, and it is claimed
+                            # before sending so a retry cannot double-report a
+                            # position.
+                            notifier = Notifier(telegram, store, settings)
+                            await notifier.send_once(
+                                "fill", f"{opened}:{claimed.id}",
+                                messages.fill_message(
                                     side=prediction.side,
                                     ticker=contract.ticker,
                                     contracts=filled_count,
                                     paid=paid,
+                                    fee=fee,
+                                    remaining=remaining,
                                     confidence=confidence_label(
                                         fill_facts, opened, blocking_level
                                     ),
                                     facts=fill_facts,
-                                    band_held=(
-                                        f"{settled_s:.0f}/"
-                                        f"{settings.entry_band_settle_s}s"
+                                    snapshot=notifier.snapshot(now_ms),
+                                    insight=notifier.insight_for(opened, now_ms),
+                                    band_hold=(
+                                        int(settled_s),
+                                        settings.entry_band_settle_s,
                                     ),
-                                    exact=exact,
-                                    remaining=remaining,
-                                    target=snapshot.target,
-                                    price=snapshot.price,
+                                    # ONLY WHEN THE PRICE IS THE REAL ONE.
+                                    # Without per-fill confirmation `paid` is
+                                    # the order average, and comparing an
+                                    # average against the decision ask reports
+                                    # a slippage figure that was never priced.
+                                    decision_ask=(
+                                        contract_ask if exact else None
+                                    ),
+                                    priority=surface.priority_lines(
+                                        recovery=store.stored_deficit(),
+                                        partial=(
+                                            "" if exact else
+                                            "fill price is the order average, "
+                                            "not a confirmed per-fill price"
+                                        ),
+                                    ),
+                                    size_reason=size_reason,
                                 ),
+                                now_ms,
                                 [("\U0001f4cb WHY THIS TRADE", f"details:{claimed.id}")],
                             )
                         else:
                             # Nothing was bought. Announcing a cost here claimed
                             # a position that does not exist.
-                            await telegram.send(
-                                f"⚠️ <b>AUTO ORDER NOT FILLED</b> "
-                                f"· {escape(contract.ticker)}\n"
-                                f"<i>{escape(result.note)}</i>\n"
-                                "<i>No contracts were bought and nothing was spent.</i>"
+                            notifier = Notifier(telegram, store, settings)
+                            await notifier.send_once(
+                                "not_filled", f"{opened}:{claimed.id}",
+                                messages.not_filled_message(
+                                    ticker=contract.ticker,
+                                    note=result.note,
+                                    snapshot=notifier.snapshot(now_ms),
+                                    insight=notifier.insight_for(
+                                        opened, now_ms),
+                                    priority=surface.priority_lines(
+                                        recovery=store.stored_deficit(),
+                                    ),
+                                ),
+                                now_ms,
                             )
                     except (httpx.HTTPError, OSError, RuntimeError, ValueError) as exc:
                         # The order stands; only the reporting failed.
@@ -1782,7 +2520,7 @@ async def primary_signal(
             store, settings, None, contract, snapshot, prediction,
             contract_ask, opened, remaining, now_ms, settled_s,
             blocking_level, contract_ask, None, action="DECLINED",
-            blocked_reason=declined_reason,
+            blocked_reason=declined_reason, brti_features=brti,
         )
     if not alerting:
         # Already alerted this window. Trading was evaluated above; there is
@@ -1797,7 +2535,11 @@ async def primary_signal(
     # printed momentum as +3.3 bps in the checks and -3.3 bps in the context -
     # one signed for our side, one raw - with nothing to say which the rule
     # had actually used.
-    facts = rule.check_facts(
+    # The SAME facts the decision was taken on. Re-running the Binance rule
+    # here would not merely render the wrong gates - `check_facts` reads
+    # `prediction.raw_probability`, which is None on the Kalshi path because
+    # no Kalshi-native model exists, so it would raise on the first alert.
+    facts = facts if settings.kalshi_only else rule.check_facts(
         prediction, snapshot, contract_ask,
         blocking_level=blocking_level, levels_ready=levels_ready,
     )
@@ -1809,7 +2551,11 @@ async def primary_signal(
                 settings, snapshot, prediction, contract_ask,
                 priced_edge, settled_s, opened,
                 rule_match=rule_match, blocking_level=blocking_level,
-                model_ok=prediction.raw_probability >= 0.9,
+                # None on the Kalshi path: there is no Kalshi-native
+                # probability model, and `None >= 0.9` raises. False is the
+                # honest reading - "the model does not vouch for this" - and
+                # is what "no model" must mean, never an implied yes.
+                model_ok=(prediction.raw_probability or 0.0) >= 0.9,
             )
         ]
     )
@@ -1819,7 +2565,18 @@ async def primary_signal(
     )
     if shadow:
         detail_body += "\n" + messages.RULE + "\n" + shadow
-    confidence = confidence_label(facts, opened, blocking_level)
+    # THE LEARNED ADJUSTMENT, in the word and in a line saying why.
+    #
+    # The delta moves the header; `policy_line` explains it, and returns empty
+    # when the layer changed nothing - silence is the right output for "the
+    # pattern supports the existing decision", and narrating every neutral
+    # trains the reader to skip the one that matters.
+    confidence = confidence_label(
+        facts, opened, blocking_level, intel_verdict.confidence_delta
+    )
+    policy_note = messages.policy_line(intel_verdict)
+    if policy_note:
+        detail_body += "\n" + messages.RULE + "\n" + policy_note
     if offer_button:
         proposal = create_proposal(
             store,
@@ -1850,42 +2607,56 @@ async def primary_signal(
         missing = missing_for_execution(settings)
         if missing:
             status += f"\n⚙️ A press will be refused — still needed: {missing}"
-        text = messages.signal_alert(
-            side=prediction.side,
-            ticker=contract.ticker,
-            ask=contract_ask,
-            price=snapshot.price,
-            target=snapshot.target,
-            remaining=remaining,
-            confidence=confidence,
-            facts=facts,
-            executable=qualified,
-            status_line=status,
-            record=record_block(store, settings),
-        )
+        # The message itself is assembled once, below, through the shared
+        # surface. This branch only decides the status line and the buttons.
         store.save_details(proposal.id, detail_body, now_ms)
         buttons = messages.signal_buttons(
             prediction.side, proposal.id, proposal.id, override=not rule_match
         )
     else:
         key = f"w{opened}"
-        text = messages.signal_alert(
-            side=prediction.side,
-            ticker=contract.ticker,
-            ask=contract_ask,
-            price=snapshot.price,
-            target=snapshot.target,
-            remaining=remaining,
-            confidence=confidence,
-            facts=facts,
-            executable=False,
-            verdict="NO ENTRY",
-            status_line="⚪ Paper only · no order placed",
-            record=record_block(store, settings),
-        )
+        status = ""
         store.save_details(key, detail_body, now_ms)
         buttons = messages.signal_buttons(prediction.side, None, key)
-    await telegram.send(text, buttons)
+    # THE SHARED SURFACE. One reconciled snapshot for the whole message, the
+    # market's own rotating insight, and a delivery record so a restart cannot
+    # replay an alert the operator has already read.
+    #
+    # A signal that is merely WAITING on the band-hold timer edits the message
+    # already on the screen rather than sending another: at a ten-second poll
+    # one window produced dozens of near-identical notifications, and the
+    # reader who learns to swipe those away swipes away the one that matters.
+    notifier = Notifier(telegram, store, settings)
+    # NAMED `money`, NOT `snapshot`. `snapshot` is already this function's
+    # MarketSnapshot parameter, and shadowing it made every later read of
+    # `snapshot.price` raise - the same collision that put a log string where
+    # the intelligence Verdict belonged.
+    money = notifier.snapshot(now_ms)
+    insight = notifier.insight_for(opened, now_ms)
+    surfaced = messages.signal_message(
+        side=prediction.side,
+        ticker=contract.ticker,
+        ask=contract_ask,
+        remaining=remaining,
+        confidence=confidence,
+        facts=facts,
+        executable=qualified,
+        status_line=status if offer_button else "⚪ Paper only · no order placed",
+        snapshot=money,
+        insight=insight,
+        band_hold=(int(settled_s), settings.entry_band_settle_s),
+        priority=surface.priority_lines(recovery=store.stored_deficit()),
+        verdict=None if offer_button else "NO ENTRY",
+    )
+    waiting = bool(offer_button and auto_blocked)
+    if waiting:
+        await notifier.update_status(
+            "signal", str(opened), surfaced, now_ms, buttons
+        )
+    else:
+        await notifier.send_once(
+            "signal", str(opened), surfaced, now_ms, buttons
+        )
 
     schedule_commentary(
         settings, store, telegram, contract, snapshot, prediction, rule,
@@ -1994,6 +2765,7 @@ async def report_settlement(
     settings: Settings,
     sizing: dict | None = None,
     basis: str = "1 contract",
+    now_ms: int | None = None,
 ) -> None:
     """Tell Telegram how the market closed and whether our setup was right.
 
@@ -2012,11 +2784,27 @@ async def report_settlement(
       one, because nothing was spent.
     """
     sizing = sizing or {"contracts": 1.0}
-    window_open, side, ticker, contract_price, qualified, target = pending
+    now_ms = int(time.time() * 1000) if now_ms is None else now_ms
+    window_open, called_side, ticker, contract_price, qualified, target = pending
     winner = "UP" if result == "yes" else "DOWN"
-    won = side == winner
 
     trade = store.trade_for_window(window_open)
+    # THE MONEY BELONGS TO THE SIDE WE HELD, NOT THE SIDE WE CALLED.
+    #
+    # `predictions` is keyed on `window_open` with INSERT OR IGNORE and written
+    # at ALERT time, so it holds the FIRST side the reference named. If the
+    # reference flips before the order fills, that row keeps the old side while
+    # the position sits on the other one - and this function then computed
+    # `won = called_side == winner` and handed the inverted flag to
+    # `position_pnl`, which turned a paid-out win into a reported loss.
+    #
+    # It reached the operator twice on real money, both times as a loss that
+    # was actually a win: 2026-09-21 (+$0.2821) and 2026-09-23 (+$0.1271, two
+    # contracts of UP at 93.2c, Kalshi paid $2.00). `daily_ledger` was correct
+    # throughout because it syncs from the broker, so the account never drifted
+    # - only the sentence did.
+    side = (trade.get("side") or called_side) if trade else called_side
+    won = side == winner
     if trade:
         # One accounting call, the same one the daily loss floor uses, so the
         # message and the safety limit can never state different money for the
@@ -2040,45 +2828,56 @@ async def report_settlement(
         else:
             basis = f"{size:g} contract" + ("s" if size != 1 else "")
         contracts_shown, price_shown = size, trade["paid"]
+        # BROKER-RECONCILED, NOT REBUILT. `daily_ledger` is the append-only
+        # realised record synced from `/portfolio/settlements`; it counts an
+        # early cash-out exactly once and the exchange may revise it. The local
+        # reconstruction above stands in only until that row exists.
+        booked = store.realised_for_ticker(ticker)
+        if booked is not None:
+            pnl = booked
     else:
         pnl = None  # nothing was bought, so there is no money to report
         contracts_shown, price_shown = None, contract_price
 
-    # settle() has already run, so this outcome is inside the scoreboard.
-    text = messages.settlement(
-        head=head_for(store, settings),
-        ticker=ticker or "",
+    # TRADED is "did money move", not "was there a proposal". `trade` is the
+    # reconciled position; without one nothing was bought and the recap must
+    # say so rather than printing a cost nobody paid.
+    traded = bool(trade)
+    exited_at = trade["exit_price"] if trade and trade.get("exit_count") else None
+
+    notifier = Notifier(store=store, telegram=telegram, settings=settings)
+    snapshot = notifier.snapshot(now_ms)
+    surfaced = messages.result_message(
         side=side,
-        winner=winner,
-        won=won,
-        target=target,
-        contract_price=price_shown,
-        pnl=pnl,
+        ticker=ticker,
+        called_side=called_side,
         qualified=bool(qualified),
-        basis=basis,
-        contracts=contracts_shown,
-        exited_at=trade["exit_price"] if trade and trade["exit_price"] else None,
-        paper=trade is None,
-        exact=trade["confirmed"] if trade else True,
-        # The compact money line, from the broker-backed record. The full
-        # scoreboard header no longer leads a result message: what the account
-        # did is the point, and three lines of paper statistics above it is
-        # what made the real figure the easiest thing on screen to miss.
-        record=record_block(store, settings),
+        contracts=contracts_shown or 0.0,
+        # The charged entry fee, so the recap's cost is the fill's cost.
+        fee=(trade.get("fee") if trade else None),
+        winner=winner,
+        won=bool(won),
+        traded=traded,
+        pnl=pnl,
+        paid=contract_price,
+        exited_at=exited_at,
+        snapshot=snapshot,
+        insight=notifier.insight_for(window_open, now_ms),
+        priority=surface.priority_lines(
+            recovery=store.stored_deficit(),
+            # MONEY AND CALL SEPARATED, as everywhere else on this surface. A
+            # market whose signal said one side and whose position took the
+            # other has two verdicts, and hiding the disagreement is what let
+            # the inverted recap look ordinary for two days.
+            partial=(
+                f"Signal called {called_side}; the position held {side}"
+                if trade and called_side != side else ""
+            ),
+        ),
     )
-    # "Qualified" means the rule liked the setup, NOT that an order was placed:
-    # it is `int(rule_match)` recorded at alert time, and most of these were
-    # never bought. Labelled paper so it cannot be read as the trading record -
-    # that one is the Live line in the header.
-    qualified_n, qualified_wins, qualified_pnl = store.scoreboard(
-        **sizing, qualified_only=True
+    await notifier.deliver_result(
+        window_open, "settlement", str(window_open), surfaced, now_ms
     )
-    if qualified_n:
-        text += (
-            f"\n\U0001f4cc <i>Rule-qualified signals: {qualified_wins}/{qualified_n} "
-            f"({qualified_wins / qualified_n:.0%}) · paper {qualified_pnl:+,.2f}</i>"
-        )
-    await telegram.send(text)
 
 
 async def cash_out_exit(
@@ -2159,9 +2958,28 @@ async def cash_out_exit(
         print(f"cash-out failed {type(exc).__name__}: {exc}", flush=True)
 
     sold = bool(result and result.filled_count > 0)
-    await telegram.send(
-        messages.cash_out(
-            head=head_for(store, settings),
+    if sold:
+        # BANK IT NOW, before the header is rendered. The proceeds are already
+        # in the account; `settlements` will not carry them for another minute,
+        # and the stale open mark still shows the position we just sold. Until
+        # 2026-09-22 that gap is what let the settlement recap four minutes
+        # later report this profit as missing and the next signal put it back.
+        filled = result.filled_count if result else count
+        banked = partial_exit_pnl(
+            paid=paid, bid=bid, filled=filled, held=count,
+            entry_fee=entry_fee, exit_fee=exit_fee,
+        )
+        # REALISED AT THE EXIT FILL, not when this loop noticed. The deficit
+        # replays in realisation order, and our own discovery time has been
+        # observed 917 seconds behind the broker's.
+        store.record_realised(
+            ticker, opened, banked, banked > 0, "cash_out", now_ms,
+            realised_ms=store.last_exit_fill_ms(ticker) or now_ms,
+        )
+    notifier = Notifier(telegram, store, settings)
+    await notifier.send_once(
+        "cash_out", f"{opened}:{ticker}",
+        messages.cash_out_message(
             ticker=ticker,
             side=side,
             paid=paid,
@@ -2173,7 +2991,11 @@ async def cash_out_exit(
             sold=sold,
             entry_fee=entry_fee,
             exit_fee=exit_fee,
-        )
+            snapshot=notifier.snapshot(now_ms),
+            insight=notifier.insight_for(opened, now_ms),
+            priority=surface.priority_lines(recovery=store.stored_deficit()),
+        ),
+        now_ms,
     )
 
 
@@ -2243,9 +3065,10 @@ async def reversal_exit(
         except (httpx.HTTPError, OSError, RuntimeError, ValueError) as exc:
             result = None
             print(f"auto-exit failed {type(exc).__name__}: {exc}", flush=True)
-        await telegram.send(
-            messages.auto_exit(
-                head=head_for(store, settings),
+        notifier = Notifier(telegram, store, settings)
+        await notifier.send_once(
+            "auto_exit", f"{opened}:{ticker}",
+            messages.auto_exit_message(
                 ticker=ticker,
                 side=side,
                 price=snapshot.price,
@@ -2254,20 +3077,30 @@ async def reversal_exit(
                 remaining=remaining,
                 note=result.note if result else "exit order failed; holding to settlement",
                 sold=bool(result and result.filled_count > 0),
-            )
+                snapshot=notifier.snapshot(now_ms),
+                insight=notifier.insight_for(opened, now_ms),
+                priority=surface.priority_lines(
+                    recovery=store.stored_deficit()),
+            ),
+            now_ms,
         )
         return
 
-    await telegram.send(
-        messages.exit_alert(
-            head=head_for(store, settings),
+    notifier = Notifier(telegram, store, settings)
+    await notifier.send_once(
+        "exit_warning", f"{opened}:{contract.ticker}",
+        messages.exit_warning_message(
             ticker=contract.ticker,
             side=side,
             price=snapshot.price,
             target=snapshot.target,
             remaining=remaining,
             bid=bid,
-        )
+            snapshot=notifier.snapshot(now_ms),
+            insight=notifier.insight_for(opened, now_ms),
+            priority=surface.priority_lines(recovery=store.stored_deficit()),
+        ),
+        now_ms,
     )
 
 
@@ -2349,9 +3182,17 @@ async def reversion_signal(
 
 async def service() -> None:
     settings = Settings()
-    market = BinanceClient(settings.symbol, settings.spot_base_url, settings.futures_base_url)
+    # KALSHI ONLY. The Binance client is not CONSTRUCTED under `kalshi_only`,
+    # so no active code path can reach it even by mistake - a flag checked at
+    # each call site is a flag someone eventually forgets.
+    market = (
+        None if settings.kalshi_only
+        else BinanceClient(settings.symbol, settings.spot_base_url,
+                           settings.futures_base_url)
+    )
     kalshi = KalshiClient(settings.kalshi_base_url, settings.kalshi_series)
     store = Store(settings.database_path)
+    store.configure_recovery_exit(settings)
     telegram = Telegram(settings.telegram_bot_token, settings.telegram_chat_id, settings.dry_run)
     trader = None
     if execution_configured(settings):
@@ -2363,12 +3204,71 @@ async def service() -> None:
             )
         except (OSError, ValueError) as exc:
             print(f"Kalshi execution disabled: {exc}", flush=True)
-    hourly = HourlyShadow(settings) if settings.hourly_enabled else None
-    levels = LevelTracker()
+    # The hourly ladder takes its OWN Binance reading (see HourlyShadow.poll),
+    # so although it never trades it IS an active Binance request. Under
+    # Kalshi-only it does not run. Its archive stays readable as history.
+    hourly = (
+        HourlyShadow(settings)
+        if settings.hourly_enabled and not settings.kalshi_only else None
+    )
+    reference = ReferenceShadow(settings) if settings.reference_enabled else None
+    recovery_add = RecoveryAddRunner(settings, store, telegram)
+    capital = CapitalController(settings, store)
+    # CONTINUOUS LEARNING, inside the service. It ingests every settled signal,
+    # refits on Kalshi-native features, and activates only what clears the
+    # promotion bar. `startup` recovers whatever the previous process was doing
+    # - including restoring a valid rollback if the artefact on disk cannot act.
+    learner = LearningRunner(
+        settings, store, telegram,
+        on_activate=lambda: reload_policy(settings),
+    )
+    try:
+        learner.startup(int(time.time() * 1000))
+    except Exception as exc:  # noqa: BLE001 - learning never stops trading
+        print(f"learning startup failed: {exc!r}", flush=True)
+    LEARNING["runner"] = learner
+    CAPITAL_DAY = {"ny": None}
+    LAST_POLL = {"ms": 0}
+    # Support/resistance is computed from Binance klines and the deployed rule
+    # has `require_blocking_level: false`, so under Kalshi-only it is not
+    # built at all rather than built and ignored.
+    levels = None if settings.kalshi_only else LevelTracker()
+    if settings.kalshi_only:
+        from . import feature_contract
+        # Under Kalshi-only the reference IS the signal source, not a shadow
+        # recorder. With it off, every poll would record an input gap and the
+        # system would go quiet in a way that looks exactly like a flat
+        # market. Refuse to start rather than run silently useless.
+        if not reference:
+            raise SystemExit(
+                "kalshi_only requires reference_enabled: BRTI is the signal "
+                "source, not a shadow recorder. With it off the bot records "
+                "an input gap every poll and never trades."
+            )
+        print(
+            f"KALSHI ONLY: quotes, books, executions, settlements and BRTI "
+            f"from Kalshi. Binance client not constructed. "
+            f"features {feature_contract.describe()}",
+            flush=True,
+        )
     if hourly:
         print(f"hourly ladder recording (shadow) -> {settings.hourly_database_path}",
               flush=True)
-    print("BTC15 signal started; execution requires Telegram approval", flush=True)
+    if reference:
+        feed = "BRTI live" if reference.brti_configured else "BRTI NOT entitled"
+        print(
+            f"settlement reference recording (shadow) -> "
+            f"{settings.reference_database_path} [{feed}; official 60s averages "
+            f"from Kalshi either way]",
+            flush=True,
+        )
+    # WHAT SOURCE IS RUNNING, from the process itself. A deployed trading
+    # service has to answer "what code is this?" from its own runtime
+    # state, not from whatever the working tree looks like when asked.
+    print(f"BTC15 signal started; {revision.line()}; execution requires "
+          "Telegram approval", flush=True)
+    store.set_setting_text("running_revision",
+                           json.dumps(revision.REVISION), int(time.time() * 1000))
     last_ticker = None
     try:
         while True:
@@ -2378,6 +3278,80 @@ async def service() -> None:
             try:
                 await process_telegram(telegram, store, kalshi, trader, settings)
                 mark("telegram")
+
+                # RECOVERY STATE, FOLDED ONCE A POLL. This is what keeps
+                # `money_snapshot` read-only: the fold happens here, the
+                # rendering path just reads the row. It also catches the
+                # arm/clear transitions, which went entirely unreported until
+                # the operator asked why a -$0.86 loss produced no visible
+                # recovery - it had armed, blocked two adds and cleared, all
+                # in silence.
+                try:
+                    event, rstate = store.recovery_transition(now_ms)
+                    if event == "armed":
+                        last = store.last_realised_loss()
+                        await telegram.send(
+                            messages.recovery_armed(
+                                rstate,
+                                f"{last[0]} settled {last[1]:+.2f}" if last else "",
+                            )
+                        )
+                    elif event == "size_ended":
+                        await telegram.send(messages.recovery_size_ended(rstate))
+                    elif event == "cleared":
+                        await telegram.send(
+                            messages.recovery_cleared(store.money_snapshot(now_ms))
+                        )
+                except Exception as exc:  # noqa: BLE001 - reporting is never fatal
+                    print(f"recovery report failed: {exc!r}", flush=True)
+
+                # SESSION CLOSE REPORTS. Driven off the hour boundary the
+                # poll stepped over, not a timer, so a slow cycle or a restart
+                # that straddles a close still reports it rather than losing
+                # it - and `session_reported` keys on the day and the session
+                # so it can never be sent twice.
+                for closed in closes_between(LAST_POLL["ms"], now_ms):
+                    today_key = ny_day(now_ms)
+                    if store.session_reported(today_key, closed):
+                        continue
+                    try:
+                        rows = store.session_rows_for(closed, now_ms)
+                        results = session_breakdown(rows)
+                        result = results[0] if results else None
+                        if result is None:
+                            from .sessions import SessionResult
+
+                            result = SessionResult(closed, 0, 0, 0.0)
+                        await telegram.send(
+                            messages.session_close(
+                                session=result,
+                                day_snapshot=store.money_snapshot(now_ms),
+                                ny_day=today_key,
+                            )
+                        )
+                        store.mark_session_reported(today_key, closed, now_ms)
+                    except Exception as exc:  # noqa: BLE001 - reporting is never fatal
+                        print(f"session report failed: {exc!r}", flush=True)
+                LAST_POLL["ms"] = now_ms
+
+                # THE DAILY CAPITAL REVIEW. At startup, and again the first
+                # time a poll lands in a new New York day - the exchange's own
+                # reset boundary, so our books and Kalshi's start together.
+                today_ny = ny_day(now_ms)
+                if CAPITAL_DAY["ny"] != today_ny:
+                    # Move the whole accounting day together, carrying any
+                    # losses already booked today so the floor is not refunded
+                    # by the change itself.
+                    store.migrate_day_boundary(now_ms)
+                    reviewed = await capital.reconcile(trader, now_ms)
+                    if reviewed is not None:
+                        CAPITAL_DAY["ny"] = today_ny
+                        print(
+                            f"capital review [{today_ny}]: cash "
+                            f"{reviewed.reconciled_cash:.2f}, base tier "
+                            f"{reviewed.base_contracts}",
+                            flush=True,
+                        )
 
                 # Settle first. A closed market's result does not depend on
                 # another market being open, and running this after the lookup
@@ -2406,6 +3380,57 @@ async def service() -> None:
                         # an ungradeable shadow can never be promoted.
                         store.settle_shadow(row[0], winning_side)
                         store.settle_decision_records(row[0], winning_side)
+                        # Grade every intelligence decision on this market,
+                        # including vetoes and refusals - those are the
+                        # counterfactuals that say whether an adjustment
+                        # helped, and they exist nowhere else.
+                        try:
+                            # Pass the WINNING SIDE, not a market-level `won`.
+                            # Each row is scored against the side it was
+                            # recorded on; the flag this loop could form -
+                            # `result == ("yes" if winning_side == "UP" ...)` -
+                            # is a tautology, and it graded all 21 rows to date
+                            # as winners.
+                            store.grade_candidates(
+                                row[0], winning_side, now_ms,
+                                lambda ask, won: (1.0 if won else 0.0) - ask
+                                - kalshi_fee_charged(ask, 1),
+                            )
+                            store.grade_intelligence(
+                                row[0], winning_side, 0.0, now_ms,
+                            )
+                        except Exception as exc:  # noqa: BLE001
+                            print(f"intelligence grading failed: {exc!r}", flush=True)
+                        # BANK IT BEFORE REPORTING IT. The recap renders the
+                        # account, and until this market is in the ledger the
+                        # count and the dollars describe different instants:
+                        # the position has settled, so it is still in the open
+                        # mark, but it is not yet a settled market in the
+                        # record. On 2026-09-22 that printed "+$3.05 - 30W-5L"
+                        # against a ledger holding 30W-6L. Read from the
+                        # broker, never rebuilt, and never fatal - a failed
+                        # sync leaves the recap on the previous snapshot,
+                        # which is stale but internally consistent.
+                        if trader is not None:
+                            try:
+                                store.record_settlements(
+                                    await trader.settlements(), now_ms
+                                )
+                                store.sync_ledger_from_settlements(now_ms)
+                                open_n, open_mark, per_ticker = (
+                                    await trader.open_mark()
+                                )
+                                store.set_setting("open_mark", open_mark, now_ms)
+                                store.set_setting("open_positions", open_n, now_ms)
+                                store.set_setting_text(
+                                    "open_mark_detail", json.dumps(per_ticker), now_ms
+                                )
+                                SETTLEMENT_SYNC["at"] = now_ms
+                            except Exception as exc:  # noqa: BLE001
+                                print(
+                                    f"pre-report settlement sync failed: {exc!r}",
+                                    flush=True,
+                                )
                         sizing, basis = report_sizing(settings)
                         await report_settlement(
                             store, telegram, row, result, settings, sizing, basis
@@ -2432,15 +3457,39 @@ async def service() -> None:
                         # The app's headline is today's realised PLUS the open
                         # position marked to the bid. Both halves or the number
                         # does not match what the operator is looking at.
-                        open_n, open_mark = await trader.open_mark()
+                        open_n, open_mark, per_ticker = await trader.open_mark()
                         store.set_setting("open_mark", open_mark, now_ms)
                         store.set_setting("open_positions", open_n, now_ms)
+                        # Per ticker, so `open_exposure` can drop anything the
+                        # ledger has already banked instead of counting it twice.
+                        store.set_setting_text(
+                            "open_mark_detail", json.dumps(per_ticker), now_ms
+                        )
+                        # The exchange is the authority on money, so every
+                        # settled market it reports is written into the ledger.
+                        # A figure a cash-out banked locally is revised only
+                        # here, and the revision is counted, never silent.
+                        store.sync_ledger_from_settlements(now_ms)
                         SETTLEMENT_SYNC["at"] = now_ms
                         mark("settlement_sync")
                     except Exception as exc:  # noqa: BLE001
                         print(f"settlement sync failed: {exc!r}", flush=True)
 
                 mark("settlements")
+
+                # CONTINUOUS LEARNING. Placed immediately after the settlement
+                # sweep because settlements are what it consumes: the markets
+                # that just resolved are in the mirror by now, so the due-check
+                # sees this poll's evidence rather than the previous poll's.
+                #
+                # The check itself is throttled and the fit runs in a worker
+                # thread, so neither the poll nor an order ever waits on it.
+                try:
+                    await learner.poll(now_ms)
+                    mark("learning")
+                except Exception as exc:  # noqa: BLE001 - never stops trading
+                    print(f"learning poll failed: {exc!r}", flush=True)
+
                 try:
                     contract = await kalshi.active_market(now_ms)
                     mark("active_market")
@@ -2458,12 +3507,55 @@ async def service() -> None:
                     if hourly:
                         await hourly.poll(now_ms, market)
                         await hourly.settle(now_ms)
+                    # The reference recorder covers the gap between windows
+                    # too: the 60 seconds a market settles on straddle the
+                    # boundary, so stopping here would blind it to exactly the
+                    # minute it exists to measure.
+                    if reference:
+                        await reference.poll(now_ms, None)
+                        await reference.reconcile(now_ms)
                     await asyncio.sleep(settings.poll_seconds)
                     continue
                 opened = contract.open_ms
                 remaining = (contract.close_ms - now_ms) // 1000
-                snapshot = replace(await market.snapshot(opened), target=contract.target)
-                mark("binance_snapshot")
+                if settings.kalshi_only:
+                    # THE REFERENCE POLL MOVES IN FRONT OF THE DECISION.
+                    # It used to sit behind the trading path so a slow feed
+                    # could not delay a fill (FINDINGS 22). That reasoning
+                    # held while BRTI only labelled a context; now it IS the
+                    # signal, and a decision taken before its own inputs are
+                    # fetched is a decision on the previous window. This is a
+                    # SWAP, not an addition - the Binance round trip it
+                    # replaces cost the same.
+                    if reference:
+                        await reference.poll(now_ms, contract)
+                        mark("brti_poll")
+                    brti_features = reference.current_features() if reference else None
+                    inputs = kalshi_signal.signal_inputs(
+                        brti_features, contract, now_ms=now_ms,
+                        stale_limit_ms=settings.reference_stale_ms,
+                        max_spread_cents=settings.max_contract_spread_cents,
+                    )
+                    if isinstance(inputs, kalshi_signal.Unavailable):
+                        # NO FALLBACK. Record which input failed and move on;
+                        # substituting another exchange is how a system trades
+                        # one instrument and settles on another.
+                        store.record_input_gap(
+                            window_open=opened, ticker=contract.ticker,
+                            observed_ms=now_ms, remaining_s=remaining,
+                            reason=inputs.reason, detail=inputs.detail,
+                        )
+                        if KALSHI_GAP["window"] != (opened, inputs.reason):
+                            KALSHI_GAP["window"] = (opened, inputs.reason)
+                            print(f"no signal [{inputs}]", flush=True)
+                        await asyncio.sleep(settings.poll_seconds)
+                        continue
+                    snapshot = kalshi_snapshot(inputs[2], contract, opened, now_ms)
+                    mark("kalshi_snapshot")
+                else:
+                    snapshot = replace(
+                        await market.snapshot(opened), target=contract.target)
+                    mark("binance_snapshot")
                 if contract.ticker != last_ticker:
                     print(f"Live market data connected: {contract.ticker}", flush=True)
                     last_ticker = contract.ticker
@@ -2471,13 +3563,27 @@ async def service() -> None:
                     settings, store, contract, snapshot, opened, remaining, now_ms
                 )
                 mark("archive")
+                # The last reference poll's BRTI, for the `brti-1` context
+                # key only. Reading the cache rather than fetching keeps the
+                # recorder behind the trading path, which is the whole reason
+                # it sits where it does: on 2026-09-21 three auto orders
+                # missed on ~2,000ms of pre-order work against a 200ms round
+                # trip. One poll of staleness is the price, and
+                # `brti_context_row` checks for it rather than assuming.
                 await primary_signal(
                     settings, store, telegram, contract, snapshot, opened, remaining,
-                    now_ms, trader, levels,
+                    now_ms, trader, levels, capital,
+                    reference.current_features() if reference else None,
                 )
-                await reversion_signal(
-                    settings, store, telegram, contract, snapshot, opened, remaining, now_ms
-                )
+                if not settings.kalshi_only:
+                    # The reversion strategy reads Binance spike/rejection
+                    # structure. It has no Kalshi-native equivalent yet, so
+                    # under Kalshi-only it does not run rather than running on
+                    # numbers that mean something else.
+                    await reversion_signal(
+                        settings, store, telegram, contract, snapshot,
+                        opened, remaining, now_ms,
+                    )
                 # Shadow recording for the hourly ladder, AFTER the trading
                 # path. It records and never trades, so it must never sit in
                 # front of an order: on 2026-09-21 three auto orders missed
@@ -2488,10 +3594,46 @@ async def service() -> None:
                 if hourly:
                     await hourly.poll(now_ms, market)
                     await hourly.settle(now_ms)
+                # Settlement reference, same contract as the hourly shadow and
+                # for the same reason: it records, it never orders, and it sits
+                # behind the trading path so a slow feed cannot delay a fill.
+                # Both calls swallow their own errors.
+                if reference:
+                    await reference.poll(now_ms, contract)
+                    await reference.reconcile(now_ms)
+                    # THE CONDITIONAL RECOVERY ADD-ON. It runs AFTER the
+                    # reference poll because it reads that poll's BRTI - one
+                    # fetch, one series, one set of numbers, so the recorder
+                    # and the order path cannot disagree about the reference
+                    # at the same instant. It swallows its own errors, and
+                    # with `recovery_add_enabled` off it records the decision
+                    # and places nothing.
+                    brti = reference.current_features()
+                    position = store.open_position_detail(opened)
+                    if brti is not None and position is not None:
+                        # SINCE THE FILL, not since the window opened. The
+                        # first live evaluation vetoed an add on a crossing
+                        # that happened 4m42s BEFORE the position existed.
+                        entry_ms = store.position_entry_ms(opened, position[3])
+                        crossed = (
+                            None if entry_ms is None
+                            else reference.crossed_since(entry_ms, position[0])
+                        )
+                        await recovery_add.step(
+                            trader=trader,
+                            contract=contract,
+                            features=brti,
+                            crossed=crossed,
+                            remaining_s=remaining,
+                            now_ms=now_ms,
+                            opened=opened,
+                        )
                 # Same reasoning as the hourly shadow: a second Binance request
                 # for a day of bars must never sit in front of an order. It
-                # self-throttles and swallows its own errors.
-                await levels.maybe_refresh(market, now_ms)
+                # self-throttles and swallows its own errors. Under
+                # Kalshi-only neither the tracker nor the client exists.
+                if levels is not None and market is not None:
+                    await levels.maybe_refresh(market, now_ms)
                 await reversal_exit(
                     settings, store, telegram, contract, snapshot, opened, remaining,
                     now_ms, trader,
@@ -2504,10 +3646,13 @@ async def service() -> None:
                 print(f"cycle error: {type(exc).__name__}: {exc}", flush=True)
             await asyncio.sleep(settings.poll_seconds)
     finally:
-        await market.close()
+        if market is not None:
+            await market.close()
         await kalshi.close()
         if hourly:
             await hourly.close()
+        if reference:
+            await reference.close()
         if trader:
             await trader.close()
 

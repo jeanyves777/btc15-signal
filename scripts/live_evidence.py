@@ -144,24 +144,23 @@ def main() -> None:
 
     # --- 3. REALISED ------------------------------------------------------
     print("\n3. REALISED - the account")
-    real = []
-    for r in db.execute(
-        f"SELECT p.count, COALESCE(p.fill_price, p.entry_limit) paid, p.fee_paid, "
-        f"p.exit_price, p.exit_count, d.won "
-        f"FROM trade_proposals p JOIN predictions d ON d.window_open = p.window_open "
-        f"WHERE p.strategy='primary' AND p.status IN {ACCOUNTED} "
-        f"AND d.won IS NOT NULL"
-    ):
-        pnl = position_pnl(
-            paid=r["paid"], count=r["count"], entry_fee=r["fee_paid"],
-            exit_price=r["exit_price"], exit_count=r["exit_count"],
-            won=bool(r["won"]),
-        )
-        if pnl is not None:
-            real.append(pnl)
-    line("realised P&L per trade", real, "   ")
+    # FROM THE LEDGER, NOT REBUILT. This section used to recompute P&L from
+    # `trade_proposals` with `position_pnl`, and it was wrong twice over:
+    # proposals exist for only 44 of the 127 traded markets, and one market
+    # came out $2.00 from the truth (+0.2821 in the ledger, -1.7179 rebuilt).
+    # It printed "+2.1583 dollars" under the heading "the account" while the
+    # account held +0.3066.
+    #
+    # `daily_ledger` is the broker's own settled figure, net of fees, one row
+    # per market. Money comes from the broker; a local reconstruction of it is
+    # a second opinion, never the number.
+    real = [r["pnl"] for r in db.execute(
+        "SELECT pnl FROM daily_ledger WHERE pnl IS NOT NULL"
+    )]
+    line("realised P&L per market", real, "   ")
     if real:
-        print(f"  {'total':<40} {sum(real):+.4f} dollars")
+        print(f"  {'total (broker ledger)':<40} {sum(real):+.4f} dollars "
+              f"over {len(real)} markets")
 
     # --- 4. THE GAP -------------------------------------------------------
     traded = [
@@ -175,9 +174,12 @@ def main() -> None:
     if real and matched:
         print("\n4. THE GAP - realised minus what a backtest would have credited")
         pm, rm = sum(matched) / len(matched), sum(real) / len(real)
-        print(f"  paper on the same trades                 {pm:+.4f}/ct")
-        print(f"  realised                                 {rm:+.4f}/ct")
-        print(f"  EXECUTION COST                           {rm - pm:+.4f}/ct")
+        print(f"  paper on the same trades                 {pm:+.4f}/ct  n={len(matched)}")
+        print(f"  realised (ledger, all markets)           {rm:+.4f}/ct  n={len(real)}")
+        print(f"  difference                               {rm - pm:+.4f}/ct")
+        print("  NOT a like-for-like subtraction: the paper leg covers the")
+        print("  markets with a proposal row, the realised leg covers every")
+        print("  market in the ledger. Read it as two summaries, not a bridge.")
 
     # --- 5. CAN IT DECIDE ANYTHING ---------------------------------------
     print("\n5. CAN THIS SAMPLE DECIDE ANYTHING YET?")

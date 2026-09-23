@@ -13,6 +13,71 @@ class Calibration:
     lower_bound: float
 
 
+# A deficit below half a cent is $0.00. The smallest thing this account can
+# trade moves whole cents, so a residue under that is arithmetic, not money
+# still to be won back.
+DEFICIT_CLEARED = 0.005
+
+# The recovery plan length, in trades. MUST match `Settings.recovery_steps`;
+# it is duplicated here only so a caller that never sizes an order - a report,
+# a script - does not have to carry the config. `test_intelligence.py` pins
+# the two together.
+DEFAULT_RECOVERY_STEPS = 4
+
+
+@dataclass(frozen=True)
+class RecoveryState:
+    """The unrecovered deficit, in realised dollars after fees.
+
+    `deficit` is money that has actually left the account and has not been won
+    back. `active` is simply `deficit > 0` - recovery runs until the money is
+    back, and stops the moment it is. `markets` counts the realised markets
+    applied since the deficit was opened, and `opened_ms` when that was.
+
+    `steps` is how many upsized trades the plan has left to win it back with.
+    It is what the deficit is divided by to get the per-trade requirement, it
+    decrements only when a trade actually takes the upsize, and a fresh loss
+    puts it back to the full plan - see `consume_recovery_step`.
+    """
+
+    deficit: float
+    active: bool
+    markets: int
+    opened_ms: int
+    steps: int = 0
+    # The cycle: what it opened owing, its identity, how many distinct
+    # profitable MARKETS have closed in it, and whether sizing has ended.
+    # `base_only` is not "cleared" - the money is still owed and `deficit`
+    # still says so. See `recovery_exit`.
+    initial: float = 0.0
+    cycle_id: str = ""
+    wins: int = 0
+    base_only: bool = False
+    # True when `initial` was adopted from an in-flight deficit at migration
+    # rather than observed as a loss. Not the original loss, and reports must
+    # not present it as one.
+    seeded: bool = False
+
+    @property
+    def owes(self) -> bool:
+        """Is money still missing, regardless of whether we upsize for it?"""
+        return self.deficit > 0
+
+    @property
+    def recovered_fraction(self) -> float:
+        from .recovery_exit import recovered_fraction
+
+        return recovered_fraction(self.initial, self.deficit)
+
+    def required_per_trade(self) -> float:
+        """Dollars one upsized trade has to be able to win, net of fees.
+
+        The divisor is floored at 1: a plan with no steps left still has a
+        requirement, and it is the whole remaining deficit.
+        """
+        return self.deficit / max(1, self.steps)
+
+
 @dataclass(frozen=True)
 class TradeProposal:
     id: str
@@ -38,6 +103,88 @@ class TradeProposal:
 # see. 'unprotected' is the most dangerous of the three to lose track of.
 HELD_STATUSES = ("filled", "protected", "unprotected")
 HELD_SQL = "('filled','protected','unprotected')"
+@dataclass(frozen=True)
+class LifetimeRecord:
+    """Realised performance over the whole reconciled record.
+
+    `complete` is False when the broker cannot show the account's entire
+    history - Kalshi's settlements endpoint reaches back only so far, and this
+    account has fills older than that. A total that silently omits earlier
+    trading must not be called a lifetime, so the label carries the date it
+    actually starts from.
+    """
+
+    markets: int
+    winners: int
+    dollars: float
+    since_ms: int | None
+    complete: bool
+
+    @property
+    def losers(self) -> int:
+        return self.markets - self.winners
+
+    def label(self) -> str:
+        if self.complete or self.since_ms is None:
+            return "Live lifetime"
+        import datetime as _dt
+
+        # `%-d` is a glibc extension and raises on Windows, where this runs.
+        day = _dt.datetime.fromtimestamp(self.since_ms / 1000, tz=_dt.UTC)
+        return f"Live since {day.day} {day:%b}"
+
+
+@dataclass(frozen=True)
+class MoneySnapshot:
+    """One account, one instant. Every message renders from one of these.
+
+    `realised` is money that is final. `open_mark` is the open position marked
+    to the bid, which moves. `headline` is their sum, which is how the Kalshi
+    app builds the figure the operator reads. Keeping the parts separate is
+    what stops a count and a dollar figure being taken from different reads.
+    """
+
+    markets: int
+    winners: int
+    realised: float
+    open_mark: float
+    taken_ms: int
+    has_mirror: bool = False
+    # The lifetime figures come from the SAME read as today's, so a message
+    # can never show a profit in one line that the other has not counted.
+    lifetime: "LifetimeRecord | None" = None
+    # And the session breakdown from the same rows as `markets`, so it sums.
+    sessions: tuple = ()
+    # Recovery state travels with the money, so every message can show
+    # what it is doing without a second read that might disagree.
+    recovery: object | None = None
+    last_add: dict | None = None
+
+    @property
+    def losers(self) -> int:
+        return self.markets - self.winners
+
+    @property
+    def headline(self) -> float:
+        return round(self.realised + self.open_mark, 6)
+
+
+def _capital(row: dict):
+    """A capital_days row as a `capital.Capital`. Imported lazily so `store`
+    does not depend on a module that depends on it."""
+    from .capital import Capital
+
+    return Capital(
+        ny_day=row["ny_day"], reconciled_cash=row["reconciled_cash"],
+        open_exposure=row["open_exposure"], base_contracts=row["base_contracts"],
+        account_ceiling=row["account_ceiling"],
+        reconciled_ms=row["reconciled_ms"],
+    )
+
+
+from . import recovery_exit  # noqa: E402
+from .sessions import breakdown as session_breakdown  # noqa: E402
+
 ACCOUNTED_SQL = "('filled','protected','unprotected','exited')"
 
 
@@ -103,6 +250,11 @@ class Store:
 
     def __init__(self, path: str) -> None:
         self.db = sqlite3.connect(path)
+        # The early stand-down thresholds. Defaults come from `recovery_exit`
+        # so a Store built in a test behaves like the live one; the service
+        # overrides them from Settings at startup via `configure_recovery_exit`
+        # - a setting that silently does nothing is worse than no setting.
+        self.recovery_exit_policy: dict = {}
         self.db.execute("""
             CREATE TABLE IF NOT EXISTS predictions (
                 window_open INTEGER PRIMARY KEY, created_at INTEGER NOT NULL,
@@ -127,6 +279,7 @@ class Store:
         # distance gate or the momentum gate was the one that cost you.
         if "failed_gates" not in columns:
             self.db.execute("ALTER TABLE predictions ADD COLUMN failed_gates TEXT")
+        self._relax_prediction_model_columns()
         # What the similarity layer WOULD have decided, recorded and never
         # acted on. Promotion to an execution policy requires this table to
         # show its calls beating the deployed rule on realised P&L - which is
@@ -194,6 +347,370 @@ class Store:
                 yes_count REAL, yes_cost REAL, no_count REAL, no_cost REAL,
                 revenue_cents INTEGER, fee_cost REAL, pnl REAL,
                 settled_ms INTEGER, synced_at INTEGER, window_ms INTEGER
+            )
+        """)
+        # THE APPEND-ONLY REALISED LEDGER. One row per market whose money is
+        # final, written the moment it becomes final and never removed.
+        #
+        # Every Telegram message used to read `settlements` + `open_mark`,
+        # which are two different 60-second snapshots of the same account. On
+        # 2026-09-22 that showed +$4.49 at the cash-out, +$3.95 in the
+        # settlement recap four minutes later, and +$4.51 at the next signal -
+        # the same $0.55 counted, dropped and recounted while no money moved.
+        # The cause is a sync gap: a position sold early is gone from the
+        # account but still carried in the stale mark, and its proceeds have
+        # not yet landed in `settlements`.
+        #
+        # This table closes the gap. A cash-out writes its realised figure
+        # immediately from the fill it already has; the broker sync writes the
+        # settled figure when it arrives. `source` records which, so a later
+        # disagreement between the two is visible rather than silent.
+        self.db.execute("""
+            CREATE TABLE IF NOT EXISTS daily_ledger (
+                ticker TEXT PRIMARY KEY,
+                window_ms INTEGER NOT NULL,
+                pnl REAL NOT NULL,
+                won INTEGER,
+                source TEXT NOT NULL,
+                first_ms INTEGER NOT NULL,
+                updated_ms INTEGER NOT NULL,
+                revisions INTEGER NOT NULL DEFAULT 0
+            )
+        """)
+        # THE UNRECOVERED DEFICIT. One row, carried across restarts.
+        #
+        # Recovery ends on RECOVERED MONEY: realised, net of fees, and never on
+        # a win count, a paper profit or an open position's mark. The figures
+        # come from `daily_ledger` above, which is the only place that counts
+        # an early cash-out exactly once and lets the exchange revise it.
+        #
+        # It is a stored running total rather than a replay because that is
+        # what "another loss INCREASES the deficit" requires: the deficit is
+        # path-dependent - it floors at zero the moment the money is back - so
+        # it cannot be re-derived from a sum, and a restart mid-recovery has to
+        # resume, not start again.
+        #
+        # NOT RESET AT MIDNIGHT. It is about money that is still missing, not
+        # about a calendar. `auto_daily_loss_limit` remains the day's own stop.
+        # If the operator wants a daily reset, this is the row to clear.
+        self.db.execute("""
+            CREATE TABLE IF NOT EXISTS recovery_deficit (
+                id INTEGER PRIMARY KEY CHECK (id = 1),
+                deficit REAL NOT NULL,
+                markets INTEGER NOT NULL DEFAULT 0,
+                opened_ms INTEGER NOT NULL DEFAULT 0,
+                updated_ms INTEGER NOT NULL DEFAULT 0,
+                steps INTEGER NOT NULL DEFAULT 0
+            )
+        """)
+        self.db.execute("""
+            CREATE TABLE IF NOT EXISTS recovery_cycle_wins (
+                cycle_id TEXT NOT NULL,
+                ticker TEXT NOT NULL,
+                net REAL NOT NULL,
+                counted_ms INTEGER NOT NULL,
+                PRIMARY KEY (cycle_id, ticker)
+            )
+        """)
+        self._add_columns("recovery_deficit", {
+            "steps": "INTEGER NOT NULL DEFAULT 0",
+            # The deficit this CYCLE opened with. Recovery progress is
+            # measured against it, net of subsequent losses - a later loss
+            # raises the outstanding figure and so lowers the percentage.
+            "initial": "REAL NOT NULL DEFAULT 0",
+            # Identifies the cycle, so wins recorded against a closed cycle
+            # can never be counted toward the next one.
+            "cycle_id": "TEXT NOT NULL DEFAULT ''",
+            # Distinct profitable closed MARKETS this cycle. Base and add-on
+            # fills on one ticker are one position with one outcome.
+            "wins": "INTEGER NOT NULL DEFAULT 0",
+            # Recovery sizing has ended while money is still owed. NOT the
+            # same as cleared, and never written by zeroing the deficit.
+            "base_only": "INTEGER NOT NULL DEFAULT 0",
+            # `initial` was ADOPTED from a deficit already in flight when this
+            # code first ran, not observed as a loss. The percentage is then
+            # measured against a migration starting point rather than the
+            # original hole, and any report of it has to say so.
+            "seeded": "INTEGER NOT NULL DEFAULT 0",
+        })
+        # WHAT HAS ALREADY BEEN APPLIED, per market, so no market can move the
+        # deficit twice. It holds the realised figure that was folded in, not a
+        # flag, so a row the exchange later revises moves the deficit by the
+        # DELTA - the difference between the banked number and the settled one
+        # - instead of being counted again in full.
+        self._add_columns("daily_ledger", {"recovery_applied": "REAL"})
+        # THE CONDITIONAL RECOVERY ADD-ON. One row per position that reached
+        # BASE ENTERED, carrying the whole lifecycle: what was placed, what
+        # filled, at what fee, with what queue ahead of it, and why it was
+        # cancelled. `client_order_id` is UNIQUE, which is the database half
+        # of the no-duplicate-contract guarantee - the API half is Kalshi
+        # rejecting the same id, and neither is trusted alone.
+        self.db.execute("""
+            CREATE TABLE IF NOT EXISTS recovery_adds (
+                client_order_id TEXT PRIMARY KEY,
+                window_open_ms INTEGER NOT NULL,
+                ticker TEXT NOT NULL,
+                side TEXT NOT NULL,
+                state TEXT NOT NULL,
+                order_id TEXT,
+                base_fill REAL,
+                limit_price REAL,
+                count INTEGER NOT NULL DEFAULT 1,
+                deficit_at_placement REAL,
+                required_at_placement REAL,
+                conditions_at_placement TEXT,
+                placed_ms INTEGER,
+                expiration_ts INTEGER,
+                filled_count REAL NOT NULL DEFAULT 0,
+                fill_price REAL,
+                fill_ms INTEGER,
+                fee_paid REAL,
+                is_taker INTEGER,
+                queue_ahead REAL,
+                book_depth REAL,
+                conditions_at_fill TEXT,
+                cancelled_ms INTEGER,
+                cancel_reason TEXT,
+                realised_pnl REAL,
+                settled INTEGER NOT NULL DEFAULT 0,
+                created_ms INTEGER NOT NULL,
+                updated_ms INTEGER NOT NULL
+            )
+        """)
+        self.db.execute(
+            "CREATE INDEX IF NOT EXISTS recovery_adds_window "
+            "ON recovery_adds(window_open_ms, state)"
+        )
+        # THE CUMULATIVE TEST BUDGET. One row, and it only ever goes UP.
+        #
+        # A cap that resets on a loss, a new day or a restart is not a cap - it
+        # is an allowance that can be spent again every time the thing it is
+        # protecting against happens. This counts every dollar the add-on has
+        # ever actually had filled, for the life of the test, and the ceiling
+        # is checked against that total PLUS whatever is resting right now.
+        self.db.execute("""
+            CREATE TABLE IF NOT EXISTS recovery_add_budget (
+                id INTEGER PRIMARY KEY CHECK (id = 1),
+                committed REAL NOT NULL DEFAULT 0,
+                fills INTEGER NOT NULL DEFAULT 0,
+                started_ms INTEGER NOT NULL,
+                updated_ms INTEGER NOT NULL
+            )
+        """)
+        # REALISED EVENTS: the cash-flow sequence the deficit is folded from.
+        #
+        # `daily_ledger` is one row per MARKET and is right for reporting, but
+        # wrong for a path-dependent figure. Two reasons, both measured on the
+        # live database:
+        #
+        #   * `first_ms` is DISCOVERY time, not realisation time.
+        #     KXBTC15M-26SEP221300-00 settled at 17:00:08 and was first banked
+        #     at 17:15:25 - 917 seconds late. Ordering by it replays a delayed
+        #     settlement 15 minutes after it actually happened.
+        #   * a partial exit and the settlement of the remainder are two cash
+        #     flows at two times. Aggregating them under one ticker loses that
+        #     ordering entirely.
+        #
+        # `realised_ms` is the BROKER's timestamp for when the money became
+        # real - `settlements.settled_ms` for a settlement, the exit fill's
+        # `filled_ms` for a cash-out - and never ours.
+        self.db.execute("""
+            CREATE TABLE IF NOT EXISTS realised_events (
+                event_id TEXT PRIMARY KEY,
+                ticker TEXT NOT NULL,
+                realised_ms INTEGER NOT NULL,
+                amount REAL NOT NULL,
+                source TEXT NOT NULL,
+                window_ms INTEGER,
+                applied REAL,
+                recorded_ms INTEGER NOT NULL
+            )
+        """)
+        self.db.execute(
+            "CREATE INDEX IF NOT EXISTS realised_events_order "
+            "ON realised_events(realised_ms, event_id)"
+        )
+        # THE DAILY CAPITAL REVIEW, keyed on the NEW YORK day - the exchange's
+        # own reset boundary, not UTC. `reconciled_cash` is settled cash only:
+        # sizing on an open position's mark would compound exposure exactly
+        # when a position is winning and most likely to be given back.
+        self.db.execute("""
+            CREATE TABLE IF NOT EXISTS capital_days (
+                ny_day TEXT PRIMARY KEY,
+                reconciled_cash REAL NOT NULL,
+                open_exposure REAL NOT NULL,
+                base_contracts INTEGER NOT NULL,
+                account_ceiling REAL NOT NULL,
+                reconciled_ms INTEGER NOT NULL
+            )
+        """)
+        # Funds claimed by an order this process has decided on but the broker
+        # has not seen yet. The UNIQUE key is the atomicity: two orders in one
+        # poll cannot both spend the same balance.
+        self.db.execute("""
+            CREATE TABLE IF NOT EXISTS fund_reservations (
+                key TEXT PRIMARY KEY,
+                amount REAL NOT NULL,
+                created_ms INTEGER NOT NULL,
+                state TEXT NOT NULL DEFAULT 'held'
+            )
+        """)
+        # EVERY INTELLIGENCE DECISION, recorded BEFORE submission and whether
+        # or not an order follows. This is what answers "what did intelligence
+        # change, why, and did it help" - a question that cannot be answered
+        # retrospectively from the orders alone, because the interesting cases
+        # are the ones where no order exists.
+        self.db.execute("""
+            CREATE TABLE IF NOT EXISTS intelligence_decisions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                window_open INTEGER NOT NULL,
+                ticker TEXT,
+                signal_id TEXT,
+                proposal_id TEXT,
+                decided_ms INTEGER NOT NULL,
+                remaining_s INTEGER,
+                side TEXT,
+                ask REAL,
+                base_qualified INTEGER NOT NULL,
+                failed_gates TEXT,
+                final_action TEXT NOT NULL,
+                overrides_gate TEXT,
+                reason TEXT,
+                confidence_delta INTEGER NOT NULL DEFAULT 0,
+                calibrated_probability REAL,
+                expected_net REAL,
+                evidence_n INTEGER,
+                uncertainty REAL,
+                context_key TEXT,
+                model_version TEXT,
+                policy_version TEXT,
+                feature_version TEXT,
+                training_cutoff_ms INTEGER,
+                features_ok INTEGER,
+                -- filled in after the fact, so an adjustment can be graded
+                order_id TEXT,
+                filled INTEGER,
+                won INTEGER,
+                realised_pnl REAL,
+                graded_ms INTEGER
+            )
+        """)
+        self.db.execute(
+            "CREATE INDEX IF NOT EXISTS intelligence_window "
+            "ON intelligence_decisions(window_open, decided_ms)"
+        )
+        # EVIDENCE AND AUTHORITY, in separate columns. `final_action` and
+        # `confidence_delta` are what took effect; these are what the policy
+        # would have done had the operator granted the permission. Without the
+        # pair, a layer running in shadow leaves a record indistinguishable
+        # from a layer that had nothing to say - and could never be promoted
+        # on it.
+        self._add_columns("intelligence_decisions", {
+            "evidence_action": "TEXT",
+            "evidence_delta": "INTEGER",
+            "authority": "TEXT",
+            "fill_price": "REAL",
+            "fee_cost": "REAL",
+            # THE MODEL'S OWN CONFIDENCE, before any learned adjustment. A
+            # calibration is a comparison between a PREDICTION and an OUTCOME,
+            # so the prediction has to be recorded when it was made -
+            # reconstructing it afterwards measures today's code, not the
+            # decision that was taken.
+            "model_points": "INTEGER",
+            # THE RAW FEATURES, not only the key built from them.
+            #
+            # `brti-1` stored the context key and nothing else, so when the key
+            # scheme changed every historical row became unreadable under the
+            # new one - the momentum band could not be recovered because
+            # momentum had never been stored. Storing the quantities means a
+            # re-keying is always possible and never orphans the archive again.
+            "brti_normalized_distance": "REAL",
+            "brti_momentum_bps": "REAL",
+            "brti_aligned_momentum_bps": "REAL",
+            "brti_volatility_bps": "REAL",
+            # CONTEXT, recorded and not keyed on: available to slice by hand,
+            # but it does not partition the evidence.
+            "session": "TEXT",
+            "vol_regime": "TEXT",
+            "band_hold_s": "INTEGER",
+        })
+        # FORWARD EVALUATION. What each frozen candidate WOULD have changed on
+        # a live signal, recorded beside what the unchanged strategy actually
+        # decided, and graded when the market settles.
+        #
+        # A candidate does not need permission to control an order to be worth
+        # watching. These rows are how one earns it: the same decision, taken
+        # prospectively, on data the candidate was not fitted to.
+        self.db.execute("""
+            CREATE TABLE IF NOT EXISTS input_gaps (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                window_open INTEGER NOT NULL,
+                ticker TEXT,
+                observed_ms INTEGER NOT NULL,
+                remaining_s INTEGER,
+                reason TEXT NOT NULL,
+                detail TEXT
+            )
+        """)
+        self.db.execute(
+            "CREATE INDEX IF NOT EXISTS input_gaps_window "
+            "ON input_gaps(window_open, reason)"
+        )
+        self.db.execute("""
+            CREATE TABLE IF NOT EXISTS candidate_evaluations (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                window_open INTEGER NOT NULL,
+                ticker TEXT,
+                decided_ms INTEGER NOT NULL,
+                candidate_id TEXT NOT NULL,
+                candidate_version TEXT NOT NULL,
+                context_key TEXT NOT NULL,
+                proposed_action TEXT NOT NULL,
+                baseline_qualified INTEGER NOT NULL,
+                would_change INTEGER NOT NULL,
+                side TEXT,
+                ask REAL,
+                remaining_s INTEGER,
+                feature_version TEXT,
+                -- graded after settlement
+                won INTEGER,
+                baseline_pnl REAL,
+                candidate_pnl REAL,
+                graded_ms INTEGER,
+                UNIQUE(window_open, candidate_id)
+            )
+        """)
+        self.db.execute(
+            "CREATE INDEX IF NOT EXISTS candidate_eval_lookup "
+            "ON candidate_evaluations(candidate_id, graded_ms)"
+        )
+        # `settings` holds REAL only. The open mark has to be carried per
+        # ticker, not as one total, so a position that has already been banked
+        # can be excluded from it - which is the whole fix.
+        # DELIVERY IDENTITY. One row per event that has actually been sent.
+        #
+        # The guards this replaces were per-process dicts and per-window alert
+        # rows; neither could say "this exact event already went out" after a
+        # restart, and neither held the message id needed to EDIT a message in
+        # place rather than send another one.
+        self.db.execute("""
+            CREATE TABLE IF NOT EXISTS notifications (
+                kind TEXT NOT NULL,
+                event_key TEXT NOT NULL,
+                message_id INTEGER,
+                body TEXT,
+                -- 'pending' once claimed, 'sent' once the API returned. A row
+                -- stuck at 'pending' across a restart is the crash window and
+                -- is resolved by an explicit per-kind policy, never silently.
+                status TEXT NOT NULL DEFAULT 'sent',
+                first_ms INTEGER NOT NULL,
+                updated_ms INTEGER NOT NULL,
+                PRIMARY KEY (kind, event_key)
+            )
+        """)
+        self.db.execute("""
+            CREATE TABLE IF NOT EXISTS settings_text (
+                key TEXT PRIMARY KEY, text_value TEXT, updated_at INTEGER
             )
         """)
         # `window_ms` was added after the table shipped: settled_ms is hours
@@ -468,6 +985,75 @@ class Store:
             "avg_round_trip_ms": row[3],
         }
 
+    def configure_recovery_exit(self, settings) -> None:
+        """Take the stand-down thresholds from the deployed configuration.
+
+        Called once at startup. Without it the module defaults apply, which
+        are the same numbers - but the settings would then be decorative, and
+        a knob that does nothing is how an operator ends up believing they
+        turned something off.
+        """
+        self.recovery_exit_policy = {
+            "enabled": bool(getattr(settings, "recovery_partial_exit_enabled", True)),
+            "exit_fraction": recovery_exit.validate_fraction(float(
+                getattr(settings, "recovery_exit_fraction",
+                        recovery_exit.EXIT_FRACTION))),
+            "required_wins": int(
+                getattr(settings, "recovery_exit_required_wins",
+                        recovery_exit.REQUIRED_WINS)),
+        }
+
+    def _relax_prediction_model_columns(self) -> None:
+        """Let `raw_probability` and `bucket` be NULL, meaning "no model".
+
+        THE BUG THIS FIXES. `predictions` declared both NOT NULL, and
+        `record()` inserts with OR IGNORE. On the Kalshi-only path there is no
+        probability model - the deployed one is Binance-weighted and does not
+        run - so `raw_probability` is None, the constraint rejects the row and
+        OR IGNORE swallows it. Every prediction would have vanished silently:
+        no settlement tracking, no grading, no learning, and not one error
+        anywhere. It was found by an end-to-end test; 726 unit tests passed
+        with it present.
+
+        SQLite cannot relax NOT NULL in place, so the table is rebuilt. Every
+        column and row is carried across inside one transaction, and the
+        rebuild only runs while the old constraint is actually there.
+        """
+        info = list(self.db.execute("PRAGMA table_info(predictions)"))
+        if not info:
+            return
+        relax = {"raw_probability", "bucket"}
+        if not any(row[1] in relax and row[3] for row in info):
+            return          # already nullable
+        names = [row[1] for row in info]
+        columns = []
+        for _, name, decl_type, notnull, default, pk in info:
+            parts = [f'"{name}"', decl_type or ""]
+            if pk:
+                parts.append("PRIMARY KEY")
+            elif notnull and name not in relax:
+                parts.append("NOT NULL")
+            if default is not None:
+                parts.append(f"DEFAULT {default}")
+            columns.append(" ".join(p for p in parts if p))
+        joined = ", ".join(f'"{n}"' for n in names)
+        try:
+            self.db.execute("BEGIN IMMEDIATE")
+            self.db.execute(
+                f"CREATE TABLE predictions_migrated ({', '.join(columns)})")
+            self.db.execute(
+                f"INSERT INTO predictions_migrated ({joined}) "
+                f"SELECT {joined} FROM predictions")
+            self.db.execute("DROP TABLE predictions")
+            self.db.execute(
+                "ALTER TABLE predictions_migrated RENAME TO predictions")
+            self.db.commit()
+            print("predictions: raw_probability/bucket now nullable "
+                  "(no-model rows were being silently dropped)", flush=True)
+        except sqlite3.Error as exc:
+            self.db.rollback()
+            print(f"prediction column migration failed: {exc!r}", flush=True)
+
     def record(self, values: tuple) -> bool:
         # `failed_gates` was added later, so a caller may still pass the older
         # ten-field tuple. Padding here rather than demanding every call site
@@ -483,7 +1069,18 @@ class Store:
             values,
         )
         self.db.commit()
-        return cursor.rowcount == 1
+        if cursor.rowcount != 1:
+            # OR IGNORE hides a duplicate AND a constraint violation behind
+            # the same silent zero. A duplicate is normal - the same window is
+            # polled many times - so only say something when the row is new.
+            existing = self.db.execute(
+                "SELECT 1 FROM predictions WHERE window_open=?", (values[0],)
+            ).fetchone()
+            if not existing:
+                print(f"prediction NOT recorded for window {values[0]} - "
+                      f"constraint rejected it", flush=True)
+            return False
+        return True
 
     def pending_settlements(self, now_ms: int) -> list[tuple]:
         """(window_open, side, ticker, contract_price, qualified, target) awaiting a result."""
@@ -969,36 +1566,336 @@ class Store:
         return written
 
     def outstanding_loss(self) -> tuple[float, int]:
-        """(dollars still to recover, markets since the loss that opened it).
+        """(dollars still to recover, markets applied since it was opened).
 
-        The operator's recovery rule: "if the $2 lost we just keep trading $2
-        to recover the lost two dollar AND RESET". Per loss, not a running
-        ledger - a cumulative ledger never clears, because in this account
-        losses arrive faster than 0.63-dollar wins repay 1.48-dollar losses.
-        Measured over 94 settled markets: cumulative would sit at $2 for 93% of
-        windows with $6.68 still outstanding and only 3 recoveries ever
-        completed, where per-loss sits at $2 for 57% and completes 11.
-
-        DERIVED FROM THE BROKER'S SETTLEMENTS, not from a stored counter. A
-        counter has to survive restarts, crashes and manual trades, and every
-        one of those is a way for the live size to drift away from what the
-        record says it should be. Replaying the settled history is idempotent
-        and cannot disagree with the money.
+        The deficit only, for callers that want the number. `recovery_state`
+        is the one sizing reads.
         """
-        debt = 0.0
-        since = 0
-        for row in self.db.execute(
-            "SELECT pnl FROM settlements WHERE ticker LIKE 'KXBTC15M%' "
-            "AND window_ms IS NOT NULL ORDER BY window_ms"
-        ):
-            pnl = float(row[0] or 0.0)
-            if pnl < 0:
-                debt = -pnl          # a new loss REPLACES the target, per the rule
-                since = 0
-            elif debt > 0:
-                debt = max(0.0, debt - pnl)
-                since += 1
-        return debt, since
+        state = self.recovery_state()
+        return state.deficit, state.markets
+
+    def recovery_state(
+        self, plan_steps: int = DEFAULT_RECOVERY_STEPS, now_ms: int | None = None
+    ) -> RecoveryState:
+        """The unrecovered deficit, brought up to date with the ledger.
+
+        THE OPERATOR'S RULE, 2026-09-22: recovery starts on a realised net
+        loss, tracks the deficit after fees, keeps sizing up until realised
+        profit covers it, and stops the moment the deficit reaches zero. A
+        further loss INCREASES the deficit; it never restarts or erases it.
+
+        Recovery ends on RECOVERED MONEY, and nothing else - not a win count,
+        not paper profit, not an open position's mark, not gross profit before
+        fees. That is why the feed is `daily_ledger`: it is the append-only
+        realised record, it counts an early cash-out exactly once, and the
+        exchange may revise it but nothing may rebuild it locally.
+
+        This supersedes the per-loss, replace-the-target rule of FINDINGS 39.
+        That rule was chosen on a measurement - cumulative would have sat at $2
+        for 93% of windows against 57%, with $6.68 outstanding and 3 recoveries
+        completed against 11 - and the operator has decided against it with
+        that measurement in view. The number to watch is how long the deficit
+        stays open.
+
+        Reading is also what applies new ledger rows, so a restart mid-recovery
+        resumes from the stored row and folds in whatever settled while the
+        service was down. A failure here returns the last stored deficit rather
+        than raising: this runs in the order path.
+        """
+        if now_ms is None:
+            now_ms = int(time.time() * 1000)
+        try:
+            return self.apply_realised_to_deficit(now_ms, plan_steps)
+        except Exception as exc:  # noqa: BLE001 - sizing must not stop trading
+            print(
+                f"recovery deficit update failed: {type(exc).__name__}: {exc}",
+                flush=True,
+            )
+            try:
+                # ROLL BACK FIRST. The fold marks each ledger row applied and
+                # writes the new deficit in one transaction; half of that left
+                # open would be committed by the next unrelated write, and the
+                # rows would be marked applied against a deficit that never saw
+                # them - money missing from the deficit, silently.
+                self.db.rollback()
+                return self.stored_deficit()
+            except Exception as inner:  # noqa: BLE001 - and still no raising
+                print(
+                    f"recovery deficit read failed: "
+                    f"{type(inner).__name__}: {inner}",
+                    flush=True,
+                )
+                return RecoveryState(0.0, False, 0, 0, 0)
+
+    def recovery_deficit(
+        self, plan_steps: int = DEFAULT_RECOVERY_STEPS, now_ms: int | None = None
+    ) -> float:
+        """Dollars of realised net loss still missing. 0.0 when nothing is owed.
+
+        The named accessor for other code. It brings the deficit up to date
+        with the ledger first, so it is never a stale read; use
+        `stored_deficit()` for the persisted row without that update.
+        """
+        return self.recovery_state(plan_steps, now_ms).deficit
+
+    def recovery_required_per_trade(
+        self, plan_steps: int = DEFAULT_RECOVERY_STEPS, now_ms: int | None = None
+    ) -> float:
+        """The deficit divided by the steps left in the plan, floored at 1 step.
+
+        What one upsized trade has to be able to win, net of fees, before the
+        upsize is allowed to apply. 0.0 when there is no deficit.
+        """
+        return self.recovery_state(plan_steps, now_ms).required_per_trade()
+
+    def recovery_is_active(
+        self, plan_steps: int = DEFAULT_RECOVERY_STEPS, now_ms: int | None = None
+    ) -> bool:
+        """Is money still missing? Recovery runs on that alone."""
+        return self.recovery_state(plan_steps, now_ms).active
+
+    def stored_deficit(self) -> RecoveryState:
+        """The persisted deficit, exactly as it was last written."""
+        row = self.db.execute(
+            "SELECT deficit, markets, opened_ms, steps, initial, cycle_id, "
+            "wins, base_only, seeded FROM recovery_deficit WHERE id=1"
+        ).fetchone()
+        if row is None:
+            return RecoveryState(0.0, False, 0, 0, 0)
+        deficit = float(row[0] or 0.0)
+        base_only = bool(row[7])
+        return RecoveryState(
+            deficit, deficit > 0 and not base_only, int(row[1] or 0),
+            int(row[2] or 0), int(row[3] or 0), float(row[4] or 0.0),
+            str(row[5] or ""), int(row[6] or 0), base_only, bool(row[8]),
+        )
+
+    def _write_deficit(self, state: RecoveryState, now_ms: int) -> RecoveryState:
+        self.db.execute(
+            "INSERT INTO recovery_deficit (id, deficit, markets, opened_ms, "
+            "updated_ms, steps, initial, cycle_id, wins, base_only, seeded) "
+            "VALUES (1,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE "
+            "SET deficit=excluded.deficit, markets=excluded.markets, "
+            "opened_ms=excluded.opened_ms, updated_ms=excluded.updated_ms, "
+            "steps=excluded.steps, initial=excluded.initial, "
+            "cycle_id=excluded.cycle_id, wins=excluded.wins, "
+            "base_only=excluded.base_only, seeded=excluded.seeded",
+            (state.deficit, state.markets, state.opened_ms, now_ms, state.steps,
+             state.initial, state.cycle_id, state.wins, int(state.base_only),
+             int(state.seeded)),
+        )
+        self.db.commit()
+        return state
+
+    def apply_realised_to_deficit(
+        self, now_ms: int, plan_steps: int = DEFAULT_RECOVERY_STEPS
+    ) -> RecoveryState:
+        """Fold every realised figure into the deficit, each one exactly once.
+
+        `recovery_applied` holds the amount already folded in for that market,
+        so a row the exchange later revises moves the deficit by the DELTA
+        between the two figures. A cash-out banked at +0.55 and settled at
+        +0.54 costs the deficit one cent, not another 54.
+
+        The three transitions the operator stated are one line of arithmetic:
+        a loss is a negative delta and ADDS to the deficit, a profit subtracts
+        from it, and it can never go below zero - which is the same thing as
+        "as soon as it reaches $0.00, recovery is off". Profit from a BASE-size
+        trade counts exactly as much as profit from an upsized one; the ledger
+        does not record what size won the money back and it does not matter.
+
+        A LOSS RESETS THE PLAN to `plan_steps`. The per-trade requirement is
+        deficit/steps, so without this the divisor would shrink while the
+        deficit grew, and the requirement would run away upwards - switching
+        the upsize off exactly where the operator wants it on.
+
+        Rows are applied in window order. The deficit is path-dependent, so
+        that order is part of the answer; a settlement that arrives for an
+        older market than one already applied is folded in where it lands.
+        """
+        state = self.stored_deficit()
+        deficit, markets = state.deficit, state.markets
+        opened_ms, steps = state.opened_ms, state.steps
+        initial, cycle_id = state.initial, state.cycle_id
+        wins, base_only, seeded = state.wins, state.base_only, state.seeded
+        # A cycle that predates these columns has no opening figure recorded.
+        # Seed it from the deficit in hand, never from zero: zero would read
+        # as "100% recovered" and end sizing on the first fold, which is the
+        # opposite of measuring anything.
+        if deficit > 0 and initial <= 0:
+            # ADOPTED, NOT OBSERVED. This deficit was already in flight when
+            # the cycle columns arrived, so `initial` is a migration starting
+            # point and the percentage measured against it is NOT progress
+            # against the original loss. Flagged so no report can imply it is.
+            initial = deficit
+            cycle_id = cycle_id or f"rc-{now_ms}"
+            seeded = True
+        # WINNING MARKETS, COUNTED ONCE EACH, FOR THIS CYCLE ONLY. Base and
+        # add-on fills on one ticker are one position with one outcome, and
+        # the ticker is the identity - counting realised EVENTS would reach
+        # four on two markets that each settled twice.
+        won_tickers: set[str] = set()
+        if cycle_id:
+            won_tickers = {
+                row[0] for row in self.db.execute(
+                    "SELECT ticker FROM recovery_cycle_wins WHERE cycle_id=?",
+                    (cycle_id,),
+                )
+            }
+        # FOLDED FROM `realised_events`, IN BROKER REALISATION ORDER.
+        #
+        # The deficit is path-dependent because profit stops reducing it at
+        # zero, so the order is part of the answer and it has to be the order
+        # the money actually moved in.
+        #
+        # Two earlier keys were both wrong. `window_ms` is the market's clock:
+        # an early cash-out realises while its own window is still running and
+        # can realise BEFORE a market that opened earlier, so a profit could be
+        # applied to a debt that did not exist yet. `first_ms` is OUR discovery
+        # time: a settlement credited at 17:00:08 was first banked at 17:15:25,
+        # 917 seconds later, so a delayed settlement replayed in the wrong
+        # place. `realised_ms` is the broker's own timestamp, and `event_id`
+        # is the tie-breaker, so a duplicate sync and a restart produce the
+        # same number - the deficit is a fact about the account, not about the
+        # run that computed it.
+        #
+        # THE EPOCH IS COMPARED ON REALISATION, NOT ON THE MARKET'S TIME. A
+        # position already open when recovery activates settles afterwards, so
+        # its money becomes real afterwards and it COUNTS. Only events whose
+        # money was already real before activation are excluded - those are
+        # history, whenever the broker happens to deliver them.
+        epoch = self.recovery_epoch_ms()
+        for event_id, ticker, amount, applied, realised_ms in self.db.execute(
+            "SELECT event_id, ticker, amount, COALESCE(applied, 0.0), realised_ms "
+            "FROM realised_events ORDER BY realised_ms, event_id"
+        ).fetchall():
+            if epoch and realised_ms < epoch:
+                if applied == 0.0:
+                    self.db.execute(
+                        "UPDATE realised_events SET applied = amount "
+                        "WHERE event_id = ?",
+                        (event_id,),
+                    )
+                continue
+            pnl = amount
+            realised = float(pnl or 0.0)
+            delta = realised - float(applied or 0.0)
+            if abs(delta) < 1e-9:
+                continue
+            was_owing = deficit > 0
+            if was_owing:
+                markets += 1
+                # ONE MARKET, ONE WIN. The ticker is the identity, so a
+                # market that settles its base and its add-on separately, or
+                # is revised by the broker later, still counts once.
+                if delta > 0 and ticker not in won_tickers and cycle_id:
+                    won_tickers.add(ticker)
+                    self.db.execute(
+                        "INSERT OR IGNORE INTO recovery_cycle_wins "
+                        "(cycle_id, ticker, net, counted_ms) VALUES (?,?,?,?)",
+                        (cycle_id, ticker, delta, now_ms),
+                    )
+            deficit = max(0.0, deficit - delta)
+            if delta < 0:
+                steps = int(plan_steps)      # a fresh loss, a fresh plan
+            # A LOSS DOES NOT DEEPEN THE DENOMINATOR. Progress is measured
+            # against what this cycle OPENED owing; a later loss raises the
+            # outstanding figure and so lowers the percentage, which is what
+            # "net of subsequent realised losses" means. It also does not
+            # reset the win counter, and in the base-only phase it does not
+            # reactivate sizing - reactivating is the loop this prevents.
+            if deficit > 0 and initial <= 0:
+                # Opened by an observed loss inside the fold, so this IS the
+                # original hole for the cycle.
+                initial = deficit
+                cycle_id = cycle_id or f"rc-{now_ms}-{event_id[:8]}"
+                seeded = False
+            if deficit < DEFICIT_CLEARED:
+                # Genuinely repaid. The CYCLE CLOSES: counters reset and a
+                # later loss opens a fresh one. Full recovery ends sizing
+                # immediately in its own right, even before four wins.
+                if cycle_id:
+                    self.db.execute(
+                        "DELETE FROM recovery_cycle_wins WHERE cycle_id=?",
+                        (cycle_id,),
+                    )
+                deficit, markets, opened_ms, steps = 0.0, 0, 0, 0
+                initial, cycle_id, base_only, seeded = 0.0, "", False, False
+                won_tickers = set()
+            elif not opened_ms:
+                opened_ms = now_ms
+            self.db.execute(
+                "UPDATE realised_events SET applied=? WHERE event_id=?",
+                (realised, event_id),
+            )
+            # Kept in step so the per-market view and the event view agree.
+            self.db.execute(
+                "UPDATE daily_ledger SET recovery_applied=pnl WHERE ticker=?",
+                (ticker,),
+            )
+        # THE EARLY STAND-DOWN. Evaluated after every fold, so it fires on the
+        # settlement that crosses the threshold rather than on the next signal.
+        # Once down it stays down for the epoch: re-arming on the next loss
+        # would rebuild the recover-lose-bigger-recover loop this prevents.
+        wins = len(won_tickers)
+        if deficit > 0 and not base_only:
+            decision = recovery_exit.decide(
+                initial, deficit, wins, **self.recovery_exit_policy
+            )
+            if decision.end_sizing:
+                base_only = True
+                print(
+                    f"RECOVERY SIZE ENDED: {decision.reason}. "
+                    f"{deficit:.4f} still owed and still tracked; "
+                    f"normal base size from here.",
+                    flush=True,
+                )
+        return self._write_deficit(
+            RecoveryState(
+                deficit,
+                # ACTIVE means "may upsize", not "owes money". A base-only
+                # cycle still owes `deficit` and still reports it.
+                deficit > 0 and not base_only,
+                markets, opened_ms, steps, initial, cycle_id, wins,
+                base_only, seeded,
+            ),
+            now_ms,
+        )
+
+    def consume_recovery_step(
+        self, now_ms: int, plan_steps: int = DEFAULT_RECOVERY_STEPS
+    ) -> None:
+        """One upsized trade is on the book. Never raises.
+
+        Only a trade that actually TOOK the upsize spends a step: a qualifying
+        trade that fell back to base size because its profit could not cover
+        the per-trade share has changed nothing about the plan. That keeps the
+        requirement roughly flat as the deficit falls - 1.64/4 = 0.41, then
+        after a 0.47 recovery, 1.17/3 = 0.39 - instead of rising as the money
+        comes back.
+
+        Called on the post-order path, where a raising write is an outage: the
+        contracts are already at the exchange by the time this runs.
+        """
+        try:
+            # The current state, not the stored row: anything that settled
+            # between the size decision and the fill belongs in the plan this
+            # step is taken out of.
+            state = self.recovery_state(plan_steps, now_ms)
+            if not state.active:
+                return
+            self._write_deficit(
+                RecoveryState(
+                    state.deficit, state.active, state.markets,
+                    state.opened_ms, max(0, state.steps - 1),
+                ),
+                now_ms,
+            )
+        except Exception as exc:  # noqa: BLE001 - bookkeeping must not stop trading
+            print(
+                f"consume_recovery_step failed: {type(exc).__name__}: {exc}",
+                flush=True,
+            )
 
     def quarantine_shifted_shadow_rows(self) -> int:
         """Mark every column-shifted legacy row, permanently. Returns the count.
@@ -1155,6 +2052,1419 @@ class Store:
         ).fetchone()
         return int(row[0] or 0), int(row[1] or 0)
 
+    def record_realised(
+        self, ticker: str, window_ms: int, pnl: float, won: bool | None,
+        source: str, now_ms: int, realised_ms: int | None = None,
+    ) -> None:
+        """Bank one market's final money, and emit its cash-flow event.
+
+        `realised_ms` is the BROKER's timestamp for when the money became
+        real - a settlement's `settled_ms`, an exit's `filled_ms`. It defaults
+        to `now_ms` only because a caller that does not know cannot do better;
+        every caller that does know passes it, because the deficit is folded
+        in realisation order and our own discovery time has been observed 917
+        seconds late.
+
+        For an `exchange` event the amount recorded is the REMAINDER - the
+        settlement total minus whatever cash-outs on the same market already
+        banked - so a partial exit and the settlement of the rest are two
+        events at two times that sum to the exchange's own figure.
+
+        A row is never deleted and never silently replaced by a smaller
+        figure that merely arrived later. The broker is still the authority -
+        if its settled number differs from what the cash-out banked, the
+        broker wins - but the change is counted in `revisions` and the source
+        recorded, so a disagreement shows up instead of being absorbed.
+        """
+        self._emit_event(ticker, window_ms, pnl, source, now_ms, realised_ms)
+        existing = self.db.execute(
+            "SELECT pnl, source, revisions FROM daily_ledger WHERE ticker=?", (ticker,)
+        ).fetchone()
+        if existing is None:
+            self.db.execute(
+                "INSERT INTO daily_ledger (ticker, window_ms, pnl, won, source, "
+                "first_ms, updated_ms, revisions) VALUES (?,?,?,?,?,?,?,0)",
+                (ticker, window_ms, pnl, None if won is None else int(won),
+                 source, now_ms, now_ms),
+            )
+            self.db.commit()
+            return
+        previous, previous_source, revisions = existing
+        if source == previous_source or abs(previous - pnl) < 1e-9:
+            return
+        # Only the exchange may revise a figure the bot banked locally.
+        if source != "exchange":
+            return
+        self.db.execute(
+            "UPDATE daily_ledger SET pnl=?, won=?, source=?, updated_ms=?, "
+            "revisions=? WHERE ticker=?",
+            (pnl, None if won is None else int(won), source, now_ms,
+             revisions + 1, ticker),
+        )
+        self.db.commit()
+        print(
+            f"ledger revision [{ticker}]: {previous_source} {previous:+.4f} -> "
+            f"exchange {pnl:+.4f}",
+            flush=True,
+        )
+
+    def sync_events_from_fills(self, now_ms: int) -> None:
+        """One cash-flow event per SELL FILL, keyed on the broker's fill id.
+
+        `cash_out:{ticker}` was not a unique identity. Two partial exits in the
+        same market collapse onto one key, and the second silently overwrites
+        the first - one of the two cash flows disappears from an order-
+        sensitive fold, and the settlement remainder is then computed against
+        the wrong banked total. The broker's `fill_id` is unique per execution
+        and stable across redelivery, which is exactly what an event id has to
+        be.
+
+        Entry cost and fee are allocated to the portion sold, so a partial
+        carries its own share and the remainder is left owing the rest.
+        """
+        floor = now_ms - self.LEDGER_SYNC_LOOKBACK_MS
+        touched: set[str] = set()
+        for fill in self._dicts(
+            "SELECT fill_id, ticker, side, count, yes_price, no_price, fee_cost, "
+            "filled_ms, window_ms FROM fills WHERE action = 'sell' AND filled_ms >= ?",
+            (floor,),
+        ):
+            event_id = f"cash_out:{fill['fill_id']}"
+            basis = self._entry_basis(fill["ticker"])
+            if basis is None:
+                continue
+            entry_price, bought, entry_fee = basis
+            sold = float(fill["count"] or 0)
+            if sold <= 0:
+                continue
+            # A sell of the YES side exits an UP position at `yes_price`; a
+            # sell of NO exits a DOWN position, whose price is the no side.
+            exit_price = float(
+                fill["no_price"] if fill["side"] == "no" else fill["yes_price"]
+            )
+            share = sold / bought if bought else 1.0
+            amount = round(
+                (exit_price - entry_price) * sold
+                - entry_fee * share
+                - float(fill["fee_cost"] or 0.0),
+                6,
+            )
+            self.record_realised_event(
+                event_id, fill["ticker"], int(fill["filled_ms"]), amount,
+                "cash_out", now_ms, fill["window_ms"],
+            )
+            touched.add(fill["ticker"])
+
+        # SUPERSEDE THE PROVISIONALS, PER TICKER, ALL OF THEM.
+        #
+        # One exit ORDER can produce several FILLS - a resting sell walked
+        # through two price levels is two executions at two instants. The
+        # provisional event was keyed on the moment the bot noticed, which
+        # matches at most one of them, so matching provisional-to-fill by
+        # timestamp would leave the rest behind and double-count the sale.
+        # Once ANY broker fill exists for a market, every provisional for that
+        # market is replaced by the real ones.
+        for ticker in touched:
+            # A provisional id is "cash_out:{ticker}:{ms}" - three parts. A
+            # broker-backed one is "cash_out:{fill_id}" - two.
+            provisionals = [
+                event["event_id"] for event in self.settlement_events(ticker)
+                if event["source"] != "exchange"
+                and event["event_id"].count(":") >= 2
+            ]
+            if not provisionals:
+                continue
+            self.db.executemany(
+                "DELETE FROM realised_events WHERE event_id = ?",
+                [(event_id,) for event_id in provisionals],
+            )
+            self.db.commit()
+            # THE AMOUNT OR THE TIMESTAMP HAS CHANGED, so the ordered fold is
+            # no longer a valid continuation of the stored figure. Replay it.
+            self.rebuild_deficit(now_ms)
+
+    def _entry_basis(self, ticker: str) -> tuple[float, float, float] | None:
+        """(price, contracts, fee) of the BUY side, from the broker's fills."""
+        row = self.db.execute(
+            "SELECT SUM(count), SUM(fee_cost), SUM(count * CASE WHEN side='no' "
+            "THEN no_price ELSE yes_price END) FROM fills "
+            "WHERE ticker = ? AND action = 'buy'",
+            (ticker,),
+        ).fetchone()
+        if not row or not row[0]:
+            return None
+        bought = float(row[0])
+        return round(float(row[2]) / bought, 6), bought, float(row[1] or 0.0)
+
+    def _emit_event(
+        self, ticker: str, window_ms: int, pnl: float, source: str,
+        now_ms: int, realised_ms: int | None,
+    ) -> None:
+        """One cash-flow event per (source, market), at broker time.
+
+        A settlement carries the REMAINDER after any cash-out on the same
+        market, so the events sum to the exchange's total while each keeps its
+        own timestamp. That is what lets a partial exit at 18:57 and the
+        settlement of the rest at 19:00 replay as the two separate cash flows
+        they were, instead of one aggregate at whichever time we noticed.
+        """
+        when = int(realised_ms if realised_ms is not None else now_ms)
+        amount = float(pnl)
+        if source != "exchange":
+            # A PROVISIONAL exit event, keyed on the instant the cash flow
+            # happened rather than on the ticker: two partial exits are two
+            # instants and therefore two events, where `cash_out:{ticker}`
+            # would have let the second overwrite the first. The broker's own
+            # fill id supersedes this as soon as the fill syncs.
+            self.record_realised_event(
+                f"cash_out:{ticker}:{when}", ticker, when, amount,
+                source, now_ms, window_ms,
+            )
+            return
+        if source == "exchange":
+            banked = sum(
+                float(event["amount"])
+                for event in self.settlement_events(ticker)
+                if event["source"] != "exchange"
+            )
+            amount = round(amount - banked, 6)
+            if abs(amount) < 1e-9 and banked:
+                return
+        self.record_realised_event(
+            f"{source}:{ticker}", ticker, when, amount, source, now_ms, window_ms
+        )
+
+    # How far back a sync looks. Kalshi settles in batches and can credit a
+    # market hours after its close, so the window has to be wider than the lag,
+    # not wider than the day.
+    LEDGER_SYNC_LOOKBACK_MS = 3 * 86_400_000
+
+    def sync_ledger_from_settlements(self, now_ms: int) -> None:
+        """Fold recent broker settlements into the ledger. The exchange wins.
+
+        SELECTED ON THE SETTLEMENT TIMESTAMP, not the market's own day.
+
+        The original filtered `COALESCE(window_ms, settled_ms) >= start of
+        today`, which silently dropped every market that closed before midnight
+        and settled after it. The 23:45 window carries a previous-day
+        `window_ms`, so at 00:05 it fell outside the filter, never reached
+        `daily_ledger`, and therefore could never open a recovery deficit - a
+        loss that financed nothing and appeared nowhere.
+
+        Looking back three days instead is safe because the fold is IDEMPOTENT:
+        `daily_ledger` is keyed by ticker and `record_realised` refuses to
+        re-apply a figure it already holds, so re-reading an old settlement
+        writes nothing and moves no deficit. Re-reading is cheap; missing one
+        is not.
+
+        `window_ms` is still stored per row, because `ledger_today` reports by
+        the MARKET's day - a 23:45 loss belongs to the day it was traded even
+        when the money arrives the next morning.
+        """
+        floor = now_ms - self.LEDGER_SYNC_LOOKBACK_MS
+        epoch = self.recovery_epoch_ms()
+        for row in self.db.execute(
+            "SELECT ticker, COALESCE(window_ms, settled_ms), pnl, settled_ms "
+            "FROM settlements WHERE COALESCE(settled_ms, window_ms) >= ?",
+            (floor,),
+        ).fetchall():
+            ticker, window_ms, pnl, settled_ms = row
+            window_ms = int(window_ms)
+            self.record_realised(
+                ticker, window_ms, float(pnl), float(pnl) > 0, "exchange", now_ms,
+                realised_ms=int(settled_ms) if settled_ms else None,
+            )
+            # A MARKET OLDER THAN THE RECOVERY EPOCH IS HISTORY, NOT A DEBT.
+            #
+            # Widening this lookback to catch the midnight settlements pulled
+            # three days of finished markets into the ledger, all unapplied.
+            # The fold then replayed them on top of the live figure and drove
+            # the deficit from $0.85 to $10.90 - a requirement of $2.73 a
+            # trade, which no two-contract position can ever satisfy, so the
+            # add-on would have sat silently disabled while looking active.
+            # Backfilled history is marked applied on arrival, so it can never
+            # retroactively open a debt that was already settled or forgiven.
+            if epoch and window_ms < epoch:
+                self.db.execute(
+                    "UPDATE daily_ledger SET recovery_applied = pnl "
+                    "WHERE ticker = ? AND recovery_applied IS NULL",
+                    (ticker,),
+                )
+        self.db.commit()
+        # The deficit folds from events, not from this table.
+        self.sync_events_from_settlements(now_ms)
+
+    # ------------------------------------------------- capital and reservations
+
+    def record_capital_day(self, capital) -> None:
+        self.db.execute(
+            "INSERT OR REPLACE INTO capital_days (ny_day, reconciled_cash, "
+            "open_exposure, base_contracts, account_ceiling, reconciled_ms) "
+            "VALUES (?,?,?,?,?,?)",
+            (capital.ny_day, capital.reconciled_cash, capital.open_exposure,
+             capital.base_contracts, capital.account_ceiling,
+             capital.reconciled_ms),
+        )
+        self.db.commit()
+
+    def capital_for_day(self, ny_day: str):
+        rows = self._dicts(
+            "SELECT * FROM capital_days WHERE ny_day = ?", (ny_day,)
+        )
+        return _capital(rows[0]) if rows else None
+
+    def previous_capital_day(self, ny_day: str):
+        rows = self._dicts(
+            "SELECT * FROM capital_days WHERE ny_day < ? ORDER BY ny_day DESC "
+            "LIMIT 1",
+            (ny_day,),
+        )
+        return _capital(rows[0]) if rows else None
+
+    def open_position_cost(self) -> float:
+        """What open positions COST, not what they are marked at.
+
+        Capital for sizing includes committed money at its cost basis, so a
+        winning position cannot inflate tomorrow's tier on a gain that has not
+        settled. `open_mark` is the mark and is deliberately not used here.
+        """
+        row = self.db.execute(
+            f"SELECT COALESCE(SUM(count * COALESCE(fill_price, entry_limit)), 0) "
+            f"FROM trade_proposals WHERE status IN {HELD_SQL}"
+        ).fetchone()
+        return round(float(row[0] or 0.0), 6)
+
+    def reserve_funds(
+        self, key: str, amount: float, now_ms: int, available: float | None = None
+    ) -> bool:
+        """Claim funds, checked against what is actually available. Atomic.
+
+        A UNIQUE KEY ALONE DOES NOT PREVENT OVERSPENDING. It stops the SAME
+        order reserving twice; it does nothing about two DIFFERENT orders - a
+        base entry and a recovery add in the same poll - each reserving a
+        different key against the same balance and together exceeding it. So
+        the check and the insert happen in one IMMEDIATE transaction, and the
+        sum of live reservations plus this request must fit inside
+        `available`.
+
+        `available` is the spendable figure the caller just read. Passing None
+        keeps the old unchecked behaviour and is only for callers that have
+        already done the arithmetic themselves.
+        """
+        amount = round(float(amount), 6)
+        try:
+            self.db.execute("BEGIN IMMEDIATE")
+            if available is not None:
+                held = self.db.execute(
+                    "SELECT COALESCE(SUM(amount), 0) FROM fund_reservations "
+                    "WHERE key != ?",
+                    (key,),
+                ).fetchone()[0]
+                if round(float(held or 0.0) + amount, 6) > round(available, 6):
+                    self.db.execute("ROLLBACK")
+                    return False
+            self.db.execute(
+                "INSERT INTO fund_reservations (key, amount, created_ms, state) "
+                "VALUES (?,?,?,'held')",
+                (key, amount, now_ms),
+            )
+            self.db.execute("COMMIT")
+            return True
+        except sqlite3.IntegrityError:
+            self.db.execute("ROLLBACK")
+            return False
+
+    def release_funds(self, key: str, reason: str = "released") -> None:
+        """Free a reservation. Only call this once the outcome is KNOWN.
+
+        Known means the broker has told us: cancelled, rejected, expired, or
+        filled and therefore now counted as position exposure instead. A
+        reservation released on a timer while its order is still resting hands
+        the same dollars out twice.
+        """
+        self.db.execute(
+            "DELETE FROM fund_reservations WHERE key = ?", (key,)
+        )
+        self.db.commit()
+        if reason != "released":
+            print(f"reservation released [{key}]: {reason}", flush=True)
+
+    def reservation_keys(self) -> list[str]:
+        return [
+            row[0] for row in self.db.execute("SELECT key FROM fund_reservations")
+        ]
+
+    def reserved_funds(self, now_ms: int) -> float:
+        """Dollars currently claimed by orders whose outcome is not yet known.
+
+        NOTHING EXPIRES HERE. A reservation used to time out after five
+        minutes, which is wrong in the exact case it matters: an order that is
+        still resting, or one whose submission outcome is unknown, has not
+        released its money and a clock cannot decide that it has. Releases are
+        driven by reconciliation - `RecoveryAddRunner.reconcile` and the
+        order path - so the only way funds come back is the broker saying so.
+        """
+        row = self.db.execute(
+            "SELECT COALESCE(SUM(amount), 0) FROM fund_reservations"
+        ).fetchone()
+        return round(float(row[0] or 0.0), 6)
+
+    def record_realised_event(
+        self, event_id: str, ticker: str, realised_ms: int, amount: float,
+        source: str, now_ms: int, window_ms: int | None = None,
+    ) -> None:
+        """One cash flow, at the BROKER's timestamp for it.
+
+        Idempotent on `event_id`: a re-sync writes nothing. The amount may be
+        revised (a cash-out banked at +0.55 that the exchange settles at
+        +0.54), and the fold applies the delta.
+        """
+        existing = self.db.execute(
+            "SELECT amount FROM realised_events WHERE event_id = ?", (event_id,)
+        ).fetchone()
+        if existing is None:
+            self.db.execute(
+                "INSERT INTO realised_events (event_id, ticker, realised_ms, "
+                "amount, source, window_ms, applied, recorded_ms) "
+                "VALUES (?,?,?,?,?,?,NULL,?)",
+                (event_id, ticker, int(realised_ms), float(amount), source,
+                 window_ms, now_ms),
+            )
+        elif abs(float(existing[0]) - float(amount)) > 1e-9:
+            self.db.execute(
+                "UPDATE realised_events SET amount = ?, realised_ms = ?, "
+                "recorded_ms = ? WHERE event_id = ?",
+                (float(amount), int(realised_ms), now_ms, event_id),
+            )
+        self.db.commit()
+
+    def last_exit_fill_ms(self, ticker: str) -> int | None:
+        """When the broker says the exit actually traded. None if unknown."""
+        row = self.db.execute(
+            "SELECT MAX(filled_ms) FROM fills WHERE ticker = ? AND action = 'sell'",
+            (ticker,),
+        ).fetchone()
+        return int(row[0]) if row and row[0] else None
+
+    def settlement_events(self, ticker: str) -> list[dict]:
+        return self._dicts(
+            "SELECT * FROM realised_events WHERE ticker = ? "
+            "ORDER BY realised_ms, event_id",
+            (ticker,),
+        )
+
+    def sync_events_from_settlements(self, now_ms: int) -> None:
+        """Turn the broker's record into an ordered cash-flow sequence.
+
+        A cash-out is a PROVISIONAL event at its fill time. The exchange's
+        settlement is the total for that market, so its own event carries the
+        REMAINDER - the total minus whatever the cash-outs already banked -
+        at `settled_ms`. The events therefore sum to the exchange's figure
+        while each keeps its own true timestamp, which is what a partial exit
+        followed by a settlement actually looks like.
+        """
+        floor = now_ms - self.LEDGER_SYNC_LOOKBACK_MS
+        for row in self.db.execute(
+            "SELECT ticker, COALESCE(window_ms, settled_ms) AS wms, pnl, settled_ms "
+            "FROM settlements WHERE COALESCE(settled_ms, window_ms) >= ?",
+            (floor,),
+        ).fetchall():
+            ticker, window_ms, pnl, settled_ms = row
+            if not settled_ms:
+                continue
+            banked = sum(
+                float(e["amount"]) for e in self.settlement_events(ticker)
+                if e["source"] != "exchange"
+            )
+            remainder = round(float(pnl) - banked, 6)
+            if abs(remainder) < 1e-9 and banked:
+                continue  # the cash-out already accounted for all of it
+            self.record_realised_event(
+                f"exchange:{ticker}", ticker, int(settled_ms), remainder,
+                "exchange", now_ms, int(window_ms),
+            )
+
+    def position_entry_ms(self, window_open: int, ticker: str) -> int | None:
+        """When the base position was actually BOUGHT, from the broker's fills.
+
+        Not the window open, and not the proposal's creation time. "Crossed
+        since entry" has to mean since the money went in: on 2026-09-22 the
+        add for KXBTC15M-26SEP221500-00 was evaluated at 18:49:40 against a
+        fill that happened at 18:49:42, while the crossing check looked all
+        the way back to the 18:45 window open - so four minutes and forty-two
+        seconds of BRTI history from BEFORE we held anything were allowed to
+        veto the add.
+
+        None when it cannot be established. The caller must treat that as
+        unknown and refuse, never as "no crossing" and never as "crossed".
+        """
+        row = self.db.execute(
+            "SELECT MIN(filled_ms) FROM fills WHERE ticker = ? AND action = 'buy'",
+            (ticker,),
+        ).fetchone()
+        if row and row[0]:
+            return int(row[0])
+        # No broker fill yet - the position may be seconds old. The proposal's
+        # own timestamp is a lower bound on when we could have been holding.
+        row = self.db.execute(
+            f"SELECT MIN(created_at) FROM trade_proposals WHERE window_open = ? "
+            f"AND ticker = ? AND status IN {HELD_SQL}",
+            (window_open, ticker),
+        ).fetchone()
+        return int(row[0]) if row and row[0] else None
+
+    def recovery_epoch_ms(self) -> int:
+        """When recovery accounting began. Markets older than this are history.
+
+        Compared against the market's OWN time, not when the settlement was
+        discovered. A market traded after the epoch counts even if the broker
+        delivers its settlement tomorrow; a market traded before it never
+        counts however late it arrives. The distinction matters because the
+        sync deliberately looks back days to catch settlements that cross
+        midnight.
+        """
+        return int(self.get_setting("recovery_epoch_ms", 0.0))
+
+    def set_recovery_epoch(self, epoch_ms: int, now_ms: int) -> None:
+        self.set_setting("recovery_epoch_ms", float(epoch_ms), now_ms)
+
+    def day_start_ms(self, now_ms: int) -> int:
+        """The start of the accounting day. NEW YORK, matching the exchange.
+
+        THE WHOLE DAY MOVES TOGETHER. The capital review, the realised ledger,
+        the trade counters and the daily loss floor were split across two
+        calendars for a few hours on 2026-09-22 - the review on New York, the
+        rest on UTC - which is worse than either alone: a loss counted in one
+        day and a floor measured over another is a floor that does not bound
+        what it claims to.
+
+        Kalshi's own utilisation resets at midnight New York, so that is the
+        boundary the account is actually kept on, but the exchange's reset does
+        not by itself define OUR accounting fields - it is the reason to pick
+        the same day for all of them, deliberately, rather than to inherit one
+        field at a time.
+        """
+        from .capital import ny_day_start_ms
+
+        return ny_day_start_ms(now_ms)
+
+    def rebuild_deficit(self, now_ms: int, plan_steps: int | None = None):
+        """Replay the deficit from zero over every event, in realisation order.
+
+        The incremental fold is a valid continuation only while history is
+        append-only. It is not, twice over: the exchange revises a figure a
+        cash-out banked, and a provisional exit is replaced by the broker's
+        real fills - which can be several, at different instants, summing to a
+        different amount. Either changes an event the fold has already applied,
+        and patching a path-dependent total in place after the fact is how a
+        floored quantity silently diverges.
+
+        So the whole sequence is replayed. It is deterministic - ordered by
+        realisation time with the event id as tie-breaker - so a rebuild and a
+        restart produce the same number, which is the property that makes the
+        deficit a fact about the account rather than about the run.
+        """
+        steps = int(plan_steps or DEFAULT_RECOVERY_STEPS)
+        self.db.execute("UPDATE realised_events SET applied = NULL")
+        self.db.execute("DELETE FROM recovery_deficit")
+        self.db.commit()
+        return self.apply_realised_to_deficit(now_ms, steps)
+
+    def migrate_day_boundary(self, now_ms: int) -> float:
+        """Carry today's pre-New-York losses across the timezone change. Once.
+
+        Returns the carried amount (<= 0). Idempotent: the marker is written
+        with the day it applies to, so a restart cannot bank it twice.
+        """
+        from .capital import ny_day
+
+        day = ny_day(now_ms)
+        marker = self.db.execute(
+            "SELECT text_value FROM settings_text WHERE key='day_boundary_migrated'"
+        ).fetchone()
+        if marker and marker[0] == day:
+            return self.get_setting("day_boundary_carry", 0.0)
+        utc_start = now_ms - (now_ms % 86_400_000)
+        ny_start = self.day_start_ms(now_ms)
+        carry = 0.0
+        if ny_start > utc_start:
+            _, _, carry = self.exchange_record(utc_start)
+            _, _, after = self.exchange_record(ny_start)
+            carry = round(min(0.0, carry - after), 6)
+        self.set_setting("day_boundary_carry", carry, now_ms)
+        self.set_setting_text("day_boundary_migrated", day, now_ms)
+        if carry:
+            print(
+                f"day boundary moved to New York: carrying {carry:+.4f} of "
+                f"losses already booked today so the floor is not refunded",
+                flush=True,
+            )
+        return carry
+
+    def day_boundary_carry(self, now_ms: int) -> float:
+        """The carried loss, but only on the day the migration happened."""
+        from .capital import ny_day
+
+        marker = self.db.execute(
+            "SELECT text_value FROM settings_text WHERE key='day_boundary_migrated'"
+        ).fetchone()
+        if not marker or marker[0] != ny_day(now_ms):
+            return 0.0
+        return self.get_setting("day_boundary_carry", 0.0)
+
+    def realised_for_ticker(self, ticker: str | None) -> float | None:
+        """The broker's realised P&L for one market, or None if not booked.
+
+        READ, NEVER REBUILT. `daily_ledger` is the append-only realised record
+        synced from `/portfolio/settlements`; it holds one row per market, it
+        counts an early cash-out exactly once, and only the exchange may revise
+        it. A recap that recomputes the figure from fill prices and a `won`
+        flag can disagree with the account - which is exactly how a market that
+        paid out $2.00 came to be announced as a $1.87 loss.
+
+        None means "not booked yet", not zero. The caller keeps its provisional
+        figure rather than asserting a settlement that has not arrived.
+        """
+        if not ticker:
+            return None
+        row = self.db.execute(
+            "SELECT pnl FROM daily_ledger WHERE ticker = ?", (ticker,)
+        ).fetchone()
+        return None if row is None or row[0] is None else float(row[0])
+
+    def ledger_today(self, now_ms: int | None = None) -> tuple[int, int, float]:
+        """(markets, winners, dollars) realised today, from the ledger alone."""
+        import time
+
+        if now_ms is None:
+            now_ms = int(time.time() * 1000)
+        start = self.day_start_ms(now_ms)
+        row = self.db.execute(
+            "SELECT COUNT(*), COALESCE(SUM(pnl > 0), 0), COALESCE(SUM(pnl), 0) "
+            "FROM daily_ledger WHERE window_ms >= ?",
+            (start,),
+        ).fetchone()
+        return int(row[0] or 0), int(row[1] or 0), float(row[2] or 0.0)
+
+    def ledger_tickers_today(self, now_ms: int | None = None) -> set[str]:
+        import time
+
+        if now_ms is None:
+            now_ms = int(time.time() * 1000)
+        start = self.day_start_ms(now_ms)
+        return {
+            row[0] for row in self.db.execute(
+                "SELECT ticker FROM daily_ledger WHERE window_ms >= ?", (start,)
+            )
+        }
+
+    def open_exposure(self) -> float:
+        """Open positions marked to the bid, EXCLUDING anything already banked.
+
+        This is the half of the headline that is allowed to move, and the
+        exclusion is the fix: a position sold four minutes ago is still in the
+        last 60-second mark, and adding that to a ledger which has already
+        banked its proceeds counts the same dollar twice.
+        """
+        import json
+
+        raw = self.db.execute(
+            "SELECT text_value FROM settings_text WHERE key='open_mark_detail'"
+        ).fetchone() if self._has_settings_text() else None
+        if not raw:
+            return self.get_setting("open_mark", 0.0)
+        try:
+            marks = json.loads(raw[0])
+        except (ValueError, TypeError):
+            return self.get_setting("open_mark", 0.0)
+        banked = self.ledger_tickers_today()
+        return sum(
+            float(value) for ticker, value in marks.items() if ticker not in banked
+        )
+
+    def _has_settings_text(self) -> bool:
+        return bool(self.db.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='settings_text'"
+        ).fetchone())
+
+    def set_setting_text(self, key: str, value: str, now_ms: int) -> None:
+        self.db.execute(
+            "INSERT OR REPLACE INTO settings_text VALUES (?,?,?)",
+            (key, value, now_ms),
+        )
+        self.db.commit()
+
+    # ------------------------------------------- the conditional recovery add
+
+    def add_budget_committed(self) -> tuple[float, int]:
+        """(dollars, fills) the add-on has EVER had filled. Never decreases."""
+        row = self.db.execute(
+            "SELECT committed, fills FROM recovery_add_budget WHERE id = 1"
+        ).fetchone()
+        return (float(row[0]), int(row[1])) if row else (0.0, 0)
+
+    def account_room(
+        self, account_size: float, balance: float, exposure: float
+    ) -> float:
+        """Dollars this order may spend, against a $30 TESTING ACCOUNT.
+
+        THE CORRECTED MODEL. The $30 was described as a testing account, and a
+        lifetime purchase cap is not that: it counts money that came back.
+        Three profitable $9 adds would exhaust a $30 "budget" while the
+        account itself was larger than when it started, and recovery would
+        stop for lack of a number rather than lack of funds.
+
+        An account is a stock, not a running total. What limits an order is
+        what is available RIGHT NOW:
+
+            room = min(broker cash, account_size - open and resting exposure)
+
+        Both terms matter. The broker balance stops us spending money we do
+        not have; the account ceiling stops the test growing past the size it
+        was authorised at, however well it goes. Cumulative spend is still
+        recorded, because it says how much trading the test has done - but it
+        does not gate anything.
+
+        A balance or exposure that could not be read is passed as a negative
+        number and yields no room: an unknown account is not an empty one, but
+        it is certainly not a licence to spend.
+        """
+        if balance < 0 or exposure < 0:
+            return -1.0
+        return round(min(balance, account_size - exposure), 6)
+
+    def add_budget_room(self, ceiling: float, resting: float) -> float:
+        """DEPRECATED lifetime purchase-spend headroom. Not a gate.
+
+        Kept so the cumulative figure stays visible in reports and tests, but
+        `account_room` is what decides whether an order may be placed. See its
+        docstring for why a lifetime cap was the wrong instrument.
+
+        THREE DIFFERENT LIMITS, AND THIS IS ONLY ONE OF THEM. The $30 the
+        operator authorised is a cumulative purchase-spend ceiling: every
+        dollar the add-on has ever paid for contracts, plus whatever is
+        resting unfilled right now. It is NOT a loss budget - a run of
+        PROFITABLE adds exhausts it just as fast as a run of losing ones,
+        because the money was spent either way and came back as settlement
+        rather than as headroom.
+
+        The other two are reported beside it by `add_budget_state` and are
+        deliberately not merged into this number:
+
+          purchase spend   cumulative, never decreases  <- the authorised cap
+          current exposure resting orders, transient
+          realised losses  what the add-on actually cost, can be negative
+
+        Silently treating the cap as a loss budget would let it run far longer
+        than authorised; treating it as pure exposure would let it reset on
+        every fill. It is neither, so all three are kept apart.
+
+        `resting` is passed in from the broker rather than inferred, because
+        an order this process did not place - a manual one, or one left by a
+        previous run - is still exposure.
+        """
+        committed, _ = self.add_budget_committed()
+        return round(ceiling - committed - max(0.0, resting), 6)
+
+    def add_budget_state(
+        self, account_size: float, resting: float, balance: float | None = None
+    ) -> dict:
+        """The limits, named and kept apart so a report cannot conflate them.
+
+        `account_room` is the one that gates an order. `lifetime_spend` is
+        history and gates nothing.
+        """
+        spend, fills = self.add_budget_committed()
+        summary = self.add_pnl_summary()
+        held = self.get_setting("open_mark", 0.0)
+        exposure = round(max(0.0, resting) + max(0.0, held), 6)
+        return {
+            "account_size": round(account_size, 6),
+            "broker_balance": None if balance is None else round(balance, 6),
+            "open_and_resting_exposure": exposure,
+            "account_room": (
+                None if balance is None
+                else self.account_room(account_size, balance, exposure)
+            ),
+            "lifetime_spend": round(spend, 6),
+            "lifetime_spend_fills": fills,
+            "realised_add_pnl": round(float(summary.get("pnl") or 0.0), 6),
+            "realised_add_fees": round(float(summary.get("fees") or 0.0), 6),
+        }
+
+    def _bump_add_budget(self, dollars: float, now_ms: int) -> None:
+        self.db.execute(
+            "INSERT INTO recovery_add_budget (id, committed, fills, started_ms, "
+            "updated_ms) VALUES (1, ?, 1, ?, ?) "
+            "ON CONFLICT(id) DO UPDATE SET committed = committed + excluded.committed, "
+            "fills = fills + 1, updated_ms = excluded.updated_ms",
+            (round(dollars, 6), now_ms, now_ms),
+        )
+
+    # ---------------------------------------------------- notifications
+    def get_setting_text(self, key: str, default: str = "") -> str:
+        """Read a TEXT setting. There was no generic reader before this.
+
+        Every previous reader was raw SQL at the call site, which is why five
+        of them exist with five slightly different fallbacks.
+        """
+        if not self._has_settings_text():
+            return default
+        row = self.db.execute(
+            "SELECT text_value FROM settings_text WHERE key = ?", (key,)
+        ).fetchone()
+        return default if row is None or row[0] is None else str(row[0])
+
+    def begin_delivery(self, kind: str, key: str, now_ms: int) -> bool:
+        """Claim this event BEFORE sending. True if the claim is ours.
+
+        THE CRASH WINDOW. A delivery table written after the send cannot make
+        a Telegram message exactly-once: if the process dies between the API
+        call returning and the row being written, the message is on the
+        operator's phone and nothing here knows it. Writing the row first
+        moves the ambiguity rather than removing it - now a crash can leave a
+        claim for a message that never went out.
+
+        Exactly-once is not achievable against an API with no idempotency key,
+        so the ambiguity is made EXPLICIT instead: a claimed-but-unconfirmed
+        row survives the restart as `pending`, and `resolve_pending` applies a
+        per-kind policy to it rather than guessing silently.
+        """
+        cursor = self.db.execute(
+            "INSERT OR IGNORE INTO notifications "
+            "(kind, event_key, status, first_ms, updated_ms) "
+            "VALUES (?,?,'pending',?,?)",
+            (kind, key, now_ms, now_ms),
+        )
+        self.db.commit()
+        return (cursor.rowcount or 0) == 1
+
+    def confirm_delivery(self, kind: str, key: str, now_ms: int,
+                         message_id: int | None, body: str) -> None:
+        """Record that the send returned. The claim becomes a delivery."""
+        self.db.execute(
+            "UPDATE notifications SET status='sent', message_id=?, body=?, "
+            "updated_ms=? WHERE kind=? AND event_key=?",
+            (message_id, body, now_ms, kind, key),
+        )
+        self.db.commit()
+
+    def abandon_delivery(self, kind: str, key: str) -> None:
+        """Release a claim whose send raised before reaching Telegram.
+
+        Only safe where the exception happened before the request went out -
+        a timeout is NOT this, because a timed-out request may still have been
+        delivered.
+        """
+        self.db.execute(
+            "DELETE FROM notifications WHERE kind=? AND event_key=? "
+            "AND status='pending'",
+            (kind, key),
+        )
+        self.db.commit()
+
+    def pending_deliveries(self) -> list[dict]:
+        """Claims that never confirmed. Each one is genuinely ambiguous."""
+        return self._dicts(
+            "SELECT * FROM notifications WHERE status='pending' "
+            "ORDER BY first_ms"
+        )
+
+    def resolve_pending(self, resend_kinds: tuple, now_ms: int) -> list[dict]:
+        """Decide what an ambiguous claim means, per kind, out loud.
+
+        There is no correct universal answer, so the choice is made per message
+        and stated:
+
+          RESEND (`resend_kinds`) - a market result, a settlement, a recovery
+              transition. Losing one is worse than showing it twice, because
+              the operator is reconciling money against it. The claim is
+              cleared so the next poll re-sends, and the row is marked so a
+              duplicate is explicable afterwards rather than mysterious.
+
+          DROP (everything else) - a signal alert, a waiting timer. These are
+              superseded by the next poll anyway, and a duplicate alert on a
+              market that has already moved is worse than a missing one.
+        """
+        resolved = []
+        for row in self.pending_deliveries():
+            kind = row["kind"]
+            if kind in resend_kinds:
+                self.db.execute(
+                    "DELETE FROM notifications WHERE kind=? AND event_key=?",
+                    (kind, row["event_key"]),
+                )
+                row["resolution"] = "resend"
+            else:
+                self.db.execute(
+                    "UPDATE notifications SET status='sent', updated_ms=? "
+                    "WHERE kind=? AND event_key=?",
+                    (now_ms, kind, row["event_key"]),
+                )
+                row["resolution"] = "drop"
+            resolved.append(row)
+        self.db.commit()
+        return resolved
+
+    def delivered(self, kind: str, key: str) -> dict | None:
+        """The delivery record for this event, or None if it never went out.
+
+        PERSISTED, so a restart cannot re-send what the operator has already
+        read. The in-memory guards this replaces reset with the process: after
+        the 13:54 restart the session-close report for the window that closed
+        during the downtime was silently dropped, because the only thing that
+        knew was a module-level dict.
+        """
+        rows = self._dicts(
+            "SELECT * FROM notifications WHERE kind = ? AND event_key = ?",
+            (kind, key),
+        )
+        return rows[0] if rows else None
+
+    def mark_delivered(self, kind: str, key: str, now_ms: int,
+                       message_id: int | None = None,
+                       body: str = "") -> bool:
+        """Record a successful send. True the first time, False afterwards.
+
+        `INSERT OR IGNORE` on the composite primary key, so the uniqueness is
+        the database's and not a read-then-write race in the poll loop.
+        """
+        cursor = self.db.execute(
+            "INSERT OR IGNORE INTO notifications "
+            "(kind, event_key, message_id, body, first_ms, updated_ms) "
+            "VALUES (?,?,?,?,?,?)",
+            (kind, key, message_id, body, now_ms, now_ms),
+        )
+        self.db.commit()
+        return (cursor.rowcount or 0) == 1
+
+    def update_delivered(self, kind: str, key: str, now_ms: int,
+                         body: str) -> None:
+        """Remember the text a message currently shows, after an edit."""
+        self.db.execute(
+            "UPDATE notifications SET body = ?, updated_ms = ? "
+            "WHERE kind = ? AND event_key = ?",
+            (body, now_ms, kind, key),
+        )
+        self.db.commit()
+
+    # --------------------------------------------------------- rotation
+    def insight_for(self, window_open: int, variants: tuple) -> str:
+        """Which insight this market shows. Stable for the whole market.
+
+        Every message about one window - the signal, the fill, the recap -
+        carries the SAME variant, so a reader following a market does not see
+        the extra line change underneath them while the market is still open.
+        The index only moves when a market result has actually been delivered.
+        """
+        if not variants:
+            return ""
+        assigned = self.get_setting_text(f"insight_market:{window_open}")
+        if assigned in variants:
+            return assigned
+        index = int(self.get_setting("insight_index", 0.0))
+        return variants[index % len(variants)]
+
+    def assign_insight(self, window_open: int, variant: str,
+                       now_ms: int) -> None:
+        self.set_setting_text(f"insight_market:{window_open}", variant, now_ms)
+
+    def advance_insight(self, variants: tuple, now_ms: int) -> None:
+        """Move the rotation on. Called ONLY after a delivered result.
+
+        Advancing on composition rather than on delivery would rotate on
+        messages that failed to send, so the operator would never see the
+        variant that was skipped.
+        """
+        if not variants:
+            return
+        index = int(self.get_setting("insight_index", 0.0))
+        self.set_setting("insight_index", float((index + 1) % len(variants)),
+                         now_ms)
+
+    def _dicts(self, sql: str, args: tuple = ()) -> list[dict]:
+        """Rows as dicts, via a cursor-local factory.
+
+        The connection's `row_factory` is left alone on purpose: most of this
+        class reads tuples by position, and flipping it globally - which
+        `clean_shadow_rows` does - would change what those reads return.
+        """
+        cursor = self.db.cursor()
+        cursor.row_factory = sqlite3.Row
+        return [dict(row) for row in cursor.execute(sql, args)]
+
+    def open_add(self, window_open_ms: int) -> dict | None:
+        """The add for this position, whatever state it is in. One per position."""
+        rows = self._dicts(
+            "SELECT * FROM recovery_adds WHERE window_open_ms = ?", (window_open_ms,)
+        )
+        return rows[0] if rows else None
+
+    def record_add(self, row: dict) -> bool:
+        """Create the add record. False if one already exists for the position.
+
+        The INSERT is what makes a restart safe: re-evaluating the same
+        position produces the same `client_order_id`, the insert is refused,
+        and no second order is placed.
+        """
+        row.setdefault("created_ms", row.get("updated_ms"))
+        columns = ", ".join(row)
+        placeholders = ", ".join(f":{name}" for name in row)
+        try:
+            self.db.execute(
+                f"INSERT INTO recovery_adds ({columns}) VALUES ({placeholders})", row
+            )
+            self.db.commit()
+            return True
+        except sqlite3.IntegrityError:
+            return False
+
+    def update_add(self, client_order_id: str, fields: dict) -> None:
+        if not fields:
+            return
+        fields = dict(fields)
+        fields["client_order_id"] = client_order_id
+        assignments = ", ".join(
+            f"{name} = :{name}" for name in fields if name != "client_order_id"
+        )
+        self.db.execute(
+            f"UPDATE recovery_adds SET {assignments} WHERE client_order_id = "
+            ":client_order_id",
+            fields,
+        )
+        self.db.commit()
+
+    def record_add_fill(
+        self, client_order_id: str, count: float, price: float, fee: float,
+        now_ms: int, is_taker: int | None = None, conditions: str | None = None,
+    ) -> None:
+        """Bank a fill once, and charge it to the lifetime budget once.
+
+        Guarded on `filled_count = 0` so a fill reported twice - by the order
+        poll and again by the fills sync - cannot charge the budget twice.
+        """
+        row = self.db.execute(
+            "SELECT filled_count FROM recovery_adds WHERE client_order_id = ?",
+            (client_order_id,),
+        ).fetchone()
+        if row is None or float(row[0] or 0) > 0:
+            return
+        self.db.execute(
+            "UPDATE recovery_adds SET state = ?, filled_count = ?, fill_price = ?, "
+            "fill_ms = ?, fee_paid = ?, is_taker = ?, conditions_at_fill = ?, "
+            "updated_ms = ? WHERE client_order_id = ?",
+            ("RECOVERY ADD EXECUTED", count, price, now_ms, fee, is_taker,
+             conditions, now_ms, client_order_id),
+        )
+        self._bump_add_budget(count * price + (fee or 0.0), now_ms)
+        self.db.commit()
+
+    def add_pnl_summary(self) -> dict:
+        """The add-on's own P&L, kept apart from the base position's.
+
+        The point of the live test is whether the SECOND contract pays. Mixing
+        it into the account total would answer a different question.
+        """
+        rows = self._dicts(
+            "SELECT COUNT(*) AS adds, "
+            "COALESCE(SUM(filled_count > 0), 0) AS filled, "
+            "COALESCE(SUM(CASE WHEN state = 'RECOVERY ADD CANCELLED' THEN 1 END), 0) "
+            "  AS cancelled, "
+            "COALESCE(SUM(CASE WHEN state = 'RECOVERY ADD SKIPPED' THEN 1 END), 0) "
+            "  AS skipped, "
+            "COALESCE(SUM(realised_pnl), 0) AS pnl, "
+            "COALESCE(SUM(fee_paid), 0) AS fees "
+            "FROM recovery_adds"
+        )
+        return rows[0] if rows else {}
+
+    def adds_needing_reconciliation(self) -> list[dict]:
+        """Adds left mid-flight by a restart: placed, not resolved."""
+        return self._dicts(
+            "SELECT * FROM recovery_adds WHERE state = 'RECOVERY ADD PENDING' "
+            "AND order_id IS NOT NULL"
+        )
+
+    def unsettled_filled_adds(self) -> list[dict]:
+        return self._dicts(
+            "SELECT * FROM recovery_adds WHERE filled_count > 0 AND settled = 0"
+        )
+
+    def money_snapshot(self, now_ms: int | None = None) -> "MoneySnapshot":
+        """Every money figure a message shows, computed ONCE, together.
+
+        The counts and the dollars used to come from different reads. The
+        headline added `open_exposure` while the W/L count came from the
+        ledger alone, so a position that had settled but not yet synced was in
+        the dollars and not in the count. On 2026-09-22 the settlement recap
+        read "+$3.05 - 30W-5L" when the ledger held 30W-6L: the money was
+        right, the record was a market short, and the two disagreed because
+        they were two snapshots of an account taken a minute apart.
+
+        One method, one instant, one set of numbers. `headline` is the figure
+        the operator compares against the Kalshi app - realised plus the open
+        position marked to the bid - and `realised` is the part that is final.
+        They are both here so a caller can show either without recomputing a
+        different account.
+        """
+        import time
+
+        if now_ms is None:
+            now_ms = int(time.time() * 1000)
+        markets, winners, realised = self.ledger_today(now_ms)
+        has_mirror = bool(markets)
+        if not markets:
+            # No ledger rows yet - fall back to the mirror, as before.
+            markets, winners, realised = self.exchange_record(
+                self.day_start_ms(now_ms)
+            )
+            has_mirror = bool(markets) or bool(self.exchange_record()[0])
+            if not markets:
+                realised = 0.0
+        open_mark = self.open_exposure()
+        return MoneySnapshot(
+            markets=markets, winners=winners, realised=round(realised, 6),
+            open_mark=round(open_mark, 6), taken_ms=now_ms, has_mirror=has_mirror,
+            lifetime=self.lifetime_record(),
+            sessions=tuple(session_breakdown(self.session_rows(now_ms))),
+            recovery=self.stored_deficit(),
+            last_add=self.last_add_decision(),
+        )
+
+    def session_rows(self, now_ms: int | None = None) -> list[tuple[int, float]]:
+        """(window_ms, pnl) for every market settled in the current NY day.
+
+        The same rows `ledger_today` counts, so the session breakdown built
+        from them sums exactly to the day's total rather than being a second
+        opinion about it.
+        """
+        import time
+
+        if now_ms is None:
+            now_ms = int(time.time() * 1000)
+        start = self.day_start_ms(now_ms)
+        return [
+            (int(row[0]), float(row[1]))
+            for row in self.db.execute(
+                "SELECT COALESCE(window_ms, first_ms), pnl FROM daily_ledger "
+                "WHERE COALESCE(window_ms, first_ms) >= ? ORDER BY 1",
+                (start,),
+            )
+        ]
+
+    def session_rows_for(self, session: str, now_ms: int) -> list[tuple[int, float]]:
+        """Just one session's markets, within the current NY day."""
+        from .sessions import session_of
+
+        return [
+            (ms, pnl) for ms, pnl in self.session_rows(now_ms)
+            if session_of(ms) == session
+        ]
+
+    def session_reported(self, ny_day: str, session: str) -> bool:
+        """Has this session's close already been reported today?
+
+        Keyed on the day AND the session so a restart cannot repeat a report,
+        and so a gap that straddles two closes still reports both once each.
+        """
+        row = self.db.execute(
+            "SELECT 1 FROM settings_text WHERE key = ?",
+            (f"session_reported:{ny_day}:{session}",),
+        ).fetchone()
+        return bool(row)
+
+    def mark_session_reported(self, ny_day: str, session: str, now_ms: int) -> None:
+        self.set_setting_text(
+            f"session_reported:{ny_day}:{session}", str(now_ms), now_ms
+        )
+
+    def recovery_transition(self, now_ms: int, plan_steps: int | None = None):
+        """(event, state) when recovery arms or clears, else (None, state).
+
+        Recovery ran for nearly an hour on 2026-09-22 - armed by a -$0.86
+        loss, two adds blocked, one order placed, then cleared - and NONE of
+        it reached Telegram. The operator's question was "I did not see the
+        recovery happening", and they were right: the word never appeared in
+        any message. A subsystem that moves real money silently is one nobody
+        can supervise.
+
+        The previous state is persisted, so a restart mid-recovery does not
+        re-announce something already reported.
+        """
+        state = self.recovery_state(plan_steps or DEFAULT_RECOVERY_STEPS, now_ms)
+        row = self.db.execute(
+            "SELECT text_value FROM settings_text WHERE key='recovery_announced'"
+        ).fetchone()
+        previous = (row[0] if row else "clear") or "clear"
+        # THREE STATES, NOT TWO. `active` going False used to mean one thing;
+        # it now means either "repaid" or "stood down with money still owed",
+        # and announcing CLEARED for the second would report a $0.00 deficit
+        # that is not $0.00.
+        if state.active:
+            current = "active"
+        elif state.base_only and state.owes:
+            current = "base_only"
+        else:
+            current = "clear"
+        if current == previous:
+            return None, state
+        self.set_setting_text("recovery_announced", current, now_ms)
+        return {
+            "active": "armed",
+            "base_only": "size_ended",
+            "clear": "cleared",
+        }[current], state
+
+    def last_realised_loss(self) -> tuple[str, float] | None:
+        """The most recent losing market, to name what armed recovery."""
+        row = self.db.execute(
+            "SELECT ticker, pnl FROM daily_ledger WHERE pnl < 0 "
+            "ORDER BY COALESCE(window_ms, first_ms) DESC LIMIT 1"
+        ).fetchone()
+        return (str(row[0]), float(row[1])) if row else None
+
+    def last_add_decision(self, window_open_ms: int | None = None) -> dict | None:
+        """The most recent add-on decision, for showing WHY it did or did not.
+
+        Without this the recovery line can say a deficit is outstanding but
+        not why nothing is being done about it - which is exactly the gap that
+        made two razor-thin refusals (momentum -0.6 bps, distance 9.9x against
+        a 10x floor) invisible until someone went looking in the database.
+        """
+        if window_open_ms is not None:
+            rows = self._dicts(
+                "SELECT * FROM recovery_adds WHERE window_open_ms = ?",
+                (window_open_ms,),
+            )
+        else:
+            rows = self._dicts(
+                "SELECT * FROM recovery_adds ORDER BY created_ms DESC LIMIT 1"
+            )
+        return rows[0] if rows else None
+
+    def record_input_gap(self, *, window_open: int, ticker, observed_ms: int,
+                         remaining_s, reason: str, detail: str = "") -> None:
+        """A poll that produced NO signal because a Kalshi input was missing.
+
+        The operator's rule: never substitute another exchange; record
+        unavailable or stale inputs explicitly. Without this row a feed
+        outage and a quiet market look identical in the archive, and the
+        first thing anyone would do to explain the silence is reach for the
+        other exchange's history - which is how the substitution creeps back
+        in through the analysis rather than the code.
+
+        Never raises: it sits on the poll path.
+        """
+        try:
+            self.db.execute(
+                "INSERT INTO input_gaps (window_open, ticker, observed_ms, "
+                "remaining_s, reason, detail) VALUES (?, ?, ?, ?, ?, ?)",
+                (window_open, ticker, observed_ms, remaining_s, reason, detail),
+            )
+            self.db.commit()
+        except sqlite3.Error as exc:
+            print(f"input gap record failed: {exc!r}", flush=True)
+
+    def input_gap_summary(self) -> list[dict]:
+        """Which inputs went missing, how often, and over how many markets."""
+        return self._dicts(
+            "SELECT reason, COUNT(*) AS polls, "
+            "COUNT(DISTINCT window_open) AS markets, "
+            "MAX(observed_ms) AS last_ms FROM input_gaps "
+            "GROUP BY reason ORDER BY polls DESC"
+        )
+
+    def record_candidate_evaluations(self, rows: list[dict]) -> None:
+        """Log each candidate's prediction. Never raises; one per market."""
+        for row in rows:
+            try:
+                columns = ", ".join(row)
+                placeholders = ", ".join(f":{name}" for name in row)
+                self.db.execute(
+                    f"INSERT OR IGNORE INTO candidate_evaluations "
+                    f"({columns}) VALUES ({placeholders})",
+                    row,
+                )
+            except sqlite3.Error as exc:
+                print(f"candidate record failed: {exc!r}", flush=True)
+        self.db.commit()
+
+    def grade_candidates(self, window_open: int, winning_side: str,
+                         now_ms: int, reward) -> None:
+        """Attach the outcome and score baseline vs candidate on this market.
+
+        Scored on each ROW's own side, like `settle_shadow`. A market-level
+        `won` flag cannot be right for both sides, and the flag the caller
+        could supply - "did the winning side win?" - is true by construction,
+        so every row would grade as a winner: a veto would always look like it
+        blocked a winner and an admission like it caught one. A forward
+        evaluation that records a 100% win rate is measuring its own
+        arithmetic, not the market.
+        """
+        from .candidates import grade
+
+        rows = self._dicts(
+            "SELECT * FROM candidate_evaluations WHERE window_open = ? "
+            "AND graded_ms IS NULL",
+            (window_open,),
+        )
+        for row in rows:
+            won = row.get("side") == winning_side
+            baseline, candidate = grade(row, won, reward)
+            self.db.execute(
+                "UPDATE candidate_evaluations SET won=?, baseline_pnl=?, "
+                "candidate_pnl=?, graded_ms=? WHERE id=?",
+                (int(won), baseline, candidate, now_ms, row["id"]),
+            )
+        self.db.commit()
+
+    def candidate_scoreboard(self) -> list[dict]:
+        """Forward performance per candidate: only rows it actually changed."""
+        return self._dicts(
+            "SELECT candidate_id, candidate_version, proposed_action, "
+            "context_key, COUNT(*) AS seen, "
+            "COALESCE(SUM(would_change), 0) AS changes, "
+            "COALESCE(SUM(graded_ms IS NOT NULL), 0) AS graded, "
+            "COALESCE(SUM(CASE WHEN would_change THEN candidate_pnl - "
+            "baseline_pnl END), 0) AS incremental "
+            "FROM candidate_evaluations GROUP BY candidate_id, candidate_version "
+            "ORDER BY incremental DESC"
+        )
+
+    def record_intelligence(self, row: dict) -> None:
+        """Log one decision. Never raises - it sits on the order path."""
+        try:
+            columns = ", ".join(row)
+            placeholders = ", ".join(f":{name}" for name in row)
+            self.db.execute(
+                f"INSERT INTO intelligence_decisions ({columns}) "
+                f"VALUES ({placeholders})",
+                row,
+            )
+            self.db.commit()
+        except sqlite3.Error as exc:
+            print(f"intelligence record failed: {exc!r}", flush=True)
+
+    def grade_intelligence(self, window_open: int, winning_side: str,
+                           pnl: float, now_ms: int) -> None:
+        """Attach the outcome to every decision taken on this market.
+
+        A veto and a rejected signal are graded too, as counterfactuals - they
+        are the evidence for whether the adjustment helped, and dropping them
+        would leave only the cases that happened to trade.
+
+        `won` is per ROW, from that row's own side. One boolean for the market
+        cannot be right for both sides of a window the model flipped inside,
+        and the one the settlement loop had to hand was true by construction.
+        """
+        self.db.execute(
+            "UPDATE intelligence_decisions "
+            "SET won = CASE WHEN side=? THEN 1 ELSE 0 END, "
+            "realised_pnl=?, graded_ms=? "
+            "WHERE window_open=? AND graded_ms IS NULL",
+            (winning_side, pnl, now_ms, window_open),
+        )
+        self.db.commit()
+
+    def intelligence_summary(self) -> dict:
+        """Did it help? Counts by action, ONE PER MARKET, outcomes where known.
+
+        `intelligence_decisions` holds one row per POLL - deliberately, so a
+        decision that changed mid-window is not lost. That makes raw COUNT(*)
+        a poll count, and 2 settled markets have appeared here as "39 rows,
+        39 won, 100%". Every figure this returns therefore counts DISTINCT
+        windows: a market is one opportunity however many times it was
+        examined, and the same correction the training corpus needed applies
+        to the live table.
+
+        THREE THINGS THAT ARE NOT THE SAME, and this counts only the first:
+
+            signal decision    the rule qualified at this poll
+            order eligibility  AND the price has held the band 60s, no
+                               position is open, the daily limits allow it
+            execution          AND an order was submitted, and filled
+
+        The row selected per (window, side, action) is the first poll whose
+        SIGNAL qualified. That is not "what the bot acts on" - an earlier
+        version of this docstring said so and it was wrong. On 2026-09-22 the
+        22:00Z window qualified at 568s, 438s, 425s, 411s and 369s and traded
+        none of them, because the price had held the band 0-27s against a
+        required 60. Order eligibility lives in `trade_proposals`; fills and
+        fees live in the broker ledger.
+
+        Side is part of the key on purpose. A window the model flips inside
+        holds UP and DOWN decisions that settle OPPOSITELY, and collapsing
+        them to one row per window would discard a real decision and give the
+        survivor's outcome to both.
+
+        `n` counts DECISIONS, not independent samples. Two decisions in one
+        window share a market, a price path and an outcome, so callers that
+        need a denominator for statistics want `markets`, reported beside it.
+        """
+        rows = self._dicts(
+            "SELECT final_action, COUNT(*) AS n, "
+            "COUNT(DISTINCT window_open) AS markets, "
+            "COALESCE(SUM(won), 0) AS wins, "
+            "COALESCE(SUM(won IS NOT NULL), 0) AS graded, "
+            "COALESCE(SUM(pnl), 0) AS pnl FROM ("
+            "  SELECT d.window_open, d.side, d.final_action, d.won, "
+            "         COALESCE(d.realised_pnl, 0) AS pnl "
+            "  FROM intelligence_decisions d "
+            "  WHERE d.id = ("
+            "    SELECT d2.id FROM intelligence_decisions d2 "
+            "    WHERE d2.window_open = d.window_open "
+            "      AND IFNULL(d2.side,'') = IFNULL(d.side,'') "
+            "      AND d2.final_action = d.final_action "
+            "    ORDER BY d2.base_qualified DESC, d2.decided_ms ASC LIMIT 1"
+            "  )"
+            ") GROUP BY final_action"
+        )
+        return {r["final_action"]: r for r in rows}
+
+    def lifetime_record(self) -> LifetimeRecord:
+        """Realised performance across every reconciled market. One per market.
+
+        `daily_ledger` is keyed by ticker, so a market counts ONCE however it
+        was traded: base and recovery contracts on the same market are one
+        position, and a partial fill or a partial exit does not make a second
+        trade. The figure is the broker's own settled P&L, net of fees -
+        paper results live in `scoreboard` and are labelled separately, and
+        deposits, withdrawals and unrealised marks never enter here.
+
+        ROUNDING. The total is summed from UNROUNDED rows and rounded once, at
+        the end. Adding up displayed components instead moves the answer by a
+        cent, in either direction:
+
+            43.2257 - 42.5142 = 0.7115 -> $0.71   but 43.23 - 42.51 = 0.72
+            49.8343 - 49.5277 = 0.3066 -> $0.31   but 49.83 - 49.53 = 0.30
+
+        The cent is rounding, not a missing trade. Never round the components
+        first to make the subtraction "work" - that would make the displayed
+        total disagree with the broker, which is the number this system is not
+        allowed to invent.
+        """
+        row = self.db.execute(
+            "SELECT COUNT(*), COALESCE(SUM(pnl > 0), 0), COALESCE(SUM(pnl), 0), "
+            "MIN(COALESCE(window_ms, first_ms)) FROM daily_ledger"
+        ).fetchone()
+        markets = int(row[0] or 0)
+        since = int(row[3]) if row[3] else None
+        return LifetimeRecord(
+            markets=markets, winners=int(row[1] or 0),
+            dollars=round(float(row[2] or 0.0), 6), since_ms=since,
+            complete=self.history_is_complete(),
+        )
+
+    def history_is_complete(self) -> bool:
+        """Does our record reach the account's first trade?
+
+        Set by `scripts/verify_lifetime.py` after comparing against everything
+        the broker will serve, including `/historical/fills`. Defaults to
+        False: claiming a complete lifetime is a claim that has to be earned,
+        and the honest fallback is to say which date the total starts from.
+        """
+        return bool(self.get_setting("history_complete", 0.0))
+
     def realised_record(self) -> tuple[int, int, float]:
         """(trades, wins, dollars) over orders that were ACTUALLY PLACED.
 
@@ -1189,12 +3499,9 @@ class Store:
         import time
 
         now_ms = int(time.time() * 1000)
-        markets, winners, dollars = self.exchange_record(now_ms - (now_ms % 86_400_000))
-        if markets:
-            return markets, winners, dollars + self.get_setting("open_mark", 0.0)
-        if self.exchange_record()[0]:
-            # The mirror is live, today simply has nothing settled in it yet.
-            return 0, 0, self.get_setting("open_mark", 0.0)
+        snapshot = self.money_snapshot(now_ms)
+        if snapshot.markets or snapshot.has_mirror:
+            return snapshot.markets, snapshot.winners, snapshot.headline
 
         rows = self.db.execute(
             "SELECT t.count, COALESCE(t.fill_price, t.entry_limit), t.fee_paid, "
@@ -1227,7 +3534,7 @@ class Store:
         Read from durable rows rather than in-memory counters, so a restart
         cannot quietly reset a limit that has already been breached.
         """
-        day_start = now_ms - (now_ms % 86_400_000)
+        day_start = self.day_start_ms(now_ms)
         # An exited trade still consumed a slot and still cost money, so it
         # counts against the daily and hourly caps exactly like a held one.
         traded = "('filled','protected','unprotected','executing','partial','exited')"
@@ -1273,6 +3580,16 @@ class Store:
             if pnl is not None:
                 realised += pnl
         realised = min(realised, exchange_today)
+        # THE TIMEZONE MIGRATION MUST NOT REFUND THE LOSS ALLOWANCE.
+        #
+        # Midnight New York is LATER in absolute time than midnight UTC, so
+        # moving the accounting day shortens the window on the day of the
+        # change, and every loss booked between the two midnights would fall
+        # outside it. The floor would quietly hand back allowance on a day that
+        # had already spent it - a stop-loss that resets when you change a
+        # setting is not a stop-loss. The carry is computed once, at migration,
+        # and only applies to the day the change happened.
+        realised += self.day_boundary_carry(now_ms)
 
         # 'filled' covers a position partially sold too - mark_exited only
         # promotes to 'exited' once the whole position is gone, so the remainder

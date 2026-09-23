@@ -11,6 +11,9 @@ network client or an event loop.
 
 from html import escape
 
+from . import surface
+from .intelligence_policy import VETO
+
 BAR_FULL = "▰"  # ▰
 BAR_EMPTY = "▱"  # ▱
 RULE = "—" * 16
@@ -19,6 +22,239 @@ RULE = "—" * 16
 def bar(fraction: float, width: int = 10) -> str:
     filled = max(0, min(width, round(fraction * width)))
     return BAR_FULL * filled + BAR_EMPTY * (width - filled)
+
+
+def policy_line(verdict) -> str:
+    """One short line, and ONLY when intelligence changed something.
+
+    A layer that narrates every neutral decision trains the reader to skip it,
+    and the one message that matters then goes unread too. Silence is the
+    correct output for "the pattern supports the existing decision".
+    """
+    if verdict is None or not getattr(verdict, "changed", False):
+        return ""
+    action = verdict.final_action
+    if action == "veto":
+        return (
+            "🧠 <b>Entry declined</b> · qualified setup matches an "
+            f"adverse pattern <i>(n={verdict.evidence_n})</i>"
+        )
+    if action == "admit":
+        return (
+            "🧠 <b>Entry allowed</b> · validated exception to "
+            f"{escape(str(verdict.overrides_gate))} <i>(n={verdict.evidence_n})</i>"
+        )
+    delta = verdict.confidence_delta
+    direction = "raised" if delta > 0 else "lowered"
+    return (
+        f"🧠 Confidence {direction} · similar setups "
+        f"{'out-earned' if delta > 0 else 'underperformed'} "
+        f"<i>(n={verdict.evidence_n})</i>"
+    )
+
+
+def recovery_line(state, last_add: dict | None = None) -> str:
+    """What recovery is doing right now, and why. Empty when inactive.
+
+    Two facts, because one without the other is unreadable: how much is
+    outstanding, and what the add-on last decided. A deficit shown with no
+    explanation of the silence beside it is what sent the operator to the
+    database to find two refusals that missed by fractions - momentum -0.6 bps
+    against a floor of zero, distance 9.9x against 10x.
+    """
+    if state is None:
+        return ""
+    # SIZE ENDED IS NOT CLEARED, and the difference must be on the screen.
+    # `active` means "may upsize"; money can still be owed with the upsize
+    # off, and going silent there would read as "paid back".
+    if getattr(state, "base_only", False) and getattr(state, "owes", False):
+        return (
+            f"\U0001f527 <b>Recovery size ended</b> · "
+            f"${state.deficit:,.2f} still outstanding · "
+            f"{state.wins} winning trades · "
+            f"{state.recovered_fraction:.0%} recovered\n"
+            f"   <i>continuing at normal base size</i>"
+        )
+    if not getattr(state, "active", False):
+        return ""
+    lines = [
+        f"\U0001f527 <b>Recovery: ${state.deficit:,.2f} outstanding</b> · "
+        f"${state.required_per_trade():,.2f} a trade · "
+        f"{max(1, state.steps)} step(s)"
+    ]
+    if last_add:
+        status = str(last_add.get("state") or "")
+        reason = (last_add.get("cancel_reason") or "").strip()
+        price = last_add.get("limit_price")
+        if status.endswith("PENDING") and last_add.get("order_id"):
+            lines.append(
+                f"   <i>add resting at {price:.2f} · order "
+                f"{str(last_add['order_id'])[:8]}</i>"
+            )
+        elif status.endswith("EXECUTED"):
+            lines.append(
+                f"   <i>add filled {last_add.get('filled_count')} at "
+                f"{last_add.get('fill_price')}</i>"
+            )
+        elif reason:
+            lines.append(f"   <i>no add: {escape(reason[:90])}</i>")
+    return "\n".join(lines)
+
+
+def _money_block(snapshot) -> str:
+    """The two money lines every message carries, from ONE snapshot.
+
+    Lifetime leads because that is the question the account actually answers -
+    a good day inside a losing record is not a good result, and a headline
+    that resets at midnight hides which one you are having. Today is kept, as
+    the secondary line, because it is what the Kalshi app shows.
+
+    Both lines come from the same read, so the profit and the counts can never
+    disagree: on 2026-09-22 a settlement recap printed "+$3.05 - 30W-5L" while
+    the ledger held 30W-6L, because the dollars and the record were taken a
+    minute apart.
+
+    PAPER RESULTS ARE NOT HERE. `scoreboard` prices every signal at a
+    hypothetical size, including the great majority never traded; it is a
+    measure of the strategy, not of the account, and it is labelled where it
+    appears.
+    """
+    # A bare (markets, winners, dollars) tuple is still accepted: callers that
+    # only have today's figures - and the tests that pin the paper/real
+    # separation - should not have to build a snapshot to render one line.
+    if isinstance(snapshot, tuple):
+        markets, winners, dollars = snapshot
+        if not markets:
+            return "\U0001f4b0 <b>Live: nothing settled yet</b>"
+        sign = "+" if dollars >= 0 else "−"
+        chip = "\U0001f4b0" if dollars >= 0 else "\U0001f4b8"
+        return (
+            f"{chip} <b>Live today: {sign}${abs(dollars):,.2f}</b> · "
+            f"{winners}W–{markets - winners}L"
+        )
+    lifetime = getattr(snapshot, "lifetime", None)
+    lines = []
+    if lifetime is not None and lifetime.markets:
+        chip = "\U0001f4b0" if lifetime.dollars >= 0 else "\U0001f4b8"
+        sign = "+" if lifetime.dollars >= 0 else "−"
+        lines.append(
+            f"{chip} <b>{lifetime.label()}: {sign}${abs(lifetime.dollars):,.2f}</b> · "
+            f"{lifetime.markets} closed · {lifetime.winners}W–{lifetime.losers}L"
+        )
+    if snapshot.markets:
+        sign = "+" if snapshot.headline >= 0 else "−"
+        lines.append(
+            f"\U0001f4c5 Today (New York): {sign}${abs(snapshot.headline):,.2f} · "
+            f"{snapshot.markets} closed · {snapshot.winners}W–{snapshot.losers}L"
+        )
+        # The day broken into sessions, under the day's own count. These SUM
+        # to the line above - a breakdown that does not add up to the total it
+        # sits beneath invites the reader to trust neither.
+        sessions = getattr(snapshot, "sessions", None)
+        if sessions:
+            from .sessions import one_line
+
+            line = one_line(sessions)
+            if line:
+                lines.append(f"<i>{line}</i>")
+    elif not lines:
+        lines.append("\U0001f4b0 <b>Live: nothing settled yet</b>")
+    # RECOVERY LAST, under the money it is working against. Empty when
+    # inactive, so a quiet system stays quiet - a permanent status line for a
+    # subsystem that is off is noise, and noise is what hides the real one.
+    recovery = recovery_line(
+        getattr(snapshot, "recovery", None), getattr(snapshot, "last_add", None)
+    )
+    if recovery:
+        lines.append(recovery)
+    return "\n".join(lines)
+
+
+def recovery_armed(state, trigger: str = "") -> str:
+    """Announced when a realised loss opens a deficit."""
+    head = (
+        f"\U0001f527 <b>RECOVERY ARMED</b> · ${state.deficit:,.2f} outstanding"
+    )
+    body = [
+        head,
+        f"<i>{escape(trigger)}</i>" if trigger else "",
+        "",
+        f"Plan: {max(1, state.steps)} step(s), "
+        f"${state.required_per_trade():,.2f} a trade.",
+        "Base entries stay at one contract. Recovery may add ONE extra "
+        "contract, resting 2¢ below a fill, and only while the BRTI evidence "
+        "still holds.",
+    ]
+    return "\n".join(x for x in body if x != "")
+
+
+def recovery_size_ended(state) -> str:
+    """The ONE transition message, in the operator's own layout.
+
+    Deliberately not the CLEARED message. That one says the deficit is back
+    to $0.00; this says the opposite - the money is still missing and we are
+    choosing to stop carrying doubled size while it comes back. Reporting the
+    two alike would tell the operator the account had recovered when it had
+    not.
+
+    Counts and percentage are the real ones, never the thresholds that were
+    met: "4 winning trades - 50% recovered" printed on a cycle that reached
+    five wins and 63% would be a template, not a report.
+    """
+    recovered = f"{state.recovered_fraction:.0%} recovered"
+    if getattr(state, "seeded", False):
+        # The baseline was ADOPTED from a deficit already in flight, so the
+        # percentage measures progress against a migration starting point -
+        # not against the loss that originally opened the hole. Printing it
+        # bare would claim more than the number knows.
+        recovered += " of the carried-over balance"
+    return "\n".join([
+        "\U0001f527 <b>RECOVERY SIZE ENDED</b>",
+        f"{state.wins} winning trades · {recovered}",
+        f"Remaining deficit: ${state.deficit:,.2f}",
+        "Continuing at normal base size.",
+    ])
+
+
+def recovery_cleared(snapshot) -> str:
+    """Announced the moment the money is back. Recovery stops immediately."""
+    return "\n".join([
+        "✅ <b>RECOVERY CLEARED</b> · deficit back to $0.00",
+        "<i>Sizing returns to base. Any unfilled recovery add is cancelled.</i>",
+        "",
+        _money_block(snapshot),
+    ])
+
+
+def session_close(*, session, day_snapshot, ny_day: str) -> str:
+    """The report sent when a trading session ends.
+
+    Two things, in this order: how THAT session went, then where the day
+    stands. The session is the news; the day is the context it belongs in.
+    A session read without the day behind it is how a good hour gets mistaken
+    for a good day.
+    """
+    from .sessions import LABELS, one_line
+
+    sign = "+" if session.dollars >= 0 else "−"
+    chip = "\U0001f4b0" if session.dollars >= 0 else "\U0001f4b8"
+    rate = (session.winners / session.markets) if session.markets else 0.0
+    lines = [
+        f"\U0001f514 <b>{LABELS.get(session.name, session.name)} session closed</b>",
+        f"<i>{escape(ny_day)} · New York accounting day</i>",
+        "",
+        f"{chip} <b>Session: {sign}${abs(session.dollars):,.2f}</b> · "
+        f"{session.markets} closed · {session.winners}W–{session.losers}L",
+    ]
+    if session.markets:
+        lines.append(f"<code>{bar(rate)}</code> <i>{rate:.0%} of this session won</i>")
+    lines += ["", _money_block(day_snapshot)]
+    breakdown = one_line(list(day_snapshot.sessions or ()))
+    if breakdown and not session.markets:
+        # `_money_block` already prints the breakdown when the day has
+        # markets; this covers the quiet-session case.
+        lines.append(f"<i>{breakdown}</i>")
+    return "\n".join(lines)
 
 
 def _live_line(markets: int, winners: int, dollars: float) -> str:
@@ -76,8 +312,8 @@ def scoreboard(
         # Real money is still reported. Returning early here dropped the Live
         # line whenever nothing had settled yet - precisely the state in which a
         # first real trade is the only thing worth showing.
-        if live and live[0]:
-            head += "\n" + _live_line(*live)
+        if live is not None:
+            head += "\n" + _money_block(live)
         return head
     rate = wins / settled
     lines = [
@@ -87,7 +323,8 @@ def scoreboard(
     ]
     if live is None:
         return "\n".join(lines)
-    lines.append(_live_line(*live))
+    # The figures above are labelled paper; the money below is real.
+    lines.append(_money_block(live))
     return "\n".join(lines)
 
 
@@ -257,6 +494,8 @@ def order_filled(
     remaining: int | None = None,
     target: float | None = None,
     price: float | None = None,
+    decision_ask: float | None = None,
+    size_reason: str = "",
 ) -> str:
     """An order that actually filled, with the gates AS THEY WERE at execution.
 
@@ -270,10 +509,27 @@ def order_filled(
         f"<code>{escape(ticker)}</code>",
         "",
         f"\U0001f4e6 {contracts:g} contract{'s' if contracts != 1 else ''} "
-        f"at {paid * 100:.0f}¢",
+        f"filled at {paid * 100:.0f}¢",
         f"\U0001f4b5 Cost ${cost:,.2f} · Maximum profit "
         f"${contracts - cost:,.2f}",
     ]
+    # TWO DIFFERENT PRICES, NAMED. The checks below show the ask the decision
+    # was taken on; the line above shows what the book actually gave. On
+    # 2026-09-22 those read 75¢ and 69¢ in the same message with nothing
+    # saying they were different facts.
+    if decision_ask is not None and abs(decision_ask - paid) >= 0.005:
+        better = decision_ask - paid
+        lines.append(
+            f"\U0001f9fe Decision ask {decision_ask * 100:.0f}¢ · filled "
+            f"{paid * 100:.0f}¢ "
+            f"({abs(better) * 100:.0f}¢ {'better' if better > 0 else 'worse'})"
+        )
+    if size_reason:
+        # SIZING IS THE OPERATOR'S, AND SAYS SO. The model never changes it -
+        # it is config plus a measured distance band - so the message names
+        # the rule that chose the size rather than leaving two contracts
+        # looking like something the intelligence decided.
+        lines.append(f"\U0001f4d0 Size {contracts:g} · {escape(size_reason)}")
     if target is not None:
         # WHAT IT SETTLES AGAINST. The fill report named the ticker and the
         # price paid but never the strike, so the one number that decides
@@ -484,6 +740,16 @@ def exit_alert(
     )
 
 
+def _cents(price: float) -> str:
+    """A contract price at the precision it actually traded at.
+
+    `0.997` shown as `100¢` claims a fill at a price the book does not offer.
+    """
+    value = price * 100
+    return (f"{value:.0f}¢" if abs(value - round(value)) < 0.05
+            else f"{value:.1f}¢")
+
+
 def settlement(
     *,
     head: str,
@@ -492,6 +758,11 @@ def settlement(
     winner: str,
     won: bool,
     target: float,
+    # THE SIDE THE SIGNAL CALLED, which is not always the side we held.
+    # `predictions` is written at ALERT time and keyed on the window, so when
+    # the reference flips before the order fills the call and the position are
+    # on opposite sides. Both are reported; neither is inferred from the other.
+    called_side: str = "",
     contract_price: float | None,
     pnl: float | None,
     qualified: bool,
@@ -531,8 +802,15 @@ def settlement(
     # would hide that the signal was wrong. Both are stated, on their own
     # lines, with their own ticks.
     chip_side = side_chip(side)
-    made_money = pnl is not None and pnl >= 0
-    money_tick = "✅\U0001f4b0" if made_money else "❌\U0001f4b8"
+    # THE VERDICT IS THE BROKER'S REALISED P&L AFTER FEES, and nothing else.
+    # Not `held side == winner`: an early exit can bank money on a position
+    # whose side later loses, and a position held through settlement can still
+    # be under water after fees. The money decides the money word.
+    flat = pnl is not None and abs(pnl) < 0.005
+    made_money = pnl is not None and pnl > 0
+    money_tick = (
+        "⚪" if flat else ("✅\U0001f4b0" if made_money else "❌\U0001f4b8")
+    )
     priced = f" at {contract_price * 100:.0f}¢" if contract_price else ""
 
     if paper:
@@ -551,7 +829,10 @@ def settlement(
             # rule refused, and only the first is a trade that got away.
             "\U0001f4a4 No order was executed · "
             + ("rule qualified it" if qualified else "rule declined it"),
-            f"\U0001f4b5 {'Profit' if won else 'Loss'}: $0.00",
+            # NOT A LOSS. Nothing was bought, so nothing was lost -
+            # "Loss: $0.00" under a red chip reads as a small defeat
+            # rather than the absence of a trade.
+            "💵 Not traded · realised P&amp;L $0.00",
         ]
         if record:
             lines.append(record)
@@ -588,16 +869,17 @@ def settlement(
             f"<code>{escape(ticker)}</code>",
             "",
             f"{chip_side} Bought <b>{side}</b>{priced}",
-            f"\U0001f4b5 Sold before expiry at {exited_at * 100:.0f}¢",
+            f"💵 Sold before expiry at {_cents(exited_at)}",
             f"\U0001f3c1 Market later settled <b>{winner}</b>",
-            f"{'✅' if won else '❌'} {side} prediction was "
-            f"{'correct' if won else 'wrong'}",
+            f"{'✅' if (called_side or side) == winner else '❌'} "
+            f"{escape(called_side or side)} prediction was "
+            f"{'correct' if (called_side or side) == winner else 'wrong'}",
         ]
-        if made_money and not won:
+        if made_money and (called_side or side) != winner:
             lines.append(
                 "✅ Trade remained profitable because it exited early"
             )
-        elif not made_money and won:
+        elif not made_money and (called_side or side) == winner:
             lines.append(
                 "❌ Trade still lost because it exited below cost"
             )
@@ -606,18 +888,43 @@ def settlement(
         # message carrying the same total reads as a total that has stalled.
         lines += ["", "🧾 <i>Profit was already counted at the sale.</i>"]
     else:
+        # BREAK-EVEN IS NOT A MARKET OUTCOME. The market settles UP or DOWN,
+        # always, and that is reported on its own line below. This word is
+        # about the TRADE's net after fees: exactly zero is "closed", not a
+        # third thing the market did.
+        headline = (
+            "CLOSED · $0.00 net" if flat
+            else f"{'WIN' if made_money else 'LOSS'} · {amount}"
+        )
         lines = [
-            f"{money_tick} <b>{'WIN' if made_money else 'LOSS'} · {amount}</b>",
+            f"{money_tick} <b>{headline}</b>",
             f"<code>{escape(ticker)}</code>",
             "",
             f"{chip_side} Bought <b>{side}</b>{priced}",
             f"\U0001f3c1 Market settled <b>{winner}</b>",
         ]
+        # THE CALL, on its own line, every time. It is a different fact from
+        # the money and it is the one that was silently inverted: the 12:15
+        # market on 2026-09-23 called DOWN, held UP, settled UP and paid
+        # +$0.1271, and the recap reported "Bought DOWN ... LOSS -$1.87".
+        call = called_side or side
+        call_right = call == winner
+        lines.append(
+            f"{'✅' if call_right else '❌'} {escape(call)} prediction was "
+            f"{'correct' if call_right else 'wrong'}"
+        )
+        if call != side:
+            lines.append(
+                f"\U0001f4e6 <i>Signal called {escape(call)}; the position "
+                f"held {escape(side)}</i>"
+            )
         if cost is not None and pnl is not None:
             # Cost, not max payout, is the money at risk - on a loss it IS the
             # loss, so it is named rather than left to be inferred.
             outcome = (
-                f"Profit ${pnl:,.2f}" if made_money else f"Lost ${abs(pnl):,.2f}"
+                "$0.00 net" if flat
+                else (f"Profit ${pnl:,.2f}" if made_money
+                      else f"Lost ${abs(pnl):,.2f}")
             )
             lines.append(f"\U0001f4b5 Cost ${cost:,.2f} · {outcome}")
         elif pnl is not None:
@@ -1014,6 +1321,317 @@ def intel(*, head: str, gates: dict, needed: int) -> str:
     return "\n".join(lines)
 
 
+def _ago(now_ms: int, then_ms: int) -> str:
+    """How long ago, in the coarsest unit that is still honest."""
+    if not then_ms:
+        return "never"
+    seconds = max(0, (now_ms - then_ms) // 1000)
+    if seconds < 90:
+        return f"{seconds}s ago"
+    if seconds < 5400:
+        return f"{seconds // 60}m ago"
+    if seconds < 172800:
+        return f"{seconds // 3600}h ago"
+    return f"{seconds // 86400}d ago"
+
+
+def _until(now_ms: int, then_ms: int) -> str:
+    if not then_ms:
+        return "unscheduled"
+    seconds = (then_ms - now_ms) // 1000
+    if seconds <= 0:
+        return "due now"
+    if seconds < 5400:
+        return f"in {seconds // 60}m"
+    return f"in {seconds // 3600}h"
+
+
+def learning_state(state: dict) -> list[str]:
+    """The four states, on four lines, never collapsed into one.
+
+    The operator asked for these to be distinguishable, and they are genuinely
+    four different claims about four different things:
+
+        RUNNING     the loop is scheduled and alive
+        UPDATING    a fit is in progress right now
+        ADJUSTING   at least one arm is re-rating displayed confidence
+        AUTHORISED  an arm may actually change an order
+
+    A system can be running, updating and adjusting confidence while being
+    authorised to change nothing - which is exactly the normal state here, and
+    reporting it as one word would make it indistinguishable from a system with
+    a live veto.
+    """
+    def tick(flag: bool) -> str:
+        return "✅" if flag else "—"
+
+    updating = state.get("updating")
+    lines = [
+        f"  {tick(state.get('running'))} <b>Running</b> · "
+        + (
+            f"every {state.get('interval_ms', 0) // 3600000}h or "
+            f"{state.get('trigger_threshold')} new settled markets"
+            if state.get("running") else "<i>disabled</i>"
+        ),
+        f"  {tick(updating)} <b>Updating</b> · "
+        + ("training now" if updating else
+           f"last completed {_ago(state['now_ms'], state.get('last_success_ms') or 0)}"),
+        f"  {tick(state.get('adjusting_confidence'))} "
+        f"<b>Adjusting confidence</b> · "
+        + (
+            f"{state.get('confidence_arms')} arm(s) active"
+            if state.get("adjusting_confidence")
+            else (
+                f"{state.get('confidence_arms')} arm(s) carry a delta but mode "
+                f"is {escape(str(state.get('mode')))}"
+                if state.get("confidence_arms")
+                else "no arm has earned one"
+            )
+        ),
+        f"  {tick(state.get('authorised_to_execute'))} "
+        f"<b>Authorised to affect execution</b> · "
+        + (
+            f"{state.get('promoted_arms')} promoted arm(s), mode "
+            f"{escape(str(state.get('mode')))}"
+            if state.get("authorised_to_execute")
+            else (
+                f"{state.get('promoted_arms')} arm(s) cleared the evidence bar "
+                f"but the operator's switches are not set"
+                if state.get("promoted_arms")
+                else "no arm has cleared the evidence bar"
+            )
+        ),
+    ]
+    return lines
+
+
+def learning(*, head: str, state: dict | None = None, candidates=None,
+             board: list[dict] | None = None,
+             min_candidate_n: int = 60, min_promotion_n: int = 120) -> str:
+    """The learning loop: what it is doing, what it last did, what is live.
+
+    Four sections, in the order the operator asked for them - the loop's own
+    state, the training schedule, what is actually active, and the forward
+    evaluation underneath. Promotion is reported SEPARATELY from everything
+    else throughout, because "the system is learning" and "an adjustment is
+    changing orders" are different claims and only the first is usually true.
+    """
+    board = board or []
+    lines = [head]
+    if state:
+        lines.append(RULE)
+        lines.append("\U0001f9e0 <b>LEARNING LOOP</b>")
+        lines.extend(learning_state(state))
+        lines.append(RULE)
+        lines.append("\U0001f4c5 <b>TRAINING</b>")
+        last = state.get("last_complete_run") or {}
+        now = state["now_ms"]
+        if last:
+            status = str(last.get("status") or "?")
+            lines.append(
+                f"  last successful update <b>"
+                f"{_ago(now, int(last.get('finished_ms') or 0))}</b> "
+                f"({escape(status)}, trigger {escape(str(last.get('trigger')))})"
+            )
+            lines.append(
+                f"      used <b>{last.get('markets_used') or 0}</b> markets "
+                f"({last.get('rows_used') or 0} decisions · "
+                f"{last.get('corpus_markets') or 0} archive + "
+                f"{last.get('live_markets') or 0} live, "
+                f"{last.get('live_actual_fills') or 0} real fills)"
+            )
+            lines.append(
+                f"      fitted {last.get('arms_fitted') or 0} arms · "
+                f"{last.get('arms_with_confidence') or 0} confidence · "
+                f"{last.get('promoted') or 0} promoted of "
+                f"{last.get('candidates_examined') or 0} examined"
+            )
+        else:
+            lines.append("  <i>no completed training run yet</i>")
+        lines.append(
+            f"  new settled markets since then: "
+            f"<b>{state.get('new_settled_markets')}</b> of "
+            f"{state.get('trigger_threshold')} needed"
+        )
+        lines.append(
+            f"  next training <b>"
+            f"{_until(now, int(state.get('next_due_ms') or 0))}</b>"
+            + (" · <i>training now</i>" if state.get("updating") else "")
+        )
+        if state.get("last_error"):
+            lines.append(
+                f"  ⚠️ last failure "
+                f"{_ago(now, int(state.get('last_error_ms') or 0))} "
+                f"({state.get('consecutive_failures')} consecutive): "
+                f"<code>{escape(str(state['last_error'])[:160])}</code>"
+            )
+            lines.append(
+                "      <i>the last valid Kalshi policy stayed active</i>"
+            )
+        lines.append(RULE)
+        lines.append("\U0001f4e6 <b>ACTIVE POLICY</b>")
+        if state.get("policy_valid"):
+            lines.append(
+                f"  <code>{escape(str(state.get('policy_version')))}</code> · "
+                f"features <code>{escape(str(state.get('feature_version')))}</code>"
+                f" <code>{escape(str(state.get('feature_fingerprint'))[:8])}</code>"
+            )
+            lines.append(
+                f"  {state.get('arms')} arms · vetoes "
+                f"{'on' if state.get('vetoes_enabled') else 'off'} · "
+                f"admissions "
+                f"{'on' if state.get('admissions_enabled') else 'off'}"
+            )
+        else:
+            lines.append(
+                f"  ❌ <b>cannot act</b> · "
+                f"<code>{escape(str(state.get('policy_version')))}</code>"
+            )
+            lines.append(
+                f"      {escape(str(state.get('policy_invalid_reason')))}"
+            )
+        adjustments = state.get("active_adjustments") or []
+        if adjustments:
+            lines.append("  <i>active adjustments</i>")
+            for item in adjustments[:6]:
+                mark = "⚙️" if item["kind"] == "execution" else "\U0001f4ca"
+                what = (
+                    f"{item['action']}"
+                    if item["kind"] == "execution"
+                    else f"confidence {item['delta']:+d}"
+                )
+                lines.append(
+                    f"    {mark} {escape(item['context_key'])} · {what} "
+                    f"<i>(n={item['n']} over {item['markets']} markets)</i>"
+                )
+        else:
+            lines.append(
+                "  <i>no arm is adjusting anything - every decision returns "
+                "the base strategy with its evidence beside it</i>"
+            )
+        for item in (state.get("withdrawals") or [])[:2]:
+            lines.append(
+                f"  \U0001f6d1 withdrawn {escape(str(item.get('context_key')))} "
+                f"· {escape(surface.clipped(item.get('reason')))}"
+            )
+    lines.append(RULE)
+    lines.append("\U0001f9ea <b>FORWARD EVALUATION</b>")
+    if candidates is None or not getattr(candidates, "candidates", ()):
+        lines.append("  <i>no candidates frozen - nothing is being watched</i>")
+        return "\n".join(lines)
+    lines.append(
+        f"  <i>artefact</i> <code>{escape(candidates.version)}</code> · "
+        f"features <code>{escape(candidates.feature_version)}</code>"
+    )
+    # SCORED BY CONTEXT AS WELL AS BY ID. Candidate ids used to be positional
+    # (`c01` was whichever cell had the most rows that day) and are now derived
+    # from the context, so the same cell has carried two ids across the change.
+    # The CELL is the identity that matters - it is what the forward rows are
+    # really about - so its record is accumulated across every id it has had,
+    # and no evidence is rewritten to achieve it.
+    scored = {r["candidate_id"]: r for r in board}
+    by_context: dict = {}
+    for row in board:
+        bucket = by_context.setdefault(
+            row.get("context_key"),
+            {"graded": 0, "changes": 0, "incremental": 0.0, "ids": set()},
+        )
+        bucket["graded"] += row.get("graded") or 0
+        bucket["changes"] += row.get("changes") or 0
+        bucket["incremental"] += row.get("incremental") or 0.0
+        bucket["ids"].add(row.get("candidate_id"))
+    for c in candidates.candidates:
+        row = scored.get(c.candidate_id) or {}
+        merged = by_context.get(c.context_key) or {}
+        graded = merged.get("graded") or row.get("graded") or 0
+        changes = merged.get("changes") or row.get("changes") or 0
+        incremental = merged.get("incremental") or row.get("incremental") or 0.0
+        state = "\U0001f7e2 PROMOTED" if c.promotes else "\U0001f441 watching"
+        lines.append(
+            f"  {state} <b>{escape(c.candidate_id)}</b> "
+            f"{escape(c.proposed_action)} · {escape(c.context_key)}"
+        )
+        lines.append(
+            f"      train n={c.train_n} {c.train_mean:+.4f}/ct · "
+            f"live {graded} graded, {changes} it would change"
+        )
+        if graded:
+            # AN OPPORTUNITY COST IS NOT A TRADING LOSS. Where the candidate
+            # would have stood aside, this figure is what the bot MADE and the
+            # candidate would have missed - money that is in the account. It is
+            # labelled so it can never be read as a drawdown.
+            label = (
+                "missed against the unchanged rule"
+                if c.proposed_action == VETO and incremental < 0
+                else "against the unchanged rule"
+            )
+            lines.append(
+                f"      forward <b>{incremental:+.4f}</b> {label} "
+                f"over {changes} market(s)"
+            )
+            if c.proposed_action == VETO and incremental < 0:
+                lines.append(
+                    "      <i>estimated opportunity cost, not a realised "
+                    "loss - those markets were traded and settled</i>"
+                )
+    promoted = sum(1 for c in candidates.candidates if c.promotes)
+    lines.append(RULE)
+    lines.append(
+        f"  <b>{promoted}</b> of <b>{len(candidates.candidates)}</b> may change "
+        "an order. The rest are recorded and graded only."
+    )
+    lines.append(
+        f"\U0001f4a1 <i>n≥{min_candidate_n} to be watched, "
+        f"n≥{min_promotion_n} with a validated interval clear of zero to "
+        "control an order. Where no order was placed the forward figure is a "
+        "SIMULATED fill: a rejected winner is evidence about direction, not "
+        "proof a fill was available.</i>"
+    )
+    return "\n".join(lines)
+
+
+def learning_activated(*, policy, report: dict, comparison: dict,
+                       reason: str) -> str:
+    """Sent when a newly trained policy becomes the live artefact.
+
+    An activation is a change to how the bot decides, so it is announced the
+    way any other such change is - with what it replaced, what it is allowed to
+    do, and what the evidence behind it was. Silence here would mean the
+    decision rule could change under the operator overnight with the only
+    record in a log file.
+    """
+    promoted = int(report.get("promoted") or 0)
+    lines = [
+        "\U0001f9e0 <b>LEARNING: NEW POLICY ACTIVE</b>",
+        RULE,
+        f"  <code>{escape(str(policy.version))}</code>",
+        f"  features <code>{escape(str(policy.feature_version))}</code> "
+        f"<code>{escape(str(policy.feature_fingerprint)[:8])}</code>",
+        f"  fitted on <b>{report.get('markets', 0)}</b> markets "
+        f"({report.get('rows', 0)} decisions), train {report.get('train_n', 0)} / "
+        f"validate {report.get('validate_n', 0)} / holdout "
+        f"{report.get('holdout_n', 0)}",
+        f"  {report.get('arms_fitted', 0)} arms · "
+        f"<b>{report.get('arms_with_confidence', 0)}</b> adjust confidence · "
+        f"<b>{promoted}</b> may change an order",
+    ]
+    if comparison:
+        lines.append(
+            f"  against the previous policy on the validation slice: "
+            f"<b>{comparison.get('delta', 0):+.4f}</b> "
+            f"({comparison.get('markets', 0)} markets)"
+        )
+    lines.append(f"  <i>{escape(reason)}</i>")
+    if not promoted:
+        lines.append(RULE)
+        lines.append(
+            "  <i>No adjustment earned the right to change an order. The "
+            "policy re-rates confidence only; every entry decision remains "
+            "the strategy's.</i>"
+        )
+    return "\n".join(lines)
+
+
 def ledger(*, head: str, rows: list[dict]) -> str:
     """Every real trade with the running balance after it.
 
@@ -1034,4 +1652,423 @@ def ledger(*, head: str, rows: list[dict]) -> str:
             f"· running <code>{row['running']:+.2f}</code>"
         )
     lines.append(f"\U0001f4b5 <b>Total {rows[-1]['running']:+,.2f}</b>")
+    return "\n".join(lines)
+
+
+# ===================================================================== v2
+#
+# THE SHARED SURFACE. Every trading and learning message below is assembled by
+# `surface.compose` in the one fixed order, from the one icon vocabulary, with
+# one money snapshot and at most one rotating insight. The older builders above
+# remain for the paths that have not moved and for the tests that pin them.
+
+
+def signal_message(*, side: str, ticker: str, ask: float, remaining: int,
+                   confidence: str, facts: list[dict], executable: bool,
+                   status_line: str, snapshot=None, insight: str = "",
+                   band_hold: tuple[int, int] | None = None,
+                   distance_text: str = "", priority=None,
+                   verdict: str = "") -> str:
+    """A signal, executed or not. The checks are always visible.
+
+    `confidence` is the ONE Kalshi-native confidence result, computed once by
+    `main.model_confidence_points` and passed in - never recomputed here, and
+    never recomputed differently in a details body. It describes how good the
+    setup looks and says nothing about whether it may be traded; a refused
+    signal reading MEDIUM is correct and not a contradiction.
+    """
+    label = verdict or ("ENTRY READY" if executable else "NOT EXECUTED")
+    essentials = [
+        f"{surface.PRICE} Ask {surface.cents(ask)} · "
+        f"{surface.CLOCK} {remaining // 60}m {remaining % 60:02d}s",
+    ]
+    if distance_text:
+        essentials.append(f"{surface.TARGET} {escape(distance_text)}")
+    essentials.append(
+        f"{surface.LEARNING} Confidence {escape(confidence)} · "
+        f"Entry checks {surface.checks_summary(facts)}"
+    )
+    return surface.compose(
+        header=f"{surface.side_icon(side)} <b>{escape(side)} SIGNAL · "
+               f"{escape(label)}</b>",
+        ticker=ticker,
+        essentials=essentials,
+        checks=surface.checks_block(facts, band_hold),
+        status=status_line,
+        snapshot=snapshot,
+        priority=priority,
+        insight=insight,
+    )
+
+
+def fill_message(*, side: str, ticker: str, contracts: float, paid: float,
+                 fee: float | None, remaining: int, confidence: str,
+                 facts: list[dict], snapshot=None, insight: str = "",
+                 band_hold: tuple[int, int] | None = None,
+                 decision_ask: float | None = None, priority=None,
+                 size_reason: str = "") -> str:
+    """An executed entry. Cost and maximum profit are both NET.
+
+    The old fill report printed `Maximum profit contracts - cost` with no fee
+    term while the settlement recap for the same trade subtracted the charged
+    fee, so the fill promised $0.20 and the recap paid $0.19.
+    """
+    size = (f"{surface.PACKAGE} {contracts:g} contract"
+            f"{'s' if contracts != 1 else ''} filled at {surface.cents(paid)}")
+    if size_reason:
+        # WHY THAT MANY, beside how many. A size that rose under a recovery
+        # rule and a size that was capped by the account limit look identical
+        # on the contract count alone, and the operator reads the count.
+        size += f" <i>({escape(surface._typography(size_reason))})</i>"
+    essentials = [
+        size,
+        surface.entry_cost(contracts, paid, fee),
+        surface.max_net_profit(contracts, paid, fee),
+    ]
+    if decision_ask is not None:
+        better = decision_ask - paid
+        essentials.append(
+            f"\U0001f9fe Decision ask {surface.cents(decision_ask)} · "
+            f"filled {surface.cents(paid)} "
+            f"({abs(better) * 100:.1f}¢ {'better' if better > 0 else 'worse'})"
+        )
+    essentials.append(
+        f"{surface.LEARNING} Confidence {escape(confidence)} · "
+        f"Entry checks {surface.checks_summary(facts)}"
+    )
+    return surface.compose(
+        header=f"{surface.side_icon(side)} <b>{escape(side)} FILLED</b>",
+        ticker=ticker,
+        essentials=essentials,
+        checks=surface.checks_block(facts, band_hold),
+        status=f"{surface.CLOCK} {remaining // 60}m {remaining % 60:02d}s "
+               f"to expiry",
+        snapshot=snapshot,
+        priority=priority,
+        insight=insight,
+    )
+
+
+def not_filled_message(*, ticker: str, note: str, snapshot=None,
+                       insight: str = "", priority=None) -> str:
+    """An order that went out and bought nothing.
+
+    Announcing a cost here claimed a position that does not exist, so this
+    says what was spent - nothing - rather than what was intended.
+    """
+    return surface.compose(
+        header=f"{surface.WARN} <b>ORDER NOT FILLED</b>",
+        ticker=ticker,
+        essentials=[
+            f"{surface.PRICE} No contracts bought · nothing spent",
+            f"<i>{escape(surface._typography(note))}</i>" if note else "",
+        ],
+        checks=[],
+        status="",
+        snapshot=snapshot,
+        priority=priority,
+        insight=insight,
+    )
+
+
+def automation_off_message(*, ask: float, snapshot=None,
+                           insight: str = "") -> str:
+    """Both switches must be on, and only one of them is.
+
+    strategy.json was reset to defaults with `enabled: false` on 2026-09-21 at
+    02:02 and automation went silent for four hours while 14 signals passed,
+    17 of 18 of which went on to win. The log line existed and was useless:
+    `/auto` was on, so there was nothing to notice.
+    """
+    return surface.compose(
+        header=f"{surface.WARN} <b>AUTOMATION IS OFF AT THE STRATEGY</b>",
+        ticker="",
+        essentials=[
+            f"<i>/auto is ON, but strategy.json has "
+            f"<code>enabled: false</code>, so no order will be placed — "
+            f"this one at {surface.cents(ask)} included.</i>",
+            "<i>Both switches must be on. Set enabled: true to resume.</i>",
+        ],
+        checks=[],
+        status="",
+        snapshot=snapshot,
+        insight=insight,
+    )
+
+
+def cash_out_message(*, ticker: str, side: str, paid: float, bid: float,
+                     count: float, captured: float, remaining: int,
+                     note: str, sold: bool, entry_fee: float | None = None,
+                     exit_fee: float | None = None, snapshot=None,
+                     insight: str = "", priority=None) -> str:
+    """A position banked before expiry because it had already earned its money.
+
+    States what it captured AND what it gave up, because both are real: selling
+    at 97c after paying 74c banks 23c and forgoes the last 3c. Reading only the
+    first half makes the rule look better than it is.
+
+    NET, after both fees. The gross figure made a cash-out announce `+0.27`
+    and the settlement four minutes later say `+0.25` for the same trade,
+    which reads as the running total failing to move.
+
+    THE FEES ARE READ, NOT MODELLED, whenever the exchange has said what it
+    charged. `kalshi_fee_charged` is a faithful copy of the published formula
+    and still only a copy; the account is debited by Kalshi, not by this
+    function. The model stays as the fallback for the moment between placing
+    the exit and reading its fill back.
+    """
+    from .validation import kalshi_fee_charged
+
+    fee_in = entry_fee if entry_fee is not None else kalshi_fee_charged(paid, count)
+    fee_out = exit_fee if exit_fee is not None else kalshi_fee_charged(bid, count)
+    profit = (bid - paid) * count - fee_in - fee_out
+
+    essentials = [
+        f"{surface.side_icon(side)} Held <b>{escape(side)}</b> \u00b7 "
+        f"bought {surface.cents(paid)}, "
+        f"{'sold' if sold else 'bid'} {surface.cents(bid)}",
+    ]
+    if sold:
+        essentials += [
+            f"{surface.TARGET} Banked "
+            f"<b>{surface._signed_dollars(profit)}</b> \u00b7 "
+            f"{captured:.0%} of the most this trade could make "
+            f"<i>(net of fees)</i>",
+            f"{surface.PRICE} Gave up the last "
+            f"${(1.0 - bid) * count:,.2f} rather than risk "
+            f"${bid * count:,.2f} on it",
+        ]
+    else:
+        # NOTHING MOVED. A failed cash-out still printed "Banked +0.20 - 91%
+        # of the most this trade could make" directly under "STILL HOLDING",
+        # which describes a sale that did not happen and contradicts its own
+        # headline. A miss must read as a miss.
+        essentials += [
+            f"\U0001f4a4 Nothing sold \u00b7 "
+            f"<b>{surface._signed_dollars(profit)}</b> is what it WOULD have "
+            f"banked at {surface.cents(bid)}",
+            "<i>Still fully exposed \u00b7 the position rides to "
+            "settlement</i>",
+        ]
+    if note:
+        essentials.append(f"<i>{escape(surface._typography(note))}</i>")
+
+    return surface.compose(
+        header=(f"{surface.MONEY} <b>CASHED OUT EARLY</b>" if sold else
+                f"{surface.WARN} <b>CASH-OUT FAILED \u00b7 STILL HOLDING</b>"),
+        ticker=ticker,
+        essentials=essentials,
+        checks=[],
+        status=f"{surface.CLOCK} {remaining // 60}m {remaining % 60:02d}s "
+               f"still to run",
+        snapshot=snapshot,
+        priority=priority,
+        insight=insight,
+    )
+
+
+def auto_exit_message(*, ticker: str, side: str, price: float, target: float,
+                      bid: float, remaining: int, note: str, sold: bool,
+                      snapshot=None, insight: str = "", priority=None) -> str:
+    """The reference crossed back through the strike and the bot sold."""
+    essentials = [
+        f"{surface.side_icon(side)} Held <b>{escape(side)}</b> \u00b7 "
+        f"the reference crossed back through ${target:,.2f}",
+        f"{surface.PRICE} Now ${price:,.2f} \u00b7 "
+        + (f"sold into {surface.cents(bid)}" if sold
+           else f"bid {surface.cents(bid)}"),
+    ]
+    if note:
+        essentials.append(f"<i>{escape(surface._typography(note))}</i>")
+    if not sold:
+        essentials.append(
+            "<i>Still holding \u00b7 the position rides to settlement</i>"
+        )
+    return surface.compose(
+        header=(f"{surface.EXIT} <b>AUTO EXIT \u00b7 REVERSAL</b>" if sold else
+                f"{surface.WARN} <b>EXIT FAILED \u00b7 STILL HOLDING</b>"),
+        ticker=ticker,
+        essentials=essentials,
+        checks=[],
+        status=f"{surface.CLOCK} {remaining // 60}m {remaining % 60:02d}s left "
+               f"\u00b7 {surface.ROBOT} no press was required "
+               f"(<code>/auto off</code> stops this)",
+        snapshot=snapshot,
+        priority=priority,
+        insight=insight,
+    )
+
+
+def exit_warning_message(*, ticker: str, side: str, price: float,
+                         target: float, bid: float, remaining: int,
+                         snapshot=None, insight: str = "",
+                         priority=None) -> str:
+    """The reference crossed back and NOTHING was sold.
+
+    It is advice, so it says so: a warning that looks like an execution is how
+    an operator comes to believe a position was closed when it is still open.
+    """
+    return surface.compose(
+        header=f"{surface.WARN} <b>REVERSAL \u00b7 STILL HOLDING</b>",
+        ticker=ticker,
+        essentials=[
+            f"{surface.side_icon(side)} Held <b>{escape(side)}</b> \u00b7 "
+            f"the reference crossed back through ${target:,.2f}",
+            f"{surface.PRICE} Now ${price:,.2f} \u00b7 "
+            f"bid {surface.cents(bid)}",
+            "<i>No order was placed. This is a warning, not an exit.</i>",
+        ],
+        checks=[],
+        status=f"{surface.CLOCK} {remaining // 60}m {remaining % 60:02d}s left",
+        snapshot=snapshot,
+        priority=priority,
+        insight=insight,
+    )
+
+
+def result_message(*, side: str, ticker: str, winner: str, won: bool,
+                   traded: bool, pnl: float | None, contracts: float = 0.0,
+                   paid: float | None = None, fee: float | None = None,
+                   exited_at: float | None = None,
+                   called_side: str = "", qualified: bool | None = None,
+                   snapshot=None, insight: str = "", priority=None) -> str:
+    """How a window closed. Three facts, never collapsed into one verdict.
+
+        WIN / LOSS / CLOSED       the broker's realised P&L after fees
+        Bought UP / DOWN          the side actually HELD
+        prediction correct/wrong  the recorded signal's side vs the settlement
+
+    THE MONEY WORD COMES FROM THE MONEY. Not from `held side == winner`: a
+    profitable early exit banks money on a position whose side later loses, and
+    a position held through settlement can still be under water after fees.
+
+    THE SIDE COMES FROM THE POSITION. `predictions` is written at ALERT time
+    and keyed on the window, so when the reference flips before the order fills
+    the call and the position sit on opposite sides. Reporting the call as the
+    position announced a paid-out win as a loss, twice, on real money.
+
+    "CLOSED" IS NOT A MARKET OUTCOME. The market settles UP or DOWN, always,
+    and that is its own line. Closed means the trade netted exactly zero.
+    """
+    call = called_side or side
+    call_right = call == winner
+    flat = pnl is not None and abs(pnl) < 0.005
+    made_money = pnl is not None and pnl > 0
+
+    if not traded:
+        chip = surface.WON_PAPER if call_right else surface.LOST_PAPER
+        headline = f"SIGNAL {'WON' if call_right else 'LOST'} · NOT TRADED"
+    elif flat:
+        # BEFORE THE EARLY-EXIT BRANCH, because a sale that netted exactly zero
+        # reached zero through it. `SOLD EARLY - +$0.00` signs zero and offers
+        # a verdict where there is none; the sale itself is still stated in the
+        # body, which is where the route belongs.
+        chip = surface.FLAT_MONEY
+        headline = "CLOSED · $0.00 net"
+    elif exited_at is not None:
+        chip = surface.result_icon(pnl, True, call_right)
+        headline = f"SOLD EARLY · {surface._signed_dollars(pnl or 0.0)}"
+    else:
+        chip = surface.result_icon(pnl, True, call_right)
+        headline = (f"{'WIN' if made_money else 'LOSS'} · "
+                    f"{surface._signed_dollars(pnl or 0.0)}")
+
+    essentials = [
+        f"{surface.side_icon(side)} "
+        + ("Bought" if traded else "Signal:")
+        + f" <b>{escape(side)}</b>"
+        + (f" at {surface.cents(paid)}" if paid is not None else ""),
+    ]
+    if exited_at is not None:
+        essentials.append(
+            f"{surface.PRICE} Sold before expiry at {surface.cents(exited_at)}"
+        )
+    essentials.append(
+        f"\U0001f3c1 Market{' later' if exited_at is not None else ''} "
+        f"settled <b>{escape(winner)}</b>"
+    )
+    # THE CALL, always, on its own line and in its own words.
+    essentials.append(
+        f"{surface.PASS if call_right else surface.FAIL} {escape(call)} "
+        f"prediction was {'correct' if call_right else 'wrong'}"
+    )
+    if traded and call != side:
+        essentials.append(
+            f"{surface.PACKAGE} <i>Signal called {escape(call)}; the position "
+            f"held {escape(side)}</i>"
+        )
+    if not traded:
+        if qualified is not None:
+            essentials.append(
+                "\U0001f4a4 No order was executed \u00b7 "
+                + ("rule qualified it" if qualified else "rule declined it")
+            )
+        essentials.append(surface.NO_TRADE)
+    elif pnl is not None:
+        # THE SAME COST THE FILL ANNOUNCED. The fill reports what left the
+        # account - stake plus the charged entry fee - and this reported the
+        # stake alone, so one trade showed $1.62 when it opened and $1.60 when
+        # it closed and neither message said which of them the fee was in.
+        cost = (contracts * paid + (fee or 0.0)
+                if contracts and paid is not None else None)
+        outcome = ("$0.00 net" if flat
+                   else (f"Profit ${pnl:,.2f}" if made_money
+                         else f"Lost ${abs(pnl):,.2f}"))
+        if cost is not None:
+            essentials.append(
+                f"{surface.PRICE} Cost ${cost:,.2f} \u00b7 {outcome} "
+                f"<i>(net of fees)</i>"
+            )
+        else:
+            amount = ("$0.00 net" if flat
+                      else f"<b>{surface._signed_dollars(pnl)}</b>")
+            essentials.append(
+                f"{surface.PRICE} Realised {amount} <i>(net of fees)</i>"
+            )
+    if exited_at is not None and pnl is not None:
+        if made_money and not call_right:
+            essentials.append(
+                f"{surface.PASS} Trade remained profitable because it exited "
+                f"early"
+            )
+        elif not made_money and call_right:
+            essentials.append(
+                f"{surface.FAIL} Trade still lost because it exited below cost"
+            )
+
+    return surface.compose(
+        header=f"{chip} <b>{escape(headline)}</b>",
+        ticker=ticker,
+        essentials=essentials,
+        checks=[],
+        status=surface.ALREADY_COUNTED if exited_at is not None else "",
+        snapshot=snapshot,
+        priority=priority,
+        insight=insight,
+    )
+
+
+def learning_update(*, markets: int, confidence_changes: int,
+                    entry_changes: int, detail: str = "") -> str:
+    """The learning notification. Plain language, no policy identifiers.
+
+    Policy ids, fingerprints, retired methods and training splits stay in the
+    log and in `/learning` details. This message answers one question: did the
+    rules the bot trades by change?
+    """
+    lines = [
+        f"{surface.LEARNING} <b>LEARNING UPDATE</b>",
+        "",
+        f"\U0001f4da Reviewed: {markets:,} markets",
+        f"{surface.TARGET} Confidence changes: "
+        + (f"{confidence_changes}" if confidence_changes else "None"),
+        "\u2699\ufe0f Entry-rule changes: "
+        + (f"{entry_changes}" if entry_changes else "None"),
+        "",
+    ]
+    if detail:
+        lines.append(detail)
+    elif not confidence_changes and not entry_changes:
+        lines.append(f"{surface.PASS} Current trading rules remain unchanged.")
+    lines.append("\U0001f504 Automatic learning continues.")
     return "\n".join(lines)

@@ -435,6 +435,12 @@ def test_the_canary_rejects_a_row_whose_columns_are_shifted():
 # ---- the operator's loss-recovery rule ------------------------------------
 
 def _settle(store, ticker, window_ms, pnl):
+    """One market settled by the exchange, as the live path records it.
+
+    The settlement is written AND folded into `daily_ledger`, because that is
+    what `sync_ledger_from_settlements` does every minute and the ledger is
+    what the recovery deficit reads.
+    """
     store.record_settlements([{
         "ticker": ticker, "market_result": "yes",
         "yes_count_fp": "1", "yes_total_cost_dollars": "0",
@@ -447,6 +453,7 @@ def _settle(store, ticker, window_ms, pnl):
         (pnl, window_ms, ticker),
     )
     store.db.commit()
+    store.record_realised(ticker, window_ms, pnl, pnl > 0, "exchange", window_ms)
 
 
 def test_a_loss_arms_the_recovery_and_a_win_does_not(tmp_path):
@@ -471,15 +478,18 @@ def test_the_recovery_resets_once_the_loss_is_repaid(tmp_path):
     assert store.outstanding_loss()[0] == 0.0, "repaid; it must reset"
 
 
-def test_a_second_loss_replaces_rather_than_compounds(tmp_path):
-    """It must never become a martingale. A new loss REPLACES the target, so
-    the amount to recover cannot grow without bound."""
+def test_a_second_loss_increases_the_deficit_and_does_not_restart_it(tmp_path):
+    """THE RULE CHANGED HERE on 2026-09-22. Until then a new loss REPLACED the
+    target, which was chosen on a measurement (FINDINGS 39: cumulative would
+    have sat at recovery size for 93% of windows against 57%, completing 3
+    recoveries against 11). The operator has decided against that measurement:
+    recovery ends when the money is back, so a second loss adds to what is
+    missing rather than erasing it."""
     store = Store(str(tmp_path / "s.db"))
     _settle(store, "KXBTC15M-A", 1_000, -0.90)
     _settle(store, "KXBTC15M-B", 2_000, -0.80)
-    debt, _ = store.outstanding_loss()
-    assert debt == pytest.approx(0.80), "the second loss replaced the first"
-    assert debt < 1.70, "a cumulative ledger would compound to 1.70"
+    deficit, _ = store.outstanding_loss()
+    assert deficit == pytest.approx(1.70), "both losses are still missing"
 
 
 def test_the_recovery_size_is_capped_and_never_escalates(tmp_path):
@@ -487,11 +497,17 @@ def test_the_recovery_size_is_capped_and_never_escalates(tmp_path):
     from btc15_signal.main import recovery_size
 
     store = Store(str(tmp_path / "s.db"))
-    settings = Settings()
-    _settle(store, "KXBTC15M-A", 1_000, -25.0)   # an enormous loss
-    count, reason = recovery_size(store, settings, base=1)
+    settings = Settings(recovery_upfront_upsize_enabled=True)
+    _settle(store, "KXBTC15M-A", 1_000, -0.40)
+    count, reason = recovery_size(store, settings, 1, 0.75)
     assert count == settings.high_confidence_contracts, reason
     assert count <= 2, "the recovery must never escalate beyond the cap"
+
+    # And an enormous deficit buys nothing extra: the cap is the cap, and a
+    # share no single trade can cover simply leaves the size at base.
+    _settle(store, "KXBTC15M-B", 2_000, -25.0)
+    big, _ = recovery_size(store, settings, 1, 0.75)
+    assert big <= settings.high_confidence_contracts
 
 
 def test_no_outstanding_loss_leaves_the_size_alone(tmp_path):
@@ -500,7 +516,7 @@ def test_no_outstanding_loss_leaves_the_size_alone(tmp_path):
 
     store = Store(str(tmp_path / "s.db"))
     _settle(store, "KXBTC15M-A", 1_000, +0.20)
-    count, reason = recovery_size(store, Settings(), base=1)
+    count, reason = recovery_size(store, Settings(), 1, 0.75)
     assert count == 1
     assert reason == "", "no recovery, no override"
 
@@ -509,11 +525,16 @@ def test_both_triggers_give_two_and_neither_cancels_the_other(tmp_path):
     """The operator wants BOTH, independently: the measured distance band
     keeps its $2, and a loss arms its own $2 whether or not the next setup
     happens to land in the band. Neither may suppress the other, and the two
-    together must still never exceed the cap."""
+    together must still never exceed the cap.
+
+    The band is switched OFF in the deployed config since 2026-09-22, so it is
+    enabled explicitly here: this test pins the relationship between the two
+    mechanisms, which is what re-enabling the band would have to preserve."""
     from btc15_signal.config import Settings
     from btc15_signal.main import confidence_size, recovery_size
 
-    settings = Settings()
+    settings = Settings(confidence_sizing_enabled=True,
+                        recovery_upfront_upsize_enabled=True)
     store = Store(str(tmp_path / "s.db"))
 
     class Snapshot:
@@ -528,23 +549,312 @@ def test_both_triggers_give_two_and_neither_cancels_the_other(tmp_path):
         side = "DOWN"
         distance_bps = 1.0
 
-    # 1. band alone, no loss outstanding
+    # 1. band alone, no deficit outstanding
     band_only, _ = confidence_size(settings, Snapshot(), InBand(), 1)
     assert band_only == 2, "the distance band must still size up on its own"
-    assert recovery_size(store, settings, band_only)[0] == 2
+    assert recovery_size(store, settings, band_only, 0.75)[0] == 2
 
-    # 2. loss outstanding, setup NOT in the band - this is the case that was
+    # 2. deficit outstanding, setup NOT in the band - this is the case that was
     #    silently doing nothing, and the whole reason the rule was missing.
     _settle(store, "KXBTC15M-L", 1_000, -0.88)
     flat, _ = confidence_size(settings, Snapshot(), OutOfBand(), 1)
     assert flat == 1, "out of band, the band contributes nothing"
-    recovered, reason = recovery_size(store, settings, flat)
-    assert recovered == 2, "a loss must size up regardless of the band"
+    recovered, reason = recovery_size(store, settings, flat, 0.75)
+    assert recovered == 2, "a deficit must size up regardless of the band"
     assert "recovering" in reason
 
     # 3. both at once - still capped, never stacked
     both, _ = confidence_size(settings, Snapshot(), InBand(), 1)
-    assert recovery_size(store, settings, both)[0] == 2, "must not stack to 4"
+    assert recovery_size(store, settings, both, 0.75)[0] == 2, "no stacking to 4"
+
+
+def test_confidence_sizing_is_off_and_a_band_setup_still_sizes_one(tmp_path):
+    """The operator, 2026-09-22: "The intelligence doubled exposure because of
+    confidence. That contradicts the earlier requirement that intelligence must
+    not change sizing." The live case was KXBTC15M-26SEP221330-30 - 2 contracts
+    at 81c on "3.0x vol is inside the measured 2-4x edge band" - which settled
+    against us for -$1.64 where one contract was about -$0.82."""
+    from btc15_signal.config import Settings
+    from btc15_signal.main import confidence_size, recovery_size
+
+    settings = Settings()
+    assert settings.confidence_sizing_enabled is False, "the deployed default is OFF"
+    assert settings.recovery_upfront_upsize_enabled is False, (
+        "recovery acts only through the conditional add-on"
+    )
+
+    class Snapshot:
+        volatility_5m_bps = 5.0
+        momentum_5m_bps = -10.0
+
+    class InBand:              # 3.0x vol, momentum aligned - squarely in band
+        side = "DOWN"
+        distance_bps = 15.0
+
+    count, reason = confidence_size(settings, Snapshot(), InBand(), 1)
+    assert count == 1, "the band must not size up while it is disabled"
+    assert reason == "", "an empty reason: no size line may claim a dead band"
+
+    # The flag gates the BAND ONLY - it must not be what silences recovery.
+    # Recovery's own upfront upsize is separately OFF (it now acts through the
+    # conditional add-on), so both are checked: with the band disabled and
+    # recovery explicitly enabled the upsize still works, which proves one
+    # switch is not standing in for the other.
+    store = Store(str(tmp_path / "s.db"))
+    _settle(store, "KXBTC15M-L", 1_000, -0.88)
+    recovered, recovery_reason = recovery_size(
+        store, Settings(recovery_upfront_upsize_enabled=True), count, 0.75
+    )
+    assert recovered == settings.high_confidence_contracts
+    assert "recovering" in recovery_reason
+
+    # And with the deployed defaults, neither path sizes up.
+    base_only, base_reason = recovery_size(store, settings, count, 0.75)
+    assert base_only == 1, "the base entry is one contract while recovery runs"
+    assert base_reason == ""
+
+
+# ---- the deficit: recovery ends when the money is back --------------------
+#
+# The operator, 2026-09-22: activate on a realised net loss, track the
+# unrecovered deficit after fees, keep going until realised profit covers it,
+# and stop immediately when it reaches $0.00. Another loss INCREASES it.
+
+def _cash_out(store, ticker, window_ms, pnl, now_ms=None):
+    store.record_realised(
+        ticker, window_ms, pnl, pnl > 0, "cash_out",
+        window_ms if now_ms is None else now_ms,
+    )
+
+
+def test_a_loss_opens_a_deficit_of_exactly_the_realised_net_amount(tmp_path):
+    """Realised, after fees, from the ledger - not a contract count and not a
+    gross figure. -1.6416 is the live loss of KXBTC15M-26SEP221330-30."""
+    store = Store(str(tmp_path / "s.db"))
+    assert store.recovery_is_active() is False, "a fresh account owes nothing"
+
+    _settle(store, "KXBTC15M-LOSS", 1_000, -1.6416)
+    state = store.recovery_state()
+    assert state.deficit == pytest.approx(1.6416)
+    assert state.active is True
+    assert store.recovery_deficit() == pytest.approx(1.6416)
+
+
+def test_a_partial_recovery_reduces_the_deficit_and_recovery_stays_on(tmp_path):
+    store = Store(str(tmp_path / "s.db"))
+    _settle(store, "KXBTC15M-LOSS", 1_000, -1.6416)
+    _settle(store, "KXBTC15M-WIN", 2_000, +0.4737)
+
+    state = store.recovery_state()
+    assert state.deficit == pytest.approx(1.1679)
+    assert state.active is True, "part of the money is still missing"
+
+
+def test_the_profit_that_clears_the_deficit_turns_recovery_off(tmp_path):
+    from btc15_signal.config import Settings
+    from btc15_signal.main import recovery_size
+
+    store, settings = (Store(str(tmp_path / "s.db")),
+                       Settings(recovery_upfront_upsize_enabled=True))
+    _settle(store, "KXBTC15M-LOSS", 1_000, -0.88)
+    _settle(store, "KXBTC15M-WIN1", 2_000, +0.50)
+    # 57% back, but on ONE winning market. The early end needs four wins AND
+    # half the deficit (see `recovery_exit`), so sizing stays on here - which
+    # is the point of requiring both: half the money back after one lucky
+    # market says nothing about whether the run is stable.
+    intermediate = store.recovery_state()
+    assert intermediate.wins == 1 and not intermediate.base_only
+    assert store.recovery_is_active() is True
+    _settle(store, "KXBTC15M-WIN2", 3_000, +0.50)
+
+    state = store.recovery_state()
+    assert state.deficit == 0.0, "recovered money, and no more than that"
+    assert state.active is False
+    assert state.steps == 0, "the plan is closed with the deficit"
+    assert recovery_size(store, settings, 1, 0.75) == (1, ""), "next trade base"
+
+
+def test_a_base_size_win_still_reduces_the_deficit(tmp_path):
+    """Rule 6. The ledger does not record what size won the money back, and it
+    must not: a trade held at base because it could not cover its share still
+    pays the deficit down when it wins."""
+    from btc15_signal.config import Settings
+    from btc15_signal.main import recovery_size
+
+    store = Store(str(tmp_path / "s.db"))
+    settings = Settings(recovery_upfront_upsize_enabled=True)
+    _settle(store, "KXBTC15M-LOSS", 1_000, -1.6416)
+    # 2 @ 90c nets 0.1874, under the 0.41 share - so this one goes at base.
+    assert recovery_size(store, settings, 1, 0.90) == (1, "")
+
+    _settle(store, "KXBTC15M-BASEWIN", 2_000, +0.1126)
+    assert store.recovery_deficit() == pytest.approx(1.5290)
+
+
+def test_an_early_cash_out_contributes_once_at_realised_net(tmp_path):
+    """Rule 8. `daily_ledger` is keyed by ticker and `recovery_applied` records
+    what was folded in, so re-reading the state cannot apply it again."""
+    store = Store(str(tmp_path / "s.db"))
+    _settle(store, "KXBTC15M-LOSS", 1_000, -1.00)
+    _cash_out(store, "KXBTC15M-OUT", 2_000, +0.30)
+
+    first = store.recovery_state().deficit
+    again = store.recovery_state().deficit
+    third = store.recovery_state().deficit
+    assert first == pytest.approx(0.70)
+    assert again == first == third, "one market, one application"
+
+    applied = store.db.execute(
+        "SELECT recovery_applied FROM daily_ledger WHERE ticker='KXBTC15M-OUT'"
+    ).fetchone()[0]
+    assert applied == pytest.approx(0.30), "what was applied, not a flag"
+
+
+def test_an_exchange_revision_moves_the_deficit_by_the_delta_only(tmp_path):
+    """A cash-out banked at +0.55 that the exchange settles at +0.54 costs the
+    deficit one cent. Counting it again in full is the failure this pins."""
+    store = Store(str(tmp_path / "s.db"))
+    _settle(store, "KXBTC15M-LOSS", 1_000, -1.00)
+    _cash_out(store, "KXBTC15M-OUT", 2_000, +0.5515)
+    assert store.recovery_deficit() == pytest.approx(0.4485)
+
+    store.record_realised(
+        "KXBTC15M-OUT", 2_000, 0.5480, True, "exchange", 2_100
+    )
+    assert store.recovery_deficit() == pytest.approx(0.4520), "the delta only"
+
+
+def test_the_deficit_survives_a_restart(tmp_path):
+    """Rule 7. Persisted, and re-reading the ledger after the restart must not
+    double-count the markets that opened it."""
+    path = str(tmp_path / "s.db")
+    store = Store(path)
+    _settle(store, "KXBTC15M-LOSS", 1_000, -1.6416)
+    store.consume_recovery_step(1_500)
+    assert store.recovery_state().steps == 3
+    store.db.close()
+
+    reopened = Store(path)
+    assert reopened.stored_deficit().deficit == pytest.approx(1.6416)
+    assert reopened.stored_deficit().steps == 3, "mid-plan, and it resumes"
+    assert reopened.recovery_state().deficit == pytest.approx(1.6416)
+
+
+# ---- eligibility: the upsize must be able to pay for itself ----------------
+
+def test_the_operators_worked_example(tmp_path):
+    """Verbatim: "deficit $1.64, plan 4 trades -> required per trade ~= $0.41;
+    2 contracts at 90c -> not eligible; 2 contracts at 75c -> eligible"."""
+    from btc15_signal.config import Settings
+    from btc15_signal.main import max_net_profit, recovery_size
+
+    # The upfront upsize is OFF by default now - recovery acts through the
+    # conditional add-on - but the eligibility arithmetic it pioneered is the
+    # same gate the add-on uses, so it is opted in here to keep it pinned.
+    store = Store(str(tmp_path / "s.db"))
+    settings = Settings(recovery_upfront_upsize_enabled=True)
+    _settle(store, "KXBTC15M-LOSS", 1_000, -1.6416)
+
+    state = store.recovery_state(settings.recovery_steps)
+    assert state.steps == settings.recovery_steps == 4
+    assert state.required_per_trade() == pytest.approx(0.4104, abs=5e-4)
+
+    assert max_net_profit(2, 0.90) == pytest.approx(0.1874, abs=5e-5)
+    assert max_net_profit(2, 0.75) == pytest.approx(0.4737, abs=5e-5)
+
+    assert recovery_size(store, settings, 1, 0.90) == (1, ""), "0.19 < 0.41"
+    count, reason = recovery_size(store, settings, 1, 0.75)
+    assert count == 2, "0.47 covers 0.41"
+    assert "recovering 1.64 outstanding" in reason
+
+
+def test_an_ineligible_trade_goes_out_at_base_and_recovery_stays_active(tmp_path):
+    """Rule 5. The trade still happens - recovery only ever changed its size -
+    and the deficit is untouched by the decision."""
+    from btc15_signal.config import Settings
+    from btc15_signal.main import recovery_size
+
+    store, settings = Store(str(tmp_path / "s.db")), Settings()
+    _settle(store, "KXBTC15M-LOSS", 1_000, -1.6416)
+
+    assert recovery_size(store, settings, 1, 0.90) == (1, "")
+    after = store.recovery_state()
+    assert after.active is True, "still owed, still recovering"
+    assert after.deficit == pytest.approx(1.6416)
+    assert after.steps == 4, "a base-size trade spends no step"
+
+
+def test_steps_decrement_only_on_an_upsized_trade_and_a_loss_resets_them(tmp_path):
+    """Judgement call (a): the divisor counts upsized trades only, so the
+    per-trade share stays roughly flat as the deficit falls. Judgement call
+    (b): a new loss restores the full plan, or the share would explode exactly
+    where the operator wants the upsize on."""
+    from btc15_signal.config import Settings
+
+    store, settings = Store(str(tmp_path / "s.db")), Settings()
+    _settle(store, "KXBTC15M-LOSS", 1_000, -1.6416)
+    assert store.recovery_required_per_trade() == pytest.approx(0.4104, abs=5e-4)
+
+    store.consume_recovery_step(1_500)                 # one upsized trade
+    _settle(store, "KXBTC15M-WIN", 2_000, +0.4737)
+    state = store.recovery_state()
+    assert state.steps == 3
+    assert state.deficit == pytest.approx(1.1679)
+    assert state.required_per_trade() == pytest.approx(0.3893, abs=5e-4)
+
+    _settle(store, "KXBTC15M-LOSS2", 3_000, -0.50)
+    reset = store.recovery_state()
+    assert reset.deficit == pytest.approx(1.6679), "increased, not restarted"
+    assert reset.steps == settings.recovery_steps, "a fresh loss, a fresh plan"
+
+
+def test_the_deficit_clearing_turns_recovery_off_even_with_steps_left(tmp_path):
+    store = Store(str(tmp_path / "s.db"))
+    _settle(store, "KXBTC15M-LOSS", 1_000, -0.50)
+    assert store.recovery_state().steps == 4
+    _settle(store, "KXBTC15M-WIN", 2_000, +0.60)
+
+    state = store.recovery_state()
+    assert state.active is False, "the money is back; nothing else decides"
+    assert state.deficit == 0.0, "and it never goes negative into credit"
+
+
+def test_the_plan_length_in_the_store_matches_the_config(tmp_path):
+    """The store carries a default so a report need not hold the config. If
+    the two ever disagree, the deficit is divided by a plan nobody deployed."""
+    from btc15_signal.config import Settings
+    from btc15_signal.store import DEFAULT_RECOVERY_STEPS
+
+    assert Settings().recovery_steps == DEFAULT_RECOVERY_STEPS
+
+
+def test_recovery_never_creates_a_trade(tmp_path):
+    """Rule 1, structurally: every gate is evaluated before sizing is reached,
+    and the sizing block sits in the branch where nothing blocked the trade."""
+    source = Path("src/btc15_signal/main.py").read_text(encoding="utf-8")
+    auto = source.split("---- unattended execution")[1]
+    gate = auto.index("blocked = autotrade.auto_block_reason(")
+    declined = auto.index("if blocked:")
+    size = auto.index("recovery_size(")
+    assert gate < declined < size, "the gates decide first, sizing second"
+    assert "else:" in auto[declined:size], "sizing is in the not-blocked branch"
+    assert "recovery" not in auto[:declined], "no deficit may reach a gate"
+
+
+def test_the_recovery_step_is_consumed_after_the_order_and_only_on_a_fill():
+    """Structural, in the house style of the post-order path tests: an order
+    that bought nothing has spent no step, and a write placed before the order
+    call is a write that can cost a fill."""
+    source = Path("src/btc15_signal/main.py").read_text(encoding="utf-8")
+    auto = source.split("---- unattended execution")[1]
+    order = auto.index("await trader.execute_with_take_profit(")
+    consumed = auto.index("store.consume_recovery_step(")
+    assert consumed > order, "the step must not be spent before the order"
+    condition = auto[:consumed].rsplit("if ", 1)[1]
+    assert "recovery_reason" in condition, "only an upsized order spends a step"
+    assert 'getattr(result, "filled_count", 0) > 0' in condition, (
+        "only a FILLED upsized order spends a step"
+    )
 
 
 # ---- bookkeeping behind real money must never stop the loop ---------------
@@ -587,7 +897,11 @@ def test_nothing_on_the_post_order_path_writes_unguarded(tmp_path):
     auto = source.split("---- unattended execution")[1]
     auto = auto[: auto.index("    head = head_for(store, settings)")]
     after_order = auto[auto.index("await trader.execute_with_take_profit("):]
-    for call in ("store.save_details(", "store.record_shadow_decision("):
+    for call in (
+        "store.save_details(",
+        "store.record_shadow_decision(",
+        "store.consume_recovery_step(",
+    ):
         if call in after_order:
             method = call.split(".")[1].rstrip("(")
             store_src = Path("src/btc15_signal/store.py").read_text(
