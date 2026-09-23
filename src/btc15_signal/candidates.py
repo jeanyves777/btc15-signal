@@ -23,6 +23,7 @@ import json
 from dataclasses import dataclass
 from pathlib import Path
 
+from . import feature_contract
 from .intelligence_policy import ADMIT, VETO
 
 
@@ -69,6 +70,20 @@ class CandidateSet:
     data_end_ms: int = 0
     training_cutoff_ms: int = 0
     candidates: tuple[Candidate, ...] = ()
+    # The definitions the fit was computed under, not just their name.
+    feature_fingerprint: str = ""
+
+    @property
+    def compatible(self) -> bool:
+        """Do these candidates describe the features being computed now?
+
+        A candidate recorded against a context built from different
+        definitions is not evidence about anything. It cannot change an
+        order either way - candidates never do - but an incompatible
+        forward record would be silently meaningless, which is worse than
+        an empty one because it looks like progress.
+        """
+        return feature_contract.compatible(self.feature_fingerprint)
 
     @classmethod
     def load(cls, path: str | Path) -> "CandidateSet":
@@ -98,6 +113,7 @@ class CandidateSet:
             data_end_ms=int(data.get("data_end_ms") or 0),
             training_cutoff_ms=int(data.get("training_cutoff_ms") or 0),
             candidates=items,
+            feature_fingerprint=str(data.get("feature_fingerprint") or ""),
         )
 
     def evaluate(self, *, context_key: str, qualified: bool) -> list[dict]:
@@ -106,6 +122,8 @@ class CandidateSet:
         Candidates whose context does not match are not recorded: a table of
         non-opinions buries the opinions.
         """
+        if not self.compatible:
+            return []
         out = []
         for candidate in self.candidates:
             if candidate.context_key != context_key:

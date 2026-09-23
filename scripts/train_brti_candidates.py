@@ -36,6 +36,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from brti_dataset import brti_context, load_policy_rows  # noqa: E402
 
 from btc15_signal.config import Settings  # noqa: E402
+from btc15_signal.feature_contract import CONTRACT, FINGERPRINT  # noqa: E402
 from btc15_signal.intelligence_policy import ADMIT, NEUTRAL, VETO, shrink  # noqa: E402
 from btc15_signal.validation import kalshi_fee_charged as fee  # noqa: E402
 
@@ -195,7 +196,9 @@ def main() -> None:
 
     artefact = {
         "version": f"brti-cand-{int(time.time())}",
-        "feature_version": "brti-1",
+        "feature_version": CONTRACT.version,
+        "feature_fingerprint": FINGERPRINT,
+        "feature_definitions": CONTRACT.payload(),
         "built_ms": int(time.time() * 1000),
         "data_end_ms": int(rows[-1]["window_open"]),
         "training_cutoff_ms": int(train[-1]["window_open"]),

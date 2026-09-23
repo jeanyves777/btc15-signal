@@ -18,6 +18,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
+from btc15_signal import feature_contract  # noqa: E402
 from btc15_signal.candidates import Candidate, CandidateSet, grade  # noqa: E402
 from btc15_signal.intelligence_policy import ADMIT, VETO  # noqa: E402
 from btc15_signal.store import Store  # noqa: E402
@@ -34,6 +35,9 @@ def reward(ask, won):
 def candidate_set(tmp_path, promotes=False) -> CandidateSet:
     artefact = {
         "version": "cand-test-1", "feature_version": "brti-1",
+        # The live contract. Candidates without it evaluate nothing, which is
+        # the runtime guard doing its job, so the fixture declares it.
+        "feature_fingerprint": feature_contract.FINGERPRINT,
         "built_ms": NOW, "data_end_ms": NOW, "training_cutoff_ms": NOW - 1,
         "candidates": [
             {"candidate_id": "c01", "context": f"{CTX}|accept",

@@ -11,14 +11,20 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
+from btc15_signal import feature_contract
 from btc15_signal import intelligence_policy as intel  # noqa: E402
 from btc15_signal import messages  # noqa: E402
 from btc15_signal.adaptive import context_of  # noqa: E402
 from btc15_signal.store import Store  # noqa: E402
 
 NOW = int(time.time() * 1000)
-KEY = "us · mid · dist3+ · px70-85|accept"
-REJECT_KEY = "us · mid · dist3+ · px<70|reject"
+# BRTI bands, because the policy under test declares `brti-1`. These were
+# Binance keys (`dist3+`) under a brti-1 label - the same mislabelling the
+# deployed artefact carried, reproduced in the fixtures. The runtime guard
+# now catches it, so the fixtures had to become honest rather than the
+# guard lenient.
+KEY = "us · mid · bd10-15 · px70-85|accept"
+REJECT_KEY = "us · mid · bd10-15 · px<70|reject"
 
 
 def policy(**overrides) -> intel.Policy:
@@ -34,6 +40,11 @@ def policy(**overrides) -> intel.Policy:
                          "delta": 8},
         },
         vetoes_enabled=True, admissions_enabled=True,
+        # The fit's DEFINITIONS, not just their name. Without this the
+        # runtime contract check refuses the policy - which is the point of
+        # the check, so the fixture declares it rather than the guard
+        # relaxing to accommodate fixtures.
+        feature_fingerprint=feature_contract.FINGERPRINT,
     )
     for k, v in overrides.items():
         setattr(base, k, v)
@@ -128,9 +139,28 @@ def test_a_stale_policy_is_not_applied():
 
 
 def test_an_incompatible_feature_version_is_refused():
+    """Declared `binance-0` over brti-1 keys. It is refused, and the reason
+    names BOTH so the disagreement is diagnosable rather than just fatal."""
     v = decide(policy=policy(feature_version="binance-0"))
     assert v.final_action == intel.NEUTRAL
-    assert "feature version" in v.reason
+    assert "binance-0" in v.reason and "brti-1" in v.reason
+
+
+def test_a_consistently_labelled_but_unsupported_version_is_also_refused():
+    """The pure version-mismatch path: the label and the keys agree with each
+    other and both disagree with what this build computes. Nothing here is
+    mislabelled, so the mislabelling guard must NOT be what catches it."""
+    unsupported = intel.Policy(
+        version="v9", model_version="m", feature_version="brti-2",
+        arms={"us · mid · bd10-15 · px70-85|accept":
+              {"n": 500, "mean": -0.05, "low": -0.09, "high": -0.01,
+               "action": intel.VETO, "delta": -5}},
+        vetoes_enabled=True, min_evidence=1,
+    )
+    assert not unsupported.mislabelled
+    v = decide(policy=unsupported)
+    assert v.final_action == intel.NEUTRAL
+    assert "brti-2" in v.reason and intel.FEATURE_VERSION in v.reason
 
 
 def test_thin_evidence_is_neutral():
@@ -249,7 +279,7 @@ def test_the_context_key_uses_only_features_available_at_the_time():
     row = {"session": "us", "vol_regime": "mid", "normalized_distance": 3.4,
            "our_ask": 0.80, "won": 1, "rule_match": 1}
     key = str(context_of(row))
-    assert "won" not in key and "1" not in key.replace("dist3+", "")
+    assert "won" not in key and "1" not in key.replace("bd10-15", "")
     # Removing the outcome must not change the context.
     row.pop("won")
     assert str(context_of(row)) == key

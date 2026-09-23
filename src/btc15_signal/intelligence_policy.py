@@ -36,6 +36,8 @@ import math
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from . import feature_contract
+
 NEUTRAL = "neutral"
 ALLOW = "allow"
 VETO = "veto"
@@ -45,6 +47,19 @@ ADMIT = "admit"
 # feature version must not be applied - the numbers would be arithmetic over
 # quantities that no longer mean the same thing.
 FEATURE_VERSION = "brti-1"
+
+# RETIRED. Binance is out of every active signal, intelligence, training,
+# evaluation and execution path. Records built on it stay readable as
+# history and are excluded from active learning; a policy keyed on them can
+# never act again, whatever its metadata claims.
+RETIRED_FEATURE_VERSIONS = ("binance-1",)
+RETIRED_FEATURE_FAMILIES = ("binance",)
+
+# The band names each feature version keys its contexts with. These are how a
+# policy's ACTUAL provenance is read, because the declared field can be wrong
+# - and was: the deployed `v1` said `brti-1` over seven Binance arms.
+BRTI_BAND_NAMES = ("bd<5", "bd5-10", "bd10-15", "bd15+")
+BINANCE_BAND_NAMES = ("dist<1.5", "dist1.5-3", "dist3+")
 
 
 @dataclass(frozen=True)
@@ -103,6 +118,11 @@ class Policy:
     admissions_enabled: bool = False
     min_evidence: int = 120
     notes: str = ""
+    # What the fit was actually computed under. `feature_version` is a name;
+    # these are the definitions. Absent means "cannot be shown to match",
+    # which `compatible()` treats as incompatible.
+    feature_fingerprint: str = ""
+    feature_definitions: dict = field(default_factory=dict)
 
     @classmethod
     def load(cls, path: str | Path) -> "Policy":
@@ -123,6 +143,49 @@ class Policy:
     @property
     def active(self) -> bool:
         return bool(self.arms) and self.version != "none"
+
+    @property
+    def keyed_feature_family(self) -> str:
+        """Which INSTRUMENT the arms are keyed on, read off the keys.
+
+        A `feature_version` field is a claim; this is the evidence. The
+        deployed `v1` artefact declared `brti-1` while every one of its seven
+        arms was a Binance context (`dist3+`, never `bd10-15`) - a
+        Binance-trained policy wearing a BRTI label, which is exactly what
+        the version guard exists to stop and exactly what it could not see.
+        It was inert only because both action flags happened to be off.
+
+        Family, not version: `brti-2` would legitimately reuse the brti band
+        names, and flagging that as a lie would make the guard cry wolf at
+        every honest revision. The band names distinguish INSTRUMENTS, which
+        is the confusion that actually loses money.
+
+        "unknown" when the keys say nothing either way.
+        """
+        for key in self.arms:
+            if any(band in key for band in BRTI_BAND_NAMES):
+                return "brti"
+            if any(band in key for band in BINANCE_BAND_NAMES):
+                return "binance"
+        return "unknown"
+
+    @property
+    def declared_feature_family(self) -> str:
+        return self.feature_version.split("-")[0] if self.feature_version else ""
+
+    @property
+    def keyed_feature_version(self) -> str:
+        """Back-compat alias reporting the family with its retired suffix."""
+        family = self.keyed_feature_family
+        return "binance-1" if family == "binance" else (
+            self.feature_version if family == "brti" else "unknown"
+        )
+
+    @property
+    def mislabelled(self) -> bool:
+        """Do the declared instrument and the keyed instrument disagree?"""
+        keyed = self.keyed_feature_family
+        return keyed != "unknown" and keyed != self.declared_feature_family
 
 
 def shrink(mean: float, n: int, prior: float, weight: float = 60.0) -> float:
@@ -163,12 +226,45 @@ def decide(
         return _with(base, reason="no active policy")
     if not features_ok:
         return _with(base, reason="features unavailable")
+    # THREE CHECKS, NOT ONE. The declared version is a claim; the keys are
+    # the evidence; and a retired instrument is barred whichever it says.
+    if policy.mislabelled:
+        return _with(
+            base,
+            reason=f"policy declares {policy.feature_version} but its arms are "
+                   f"keyed on {policy.keyed_feature_family} "
+                   f"({FEATURE_VERSION} expected)",
+        )
+    if policy.keyed_feature_family in RETIRED_FEATURE_FAMILIES:
+        return _with(
+            base,
+            reason=f"policy is keyed on retired features "
+                   f"{policy.keyed_feature_family}-1",
+        )
+    if policy.feature_version in RETIRED_FEATURE_VERSIONS:
+        return _with(base, reason=f"{policy.feature_version} is retired")
     if policy.feature_version != FEATURE_VERSION:
         return _with(
             base,
             reason=f"policy feature version {policy.feature_version} != "
                    f"{FEATURE_VERSION}",
         )
+    # THE FINGERPRINT. The three checks above compare NAMES; this compares
+    # the definitions themselves - source, units, cadence, smoothing,
+    # lookbacks, cutoff rule and every band boundary. A policy fitted under a
+    # 300s lookback and applied under a 600s one agrees on every name and is
+    # still arithmetic over a different quantity. Unknown is not compatible:
+    # an artefact that does not say what it was fitted under cannot be shown
+    # to match, and that is the same as must-not-act.
+    if not feature_contract.compatible(policy.feature_fingerprint):
+        differences = feature_contract.CONTRACT.differences(
+            policy.feature_definitions
+        )
+        detail = differences[0] if differences else (
+            f"artefact fp={policy.feature_fingerprint or 'absent'} != "
+            f"live fp={feature_contract.FINGERPRINT}"
+        )
+        return _with(base, reason=f"feature contract mismatch ({detail})")
     freshness_ms = policy.data_end_ms or policy.training_cutoff_ms
     if max_age_ms and now_ms and freshness_ms and now_ms - freshness_ms > max_age_ms:
         return _with(base, reason="policy is stale")
