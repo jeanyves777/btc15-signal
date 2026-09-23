@@ -264,3 +264,82 @@ def test_recorder_writes_nothing_to_the_trading_database(tmp_path):
     assert not Path(settings.database_path).samefile(settings.reference_database_path) \
         if Path(settings.database_path).exists() else True
     asyncio.run(shadow.close())
+
+
+# ------------------------------------------- the crossing question, and lag
+#
+# `crossed_since` is the safety gate behind the recovery add: has BRTI been on
+# the wrong side of the strike since we bought? It must answer None - unknown -
+# whenever it cannot see far enough back, and the caller must never read that
+# as "no".
+#
+# It was doing exactly that, and it was still the cause of every refused add on
+# 2026-09-23. BRTI's live_data series is quantised to whole seconds and trails
+# real time by 0-2s; the add is evaluated on the same poll that creates the
+# entry, so the newest sample is routinely a second OLDER than the entry
+# instant and there is nothing to test. The honest answer is None. What was
+# wrong was upstream - spending the position's one evaluation on it.
+#
+# These pin the semantics so the race can never be "fixed" by relaxing them.
+
+def _shadow_with_series(tmp_path, series, target=86_430.49):
+    from btc15_signal.brti import features_from_series
+
+    shadow = ReferenceShadow(settings_for(tmp_path))
+    shadow._brti_series = sorted(series)
+    shadow._brti_event = "E"
+    shadow._brti_features = features_from_series(
+        "E", shadow._brti_series, target, series[-1][0],
+    )
+    return shadow
+
+
+def test_a_series_that_stops_before_entry_answers_unknown(tmp_path):
+    """The measured case: newest sample 1.4s older than the fill."""
+    base = 1_790_196_576_000
+    shadow = _shadow_with_series(
+        tmp_path, [(base + i * 1000, 86_400.0) for i in range(60)]
+    )
+    entry_ms = base + 59_000 + 1_400  # 1.4s after the newest sample
+    assert shadow.crossed_since(entry_ms, "DOWN") is None
+    asyncio.run(shadow.close())
+
+
+def test_unknown_is_never_reported_as_no_crossing(tmp_path):
+    """None and False are different answers and must not collapse."""
+    base = 1_790_196_576_000
+    shadow = _shadow_with_series(
+        tmp_path, [(base + i * 1000, 86_400.0) for i in range(60)]
+    )
+    assert shadow.crossed_since(base + 120_000, "DOWN") is not False
+    asyncio.run(shadow.close())
+
+
+def test_a_series_covering_the_entry_answers_the_question(tmp_path):
+    """One second later there is a sample, and the gate works normally."""
+    base = 1_790_196_576_000
+    below = [(base + i * 1000, 86_400.0) for i in range(60)]
+    shadow = _shadow_with_series(tmp_path, below)
+    # Held DOWN, strike 86,430.49, BRTI below it throughout: never crossed.
+    assert shadow.crossed_since(base + 30_000, "DOWN") is False
+    asyncio.run(shadow.close())
+
+
+def test_a_crossing_inside_the_window_is_still_caught(tmp_path):
+    """The gate must keep vetoing what it exists to veto."""
+    base = 1_790_196_576_000
+    points = [(base + i * 1000, 86_400.0) for i in range(60)]
+    points[45] = (base + 45_000, 86_500.0)  # above the strike, held DOWN
+    shadow = _shadow_with_series(tmp_path, points)
+    assert shadow.crossed_since(base + 30_000, "DOWN") is True
+    asyncio.run(shadow.close())
+
+
+def test_a_series_starting_after_entry_answers_unknown(tmp_path):
+    """A restart with a short buffer cannot rule a crossing out."""
+    base = 1_790_196_576_000
+    shadow = _shadow_with_series(
+        tmp_path, [(base + i * 1000, 86_400.0) for i in range(60)]
+    )
+    assert shadow.crossed_since(base - 60_000, "DOWN") is None
+    asyncio.run(shadow.close())

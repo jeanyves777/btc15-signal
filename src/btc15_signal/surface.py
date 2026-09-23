@@ -392,11 +392,16 @@ def recovery_line(state) -> str:
     """
     if state is None or not getattr(state, "owes", False):
         return ""
-    allowed = not getattr(state, "base_only", False)
-    permission = ("extra sizing allowed" if allowed
-                  else "base size only")
+    if getattr(state, "base_only", False):
+        # THE SAME WORDS THE TRANSITION USED. "Recovery: $0.16 outstanding"
+        # standing under a "RECOVERY SIZE ENDED" sent minutes earlier reads as
+        # a second, contradicting subsystem rather than the same fact restated,
+        # and the operator read it that way. Echoing "size ended" makes the
+        # standing line the continuation of the announcement it follows.
+        return (f"{RECOVERY} Recovery size ended · "
+                f"${state.deficit:,.2f} still outstanding · base size only")
     return (f"{RECOVERY} Recovery: ${state.deficit:,.2f} outstanding · "
-            f"{permission}")
+            f"extra sizing allowed")
 
 
 # ------------------------------------------------------------ the assembler
@@ -458,6 +463,17 @@ def position_block(position: dict | None, side: str = "") -> list[str]:
         if state == "filled":
             lines.append(
                 f"{RECOVERY} Recovery add: {count:g} @ {cents(price)}"
+            )
+        elif state == "skipped":
+            # NEVER PLACED, so it never rested and there is no price to quote.
+            # Naming one here is what produced "Recovery add: pending - rested
+            # at 82c" for an add the runner had declined: the limit price on a
+            # skipped row is the price it WOULD have rested at, and printing it
+            # beside a state word turned a refusal into a working order. The
+            # reason is the fact the operator is actually looking for.
+            why = _typography(str(leg.get("reason") or "conditions not met"))
+            lines.append(
+                f"{RECOVERY} No recovery add \u00b7 <i>{escape(clipped(why, 90))}</i>"
             )
         else:
             # NAMED, NOT DROPPED. A reader who sees nothing cannot tell an add

@@ -300,7 +300,125 @@ def test_unknown_crossing_history_is_not_a_pass(tmp_path):
         crossed=None, remaining_s=500, now_ms=NOW, opened=WINDOW,
     ))
     assert trader.placed == []
-    assert "crossing history" in (store.open_add(WINDOW)["cancel_reason"] or "")
+    assert store.open_add(WINDOW)["order_id"] is None
+
+
+# ------------------------------------- an unanswerable question is not a NO
+#
+# THE DEFECT, on real money, 2026-09-23. Every recovery add that day was
+# refused for "crossing history unavailable for this window" - 25 of 25 - and
+# not one of them was a decision about a market.
+#
+# The add is evaluated on the same poll that creates the entry. No broker fill
+# has synced yet, so `position_entry_ms` falls back to the proposal's own
+# timestamp; BRTI's live_data series is quantised to whole seconds and trails
+# real time by 0-2s, so there is never a sample at or after that instant and
+# `crossed_since` correctly answers "unknown". The runner then wrote a
+# TERMINAL skip - and `_step` returns on any existing row, so the position's
+# one evaluation was spent on a feed that caught up a second later.
+#
+# Measured across all 25: lag 0.0s to 1.9s, every one with no sample at or
+# after entry. Nothing here relaxes the gate - unknown still never places.
+
+def test_an_unanswerable_crossing_is_deferred_not_refused(tmp_path):
+    settings, store = make(tmp_path)
+    trader = FakeTrader()
+    asyncio.run(RecoveryAddRunner(settings, store).step(
+        trader=trader, contract=FakeContract(), features=features(),
+        crossed=None, remaining_s=500, now_ms=NOW, opened=WINDOW,
+    ))
+    row = store.open_add(WINDOW)
+    assert trader.placed == [], "unknown is still never a pass"
+    assert row["state"] == AddState.DEFERRED
+    assert row["state"] != AddState.SKIPPED
+
+
+def test_the_next_poll_asks_again_once_brti_has_caught_up(tmp_path):
+    """The whole point: one second later the question is answerable."""
+    settings, store = make(tmp_path)
+    runner = RecoveryAddRunner(settings, store)
+    trader = FakeTrader()
+    run(runner, trader, crossed=None)
+    assert trader.placed == []
+
+    run(runner, trader, crossed=False)
+    assert len(trader.placed) == 1, "the deferred question was re-asked"
+    assert store.open_add(WINDOW)["state"] == AddState.PENDING
+
+
+def test_a_real_refusal_is_still_terminal_under_an_unknown_crossing(tmp_path):
+    """Unknown crossing plus a genuine veto is a decision, not a data gap.
+
+    The distance floor fails whatever the crossing did, so this is a refusal
+    about the market - recorded under its own reason rather than mislabelled
+    as a feed problem, and never re-asked."""
+    settings, store = make(tmp_path)
+    runner = RecoveryAddRunner(settings, store)
+    trader = FakeTrader()
+    thin = features(distance=7.7)
+    run(runner, trader, crossed=None, feats=thin)
+    row = store.open_add(WINDOW)
+    assert row["state"] == AddState.SKIPPED
+    assert "crossing" not in (row["cancel_reason"] or "")
+    assert "distance" in (row["cancel_reason"] or "")
+
+    run(runner, trader, crossed=False)
+    assert trader.placed == [], "a terminal refusal is not re-opened"
+
+
+def test_a_deferred_row_still_places_only_one_order(tmp_path):
+    """The deferred path must not become a second way to open a contract."""
+    settings, store = make(tmp_path)
+    runner = RecoveryAddRunner(settings, store)
+    trader = FakeTrader()
+    run(runner, trader, crossed=None)
+    run(runner, trader, crossed=False)
+    run(runner, trader, crossed=False)
+    run(runner, trader, crossed=False)
+    assert len(trader.placed) == 1
+
+
+def test_a_deferred_row_running_out_of_time_becomes_a_real_refusal(tmp_path):
+    """It resolves by itself. Past the deadline, the clock is the reason."""
+    settings, store = make(tmp_path)
+    runner = RecoveryAddRunner(settings, store)
+    trader = FakeTrader()
+    run(runner, trader, crossed=None)
+    assert store.open_add(WINDOW)["state"] == AddState.DEFERRED
+
+    run(runner, trader, crossed=None, remaining=30)
+    row = store.open_add(WINDOW)
+    assert row["state"] == AddState.SKIPPED
+    assert "deadline" in (row["cancel_reason"] or "")
+
+
+def test_a_terminal_row_is_never_advanced(tmp_path):
+    """`record_or_advance_add` keeps the protection the bare insert gave.
+
+    Only DEFERRED - our own open question - may be moved on. Every terminal
+    state refuses, which is what stops a second contract."""
+    settings, store = make(tmp_path)
+    coid = client_order_id(TICKER, "DOWN", WINDOW)
+    base = {
+        "client_order_id": coid, "window_open_ms": WINDOW, "ticker": TICKER,
+        "side": "DOWN", "base_fill": 0.77, "limit_price": 0.75, "count": 1,
+        "created_ms": NOW, "updated_ms": NOW,
+    }
+    for terminal in (AddState.SKIPPED, AddState.EXECUTED, AddState.CANCELLED,
+                     AddState.PENDING):
+        store.db.execute("DELETE FROM recovery_adds")
+        store.db.commit()
+        assert store.record_or_advance_add({**base, "state": terminal})
+        assert not store.record_or_advance_add(
+            {**base, "state": AddState.PENDING, "placed_ms": NOW}
+        ), f"{terminal} must not be advanced"
+        assert store.open_add(WINDOW)["state"] == terminal
+
+    store.db.execute("DELETE FROM recovery_adds")
+    store.db.commit()
+    assert store.record_or_advance_add({**base, "state": AddState.DEFERRED})
+    assert store.record_or_advance_add({**base, "state": AddState.PENDING})
+    assert store.open_add(WINDOW)["state"] == AddState.PENDING
 
 
 def test_the_runner_never_raises_when_the_broker_is_broken(tmp_path):

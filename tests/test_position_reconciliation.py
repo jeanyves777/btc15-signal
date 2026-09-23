@@ -213,6 +213,72 @@ def test_a_pending_add_contributes_nothing(tmp_path):
     assert add["state"] == "pending"
 
 
+# ------------------------------- an add that was never placed never rested
+#
+# THE SECOND DEFECT, on real money, 2026-09-23, KXBTC15M-26SEP231700-00. The
+# recap said:
+#
+#     🔧 Recovery add: pending · rested at 82¢
+#
+# The row said `RECOVERY ADD SKIPPED`, order_id NULL, placed_ms NULL, reason
+# "crossing history unavailable for this window". Nothing was ever sent. The
+# 82¢ was the price it would have rested at had it been placed.
+#
+# The leg state was a three-way guess with no case for a refusal, and 46 of
+# the 57 adds on record are refusals - so the commonest outcome was the one
+# reported wrongly, and it read as recovery still buying minutes after
+# RECOVERY SIZE ENDED had gone out.
+
+def skipped(tmp_path):
+    """A refused add, written the way the runner writes one."""
+    store = Store(str(tmp_path / "s.db"))
+    store.db.execute(
+        "INSERT INTO trade_proposals (id, strategy, window_open, ticker, side,"
+        " entry_limit, take_profit, count, expires_at, close_ms, status,"
+        " created_at, entry_order_id, fill_price, fee_paid, exit_price,"
+        " exit_count)"
+        " VALUES ('base','primary',?,?,'DOWN',0.85,0.99,2,0,0,'exited',0,"
+        "'01a0cfde-71e8-7900-96bb-bc903c415d91',0.84,0.02,0.999,2)",
+        (W, TICKER),
+    )
+    store.db.execute(
+        "INSERT INTO recovery_adds (client_order_id, window_open_ms, ticker,"
+        " side, state, order_id, base_fill, limit_price, count, placed_ms,"
+        " cancelled_ms, cancel_reason, created_ms, updated_ms)"
+        " VALUES ('coid',?,?,'DOWN','RECOVERY ADD SKIPPED',NULL,0.84,0.82,1,"
+        "NULL,NULL,'crossing history unavailable for this window',0,0)",
+        (W, TICKER),
+    )
+    store.db.commit()
+    return store
+
+
+def test_a_skipped_add_is_not_reported_as_pending(tmp_path):
+    pos = skipped(tmp_path).position_for_window(W)
+    add = next(leg for leg in pos["legs"] if leg["kind"] == "recovery")
+    assert add["state"] == "skipped"
+    assert add["state"] != "pending"
+
+
+def test_a_skipped_add_still_contributes_nothing(tmp_path):
+    pos = skipped(tmp_path).position_for_window(W)
+    assert pos["contracts"] == 2.0
+    assert round(pos["cost"], 4) == 1.68
+
+
+def test_the_recap_never_says_a_skipped_add_rested(tmp_path):
+    text = recap(skipped(tmp_path).position_for_window(W), paid=0.84, pnl=0.30)
+    assert "rested at" not in text
+    assert "pending" not in text
+
+
+def test_the_recap_says_why_there_was_no_add(tmp_path):
+    """Named, not dropped - and named with the reason, not a price."""
+    text = recap(skipped(tmp_path).position_for_window(W), paid=0.84, pnl=0.30)
+    assert "No recovery add" in text
+    assert "crossing history unavailable" in text
+
+
 # ------------------------------------------------- and the recap says so
 
 def recap(pos, **over):
@@ -333,3 +399,85 @@ def test_the_repair_charges_the_budget_only_once(tmp_path):
     once = committed()
     store.reconcile_recovery_adds(W)
     assert committed() == once
+
+
+# ---------------------------- no renderer may show an unplaced add as resting
+#
+# Requirement, after the 2026-09-23 recap said "Recovery add: pending - rested
+# at 82c" over a row that was never sent: an add that has no `placed_ms` never
+# rested, and no message may say otherwise, whatever its state string is.
+# Swept over every state a row can actually hold rather than the one state the
+# old tests happened to build.
+
+ADD_STATES = [
+    "RECOVERY ADD SKIPPED",
+    "RECOVERY ADD DEFERRED",
+    "RECOVERY ADD CANCELLED",
+    "RECOVERY ADD PENDING",
+    "RECOVERY ADD EXECUTED",
+]
+
+
+def one_add(tmp_path, state, *, placed, filled=0.0, name="x.db"):
+    store = Store(str(tmp_path / name))
+    store.db.execute(
+        "INSERT INTO trade_proposals (id, strategy, window_open, ticker, side,"
+        " entry_limit, take_profit, count, expires_at, close_ms, status,"
+        " created_at, entry_order_id, fill_price, fee_paid, exit_price,"
+        " exit_count)"
+        " VALUES ('base','primary',?,?,'DOWN',0.85,0.99,2,0,0,'exited',0,"
+        "'01a0cfde-71e8-7900-96bb-bc903c415d91',0.84,0.02,0.999,2)",
+        (W, TICKER),
+    )
+    store.db.execute(
+        "INSERT INTO recovery_adds (client_order_id, window_open_ms, ticker,"
+        " side, state, order_id, base_fill, limit_price, count, placed_ms,"
+        " filled_count, fill_price, cancelled_ms, cancel_reason, created_ms,"
+        " updated_ms) VALUES ('coid',?,?,'DOWN',?,?,0.84,0.82,1,?,?,?,NULL,"
+        "'reason text',0,0)",
+        (W, TICKER, state, "ord-1" if placed else None,
+         1_790_196_577_000 if placed else None,
+         filled, 0.82 if filled else None),
+    )
+    store.db.commit()
+    return store
+
+
+def test_no_unplaced_add_is_ever_rendered_as_resting(tmp_path):
+    for i, state in enumerate(ADD_STATES):
+        store = one_add(tmp_path, state, placed=False, name=f"u{i}.db")
+        pos = store.position_for_window(W)
+        leg = next(l for l in pos["legs"] if l["kind"] == "recovery")
+        assert leg["state"] == "skipped", f"{state} was never placed"
+        text = plain(recap(pos, paid=0.84, pnl=0.30))
+        assert "rested at" not in text, state
+        assert "pending" not in text, state
+        assert "82" not in text, f"{state}: a price it never traded at"
+
+
+def test_an_unplaced_add_contributes_nothing_whatever_its_state(tmp_path):
+    for i, state in enumerate(ADD_STATES):
+        store = one_add(tmp_path, state, placed=False, name=f"c{i}.db")
+        pos = store.position_for_window(W)
+        assert pos["contracts"] == 2.0, state
+        assert round(pos["cost"], 4) == 1.68, state
+
+
+def test_an_add_that_really_rested_is_still_shown_as_resting(tmp_path):
+    """The fix must not silence a genuine working order."""
+    store = one_add(tmp_path, "RECOVERY ADD PENDING", placed=True, name="p.db")
+    pos = store.position_for_window(W)
+    leg = next(l for l in pos["legs"] if l["kind"] == "recovery")
+    assert leg["state"] == "pending"
+    text = plain(recap(pos, paid=0.84, pnl=0.30))
+    assert "rested at 82¢" in text
+
+
+def test_a_filled_add_is_counted_however_the_state_string_reads(tmp_path):
+    """A reconciled row keeps a stale state string; the fill is what counts."""
+    store = one_add(tmp_path, "RECOVERY ADD CANCELLED", placed=True,
+                    filled=1.0, name="f.db")
+    pos = store.position_for_window(W)
+    leg = next(l for l in pos["legs"] if l["kind"] == "recovery")
+    assert leg["state"] == "filled"
+    assert pos["contracts"] == 3.0

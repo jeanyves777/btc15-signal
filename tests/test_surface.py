@@ -249,6 +249,19 @@ def test_recovery_is_one_line_with_deficit_and_permission():
     assert surface.recovery_line(State()) == ""
 
 
+def test_the_standing_line_echoes_the_transition_that_preceded_it():
+    """The operator read "RECOVERY SIZE ENDED" and then, two minutes later,
+    "Recovery: $0.16 outstanding" - and took the second for a contradiction of
+    the first. It is the same fact, so it uses the same words."""
+    class State:
+        owes, deficit, base_only = True, 0.16, True
+
+    line = surface.recovery_line(State())
+    assert "Recovery size ended" in line
+    assert "$0.16 still outstanding" in line
+    assert "base size only" in line
+
+
 # ------------------------------------------------------- 7. learning
 
 

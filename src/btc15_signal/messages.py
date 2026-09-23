@@ -97,7 +97,11 @@ def recovery_line(state, last_add: dict | None = None) -> str:
                 f"{last_add.get('fill_price')}</i>"
             )
         elif reason:
-            lines.append(f"   <i>no add: {escape(reason[:90])}</i>")
+            # ONE PHRASE FOR ONE FACT. `surface.position_block` says the same
+            # thing about the same row in the trade recap; two spellings of
+            # "nothing was placed" in two messages minutes apart is how the
+            # operator came to read the add lines as a separate subsystem.
+            lines.append(f"   <i>no recovery add · {escape(reason[:90])}</i>")
     return "\n".join(lines)
 
 

@@ -99,7 +99,7 @@ class RecoveryAddRunner:
                 trader, existing, features, crossed, remaining_s, now_ms, opened
             )
             return
-        if existing is not None:
+        if existing is not None and existing["state"] != AddState.DEFERRED:
             return  # already executed, skipped or cancelled - one per position
 
         position = self._store.open_position_detail(opened)
@@ -152,26 +152,53 @@ class RecoveryAddRunner:
             except (AttributeError, ValueError):
                 current_ask = None
 
-        decision = evaluate(
-            features=features,
-            entry_side=side,
-            entry_fill=paid,
-            current_ask=current_ask,
-            crossed_since_entry=bool(crossed) if crossed is not None else True,
-            remaining_s=remaining_s,
-            required_per_trade=state.required_per_trade(),
-            recovery_active=state.active,
-            already_added=False,
-            open_exposure=spent,
-            limits=self._limits,
-            fee=kalshi_fee_charged,
-        )
-        if crossed is None:
-            # Unknown is not a pass. Record why rather than silently skipping.
-            decision = type(decision)(
-                False, "crossing history unavailable for this window",
-                decision.price, decision.failed,
+        def judge(crossed_since_entry: bool):
+            return evaluate(
+                features=features,
+                entry_side=side,
+                entry_fill=paid,
+                current_ask=current_ask,
+                crossed_since_entry=crossed_since_entry,
+                remaining_s=remaining_s,
+                required_per_trade=state.required_per_trade(),
+                recovery_active=state.active,
+                already_added=False,
+                open_exposure=spent,
+                limits=self._limits,
+                fee=kalshi_fee_charged,
             )
+
+        # UNKNOWN IS STILL NOT A PASS. When the crossing cannot be established
+        # the conservative assumption stands - we evaluate as though it DID
+        # cross, which vetoes - and nothing below ever acts on the other
+        # branch. What the second call decides is only whether that veto is
+        # TERMINAL, and that distinction is the whole defect:
+        #
+        # the position gets ONE evaluation, and on 2026-09-23 all 25 refusals
+        # were spent on "crossing history unavailable" - every one of them
+        # because BRTI's series trailed the entry instant by 0-2 seconds, and
+        # every one answerable a second later. A feed that is briefly behind
+        # is not a decision about this market.
+        #
+        # So: if the ONLY thing in the way is the unanswerable question, the
+        # row is DEFERRED and the next poll asks again. If the add would have
+        # been refused anyway, that refusal is real, is independent of the
+        # crossing, and is recorded under its own reason rather than mislabelled
+        # as a data problem.
+        deferred = False
+        decision = judge(bool(crossed) if crossed is not None else True)
+        if crossed is None:
+            without_crossing = judge(False)
+            if without_crossing.place:
+                deferred = True
+                decision = type(decision)(
+                    False,
+                    "BRTI has no sample covering the entry instant yet; "
+                    "will re-ask next poll",
+                    without_crossing.price, decision.failed,
+                )
+            else:
+                decision = without_crossing
 
         conditions = json.dumps({
             "side": getattr(features, "side", None),
@@ -199,10 +226,18 @@ class RecoveryAddRunner:
         }
 
         if not decision.place:
-            base["state"] = AddState.SKIPPED
+            # DEFERRED is written the same way and read differently: it is the
+            # one state `_step` will come back to, so the question gets asked
+            # again while the window is still open. It becomes terminal by
+            # itself - the add places, or a real refusal replaces it, or the
+            # add deadline passes and `evaluate` refuses on the clock.
+            base["state"] = AddState.DEFERRED if deferred else AddState.SKIPPED
             base["cancel_reason"] = decision.reason
-            self._store.record_add(base)
-            print(f"recovery add SKIPPED [{ticker}]: {decision.reason}", flush=True)
+            self._store.record_or_advance_add(base)
+            print(
+                f"recovery add {base['state']} [{ticker}]: {decision.reason}",
+                flush=True,
+            )
             return
 
         # RESERVE BEFORE SENDING, including the fee. Kalshi reserves worst-case
@@ -224,7 +259,7 @@ class RecoveryAddRunner:
                 base["cancel_reason"] = (
                     f"could not reserve {claim:.4f} against available funds"
                 )
-                self._store.record_add(base)
+                self._store.record_or_advance_add(base)
                 return
         expiration = max(
             (contract.close_ms // 1000) - self._limits.min_seconds_remaining,
@@ -233,7 +268,11 @@ class RecoveryAddRunner:
         base["state"] = AddState.PENDING
         base["placed_ms"] = now_ms
         base["expiration_ts"] = expiration
-        if not self._store.record_add(base):
+        # STILL THE PLACEMENT GUARD. `record_or_advance_add` advances a row
+        # only while it is DEFERRED - our own open question - and refuses every
+        # terminal state exactly as the bare insert did, so no second order can
+        # be opened against a position that already has one.
+        if not self._store.record_or_advance_add(base):
             return  # another pass already owns this position
 
         if not self.live or trader is None:

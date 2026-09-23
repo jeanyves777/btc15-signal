@@ -4542,3 +4542,69 @@ loss sat above totals that had absorbed the mark but not the settlement.
 mark; a recap whose market the broker has not settled says its totals are as
 of the last reconciliation.
 
+
+## 51. Recovery read as two subsystems contradicting each other (2026-09-23)
+
+The operator, on three consecutive Telegram messages:
+
+    16:58  RECOVERY SIZE ENDED / 4 winning trades - 91% recovered
+           $0.16 still outstanding / Continuing at normal base size.
+    17:00  Recovery add: pending - rested at 82c
+           Recovery: $0.16 outstanding - base size only
+
+*"One message says recovery has ended because he has already exceeded the
+50%. Another said still active."*
+
+Both readings were reasonable. One of the two lines was false.
+
+### The add never rested. It was never placed.
+
+`KXBTC15M-26SEP231700-00`, the row behind that recap:
+
+    state         RECOVERY ADD SKIPPED
+    order_id      NULL
+    placed_ms     NULL
+    limit_price   0.82
+    cancel_reason crossing history unavailable for this window
+
+The 82c was the price the add WOULD have rested at. Nothing was sent to the
+exchange.
+
+**Root cause.** `position_for_window` derived the leg state by elimination:
+
+    filled if filled_count, else cancelled if cancelled_ms, else "pending"
+
+There is no case for a refusal, and a refusal sets none of those fields - so
+it fell to the `else`. **46 of the 57 adds on record are refusals**, so the
+commonest outcome was the one reported wrongly, and it was reported as the
+one state that implies live money in the book.
+
+The state now comes from the record, not from silence: `placed_ms IS NULL`
+means never placed, and a leg that was never placed is `skipped` and is
+rendered with its reason rather than a price it never traded at.
+
+**Why a full suite passed.** Both tests that touched this built the add with
+`RECOVERY ADD PENDING`. The 80%-of-rows case had no fixture at all.
+
+### Size ended and still outstanding are the same fact, spelled two ways
+
+`surface.recovery_line` printed `Recovery: $0.16 outstanding - base size only`
+under a `RECOVERY SIZE ENDED` sent two minutes earlier. Accurate, and it reads
+as a second subsystem disagreeing with the first. The standing line now echoes
+the transition it follows - `Recovery size ended - $0.16 still outstanding -
+base size only` - and the refusal is spelled `no recovery add - <reason>` in
+both the recap and the status header, which had two spellings for it.
+
+**Nothing about sizing, the exit rule or the ledger changed.** The 50%-and-
+four-wins rule (section 48) fired correctly at 91% and 4 wins; the deficit,
+the transition machine and the money were right throughout. This was the
+report.
+
+### Left open, not fixed here: the crossing gate is refusing almost everything
+
+Every add since 09-23 06:07 UTC bar one was refused for `crossing history
+unavailable for this window` - 25 of the 46 lifetime skips, and all but one
+of today's. That is a data-availability failure being spent as a strategy
+refusal, and it means the add has been effectively off all day. It is a
+separate question from the reporting, and wants measuring before it is
+touched.

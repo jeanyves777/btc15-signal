@@ -46,6 +46,15 @@ class AddState(StrEnum):
     EXECUTED = "RECOVERY ADD EXECUTED"
     SKIPPED = "RECOVERY ADD SKIPPED"
     CANCELLED = "RECOVERY ADD CANCELLED"
+    # NOT A VERDICT. The position gets ONE evaluation - `_step` returns on any
+    # existing row - so a refusal is permanent for that market. That is right
+    # for a decision and wrong for a question that could not be asked yet: on
+    # 2026-09-23 all 25 of the day's refusals were "crossing history
+    # unavailable", every one of them because BRTI's series trailed the entry
+    # instant by 0-2 seconds, and every one of them would have been answerable
+    # on the next poll. DEFERRED records that the question is still open and is
+    # the one state `_step` will re-enter.
+    DEFERRED = "RECOVERY ADD DEFERRED"
 
 
 def client_order_id(ticker: str, side: str, window_open_ms: int) -> str:

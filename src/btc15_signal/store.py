@@ -199,6 +199,32 @@ def _hour_utc(window_open: int) -> int:
     return datetime.fromtimestamp(window_open / 1000, UTC).hour
 
 
+def _add_leg_state(add: dict, filled: float) -> str:
+    """What the add ACTUALLY did, read from the record rather than guessed.
+
+    This was a three-way guess - filled, else cancelled if there was a cancel
+    timestamp, else `pending` - with no case for the commonest outcome by far.
+    An add the runner DECLINES is written with no order id, no `placed_ms` and
+    no `cancelled_ms`, so it fell through to the `else` and was reported to the
+    operator as a resting order. 46 of the 57 adds on record are that case, and
+    the recap for one of them read "Recovery add: pending - rested at 82c" over
+    a row whose reason was "crossing history unavailable for this window".
+    Nothing had been sent to the exchange.
+
+    `placed_ms` is the fact that settles it: an add that was never placed never
+    rested, whatever the rest of the row looks like. It is tested against NULL
+    rather than for truth because "placed at epoch 0" is a fixture, not a
+    refusal. `state` is not read directly because a reconciled row carries the
+    broker's verdict while its original state string is left behind - `filled`
+    above already covers that.
+    """
+    if filled:
+        return "filled"
+    if add.get("placed_ms") is None:
+        return "skipped"
+    return "cancelled" if add.get("cancelled_ms") else "pending"
+
+
 def position_pnl(
     *,
     paid: float,
@@ -1267,9 +1293,7 @@ class Store:
                 "price": add["fill_price"] if filled else add["limit_price"],
                 "fee": float(add["fee_paid"] or 0),
                 "confirmed": bool(filled),
-                "state": ("filled" if filled
-                          else ("cancelled" if add.get("cancelled_ms")
-                                else "pending")),
+                "state": _add_leg_state(add, filled),
                 "reason": add.get("cancel_reason") or "",
             })
         held = [leg for leg in legs if leg["count"] > 0]
@@ -3184,6 +3208,34 @@ class Store:
         except sqlite3.IntegrityError:
             return False
 
+    def record_or_advance_add(self, row: dict) -> bool:
+        """Create the add record, or move a DEFERRED one forward.
+
+        `record_add` alone cannot do this. A deferred row is a question still
+        open, so the next poll has to be able to answer it - but the INSERT
+        that makes a restart safe refuses the second write, and the caller
+        treats that refusal as "another pass owns this position".
+
+        The UPDATE is therefore conditional on the row STILL being DEFERRED,
+        in SQL. That keeps the protection exactly as it was for every terminal
+        state: a PENDING, EXECUTED, SKIPPED or CANCELLED row is never
+        overwritten, and this returns False just as the plain insert did.
+        """
+        if self.record_add(row):
+            return True
+        fields = {k: v for k, v in row.items() if k != "client_order_id"}
+        if not fields:
+            return False
+        assignments = ", ".join(f"{name} = :{name}" for name in fields)
+        cursor = self.db.execute(
+            f"UPDATE recovery_adds SET {assignments} WHERE client_order_id = "
+            ":client_order_id AND state = :_deferred",
+            {**fields, "client_order_id": row["client_order_id"],
+             "_deferred": "RECOVERY ADD DEFERRED"},
+        )
+        self.db.commit()
+        return cursor.rowcount > 0
+
     def update_add(self, client_order_id: str, fields: dict) -> None:
         if not fields:
             return
@@ -3237,6 +3289,12 @@ class Store:
             "  AS cancelled, "
             "COALESCE(SUM(CASE WHEN state = 'RECOVERY ADD SKIPPED' THEN 1 END), 0) "
             "  AS skipped, "
+            # COUNTED APART FROM `skipped`. A deferred row is a question still
+            # open, not a refusal, and folding the two together would report a
+            # feed that is briefly behind as a strategy decision - which is the
+            # reading that hid 25 of them in a day.
+            "COALESCE(SUM(CASE WHEN state = 'RECOVERY ADD DEFERRED' THEN 1 END), 0) "
+            "  AS deferred, "
             "COALESCE(SUM(realised_pnl), 0) AS pnl, "
             "COALESCE(SUM(fee_paid), 0) AS fees "
             "FROM recovery_adds"

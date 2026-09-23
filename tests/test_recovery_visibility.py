@@ -111,7 +111,9 @@ def test_the_line_says_WHY_no_add_was_made(tmp_path):
     store.recovery_state(4)
     blocked_add(store)
     text = messages._money_block(store.money_snapshot(NOW))
-    assert "no add" in text
+    # The same phrase the trade recap uses for the same row, so the two
+    # messages read as one account of one add rather than two subsystems.
+    assert "no recovery add" in text
     assert "momentum not aligned" in text
 
 
