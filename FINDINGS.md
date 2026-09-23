@@ -3325,3 +3325,108 @@ can round either way. The wrong fix is to round them so the subtraction
 the one number this system is not allowed to invent (section 37).
 `lifetime_record` carries the same note so nobody reconciles it backwards
 later.
+
+## 47. Kalshi-only, and the five Binance dependencies hiding in it (2026-09-22)
+
+Binance is out of every active signal, intelligence, training and evaluation
+path. Kalshi supplies quotes, books, executions, settlements and BRTI. The
+Binance-trained policy is retired, historical records keep their source
+labels, and there is no fallback: a missing or stale input is recorded and
+produces no signal.
+
+Deployed revision **a51f1f2**, running from 23:45:15. 743 tests pass.
+
+### The mislabel that was already live
+
+`runtime/intelligence_policy.json` declared `feature_version: brti-1` over
+seven arms every one of which was keyed on **Binance** bands (`dist3+`, never
+`bd10-15`). A Binance-trained policy wearing a BRTI label - exactly what the
+version guard existed to stop, and exactly what it could not see, because it
+compared the declared field to itself. It was inert only because both action
+flags happened to be off.
+
+Provenance is now read from the **arm keys**, not the metadata:
+`keyed_feature_family` says what a policy actually is, `mislabelled` compares
+that to what it claims, and `binance` is a retired family that cannot act
+under any label. The artefact is relabelled `v1-retired` / `binance-1` and
+refuses with *"policy is keyed on retired features binance-1"*.
+
+### Five live dependencies, found five different ways
+
+Removing the client was the easy part. What it exposed:
+
+| # | where | found by | would have |
+|---|---|---|---|
+| 1 | `hourly.poll(now_ms, market)` | crash at 23:00 | killed the service on startup |
+| 2 | `levels.maybe_refresh(market, …)` | 55s dry run | killed the service on the first poll |
+| 3 | `await market.close()` | code read | raised on shutdown |
+| 4 | `decision_record` → Binance `check_detail` | dry-run log | lost EVERY decision record silently |
+| 5 | `ReferenceShadow._binance.latest()` | **netstat** | kept an open Binance connection |
+| 5b | `._binance.seconds()` | live log line | broke second-bar decomposition quietly |
+
+Number 5 is the one worth remembering. The signal path had been migrated, the
+code read clean, 738 tests passed - and `netstat -ano` against the running
+process showed an ESTABLISHED connection to `data-api.binance.vision`. The
+recorder's Binance column is archive and nothing reads it to decide anything,
+but **an archive column that costs a live request every ten seconds is an
+active dependency however it is labelled.** I would have reported "no active
+Binance dependency" and been wrong.
+
+Verified after deploy: the service holds connections to
+`external-api.kalshi.com` only.
+
+### Thresholds do not survive a change of instrument
+
+Two gates were calibrated on Binance and would have transferred silently:
+
+* **distance.** `min_normalized_distance = 1.5` measures Binance RAW
+  volatility; BRTI reads 10-20 on the identical market. Reusing it passes the
+  gate on everything while still drawing a tick beside it. The active rule is
+  `KalshiBRTIRule` with the measured 10x floor (FINDINGS 43).
+* **spread.** `max_spread_bps = 2.0` gates Binance SPOT spread, whose p99
+  over 10,094 archived observations is **0.001 bps** - it had never rejected
+  anything. A 2c Kalshi spread on a 79c mid is **253 bps**, so carrying the
+  number across would have discarded *every* signal. Replaced by a gate in
+  cents at ~p99 of the measured contract distribution (median 0.4c, p95 10c,
+  p99 19c), plus an explicit refusal for crossed books, which are ~10% of
+  archived observations.
+
+### No model, rather than a fabricated one
+
+`predict()` is a hand-weighted Binance model: three of its five terms
+(`bid_imbalance`, `taker_imbalance`, `futures_basis_bps`) do not exist on
+Kalshi, and on BRTI's scale `1.15 * 15` saturates the sigmoid so the
+`model confidence >= 0.50` gate would pass on everything. It does not run.
+
+There is no Kalshi-native probability model, so **none is reported**:
+`raw_probability` is NULL and `bucket` is -1, meaning "no model". That
+required relaxing two NOT NULL columns - and finding that `record()` inserts
+with `OR IGNORE`, so the constraint was rejecting the row and the IGNORE was
+swallowing it. Every prediction would have vanished: no settlement tracking,
+no grading, no learning, and not one error anywhere.
+
+### One feature contract, enforced
+
+`feature_contract.py` hashes the definitions - source, units, cadence,
+smoothing, both lookbacks, the cutoff rule and every band boundary - to
+`fp=90a70cfa994e7a08`. Artefacts record the fingerprint they were fitted
+under; `decide()` and `CandidateSet.evaluate()` refuse a mismatch and name the
+differing field. Absent is not compatible: an artefact that will not say what
+it was fitted under cannot be shown to match.
+
+### What the live loop now does, verified end to end
+
+Market `KXBTC15M-26SEP222315-15`, on the deployed code:
+
+    23:04:10  decision recorded, DOWN @ 0.80, qualified, action=neutral
+              context asia · mid · bd10-15 · px70-85
+              reason  policy is keyed on retired features binance-1
+              won=None            <- outcome unknown, as it must be
+    23:08:14  decision recorded, DOWN @ 0.917, context moved to bd15+/px85-94
+    23:15:18  settled and graded: won=1, on each row's own recorded side
+              16 decisions, all DOWN, all graded
+
+No candidate row: the frozen candidate speaks only to
+`asia · mid · bd10-15 · px85-94` and this market was never in that cell. An
+unmatched candidate writes nothing, because a table of non-opinions buries the
+opinions.
