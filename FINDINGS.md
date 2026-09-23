@@ -4095,8 +4095,10 @@ Three slices, used once each and in order, so nothing grades its own homework:
 **Drift is only part of it.** The base rate fell 0.7199 -> 0.6998 -> 0.7109
 across the three slices (accepted leg 0.8584 -> 0.8282 -> 0.8357), so about one
 to two points of the bias is the market moving, which periodic refitting
-tracks. The remaining three to four points is in-sample optimism: each bucket
-is fitted to its own noise and pays for it out of sample.
+tracks. The remaining three to four points is NOT diagnosed. Shrinkage optimism is
+one candidate; regime change beyond the base-rate shift, bucket instability
+and composition change between slices are others, and nothing measured here
+distinguishes them. See the correction below.
 
 **With the bias removed, NO cell clears zero on the holdout** - including the
 active one:
@@ -4136,17 +4138,113 @@ the mapping. The honest position is that the confidence layer has no validated
 adjustment, and the previous two entries each claimed one on a weaker test than
 this.
 
+
+### The -9 is withdrawn, and the confidence bar is rebuilt
+
+Two things were wrong and the operator named both.
+
+**"Label-only" does not license displaying an unsupported number.** The -9 was
+left live on the grounds that it could not reach an order. That is true and it
+is not the point: the confidence label is shown to a person, and a number the
+analysis no longer supports should not be on the screen whatever it cannot
+reach. It is withdrawn.
+
+**A correction cannot wait behind a self-imposed rule.** "Avoid repeated
+restarts" was about churn, not about preserving a known defect. Hot reload
+could not do it - `deteriorated()` covers promoted EXECUTION arms on forward
+evidence, and nothing outside the runner can drop the cached policy - so this
+went out as one tested corrective deployment.
+
+### The corrected method: nested chronological folds
+
+The old bar could not separate a cell from the mapping. It measured a cell's
+gap against a curve fitted in-sample and checked it on a validation slice using
+THAT SAME CURVE, so the curve's level error was present identically in both and
+"validate agrees" confirmed the error reproduced rather than that the cell was
+distinctive.
+
+Now every prediction comes from a mapping that saw only earlier data, de-biased
+on a slice earlier still than the one being tested:
+
+    fold k    curve fitted on folds 0..k-2
+              per-bucket bias estimated on fold k-1
+              cell residuals measured on fold k
+
+Five folds cut by MARKET, three of them tested, 3,841 scored rows. Nothing
+grades its own homework and the result does not rest on any single holdout -
+which matters, because a holdout once inspected is spent, and the one from the
+previous entry is now evaluation evidence rather than a test set.
+
+### Multiplicity applies to confidence after all
+
+The previous entry argued it did not: a delta is computed for every eligible
+cell rather than the best of k being picked, so there was said to be no
+selection to correct. **That was wrong**, and the corrected method is what
+exposed it - a significance test decides WHICH cells get a non-zero delta, and
+keeping whichever of k cells clears an interval is k chances to be fooled
+however many were looked at.
+
+Under the nested test, 7 cells had enough evidence and 2 cleared zero raw:
+
+    +0.0620 [+0.0090,+0.1112] n=142  us · mid · bd10-15 · px85-94|accept
+    -0.0780 [-0.1420,-0.0235] n=185  us · mid · bd10-15 · px70-85|accept
+
+Against 0.35 expected by chance at 95% across 7 cells, that is suggestive and
+no more. **Neither survives the sqrt(7) widening** the execution bar has always
+applied, and neither is activated. The widening was added on discovering the
+selection - which makes the bar stricter. Relaxing one after seeing a result
+would be the other thing, and is what this file exists to catch.
+
+The old -9 cell now reads `-0.0510 [-0.1141,+0.0080]`: it spans zero even
+before the widening.
+
+**Result: 128 arms, ZERO confidence adjustments, zero promoted.** The
+confidence layer has no validated adjustment and the artefact says so.
+
+### A correction to the previous entry's causal claim
+
+It said the residual bias, after drift, "is in-sample optimism: each bucket is
+fitted to its own noise and pays for it out of sample". **That is not
+established.** What the comparisons show is out-of-sample miscalibration -
+the mapping over-predicted in all nine buckets, mean -0.0516, while the base
+rate fell 0.7199 -> 0.6998 -> 0.7109. Shrinkage optimism is one candidate
+cause. Regime change beyond the base-rate shift, bucket instability, and
+composition change between slices are others, and nothing measured here
+distinguishes them. The claim is withdrawn to: **the mapping's level is wrong
+out of sample by roughly five points, and why is not determined.**
+
+That distinction is not pedantry. "Optimism" implies the fix is shrinkage;
+"drift" implies the fix is refitting; "composition" implies the buckets are
+wrong. The corrected method de-biases against held-out data, which helps under
+all three, and that is the honest reason to prefer it.
+
+### What is and is not claimed
+
+    the loop runs, ingests, refits, evaluates, activates      DEPLOYED
+    an adjustment has earned the right to change a label      NO
+    an adjustment has earned the right to change an order     NO
+    the confidence score carries information about winning    YES, as a
+                                                              RANKING: Brier
+                                                              0.1839-0.1896
+                                                              against a base
+                                                              rate of
+                                                              0.2058-0.2103
+    that score's LEVEL is a probability                       NOT SHOWN
+    intelligence improves signals                             NOT CLAIMED
+
+The next confidence adjustment needs fresh forward evidence strong enough to
+clear a nested, selection-corrected interval. On today's corpus nothing does,
+and that is the correct state rather than a disappointing one.
+
 ### What is live, and what is not
 
     running                          YES  - scheduled, persisted, restart-safe
     updating                         YES  - refits on settlements or 6h
-    adjusting confidence             YES, BUT NOT WELL FOUNDED - 1 arm, -9
-                                            SCORE POINTS on the 0-100 scale.
-                                            About half is the mapping's own
-                                            out-of-sample bias; the residual
-                                            does not clear zero on the
-                                            holdout. Label only: it reaches no
-                                            gate, no order and no size.
+    adjusting confidence             NO - the -9 was withdrawn and the bar
+                                            rebuilt on nested out-of-sample
+                                            folds with multiplicity applied.
+                                            Nothing on today's corpus clears
+                                            it.
     authorised to affect execution   NO   - 0 arms cleared the evidence bar,
                                             and the operator's two switches
                                             are not set either

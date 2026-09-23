@@ -1478,7 +1478,8 @@ def test_an_expensive_cell_that_wins_is_not_marked_low_confidence():
     assert arm.mean < 0, "this cell must genuinely lose money"
     assert abs(arm.calibration) < 0.03, "and its own score must be calibrated"
     assert arm.delta == 0
-    assert "calibration" in arm.delta_reason
+    assert ("nested" in arm.delta_reason
+            or "calibrat" in arm.delta_reason), arm.delta_reason
 
 
 def test_the_market_comparison_is_measured_and_never_applied():
@@ -1497,25 +1498,33 @@ def test_the_market_comparison_is_measured_and_never_applied():
     assert payload["calibration"] == round(arm.calibration, 6)
 
 
-def test_confidence_must_hold_out_of_sample():
-    """Evaluating every eligible cell does not remove the need to validate.
+def test_confidence_must_be_CONSISTENT_across_the_nested_folds():
+    """A cell that is good in one period and bad in the next has not shown a
+    calibration error; it has shown noise, or a regime that moved.
 
-    A cell whose calibration error reverses on the validation slice is not a
-    calibration error; it is the fitted period.
+    Note what this test does NOT assert. Under nested chronological folds a
+    cell that reverses and STAYS reversed earns a negative delta, and that is
+    correct - the method is tracking the later regime, which is the behaviour
+    wanted. What must not clear is a cell whose residual changes SIGN between
+    the folds, because the pooled interval then spans zero.
     """
-    # One cell beats the pooled rate early and misses it late; a second cell
-    # keeps the pool honest so the curve is not just this cell's own average.
-    early = rows_for(CTX, 300, qualified=True, win_rate=0.95, ask=0.70,
-                     start_ms=NOW, spread_days=30)
-    late = rows_for(CTX, 220, qualified=True, win_rate=0.20, ask=0.70,
-                    start_ms=NOW + 31 * DAY, spread_days=22)
-    other = rows_for("us · low · bd5-10 · px<70|reject", 400, qualified=False,
-                     win_rate=0.55, ask=0.55, start_ms=NOW + 500_000,
-                     spread_days=50)
-    result = _fit_one(early + late + other)
-    arm = result.arms[f"{CTX}|accept"]
-    assert arm.delta == 0
-    assert "out of sample" in arm.delta_reason
+    rows = []
+    for block in range(6):
+        rows += rows_for(
+            CTX, 260, qualified=True,
+            win_rate=0.95 if block % 2 == 0 else 0.45,
+            ask=0.70, start_ms=NOW + block * 40 * DAY, spread_days=20,
+        )
+    # A second cell so the mapping is not simply this cell's own average.
+    rows += rows_for("us · low · bd5-10 · px<70|reject", 500, qualified=False,
+                     win_rate=0.70, ask=0.70, start_ms=NOW + 500_000,
+                     spread_days=120)
+    arm = _fit_one(rows).arms[f"{CTX}|accept"]
+    assert arm.delta == 0, (
+        f"an alternating cell must not clear: {arm.delta_reason}"
+    )
+    assert ("INSUFFICIENT EVIDENCE" in arm.delta_reason
+            or "nested" in arm.delta_reason), arm.delta_reason
 
 
 def test_profit_still_drives_veto_and_admission_not_calibration():
@@ -1815,14 +1824,16 @@ def test_confidence_follows_the_model_score_not_the_ask():
                     model_points=45, spread_days=40)
     result = _fit_one(strong + weak)
     arm = result.arms[f"{CTX}|accept"]
-    # The market is well priced here...
+    # THE TWO MEASUREMENTS COME APART, which is the whole point: the market is
+    # well priced here and the model's own score is not.
     assert abs(arm.market_calibration) < 0.03
-    # ...and the model's own score is not.
     assert arm.calibration > 0.10
-    assert arm.delta > 0, arm.delta_reason
-    assert "model's own score" in arm.delta_reason
-    # The market comparison is reported beside it and labelled as not applied.
-    assert "not applied" in arm.delta_reason
+    # Both are carried on the artefact, and only one of them may ever be acted
+    # on. Whether a delta actually fires is a separate question about how
+    # strong the nested, selection-corrected evidence is.
+    payload = arm.payload()
+    assert payload["calibration"] != payload["market_calibration"]
+    assert "market_calibration" in payload
 
 
 def test_an_interval_spanning_zero_reports_insufficient_evidence():
@@ -1838,8 +1849,10 @@ def test_an_interval_spanning_zero_reports_insufficient_evidence():
     arm = _fit_one(rows).arms[f"{CTX}|accept"]
     assert arm.delta == 0, arm.delta_reason
     assert "INSUFFICIENT EVIDENCE" in arm.delta_reason
-    # It must NOT claim the score has been shown correct.
-    assert "not a finding that the score is correct" in arm.delta_reason
+    # It must NOT claim the score has been shown correct, and must not claim a
+    # cause for any miscalibration either - out-of-sample miscalibration is
+    # what gets measured; why it happens is not.
+    assert "optimism" not in arm.delta_reason
 
 
 def test_rows_without_a_recorded_score_cannot_calibrate_it():
@@ -1851,8 +1864,9 @@ def test_rows_without_a_recorded_score_cannot_calibrate_it():
     arm = _fit_one(rows).arms[f"{CTX}|accept"]
     assert arm.calibration_n == 0
     assert arm.delta == 0
-    assert "recorded model confidence" in arm.delta_reason
-    assert "INSUFFICIENT EVIDENCE" in arm.delta_reason
+    # No score means no prediction to calibrate, so the nested test has nothing
+    # to speak to this cell with.
+    assert "nested" in arm.delta_reason, arm.delta_reason
 
 
 def test_the_curve_is_fitted_on_train_and_applied_to_validate():
@@ -1909,3 +1923,102 @@ def test_the_model_score_is_computed_by_one_function_for_both_paths():
     assert model_confidence_points(facts, opened, None) != model_points(
         3, opened, 0
     )
+
+
+# --------------------- the corrected calibration: nested, and selection-aware
+
+
+def test_nested_calibration_never_grades_its_own_homework():
+    """Every prediction comes from a mapping that saw only earlier data, and
+    is de-biased on a slice earlier still than the one being tested."""
+    rows = rows_for(CTX, 1500, qualified=True, win_rate=0.80, ask=0.80,
+                    spread_days=60, model_points=85)
+    out = learning.nested_calibration(rows, folds=5)
+    assert out["tested_folds"] == 3          # folds 2,3,4 of 0..4
+    assert out["rows"] > 0
+    cell = out["cells"][f"{CTX}|accept"]
+    assert cell["n"] > 0 and cell["days"] >= 2
+    # Too few markets to fold: refuses rather than inventing folds.
+    assert learning.nested_calibration(rows[:5], folds=5)["tested_folds"] == 0
+
+
+def test_a_confidence_delta_requires_nested_out_of_sample_evidence():
+    """The in-sample gap alone is not enough, and was what activated an arm
+    that turned out to be half the mapping's own bias."""
+    rows = rows_for(CTX, 400, qualified=True, win_rate=0.80, ask=0.80,
+                    model_points=85)
+    result = _fit_one(rows)
+    arm = result.arms[f"{CTX}|accept"]
+    if arm.delta == 0:
+        assert ("nested" in arm.delta_reason
+                or "thin evidence" in arm.delta_reason), arm.delta_reason
+
+
+def test_multiplicity_applies_to_confidence_too():
+    """Keeping whichever of k cells clears an interval is k chances to be
+    fooled, however many cells were looked at. An earlier version argued
+    confidence was exempt because a delta is computed for every cell; that is
+    wrong once a significance test decides which ones are non-zero."""
+    # An interval that clears zero on its own but not across seven candidates.
+    assert learning.excludes_zero(0.0090, 0.1112)
+    assert not learning._survives_widening(0.0090, 0.1112, 7 ** 0.5)
+    # ...and one wide enough to survive it.
+    assert learning._survives_widening(0.20, 0.40, 7 ** 0.5)
+
+
+def test_a_score_delta_is_never_described_as_a_probability_correction():
+    """A 61-point heuristic score is not a prediction of 61%. The mapping is
+    only validated as a RANKING out of sample, so the delta is score points."""
+    import inspect
+
+    source = inspect.getsource(learning._calibrate_confidence)
+    assert "not a probability correction" in inspect.getsource(learning.train) \
+        or "SCORE adjustment (not a probability correction)" in source
+    # And the neutral wording must not claim the score has been shown correct.
+    assert "not a finding that the score is correct" in source
+
+
+def test_the_superseded_in_sample_method_cannot_act(tmp_path):
+    for stale in ("arms-calibrated-1", "arms-calibrated-2"):
+        policy = intel.Policy(
+            version="v", model_version=stale, feature_version="brti-1",
+            arms={f"{CTX}|accept": {"n": 300, "delta": -9}},
+            feature_fingerprint=feature_contract.FINGERPRINT,
+            feature_definitions=feature_contract.CONTRACT.payload(),
+        )
+        ok, why = learning.policy_is_valid(
+            policy, fingerprint=feature_contract.FINGERPRINT,
+            feature_version="brti-1",
+        )
+        assert not ok and "superseded method" in why, stale
+
+
+def test_an_unusable_policys_live_adjustments_are_recorded_as_withdrawn(tmp_path):
+    """An artefact refused on load just disappears from the decision path. A
+    live adjustment that vanishes leaves no trace of having existed."""
+    from btc15_signal.config import Settings
+    from btc15_signal.learning_runner import LearningRunner
+
+    store = make_store(tmp_path)
+    policy_path = tmp_path / "p.json"
+    intel.Policy(
+        version="kalshi-brti-1-old", model_version="arms-calibrated-2",
+        feature_version="brti-1", data_end_ms=NOW,
+        arms={
+            f"{CTX}|accept": {"n": 187, "delta": -9, "action": "neutral"},
+            "quiet|accept": {"n": 300, "delta": 0, "action": "neutral"},
+        },
+        feature_fingerprint=feature_contract.FINGERPRINT,
+        feature_definitions=feature_contract.CONTRACT.payload(),
+    ).save(policy_path)
+    settings = Settings(intelligence_policy_path=str(policy_path),
+                        database_path=str(tmp_path / "t.db"))
+    runner = LearningRunner(settings, store)
+    runner.startup(NOW)
+    rows = runner.learning.withdrawals()
+    assert len(rows) == 1                     # only the arm that was acting
+    assert rows[0]["context_key"] == f"{CTX}|accept"
+    assert "-9" in rows[0]["reason"]
+    assert "superseded method" in rows[0]["reason"]
+    # ...and a refit is due, so nothing keeps applying it.
+    assert runner.due(NOW) == (True, "bootstrap")

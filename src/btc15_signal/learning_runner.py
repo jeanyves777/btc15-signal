@@ -47,6 +47,7 @@ from pathlib import Path
 
 from . import feature_contract, learning, learning_data
 from .intelligence_policy import NEUTRAL, VETO, Policy
+from .learning import Withdrawal
 from .learning_store import (
     FAILED,
     FAILURES,
@@ -128,6 +129,13 @@ class LearningRunner:
             )
         else:
             print(f"learning: active policy CANNOT ACT - {why}", flush=True)
+            # RECORD WHAT IT WAS DOING BEFORE IT STOPPED DOING IT. An artefact
+            # refused on load simply disappears from the decision path, and a
+            # live adjustment that vanishes leaves no trace of having existed -
+            # so `/learning` would show "no adjustments" with nothing saying
+            # one was withdrawn or why. The arms are written into
+            # `policy_withdrawals` first.
+            self._record_load_withdrawals(active, now_ms, why)
             # RESTART RECOVERY. A valid rollback is restored immediately rather
             # than waiting for the next training run: the whole point of
             # keeping one is that the system is never left running on an
@@ -140,6 +148,36 @@ class LearningRunner:
                 flush=True,
             )
             self.learning.set(NEXT_DUE, now_ms, now_ms)
+
+    def _record_load_withdrawals(self, policy: Policy, now_ms: int,
+                                 why: str) -> None:
+        """Log every adjustment an unusable artefact was carrying."""
+        try:
+            withdrawals = [
+                Withdrawal(
+                    key=key, changes=0, incremental=0.0,
+                    reason=(
+                        f"policy refused on load ({why}); it was applying "
+                        f"delta {int(arm.get('delta') or 0):+d}"
+                        + (f" and action {arm.get('action')}"
+                           if arm.get("action") not in (None, NEUTRAL) else "")
+                    ),
+                )
+                for key, arm in policy.arms.items()
+                if int(arm.get("delta") or 0)
+                or arm.get("action") not in (None, NEUTRAL)
+            ]
+            if not withdrawals:
+                return
+            self.learning.record_withdrawals(
+                now_ms=now_ms, policy_version=policy.version,
+                withdrawals=withdrawals,
+            )
+            for item in withdrawals:
+                print(f"learning: WITHDRAWN on load {item.key} - {item.reason}",
+                      flush=True)
+        except Exception as exc:  # noqa: BLE001 - never blocks startup
+            print(f"learning: load-withdrawal record failed {exc!r}", flush=True)
 
     def _restore_rollback(self, now_ms: int, why: str) -> bool:
         rollback = Policy.load(self.rollback_path)

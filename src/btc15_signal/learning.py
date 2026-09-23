@@ -80,12 +80,16 @@ MIN_WITHDRAWAL_N = 20      # enough forward changes to call an active arm bad
 #                      recorded, pre-adjustment score, validated out of
 #                      sample. Profit drives execution; the market comparison
 #                      is reported beside it and never applied.
-MODEL_VERSION = "arms-calibrated-2"
+MODEL_VERSION = "arms-nested-1"
 SUPERSEDED_MODEL_VERSIONS = (
     "arms-shrunk-1", "arms-shrunk-2",
     # arms-calibrated-1 sized confidence from the ASK, which
     # calibrates Kalshi rather than our own score.
     "arms-calibrated-1",
+    # arms-calibrated-2 sized confidence from an IN-SAMPLE gap against a
+    # mapping whose own out-of-sample level error was larger than most cell
+    # gaps. Its one activated arm was about half mapping bias.
+    "arms-calibrated-2",
 )
 
 TRAIN_FRACTION = 0.55
@@ -239,6 +243,100 @@ def predicted_probability(points, curve: dict) -> float | None:
     return curve["buckets"].get(_bucket(points), curve["prior"])
 
 
+NESTED_FOLDS = 5
+
+
+def nested_calibration(rows: list[dict], folds: int = NESTED_FOLDS) -> dict:
+    """Per-cell calibration residual, evaluated with nested chronological folds.
+
+    THE PREVIOUS BAR COULD NOT SEPARATE A CELL FROM THE MAPPING. It measured a
+    cell's gap against a curve fitted in-sample, and checked it on a validation
+    slice using that same curve - so the curve's own level error was present
+    identically in both and "validate agrees" confirmed the error reproduced,
+    not that the cell was distinctive. Measured afterwards, the mapping
+    over-predicted in all nine buckets by a mean of 0.0516, and the one arm it
+    had activated turned out to be about half mapping bias.
+
+    So every prediction here is made by a mapping that saw only EARLIER data,
+    and is de-biased using a slice that is itself earlier than the one being
+    tested:
+
+        fold k   curve fitted on folds 0..k-2
+                 per-bucket bias estimated on fold k-1
+                 cell residuals measured on fold k
+
+    Nothing grades its own homework, and the result does not depend on any
+    single holdout - which matters because a holdout, once inspected, is spent.
+
+    Folds are cut by MARKET and in time order, so no window straddles two.
+    """
+    ordered = sorted(rows, key=lambda r: (r["window_open"], r.get("side") or ""))
+    markets = sorted({r["window_open"] for r in ordered})
+    if len(markets) < folds * 2:
+        return {"cells": {}, "tested_folds": 0, "rows": 0}
+    size = len(markets) // folds
+    edges = [set(markets[i * size:(i + 1) * size]) for i in range(folds - 1)]
+    edges.append(set(markets[(folds - 1) * size:]))
+    slices = [[r for r in ordered if r["window_open"] in edge] for edge in edges]
+
+    residuals: dict[str, list[float]] = defaultdict(list)
+    days: dict[str, list[str]] = defaultdict(list)
+    tested = 0
+    for k in range(2, folds):
+        history = [r for part in slices[:k - 1] for r in part]
+        bias_rows = slices[k - 1]
+        test_rows = slices[k]
+        curve = reliability_curve(history)
+        if not curve.get("n"):
+            continue
+        bias = _bucket_bias(bias_rows, curve)
+        tested += 1
+        for row in test_rows:
+            points = row.get("model_points")
+            if points is None:
+                continue
+            predicted = predicted_probability(points, curve)
+            if predicted is None:
+                continue
+            adjusted = predicted + bias.get(_bucket(points), bias.get("mean", 0.0))
+            key = context_key_of(row)
+            residuals[key].append((1.0 if row.get("won") else 0.0) - adjusted)
+            days[key].append(day_of(row["window_open"]))
+
+    cells = {}
+    for key, values in residuals.items():
+        low, high = cluster_ci(values, days[key])
+        cells[key] = {
+            "n": len(values),
+            "days": len(set(days[key])),
+            "mean": round(sum(values) / len(values), 6),
+            "low": round(low, 6),
+            "high": round(high, 6),
+        }
+    return {
+        "cells": cells, "tested_folds": tested,
+        "rows": sum(len(v) for v in residuals.values()),
+    }
+
+
+def _bucket_bias(rows: list[dict], curve: dict) -> dict:
+    """The mapping's level error per bucket, measured on rows it never saw."""
+    groups: dict[int, list[int]] = defaultdict(list)
+    for row in rows:
+        points = row.get("model_points")
+        if points is not None:
+            groups[_bucket(points)].append(1 if row.get("won") else 0)
+    out: dict = {}
+    for key, outcomes in groups.items():
+        if len(outcomes) >= MIN_BUCKET_N:
+            predicted = curve["buckets"].get(key, curve["prior"])
+            out[key] = sum(outcomes) / len(outcomes) - predicted
+    out["mean"] = sum(
+        v for k, v in out.items() if k != "mean"
+    ) / max(1, len([k for k in out if k != "mean"]))
+    return out
+
+
 # --------------------------------------------------------------- fitting
 
 
@@ -277,6 +375,9 @@ class ArmFit:
     calibration_n: int = 0
     model_probability: float = 0.0
     validate_calibration: float | None = None
+    # The nested out-of-sample residual: the only thing a confidence
+    # delta may be sized from.
+    nested: dict = field(default_factory=dict)
     # THE MARKET's calibration: observed outcome minus the ask, which is what
     # Kalshi predicted. Reported, never applied - it says whether the PRICE is
     # right, which is a different claim from whether our confidence is.
@@ -325,6 +426,7 @@ class ArmFit:
             "calibration_low": round(self.calibration_low, 6),
             "calibration_high": round(self.calibration_high, 6),
             "calibration_n": self.calibration_n,
+            "nested": self.nested,
             "model_probability": round(self.model_probability, 6),
             "market_calibration": round(self.market_calibration, 6),
             "action": self.action, "gate": self.gate,
@@ -474,6 +576,9 @@ class TrainingReport:
     holdout_n: int = 0
     arms_fitted: int = 0
     arms_eligible_for_confidence: int = 0
+    nested_eligible_cells: int = 0
+    nested_folds: int = 0
+    nested_rows: int = 0
     arms_with_confidence: int = 0
     # How many confidence arms would survive the multiplicity widening the
     # EXECUTION bar applies. Reported because the confidence bar deliberately
@@ -567,6 +672,21 @@ def train(
     # THE CURVE IS FITTED ON TRAIN AND APPLIED UNCHANGED TO VALIDATE, so
     # the out-of-sample check is genuinely out of sample.
     curve = reliability_curve(train_rows)
+    # THE CONFIDENCE BAR RESTS ON THIS, not on the in-sample gap.
+    # Nested chronological folds, so every prediction comes from a
+    # mapping that saw only earlier data and is de-biased on a slice
+    # earlier still.
+    nested = nested_calibration(rows)
+    # How many cells the nested test could speak to at all. This is k
+    # for the multiplicity correction: the pool a significant cell was
+    # selected out of.
+    eligible_cells = sum(
+        1 for c in nested.get("cells", {}).values()
+        if c["n"] >= MIN_CONFIDENCE_N and c["days"] >= 2
+    )
+    report.nested_eligible_cells = eligible_cells
+    report.nested_folds = nested.get("tested_folds", 0)
+    report.nested_rows = nested.get("rows", 0)
     arms = fit_arms(train_rows, reward, curve=curve)
     validate_arms = fit_arms(validate_rows, reward, curve=curve)
     report.arms_fitted = len(arms)
@@ -589,7 +709,8 @@ def train(
         arm.validate_n = val.n if val else 0
         arm.validate_mean = round(val.mean, 6) if val else None
         arm.shrunk = shrink(arm.mean, arm.n, priors[arm.applies_to])
-        _calibrate_confidence(arm, validate_arms)
+        _calibrate_confidence(arm, validate_arms, nested,
+                              eligible_cells)
         _propose_execution(arm, priors, validate_arms, widening,
                            forward or {}, min_evidence)
         _count_error_directions(arm, train_rows, validate_rows)
@@ -655,7 +776,9 @@ def _proposed_action(arm: ArmFit, priors: dict) -> str:
     return NEUTRAL
 
 
-def _calibrate_confidence(arm: ArmFit, validate_arms: dict) -> None:
+def _calibrate_confidence(arm: ArmFit, validate_arms: dict,
+                          nested: dict | None = None,
+                          eligible_cells: int = 1) -> None:
     """May this cell re-rate what the operator is shown, and by how much?
 
     CONFIDENCE IS ABOUT WINNING, NOT ABOUT PROFIT. Those come apart, and
@@ -693,50 +816,75 @@ def _calibrate_confidence(arm: ArmFit, validate_arms: dict) -> None:
     arm.validate_calibration = (
         round(val.calibration, 6) if val is not None else None
     )
+    cell = (nested or {}).get("cells", {}).get(arm.key)
+    arm.nested = dict(cell) if cell else {}
     if arm.n < MIN_CONFIDENCE_N:
         arm.delta, arm.delta_reason = 0, (
             f"thin evidence for calibration (n={arm.n} < {MIN_CONFIDENCE_N})"
         )
         return
-    if arm.days < 2:
+    if not cell:
         arm.delta, arm.delta_reason = 0, (
-            f"evidence spans {arm.days} day; no interval can be formed"
+            "no nested out-of-sample evidence for this cell"
         )
         return
-    if arm.calibration_n < MIN_CONFIDENCE_N:
+    if cell["n"] < MIN_CONFIDENCE_N:
         arm.delta, arm.delta_reason = 0, (
-            f"only {arm.calibration_n} of {arm.n} rows carry a recorded model "
-            f"confidence; INSUFFICIENT EVIDENCE to calibrate it"
+            f"nested out-of-sample n={cell['n']} < {MIN_CONFIDENCE_N}: "
+            f"INSUFFICIENT EVIDENCE"
         )
         return
-    if not excludes_zero(arm.calibration_low, arm.calibration_high):
-        # INSUFFICIENT EVIDENCE, not proof the model is right. An interval
-        # spanning zero says this cell has not shown a measurable calibration
-        # error at this sample size; it does not say there is none.
+    if cell["days"] < 2:
         arm.delta, arm.delta_reason = 0, (
-            f"model calibration {arm.calibration:+.4f} interval "
-            f"[{arm.calibration_low:+.4f},{arm.calibration_high:+.4f}] spans "
-            f"zero: INSUFFICIENT EVIDENCE at n={arm.calibration_n}, not a "
-            f"finding that the score is correct"
+            f"nested evidence spans {cell['days']} day; no interval"
         )
         return
-    if val is None or val.n < MIN_VALIDATE_N:
+    # MULTIPLICITY APPLIES TO CONFIDENCE TOO.
+    #
+    # An earlier version of this argued it did not: a delta is computed for
+    # every eligible cell rather than the best of k being picked, so there was
+    # said to be no selection to correct. That was wrong, and the corrected
+    # method is what exposed it. A significance test decides WHICH cells get a
+    # non-zero delta, and keeping whichever of k cells clears an interval is
+    # k chances to be fooled however many cells were looked at. On this corpus
+    # 7 cells had nested evidence and 2 cleared at 95% - against 0.35 expected
+    # by chance, suggestive but not enough - and NEITHER survived the widening.
+    #
+    # The widening is the same sqrt(k) the execution bar uses, for the same
+    # reason. It was added on discovering the selection, which makes the bar
+    # stricter; relaxing a bar after seeing a result would be the other thing.
+    widening = max(1.0, math.sqrt(max(1, eligible_cells)))
+    if not _survives_widening(cell["low"], cell["high"], widening):
+        raw = "clears" if excludes_zero(cell["low"], cell["high"]) else "spans"
         arm.delta, arm.delta_reason = 0, (
-            f"calibration {arm.calibration:+.4f} not validated out of sample "
-            f"(validate n={val.n if val else 0} < {MIN_VALIDATE_N})"
+            f"nested residual {cell['mean']:+.4f} "
+            f"[{cell['low']:+.4f},{cell['high']:+.4f}] {raw} zero raw but does "
+            f"NOT survive multiplicity widening across {eligible_cells} "
+            f"examined cells: INSUFFICIENT EVIDENCE"
         )
         return
-    if (arm.calibration > 0) != (val.calibration > 0):
+    if not excludes_zero(cell["low"], cell["high"]):
+        # INSUFFICIENT EVIDENCE, and nothing more. The interval spanning zero
+        # says this cell has not been shown to deviate from the mapping at this
+        # sample size. It does not say the score is right, and it does not say
+        # why the mapping's level is off - out-of-sample miscalibration is what
+        # was measured; its cause was not.
         arm.delta, arm.delta_reason = 0, (
-            f"calibration {arm.calibration:+.4f} did not hold out of sample "
-            f"(validate {val.calibration:+.4f}, opposite sign)"
+            f"nested residual {cell['mean']:+.4f} "
+            f"[{cell['low']:+.4f},{cell['high']:+.4f}] spans zero over "
+            f"n={cell['n']}: INSUFFICIENT EVIDENCE that this cell deviates "
+            f"from the mapping, not a finding that the score is correct"
         )
         return
     # IN PROBABILITY POINTS, on the same 0-100 scale the confidence label is
     # scored in. A cell that wins five points more often than its price implies
     # moves the label by five. No dollar figure enters this.
+    # SCORE POINTS on the 0-100 confidence scale, sized from the nested
+    # residual. NOT a probability correction: the points -> frequency mapping
+    # is itself only validated as a RANKING out of sample, so a delta of -9 is
+    # nine points of score, not nine percentage points of win probability.
     arm.delta = max(-DELTA_CLAMP, min(DELTA_CLAMP,
-                                      int(round(arm.calibration * 100))))
+                                      int(round(cell["mean"] * 100))))
     # THE CALIBRATED PROBABILITY, shrunk toward the price. The price is the
     # market's own estimate and a good one (FINDINGS 36: no model beats the
     # ask), so a few hundred observations should move it a little, not replace
@@ -746,17 +894,17 @@ def _calibrate_confidence(arm: ArmFit, validate_arms: dict) -> None:
     )
     if arm.delta == 0:
         arm.delta_reason = (
-            f"model calibration {arm.calibration:+.4f} rounds to no change"
+            f"nested residual {cell['mean']:+.4f} rounds to no change"
         )
     else:
         arm.delta_reason = (
-            f"wins {arm.win_rate:.3f} where the model's own score predicted "
-            f"{arm.model_probability:.3f} ({arm.calibration:+.4f}) over "
-            f"n={arm.calibration_n} in {arm.days} days; interval "
-            f"[{arm.calibration_low:+.4f},{arm.calibration_high:+.4f}] clear "
-            f"of zero; validate n={val.n} {val.calibration:+.4f} agrees. "
-            f"[market, not applied: wins {arm.win_rate:.3f} against an ask of "
-            f"{arm.mean_ask:.3f}, {arm.market_calibration:+.4f}]"
+            f"SCORE adjustment (not a probability correction): nested "
+            f"out-of-sample residual {cell['mean']:+.4f} "
+            f"[{cell['low']:+.4f},{cell['high']:+.4f}] over n={cell['n']} in "
+            f"{cell['days']} days, clear of zero across "
+            f"{(nested or {}).get('tested_folds', 0)} chronological folds. "
+            f"[in-sample gap {arm.calibration:+.4f}; market, not applied: "
+            f"{arm.market_calibration:+.4f}]"
         )
 
 
