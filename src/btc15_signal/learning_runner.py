@@ -453,12 +453,26 @@ class LearningRunner:
             try:
                 from . import messages
 
-                await self.telegram.send(
-                    messages.learning_activated(
-                        policy=policy, report=report,
-                        comparison=outcome.comparison,
-                        reason=outcome.activation_reason,
-                    )
+                from .notify import Notifier
+
+                # THE SHARED SURFACE, and claimed before sending like every
+                # other money-adjacent event. `learning` is resent when a
+                # claim is left unresolved: a policy change the operator never
+                # saw is a change they cannot question.
+                notifier = Notifier(self.telegram, self.store, self.settings)
+                await notifier.send_once(
+                    "learning", str(policy.version),
+                    messages.learning_update(
+                        markets=int(report.get("markets") or 0),
+                        # COUNTS, not collections. `_confidence_arms` and
+                        # `_promoted_arms` already return ints; wrapping them
+                        # in len() raised TypeError inside the one handler
+                        # that swallows it, so the notification would have
+                        # gone missing with a line in the log.
+                        confidence_changes=int(outcome.confidence_arms or 0),
+                        entry_changes=int(outcome.promoted_arms or 0),
+                    ),
+                    now_ms,
                 )
             except Exception as exc:  # noqa: BLE001 - reporting is never fatal
                 print(f"learning activation report failed: {exc!r}", flush=True)

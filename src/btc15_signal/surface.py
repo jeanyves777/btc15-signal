@@ -141,7 +141,17 @@ def _typography(text: str) -> str:
 
     text = re.sub(r"(?<=\d)c(?![a-z])", "¢", text)
     text = re.sub(r"(?<=\d)x(?![a-z])", "×", text)
-    text = re.sub(r"(?<=\d)-(?=\d)", "–", text)
+    # ONLY A BARE NUMERIC RANGE. The previous rule was `(?<=\d)-(?=\d)`,
+    # which also rewrote the hyphen inside `KXBTC15M-26SEP231400-00` -
+    # corrupting the one field on the message that exists to be copied into a
+    # search box. A range must stand alone rather than sit inside a longer
+    # alphanumeric token, and a date like `2026-09-23` is left alone for the
+    # same reason.
+    text = re.sub(
+        r"(?<![\w-])(\d+)-(\d+)(?![\w-])",
+        lambda m: f"{m.group(1)}\u2013{m.group(2)}",
+        text,
+    )
     text = text.replace(" - needs ", " · minimum ")
     text = text.replace(" · needs ", " · minimum ")
     text = text.replace(" within ", " · range ")

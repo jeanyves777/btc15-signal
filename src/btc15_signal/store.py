@@ -234,6 +234,54 @@ def position_pnl(
 
 
 class Store:
+    # Every column delivery tracking reads or writes, in one place.
+    #
+    #   kind, event_key   the identity of the event  (composite primary key)
+    #   status            'pending' once claimed, 'sent' once the API returned
+    #   message_id        needed to EDIT a message rather than send another
+    #   body              what is on the screen, so an identical edit is a
+    #                     no-op instead of a second notification
+    #   first_ms          when the event was first claimed
+    #   updated_ms        when the row last changed
+    #
+    # THE DEFAULT IS 'sent', NOT 'pending'. Rows written before the column
+    # existed DID go out; defaulting them to pending would make every one of
+    # them an unresolved claim and resend the lot on the next startup.
+    DELIVERY_COLUMNS = {
+        "message_id": "INTEGER",
+        "body": "TEXT",
+        "status": "TEXT NOT NULL DEFAULT 'sent'",
+        "first_ms": "INTEGER",
+        "updated_ms": "INTEGER",
+    }
+
+    def _migrate_delivery(self) -> None:
+        """Bring `notifications` up to what delivery tracking needs.
+
+        `status` shipped inside `CREATE TABLE IF NOT EXISTS`, which adds
+        nothing to a table that already exists - so it reached every fresh
+        install and no live database. `begin_delivery` is the first statement
+        `send_once` runs and it sits OUTSIDE that method's try block, so on
+        the live system the first message after the deploy raised `no such
+        column: status` straight out of the poll loop.
+
+        Idempotent by construction: `_add_columns` checks `PRAGMA table_info`
+        first, so running this on every start costs one pragma and changes
+        nothing once it has run.
+
+        It runs HERE, in `_create`, which `__init__` calls - so no notifier,
+        no learning runner and no poll can reach the table before it.
+        """
+        self._add_columns("notifications", self.DELIVERY_COLUMNS)
+        # The insight rotation persists in `settings_text`; a message that
+        # cannot read its variant is a message that silently stops rotating.
+        self.db.execute("""
+            CREATE TABLE IF NOT EXISTS settings_text (
+                key TEXT PRIMARY KEY, text_value TEXT, updated_at INTEGER
+            )
+        """)
+        self.db.commit()
+
     def _add_columns(self, table: str, columns: dict[str, str]) -> None:
         """Add any missing columns to an existing table, idempotently.
 
@@ -708,6 +756,7 @@ class Store:
                 PRIMARY KEY (kind, event_key)
             )
         """)
+        self._migrate_delivery()
         self.db.execute("""
             CREATE TABLE IF NOT EXISTS settings_text (
                 key TEXT PRIMARY KEY, text_value TEXT, updated_at INTEGER

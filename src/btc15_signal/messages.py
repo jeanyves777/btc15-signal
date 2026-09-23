@@ -1926,6 +1926,121 @@ def exit_warning_message(*, ticker: str, side: str, price: float,
     )
 
 
+def recovery_armed_message(state, trigger: str = "", *, snapshot=None,
+                           insight: str = "") -> str:
+    """A realised loss opened a deficit, and sizing may now rise.
+
+    What it may rise BY is stated here rather than left to the reader: the
+    shipped rule adds ONE extra contract, resting 2c below a fill. It is not
+    a martingale and the message must not read like one.
+    """
+    return surface.compose(
+        header=f"{surface.RECOVERY} <b>RECOVERY ARMED</b>",
+        ticker="",
+        essentials=[
+            f"{surface.PRICE} <b>${state.deficit:,.2f}</b> outstanding",
+            f"<i>{escape(surface._typography(trigger))}</i>" if trigger else "",
+            f"{surface.TARGET} Plan: {max(1, state.steps)} step"
+            f"{'s' if max(1, state.steps) != 1 else ''} \u00b7 "
+            f"${state.required_per_trade():,.2f} a trade",
+            "<i>Base entries stay at one contract. Recovery may add ONE "
+            "extra contract, resting 2\u00a2 below a fill, and only while "
+            "the BRTI evidence still holds.</i>",
+        ],
+        checks=[],
+        status="",
+        snapshot=snapshot,
+        insight=insight,
+    )
+
+
+def recovery_size_ended_message(state, *, snapshot=None,
+                                insight: str = "") -> str:
+    """Sizing returns to base while the money is STILL MISSING.
+
+    Deliberately not the cleared message. That one says the deficit is back to
+    $0.00; this says the opposite - we are choosing to stop carrying extra
+    size while it comes back. Reporting the two alike would tell the operator
+    the account had recovered when it had not.
+
+    Counts and percentage are the real ones, never the thresholds that were
+    met: "4 winning trades - 50% recovered" printed on a cycle that reached
+    five wins and 63% would be a template, not a report.
+    """
+    recovered = f"{state.recovered_fraction:.0%} recovered"
+    if getattr(state, "seeded", False):
+        # The baseline was ADOPTED from a deficit already in flight, so the
+        # percentage measures progress against a migration starting point -
+        # not against the loss that originally opened the hole. Printing it
+        # bare would claim more than the number knows.
+        recovered += " of the carried-over balance"
+    return surface.compose(
+        header=f"{surface.RECOVERY} <b>RECOVERY SIZE ENDED</b>",
+        ticker="",
+        essentials=[
+            f"{surface.PASS} {state.wins} winning trade"
+            f"{'s' if state.wins != 1 else ''} \u00b7 {recovered}",
+            f"{surface.PRICE} <b>${state.deficit:,.2f}</b> still outstanding",
+            "<i>Continuing at normal base size.</i>",
+        ],
+        checks=[],
+        status="",
+        snapshot=snapshot,
+        insight=insight,
+    )
+
+
+def recovery_cleared_message(snapshot=None, *, insight: str = "") -> str:
+    """The money is back. Recovery stops immediately."""
+    return surface.compose(
+        header=f"{surface.PASS} <b>RECOVERY CLEARED</b>",
+        ticker="",
+        essentials=[
+            f"{surface.PRICE} Deficit back to <b>$0.00</b>",
+            "<i>Sizing returns to base. Any unfilled recovery add is "
+            "cancelled.</i>",
+        ],
+        checks=[],
+        status="",
+        snapshot=snapshot,
+        insight=insight,
+    )
+
+
+def session_close_message(*, session, day_snapshot, ny_day: str,
+                          insight: str = "") -> str:
+    """How that session went, then where the day stands.
+
+    The session is the news; the day is the context it belongs in, and it
+    comes from the same reconciled snapshot as every other message rather
+    than a second renderer with its own wording.
+    """
+    from .sessions import LABELS
+
+    rate = (session.winners / session.markets) if session.markets else 0.0
+    essentials = [
+        f"{surface.MONEY if session.dollars >= 0 else surface.PRICE} "
+        f"<b>{surface._signed_dollars(session.dollars)}</b> this session "
+        f"\u00b7 {session.markets} closed \u00b7 "
+        f"{session.winners}W\u2013{session.losers}L",
+    ]
+    if session.markets:
+        essentials.append(
+            f"<code>{bar(rate)}</code> <i>{rate:.0%} of this session won</i>"
+        )
+    return surface.compose(
+        header=f"\U0001f514 <b>"
+               f"{escape(LABELS.get(session.name, session.name))} "
+               f"SESSION CLOSED</b>",
+        ticker="",
+        essentials=essentials,
+        checks=[],
+        status=f"<i>{escape(ny_day)} \u00b7 New York accounting day</i>",
+        snapshot=day_snapshot,
+        insight=insight,
+    )
+
+
 def result_message(*, side: str, ticker: str, winner: str, won: bool,
                    traded: bool, pnl: float | None, contracts: float = 0.0,
                    paid: float | None = None, fee: float | None = None,
@@ -2055,20 +2170,27 @@ def learning_update(*, markets: int, confidence_changes: int,
     Policy ids, fingerprints, retired methods and training splits stay in the
     log and in `/learning` details. This message answers one question: did the
     rules the bot trades by change?
+
+    CONFIDENCE AND ENTRY RULES ARE SEPARATE LINES because they are separate
+    permissions. A confidence adjustment re-rates the word on the header and
+    can do nothing else; an entry-rule adjustment changes what is ordered.
+    Reporting them as one count - which `learning_activated` effectively did
+    by leading with an arm total - makes a label-only change read as a change
+    to how money is spent.
     """
     lines = [
         f"{surface.LEARNING} <b>LEARNING UPDATE</b>",
-        "",
-        f"\U0001f4da Reviewed: {markets:,} markets",
-        f"{surface.TARGET} Confidence changes: "
-        + (f"{confidence_changes}" if confidence_changes else "None"),
-        "\u2699\ufe0f Entry-rule changes: "
-        + (f"{entry_changes}" if entry_changes else "None"),
-        "",
+        f"\U0001f4da Reviewed: {markets:,} historical markets",
+        f"{surface.TARGET} Confidence: "
+        + (f"{confidence_changes} setup adjustment"
+           f"{'s' if confidence_changes != 1 else ''} enabled"
+           if confidence_changes else "Unchanged"),
+        "\u2699\ufe0f Entry rules: "
+        + (f"{entry_changes} adjustment"
+           f"{'s' if entry_changes != 1 else ''} enabled"
+           if entry_changes else "Unchanged"),
     ]
     if detail:
         lines.append(detail)
-    elif not confidence_changes and not entry_changes:
-        lines.append(f"{surface.PASS} Current trading rules remain unchanged.")
     lines.append("\U0001f504 Automatic learning continues.")
     return "\n".join(lines)

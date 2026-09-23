@@ -256,10 +256,9 @@ def test_the_learning_notification_keeps_identifiers_out():
     text = messages.learning_update(markets=6475, confidence_changes=0,
                                     entry_changes=0)
     assert "LEARNING UPDATE" in text
-    assert "Reviewed: 6,475 markets" in text
-    assert "Confidence changes: None" in text
-    assert "Entry-rule changes: None" in text
-    assert "Current trading rules remain unchanged." in text
+    assert "Reviewed: 6,475 historical markets" in text
+    assert "Confidence: Unchanged" in text
+    assert "Entry rules: Unchanged" in text
     assert "Automatic learning continues." in text
     # Policy ids, hashes, methods and splits belong in the log and /learning.
     for leak in ("kalshi-brti", "fingerprint", "arms-", "holdout", "brti-2"):
@@ -270,8 +269,18 @@ def test_a_learning_change_names_the_setup_and_what_changed():
     text = messages.learning_update(
         markets=6475, confidence_changes=1, entry_changes=0,
         detail="Confidence raised on 10–15× distance setups priced 85–93¢.")
-    assert "Confidence changes: 1" in text
+    assert "Confidence: 1 setup adjustment enabled" in text
     assert "10–15× distance setups priced 85–93¢" in text
+
+
+def test_confidence_and_entry_rules_are_reported_apart():
+    """A confidence adjustment re-rates a word on the header; an entry-rule
+    adjustment changes what is ordered. One count for both would make a
+    label-only change read as a change to how money is spent."""
+    text = messages.learning_update(markets=100, confidence_changes=3,
+                                    entry_changes=2)
+    assert "Confidence: 3 setup adjustments enabled" in text
+    assert "Entry rules: 2 adjustments enabled" in text
 
 
 # --------------------------------------------- 8. duplicate suppression

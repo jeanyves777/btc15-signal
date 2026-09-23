@@ -3288,19 +3288,31 @@ async def service() -> None:
                 # in silence.
                 try:
                     event, rstate = store.recovery_transition(now_ms)
-                    if event == "armed":
-                        last = store.last_realised_loss()
-                        await telegram.send(
-                            messages.recovery_armed(
+                    if event:
+                        notifier = Notifier(telegram, store, settings)
+                        # ONE snapshot for the message, taken once.
+                        money = notifier.snapshot(now_ms)
+                        if event == "armed":
+                            last = store.last_realised_loss()
+                            body = messages.recovery_armed_message(
                                 rstate,
-                                f"{last[0]} settled {last[1]:+.2f}" if last else "",
+                                f"{last[0]} settled {last[1]:+.2f}"
+                                if last else "",
+                                snapshot=money,
                             )
-                        )
-                    elif event == "size_ended":
-                        await telegram.send(messages.recovery_size_ended(rstate))
-                    elif event == "cleared":
-                        await telegram.send(
-                            messages.recovery_cleared(store.money_snapshot(now_ms))
+                        elif event == "size_ended":
+                            body = messages.recovery_size_ended_message(
+                                rstate, snapshot=money)
+                        else:
+                            body = messages.recovery_cleared_message(money)
+                        # KEYED ON THE CYCLE AND THE TRANSITION. A deficit can
+                        # arm, end sizing and clear more than once in a day,
+                        # and keying on the event alone would suppress the
+                        # second cycle's arm as a duplicate of the first.
+                        await notifier.send_once(
+                            "recovery",
+                            f"{getattr(rstate, 'cycle_id', '')}:{event}",
+                            body, now_ms,
                         )
                 except Exception as exc:  # noqa: BLE001 - reporting is never fatal
                     print(f"recovery report failed: {exc!r}", flush=True)
@@ -3322,12 +3334,15 @@ async def service() -> None:
                             from .sessions import SessionResult
 
                             result = SessionResult(closed, 0, 0, 0.0)
-                        await telegram.send(
-                            messages.session_close(
+                        notifier = Notifier(telegram, store, settings)
+                        await notifier.send_once(
+                            "session_close", f"{today_key}:{closed}",
+                            messages.session_close_message(
                                 session=result,
-                                day_snapshot=store.money_snapshot(now_ms),
+                                day_snapshot=notifier.snapshot(now_ms),
                                 ny_day=today_key,
-                            )
+                            ),
+                            now_ms,
                         )
                         store.mark_session_reported(today_key, closed, now_ms)
                     except Exception as exc:  # noqa: BLE001 - reporting is never fatal

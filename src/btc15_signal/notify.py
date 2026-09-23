@@ -95,17 +95,38 @@ class Notifier:
         send twice, silently" into "might leave a claim that is visibly
         unresolved", and `resolve_crash_window` then applies a stated per-kind
         policy to it at startup rather than any path here guessing.
+
+        IT NEVER RAISES. Reporting is not trading, and this is called from the
+        path that has just opened or closed a position. Whatever fails here -
+        the database, the network, Telegram itself - the claim is the durable
+        record and startup resolves it by policy; propagating the exception
+        would let a formatting or connectivity problem reach the code that
+        manages real money. The failure is printed, loudly, and returns False.
         """
-        if not self.store.begin_delivery(kind, key, now_ms):
+        try:
+            claimed = self.store.begin_delivery(kind, key, now_ms)
+        except Exception as exc:  # noqa: BLE001 - see the docstring
+            print(f"notify: could not claim {kind}/{key}: {exc!r}", flush=True)
+            return False
+        if not claimed:
             return False
         try:
             message_id = await self.telegram.send(text, buttons)
-        except Exception:
+        except Exception as exc:  # noqa: BLE001
             # The request may or may not have reached Telegram. Leaving the
             # claim as `pending` is the honest record: startup resolves it by
             # policy instead of this path guessing.
-            raise
-        self.store.confirm_delivery(kind, key, now_ms, message_id, text)
+            print(f"notify: send failed {kind}/{key}, claim left pending: "
+                  f"{exc!r}", flush=True)
+            return False
+        try:
+            self.store.confirm_delivery(kind, key, now_ms, message_id, text)
+        except Exception as exc:  # noqa: BLE001
+            # It WENT OUT. The row stays pending, which for a resending kind
+            # means one duplicate at the next startup - the cheaper of the two
+            # mistakes, and the one this policy already chose.
+            print(f"notify: sent {kind}/{key} but could not confirm: {exc!r}",
+                  flush=True)
         return True
 
     async def update_status(self, kind: str, key: str, text: str, now_ms: int,
@@ -118,19 +139,29 @@ class Notifier:
 
         Used for the waiting timer: the signal's own status line is rewritten
         as the band-hold advances, rather than a second message being sent.
+
+        It never raises, for the same reason `send_once` does not: this runs
+        on the poll that is deciding whether to order.
         """
-        record = self.store.delivered(kind, key)
+        try:
+            record = self.store.delivered(kind, key)
+        except Exception as exc:  # noqa: BLE001 - reporting is not trading
+            print(f"notify: could not read {kind}/{key}: {exc!r}", flush=True)
+            return False
         if record is None:
-            await self.send_once(kind, key, text, now_ms, buttons)
-            return True
+            return await self.send_once(kind, key, text, now_ms, buttons)
         if (record.get("body") or "") == text:
             return False          # the screen already says this
         message_id = record.get("message_id")
         if not message_id:
             return False
-        changed = await self.telegram.edit(message_id, text, buttons)
-        if changed:
-            self.store.update_delivered(kind, key, now_ms, text)
+        try:
+            changed = await self.telegram.edit(message_id, text, buttons)
+            if changed:
+                self.store.update_delivered(kind, key, now_ms, text)
+        except Exception as exc:  # noqa: BLE001
+            print(f"notify: edit failed {kind}/{key}: {exc!r}", flush=True)
+            return False
         return changed
 
     # MONEY EVENTS RESEND; TRANSIENT ONES DO NOT.
@@ -162,7 +193,12 @@ class Notifier:
         nag is dropped, because the next poll supersedes it and a stale
         duplicate is worse than a gap.
         """
-        return self.store.resolve_pending(self.RESEND_ON_AMBIGUITY, now_ms)
+        try:
+            return self.store.resolve_pending(self.RESEND_ON_AMBIGUITY, now_ms)
+        except Exception as exc:  # noqa: BLE001 - startup must not be blocked
+            print(f"notify: crash-window resolution failed: {exc!r}",
+                  flush=True)
+            return []
 
     async def deliver_result(self, window_open: int, kind: str, key: str,
                              text: str, now_ms: int) -> bool:

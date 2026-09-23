@@ -250,3 +250,104 @@ def test_closing_a_position_is_resent_when_a_claim_is_unresolved():
     assert "auto_exit" in Notifier.RESEND_ON_AMBIGUITY
     # The warning placed no order, and the next poll re-raises it.
     assert "exit_warning" not in Notifier.RESEND_ON_AMBIGUITY
+
+
+# ------------------------------------------ recovery and the session close
+
+def _state(**over):
+    from btc15_signal.store import RecoveryState
+    base = dict(active=True, deficit=1.87, markets=0, opened_ms=0, steps=2,
+                initial=1.87, cycle_id="c1", wins=0)
+    base.update(over)
+    return RecoveryState(**base)
+
+
+def test_recovery_armed_states_the_shipped_rule_not_a_martingale():
+    """"Recovery" is the deployed ONE extra contract at 2c below a fill, not
+    the rejected doubling. The message must not read like the latter."""
+    text = plain(messages.recovery_armed_message(_state(), "", snapshot=None))
+    assert "ONE extra contract" in text
+    assert "$1.87" in text
+    assert "double" not in text.lower()
+
+
+def test_size_ended_says_the_money_is_still_missing():
+    """It is deliberately NOT the cleared message. Reporting the two alike
+    tells the operator the account recovered when it has not."""
+    text = plain(messages.recovery_size_ended_message(
+        _state(deficit=0.93, wins=4), snapshot=None))
+    assert "still outstanding" in text
+    assert "$0.93" in text
+    assert "CLEARED" not in text
+
+
+def test_size_ended_reports_the_real_counts_not_the_thresholds():
+    """"4 winning trades - 50% recovered" printed on a cycle that reached
+    five wins and 63% would be a template, not a report."""
+    text = plain(messages.recovery_size_ended_message(
+        _state(deficit=0.70, wins=5, initial=1.87), snapshot=None))
+    assert "5 winning trades" in text
+    assert "4 winning" not in text
+
+
+def test_a_seeded_cycle_does_not_claim_the_original_loss():
+    text = plain(messages.recovery_size_ended_message(
+        _state(deficit=0.93, wins=4, seeded=True), snapshot=None))
+    assert "carried-over balance" in text
+
+
+def test_recovery_cleared_says_zero():
+    text = plain(messages.recovery_cleared_message(None))
+    assert "$0.00" in text
+    assert "outstanding" not in text
+
+
+def test_the_recovery_messages_carry_the_money_footer():
+    for text in (messages.recovery_armed_message(_state(), "", snapshot=None),
+                 messages.recovery_size_ended_message(_state(), snapshot=None),
+                 messages.recovery_cleared_message(None)):
+        assert surface.DIVIDER in text
+        assert "New York" not in text
+
+
+def test_the_session_close_uses_one_money_renderer():
+    from btc15_signal.sessions import SessionResult
+
+    text = plain(messages.session_close_message(
+        session=SessionResult("us", 5, 4, 1.41), day_snapshot=None,
+        ny_day="2026-09-23"))
+    assert "+$1.41 this session" in text
+    assert "New York accounting day" in text
+    # The OTHER renderer's wording must not appear beside it.
+    assert "Today (New York)" not in text
+
+
+def test_the_trading_loop_no_longer_calls_the_v1_recovery_builders():
+    for old in ("messages.recovery_armed(", "messages.recovery_size_ended(",
+                "messages.recovery_cleared(", "messages.session_close("):
+        assert old not in MAIN, f"{old} is still wired in"
+
+
+def test_a_recovery_transition_is_keyed_on_its_cycle():
+    """A deficit can arm, end sizing and clear more than once in a day.
+    Keying on the event alone suppresses the second cycle's arm as a
+    duplicate of the first."""
+    assert 'f"{getattr(rstate, \'cycle_id\', \'\')}:{event}"' in MAIN
+
+
+# ------------------------------------------------ typography vs identifiers
+
+def test_the_range_rule_leaves_a_ticker_alone():
+    r"""`(?<=\d)-(?=\d)` rewrote the hyphen inside
+    `KXBTC15M-26SEP231400-00`, corrupting the one field on the message that
+    exists to be copied into a search box."""
+    out = surface._typography("KXBTC15M-26SEP231400-00 settled -1.87")
+    assert out == "KXBTC15M-26SEP231400-00 settled -1.87"
+
+
+def test_the_range_rule_still_formats_a_range():
+    assert surface._typography("needs 70-93c").endswith("70–93¢")
+
+
+def test_the_range_rule_leaves_a_date_alone():
+    assert surface._typography("2026-09-23") == "2026-09-23"
