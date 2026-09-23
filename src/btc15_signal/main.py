@@ -1549,6 +1549,18 @@ def intelligence_verdict(
             / max(getattr(snapshot, "volatility_5m_bps", 1.0) or 1.0, 1.0),
             "our_ask": ask,
         }
+        # BINANCE CONTEXT, ON PURPOSE, AND IT MUST STAY THAT WAY.
+        #
+        # Two feature versions run side by side, each keyed by the features
+        # its own model was fitted to:
+        #
+        #   policy v1   Binance features -> context_of        (this line)
+        #   candidates  BRTI features    -> brti_context_of   (forward eval)
+        #
+        # "Unifying" them would hand the policy cells it was never trained on
+        # - a BRTI distance reads 10-20 where Binance reads 2-4 - and the key
+        # would still format, so nothing would fail. Each artefact carries a
+        # `feature_version`; match the key to that, never to the newer name.
         key = f"{context_of(row)}|{'accept' if rule_match else 'reject'}"
         gates = tuple(
             f["name"] for f in (failed_checks or []) if isinstance(f, dict)
