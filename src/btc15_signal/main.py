@@ -1935,10 +1935,24 @@ async def primary_signal(
             # The numbers, not just the label: "target distance" alone hides
             # whether it missed by a hair or by a mile, and overnight that is
             # the difference between a rule to tune and a rule that is working.
-            detail = rule.check_detail(
-                prediction, snapshot, contract_ask,
-                blocking_level=blocking_level, levels_ready=levels_ready,
-            )
+            # The KALSHI facts under kalshi_only. This was the fifth call site
+            # into the Binance rule, and it crashed the service every window
+            # from 00:21 to 05:04: `check_facts` compares
+            # `raw_probability >= min_raw_probability`, and that is None here.
+            # It is reached only on the auto path when a market is eligible
+            # and the rule then refuses it, which is why the first twenty
+            # minutes after the deploy looked clean.
+            if settings.kalshi_only:
+                detail = [
+                    (f["name"], f["passed"],
+                     f["pass_text"] if f["passed"] else f["fail_text"])
+                    for f in facts
+                ]
+            else:
+                detail = rule.check_detail(
+                    prediction, snapshot, contract_ask,
+                    blocking_level=blocking_level, levels_ready=levels_ready,
+                )
             verdict = "rule: " + "; ".join(
                 f"{name}({value})" for name, passed, value in detail if not passed
             )

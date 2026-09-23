@@ -243,3 +243,88 @@ def test_the_crash_handler_reports_where_not_only_the_type():
     source = handler.read_text()
     assert "extract_tb" in source
     assert "Service stopped: %s at %s" in source
+
+
+# ------------------- no Binance-rule call may be reached under kalshi_only
+
+def test_every_binance_rule_call_in_primary_signal_is_guarded():
+    """Five call sites, found one at a time, the last by a crash loop.
+
+    `rule` is the BINANCE EntryRule. Its `matches`, `check_facts` and
+    `check_detail` all compare `prediction.raw_probability >=
+    min_raw_probability`, and that is None on the Kalshi path. Every one is a
+    TypeError waiting for the right market state:
+
+      main.py:1766  matches       - the decision itself
+      main.py:1952  check_detail  - the auto-path refusal line. Reached ONLY
+                                    when a market is eligible and the rule
+                                    then refuses it, which is why the first
+                                    twenty minutes after deploy looked clean
+                                    and the service then crashed every window
+                                    from 00:21 to 05:04.
+      main.py:2196  check_facts   - the fill record
+      main.py:2305  check_facts   - the alert
+
+    Hunting them one at a time is not a method. This scans instead.
+    """
+    import inspect
+    import re
+
+    source = inspect.getsource(m.primary_signal)
+    lines = source.splitlines()
+
+    def guarded(index: int) -> bool:
+        """Is this call reachable only when kalshi_only is False?
+
+        Two shapes count and nothing else does:
+          * an inline conditional on this line or the one above
+          * an `else:` whose matching `if` tests kalshi_only, located by
+            walking back to the nearest line at LOWER indentation
+
+        Indentation rather than a fixed window, so a long branch cannot make
+        a genuinely unguarded call look safe merely by sitting near the word.
+        """
+        line = lines[index]
+        if "kalshi_only" in line or "kalshi_only" in lines[index - 1]:
+            return True
+        indent = len(line) - len(line.lstrip())
+        for j in range(index - 1, -1, -1):
+            candidate = lines[j]
+            if not candidate.strip():
+                continue
+            here = len(candidate) - len(candidate.lstrip())
+            if here >= indent:
+                continue
+            if candidate.strip() != "else:":
+                return False
+            for k in range(j - 1, -1, -1):          # the matching `if`
+                probe = lines[k]
+                if not probe.strip():
+                    continue
+                probe_indent = len(probe) - len(probe.lstrip())
+                if probe_indent == here and probe.strip().startswith("if "):
+                    return "kalshi_only" in probe
+                if probe_indent < here:
+                    return False
+            return False
+        return False
+
+    unguarded = [
+        (i, line.strip()) for i, line in enumerate(lines)
+        if re.search(r"\brule\.(matches|check_facts|check_detail)\b", line)
+        and not guarded(i)
+    ]
+    assert not unguarded, f"unguarded Binance-rule calls: {unguarded}"
+
+
+def test_the_auto_refusal_line_renders_from_kalshi_facts(tmp_path):
+    """The exact state that crashed: a market inside the actionable band that
+    the rule then refuses. Drive it and require no exception."""
+    settings, store, telegram = run(
+        tmp_path, dist=2.0,                    # below the 10x floor -> refused
+        contract=Contract(0.78, 0.80),         # but inside the price band
+        auto_trade_enabled=True,               # so the auto path is taken
+    )
+    rows = store._dicts("SELECT * FROM predictions WHERE window_open=?", (OPENED,))
+    assert rows and rows[0]["qualified"] == 0
+    assert rows[0]["failed_gates"], "the refusal reason must be recorded"

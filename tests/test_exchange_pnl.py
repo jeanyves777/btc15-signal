@@ -21,26 +21,44 @@ from btc15_signal.execution import KalshiExecutionClient  # noqa: E402
 
 pnl = KalshiExecutionClient.settlement_pnl
 
+
+def todays_ticker(hhmm: str) -> str:
+    """A ticker on the CURRENT New York accounting day.
+
+    `realised_record` reports TODAY, and the day comes from the ticker via
+    `market_open_ms`. Hard-coded `26SEP22` tickers therefore made these tests
+    pass only on 2026-09-22 and fail silently at the next midnight - which is
+    exactly what happened. The date is derived so the test asserts the
+    behaviour rather than the calendar.
+    """
+    import datetime as dt
+
+    from btc15_signal.capital import ny_day
+
+    today = ny_day(int(dt.datetime.now(dt.UTC).timestamp() * 1000))
+    stamp = dt.datetime.strptime(today, "%Y-%m-%d").strftime("%y%b%d").upper()
+    return f"KXBTC15M-{stamp}{hhmm}"
+
 # KXBTC15M-26SEP220615-15, exactly as the API returned it. Bought 2 NO for
 # $1.60, closed by buying 2 YES for $0.012 (i.e. sold the NO at 0.994).
 # `market_result` is "no" and `revenue` is 0, because nothing survived to
 # settle - the pair was netted at $1 each when the closing trade filled.
 CLOSED_EARLY = {
-    "ticker": "KXBTC15M-26SEP220615-15", "market_result": "no",
+    "ticker": todays_ticker("0615-15"), "market_result": "no",
     "yes_count_fp": "2.00", "yes_total_cost_dollars": "0.012000",
     "no_count_fp": "2.00", "no_total_cost_dollars": "1.600000",
     "revenue": 0, "value": 0, "fee_cost": "0.023300",
 }
 # KXBTC15M-26SEP220415-15: 2 YES for $1.78, held to settlement, result "yes".
 HELD_WINNER = {
-    "ticker": "KXBTC15M-26SEP220415-15", "market_result": "yes",
+    "ticker": todays_ticker("0415-15"), "market_result": "yes",
     "yes_count_fp": "2.00", "yes_total_cost_dollars": "1.780000",
     "no_count_fp": "0.00", "no_total_cost_dollars": "0.000000",
     "revenue": 200, "value": 100, "fee_cost": "0.013800",
 }
 # A held loser: 1 YES for $0.79, result "no", nothing paid back.
 HELD_LOSER = {
-    "ticker": "KXBTC15M-26SEP220630-30", "market_result": "no",
+    "ticker": todays_ticker("0630-30"), "market_result": "no",
     "yes_count_fp": "1.00", "yes_total_cost_dollars": "0.790000",
     "no_count_fp": "0.00", "no_total_cost_dollars": "0.000000",
     "revenue": 0, "value": 0, "fee_cost": "0.011700",
