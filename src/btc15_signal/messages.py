@@ -61,17 +61,16 @@ def recovery_line(state, last_add: dict | None = None) -> str:
     """
     if state is None:
         return ""
-    # STOOD DOWN IS NOT CLEARED, and the difference must be on the screen.
+    # SIZE ENDED IS NOT CLEARED, and the difference must be on the screen.
     # `active` means "may upsize"; money can still be owed with the upsize
     # off, and going silent there would read as "paid back".
-    if getattr(state, "stood_down", False) and getattr(state, "owes", False):
+    if getattr(state, "base_only", False) and getattr(state, "owes", False):
         return (
-            f"\U0001f6d1 <b>Recovery stood down</b> · "
+            f"\U0001f527 <b>Recovery size ended</b> · "
             f"${state.deficit:,.2f} still outstanding · "
-            f"{state.recovered_fraction:.0%} of the "
-            f"${state.peak:,.2f} peak recovered\n"
-            f"   <i>base size from here - the upsize is most dangerous "
-            f"where it looks nearly finished</i>"
+            f"{state.wins} winning trades · "
+            f"{state.recovered_fraction:.0%} recovered\n"
+            f"   <i>continuing at normal base size</i>"
         )
     if not getattr(state, "active", False):
         return ""
@@ -186,26 +185,24 @@ def recovery_armed(state, trigger: str = "") -> str:
     return "\n".join(x for x in body if x != "")
 
 
-def recovery_stood_down(state, snapshot) -> str:
-    """Announced when the UPSIZE stops early, with money still outstanding.
+def recovery_size_ended(state) -> str:
+    """The ONE transition message, in the operator's own layout.
 
     Deliberately not the CLEARED message. That one says the deficit is back
-    to $0.00; this one says the opposite - the money is still missing, and we
-    are choosing to stop chasing it at double size. Reporting the two the
-    same way would tell the operator the account had recovered when it had
+    to $0.00; this says the opposite - the money is still missing and we are
+    choosing to stop carrying doubled size while it comes back. Reporting the
+    two alike would tell the operator the account had recovered when it had
     not.
+
+    Counts and percentage are the real ones, never the thresholds that were
+    met: "4 winning trades - 50% recovered" printed on a cycle that reached
+    five wins and 63% would be a template, not a report.
     """
     return "\n".join([
-        f"🛑 <b>RECOVERY STOOD DOWN</b> · "
-        f"${state.deficit:,.2f} still outstanding",
-        f"<i>{state.recovered_fraction:.0%} of the ${state.peak:,.2f} peak "
-        f"recovered over {state.wins} win(s).</i>",
-        "",
-        "Sizing returns to base and any unfilled recovery add is cancelled. "
-        "The deficit stays on the books and ordinary wins keep paying it "
-        "down - the upsize is most dangerous where it looks nearly finished.",
-        "",
-        _money_block(snapshot),
+        "\U0001f527 <b>RECOVERY SIZE ENDED</b>",
+        f"{state.wins} winning trades · {state.recovered_fraction:.0%} recovered",
+        f"Remaining deficit: ${state.deficit:,.2f}",
+        "Continuing at normal base size.",
     ])
 
 

@@ -320,6 +320,7 @@ class RecoveryAddRunner:
             crossed_since_entry=bool(crossed),
             remaining_s=remaining_s,
             recovery_active=state.active,
+            recovery_owes=state.owes,
             base_position_open=position is not None,
             limits=self._limits,
         )

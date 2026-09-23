@@ -1,108 +1,119 @@
-"""When to STOP recovering, even though money is still missing.
+"""When recovery SIZING ends, before the deficit is repaid.
 
-THE OPERATOR'S RULE, and the reasoning behind it.
+THE OPERATOR'S RULE, as specified.
 
-Recovery arms on a realised deficit and upsizes the next qualifying trade.
-Left alone it stays armed until the deficit reaches zero, which means the
-upsize is still on the book at the moment a loss is most expensive: late in a
-recovery, the remaining deficit is small, but the position is still double
-size, so one loss more than undoes the run of wins that got you there. That
-is the loop - recover, lose bigger, recover again - and it is what this
-module exists to break.
+    End recovery sizing when BOTH conditions are met:
+      * four profitable, fully closed market positions since the cycle began
+      * at least 50% of the cycle's INITIAL deficit recovered, net of fees
+        and subsequent realised losses
 
-    "Even if after a 50% recovery of the initial loss, turn off recovery -
-     that's enough, because we've seen that even regular size is able to
-     recover on its own."
+Both, not either. Four wins that have barely moved the deficit leave real
+ground to make up; half the money back after one lucky market says nothing
+about whether the run is stable. The rule fires where the two agree.
 
-So recovery stands down early, on either of two conditions:
+    "This is an exposure-reduction rule - not a claim that a loss becomes
+     more likely after four wins."
 
-    HALFWAY     recovered >= 50% of the peak deficit
-    PATIENCE    4 wins into the epoch and recovered >= 40%
+That framing matters for how the code is written. Nothing here predicts
+anything. It caps how long the account carries doubled size, which is a
+statement about exposure, not about the market.
 
-The second exists because a long grind of small wins is exactly the state in
-which the next loss hurts most: many trades have gone by, the upsize has been
-riding all of them, and the deficit has barely moved.
+COUNTING.
 
-WHAT "TURN OFF" MEANS, PRECISELY. It stops the UPSIZE. It does NOT zero the
-deficit, and it must never be implemented that way: the money really is still
-missing, and writing it off would make the ledger lie about the account. The
-deficit stays on the books, keeps being reduced by ordinary base-size wins,
-and clears when it genuinely reaches zero. `stood_down` is a separate flag
-answering a separate question - "may we upsize?" - from "is money owed?".
+  * A MARKET counts once. Base and add-on fills on the same ticker are one
+    position with one outcome, and counting contracts or fills would reach
+    four on a single market that happened to be filled twice.
+  * Wins need not be consecutive. A loss in between does not reset the count.
+  * Progress counts EVERY realised trade, base-size or upsized alike. The
+    ledger does not record which size won the money back and it does not
+    matter.
+  * The denominator is the cycle's INITIAL deficit - the hole this cycle
+    opened with. Subsequent losses reduce the measured progress because they
+    add to what is still owed, which is what "net of subsequent realised
+    losses" means.
 
-ONCE DOWN, IT STAYS DOWN for the rest of the epoch. Re-arming on the next
-loss would rebuild the loop this is meant to prevent. The epoch ends when the
-deficit actually clears, and a future loss arms recovery again normally.
+WHAT ENDING MEANS. The UPSIZE stops. The deficit is preserved in the ledger,
+is not erased, and is never announced as a full recovery. Base-size profits
+clear the remainder. A new loss in that base-only phase is recorded in the
+deficit but does NOT reactivate sizing or reset the win counter - reactivating
+is the loop this exists to prevent. When the deficit genuinely reaches zero
+the cycle closes, and a later loss opens a fresh one.
+
+Full recovery remains an immediate end in its own right, even before four
+wins: there is nothing left to size for.
 """
 
 from dataclasses import dataclass
 
-# Recovered fraction that is "enough" on its own.
+# Fraction of the cycle's INITIAL deficit that must be back. The operator set
+# 50% as the default and 40-60% as the range within which it may be tuned;
+# values outside that are refused rather than silently clamped, because a
+# threshold nobody intended is worse than an error.
 EXIT_FRACTION = 0.50
-# After this many realised wins in the epoch, a lower bar applies.
-PATIENCE_WINS = 4
-PATIENCE_FRACTION = 0.40
+FRACTION_MIN = 0.40
+FRACTION_MAX = 0.60
+REQUIRED_WINS = 4
 
 
 @dataclass(frozen=True)
 class ExitDecision:
-    stand_down: bool
+    end_sizing: bool
     reason: str
     recovered_fraction: float = 0.0
+    wins: int = 0
 
     def __bool__(self) -> bool:
-        return self.stand_down
+        return self.end_sizing
 
 
-def recovered_fraction(peak: float, deficit: float) -> float:
-    """How much of the worst point has been won back, as 0.0-1.0.
+def recovered_fraction(initial: float, deficit: float) -> float:
+    """How much of the cycle's opening hole is back, as 0.0-1.0.
 
-    Measured against the PEAK of this epoch, not the opening deficit. A loss
-    part-way through recovery raises the peak, so progress is always judged
-    against the deepest hole actually dug - otherwise a fresh loss would make
-    the percentage jump backwards and the exit rule would fire on arithmetic
-    rather than on progress.
+    Net of subsequent losses by construction: a loss raises `deficit`, which
+    lowers this. Clamped at zero so a cycle now deeper than it started reads
+    as no progress rather than a negative percentage.
     """
-    if peak <= 0:
+    if initial <= 0:
         return 0.0
-    return max(0.0, min(1.0, (peak - max(0.0, deficit)) / peak))
+    return max(0.0, min(1.0, (initial - max(0.0, deficit)) / initial))
+
+
+def validate_fraction(fraction: float) -> float:
+    """Inside the operator's 40-60% range, or raise."""
+    if not FRACTION_MIN <= fraction <= FRACTION_MAX:
+        raise ValueError(
+            f"recovery exit fraction {fraction} is outside the "
+            f"{FRACTION_MIN:.0%}-{FRACTION_MAX:.0%} range the operator set"
+        )
+    return fraction
 
 
 def decide(
-    peak: float,
+    initial: float,
     deficit: float,
     wins: int,
     *,
     exit_fraction: float = EXIT_FRACTION,
-    patience_wins: int = PATIENCE_WINS,
-    patience_fraction: float = PATIENCE_FRACTION,
+    required_wins: int = REQUIRED_WINS,
     enabled: bool = True,
 ) -> ExitDecision:
-    """Should recovery sizing stand down now?
+    """Should recovery SIZING end now? Pure, so replay and live agree.
 
-    Pure, so the live path and any replay reach the same answer from the same
-    three numbers.
+    `wins` is a count of distinct profitable closed MARKETS in this cycle.
     """
-    fraction = recovered_fraction(peak, deficit)
+    fraction = recovered_fraction(initial, deficit)
     if not enabled:
-        return ExitDecision(False, "partial exit disabled", fraction)
-    if peak <= 0 or deficit <= 0:
-        # Nothing owed: there is nothing to stand down FROM, and saying so
-        # keeps "cleared" and "stood down" from being confused in the logs.
-        return ExitDecision(False, "", fraction)
-    if fraction >= exit_fraction:
-        return ExitDecision(
-            True,
-            f"recovered {fraction:.0%} of the {peak:.2f} peak "
-            f"(>= {exit_fraction:.0%}); base size recovers the rest",
-            fraction,
-        )
-    if wins >= patience_wins and fraction >= patience_fraction:
-        return ExitDecision(
-            True,
-            f"{wins} wins into recovery and {fraction:.0%} back "
-            f"(>= {patience_fraction:.0%} after {patience_wins}); "
-            f"not risking the upsize on the next loss",
-            fraction,
-        )
-    return ExitDecision(False, "", fraction)
+        return ExitDecision(False, "partial exit disabled", fraction, wins)
+    if initial <= 0 or deficit <= 0:
+        # Nothing owed. Full recovery ends the cycle on its own path, and
+        # saying "ended early" there would confuse repaid with stood down.
+        return ExitDecision(False, "", fraction, wins)
+    if wins < required_wins or fraction < exit_fraction:
+        return ExitDecision(False, "", fraction, wins)
+    return ExitDecision(
+        True,
+        f"{wins} winning markets and {fraction:.0%} of the "
+        f"${initial:,.2f} deficit recovered",
+        fraction,
+        wins,
+    )

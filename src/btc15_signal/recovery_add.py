@@ -194,6 +194,7 @@ def should_cancel(
     recovery_active: bool,
     base_position_open: bool,
     limits: AddLimits,
+    recovery_owes: bool = False,
 ) -> tuple[bool, str]:
     """A resting add must be killed the moment its justification goes.
 
@@ -204,7 +205,14 @@ def should_cancel(
     if not base_position_open:
         return True, "base position is no longer open"
     if not recovery_active:
-        return True, "recovery completed"
+        # TWO WAYS TO BE INACTIVE, and they are not the same event. "Completed"
+        # means the money came back; a base-only cycle still owes it and only
+        # the sizing ended. Recording the wrong one would put a false
+        # repayment in the add-on's audit trail.
+        return True, (
+            "recovery sizing ended; deficit still outstanding"
+            if recovery_owes else "recovery completed"
+        )
     if remaining_s < limits.min_seconds_remaining:
         return True, "past the add-entry deadline"
     if features is None:

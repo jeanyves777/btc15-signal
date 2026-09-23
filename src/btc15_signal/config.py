@@ -389,9 +389,11 @@ class Settings(BaseSettings):
     # Standing down NEVER zeroes the deficit. The money is still missing and
     # the ledger keeps saying so; only the upsize stops. See `recovery_exit`.
     recovery_partial_exit_enabled: bool = True
-    recovery_exit_fraction: float = 0.50       # halfway is enough on its own
-    recovery_exit_patience_wins: int = 4       # after this many wins...
-    recovery_exit_patience_fraction: float = 0.40   # ...40% is enough
+    # BOTH must hold. Four wins that barely moved the deficit leave real
+    # ground to make up; half the money back after one lucky market says
+    # nothing about whether the run is stable.
+    recovery_exit_fraction: float = 0.50       # of the cycle's INITIAL deficit
+    recovery_exit_required_wins: int = 4       # distinct profitable MARKETS
     # OFF. Recovery buys no larger BASE position; it acts only through the
     # conditional add-on, which rests ONE extra contract 2c below the actual
     # fill and only while the BRTI evidence holds. With both on they stack:

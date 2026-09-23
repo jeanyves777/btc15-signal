@@ -33,30 +33,34 @@ DEFICIT_CLEARED = 0.005
 
 
 def replay(events, enabled: bool):
-    """Walk the realised record, tracking the epoch exactly as the store does."""
-    deficit = peak = 0.0
-    wins = 0
-    stood_down = False
-    upsized_while_armed = []      # (ticker, amount) folded while recovery armed
-    stand_downs = []
+    """Walk the realised record, tracking the cycle exactly as the store does.
+
+    Wins are counted per MARKET, matching `recovery_cycle_wins`: base and
+    add-on on one ticker are one position with one outcome.
+    """
+    deficit = initial = 0.0
+    won_tickers: set[str] = set()
+    base_only = False
+    upsized_while_armed = []      # (ticker, amount) folded while sizing was on
+    ended = []
     for ticker, amount in events:
-        armed = deficit > 0 and not stood_down
-        if armed:
+        if deficit > 0 and not base_only:
             upsized_while_armed.append((ticker, amount))
         if deficit > 0 and amount > 0:
-            wins += 1
+            won_tickers.add(ticker)
         deficit = max(0.0, deficit - amount)
-        peak = max(peak, deficit)
+        if deficit > 0 and initial <= 0:
+            initial = deficit
         if deficit < DEFICIT_CLEARED:
-            deficit = peak = 0.0
-            wins, stood_down = 0, False
+            deficit = initial = 0.0
+            won_tickers, base_only = set(), False
             continue
-        if enabled and deficit > 0 and not stood_down:
-            decision = recovery_exit.decide(peak, deficit, wins)
-            if decision.stand_down:
-                stood_down = True
-                stand_downs.append((ticker, deficit, peak, wins))
-    return upsized_while_armed, stand_downs
+        if enabled and deficit > 0 and not base_only:
+            decision = recovery_exit.decide(initial, deficit, len(won_tickers))
+            if decision.end_sizing:
+                base_only = True
+                ended.append((ticker, deficit, initial, len(won_tickers)))
+    return upsized_while_armed, ended
 
 
 def main() -> None:

@@ -1,23 +1,17 @@
-"""Recovery stands down early, and standing down is not the same as repaid.
+"""Recovery SIZING ends before the deficit is repaid, on the operator's rule.
 
-The operator's rule, and it is a requirement rather than a proposal:
+    End recovery sizing when BOTH are met:
+      * four profitable, fully closed market positions since the cycle began
+      * at least 50% of the cycle's INITIAL deficit recovered, net of fees and
+        subsequent realised losses
 
-    "Although we trigger the recovery after a certain set of wins - one, two,
-     three, four wins - we should not stay at a recovery size, because there
-     is a likelihood of a losing trade to come in and that will set us back.
-     Even after a 50% recovery of the initial loss, turn off recovery. That's
-     enough, because we've seen that even regular size is able to recover on
-     its own."
+It is an exposure-reduction rule, not a claim that a loss becomes more likely
+after four wins. Nothing here predicts anything; it caps how long the account
+carries doubled size.
 
-The failure mode being prevented: late in a recovery the remaining deficit is
-small but the position is still double size, so one loss more than undoes the
-run of wins that got there - and arms recovery again, deeper. Recover, lose
-bigger, recover. The upsize is most dangerous exactly where it looks nearly
-finished.
-
-The line these tests defend hardest is that standing down must NOT zero the
-deficit. The money is still missing; writing it off would make the ledger lie
-about the account.
+The line these tests defend hardest: ending sizing must NOT erase the deficit
+or announce a full recovery. The money is still missing and the ledger has to
+keep saying so.
 """
 
 import sys
@@ -25,211 +19,366 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from btc15_signal import recovery_exit  # noqa: E402
+from btc15_signal import messages, recovery_exit  # noqa: E402
 from btc15_signal.store import Store  # noqa: E402
 
 NOW = 1_790_000_000_000
 
 
-# ------------------------------------------------------------ the rule
+# ---------------------------------------------------- the rule, in isolation
 
-def test_halfway_is_enough_on_its_own():
-    d = recovery_exit.decide(peak=2.00, deficit=1.00, wins=1)
-    assert d.stand_down
-    assert "50%" in d.reason
-
-
-def test_just_under_halfway_is_not_enough():
-    d = recovery_exit.decide(peak=2.00, deficit=1.02, wins=1)
-    assert not d.stand_down
+def test_both_conditions_are_required():
+    """AND, not OR. Either alone leaves the upsize on."""
+    assert not recovery_exit.decide(initial=2.00, deficit=1.40, wins=4)
+    assert not recovery_exit.decide(initial=2.00, deficit=0.80, wins=3)
+    assert recovery_exit.decide(initial=2.00, deficit=0.80, wins=4)
 
 
-def test_four_wins_lowers_the_bar_to_forty_percent():
-    """A long grind of small wins is the state in which the next loss hurts
-    most: many trades have gone by with the upsize riding all of them."""
-    assert not recovery_exit.decide(peak=2.00, deficit=1.25, wins=3).stand_down
-    d = recovery_exit.decide(peak=2.00, deficit=1.20, wins=4)
-    assert d.stand_down
-    assert "4 wins" in d.reason
+def test_the_boundaries_are_inclusive():
+    """Exactly four wins and exactly 50% must fire - a rule that needs a
+    fraction more than it states is not the rule that was specified."""
+    assert recovery_exit.decide(initial=2.00, deficit=1.00, wins=4)
+    assert not recovery_exit.decide(initial=2.00, deficit=1.0001, wins=4)
+    assert not recovery_exit.decide(initial=2.00, deficit=1.00, wins=3)
 
 
-def test_four_wins_does_not_fire_below_forty_percent():
-    """Patience is not a licence: four wins that barely moved the deficit
-    leave the upsize on, because there is still real ground to make up."""
-    assert not recovery_exit.decide(peak=2.00, deficit=1.70, wins=4).stand_down
+def test_the_fraction_is_configurable_inside_the_operators_range():
+    assert recovery_exit.decide(initial=2.00, deficit=1.15, wins=4,
+                                exit_fraction=0.40)
+    assert not recovery_exit.decide(initial=2.00, deficit=1.15, wins=4,
+                                    exit_fraction=0.60)
+    assert recovery_exit.validate_fraction(0.40) == 0.40
+    assert recovery_exit.validate_fraction(0.60) == 0.60
 
 
-def test_nothing_owed_is_not_a_stand_down():
-    """Cleared and stood-down are different states and must not share a
-    message - one means the money came back, the other that it did not."""
-    d = recovery_exit.decide(peak=2.00, deficit=0.0, wins=9)
-    assert not d.stand_down and d.reason == ""
+def test_a_fraction_outside_the_range_is_refused_not_clamped():
+    """A threshold nobody intended is worse than an error."""
+    import pytest
+
+    for bad in (0.10, 0.39, 0.61, 0.95):
+        with pytest.raises(ValueError):
+            recovery_exit.validate_fraction(bad)
 
 
-def test_progress_is_measured_against_the_PEAK_not_the_opening_deficit():
-    """A loss part-way through deepens the hole. Judging against the original
-    figure would make the percentage jump on arithmetic rather than money."""
-    assert recovery_exit.recovered_fraction(peak=4.00, deficit=2.00) == 0.5
-    # Same dollars owed, deeper hole dug -> less of it recovered.
-    assert recovery_exit.recovered_fraction(peak=8.00, deficit=2.00) == 0.75
-    assert recovery_exit.recovered_fraction(peak=0.0, deficit=1.0) == 0.0
+def test_progress_is_net_of_subsequent_losses():
+    """The denominator is the cycle's OPENING deficit. A later loss raises
+    what is outstanding and so lowers the percentage."""
+    assert recovery_exit.recovered_fraction(initial=4.00, deficit=2.00) == 0.5
+    assert recovery_exit.recovered_fraction(initial=4.00, deficit=5.00) == 0.0
+    assert recovery_exit.recovered_fraction(initial=0.0, deficit=1.0) == 0.0
+
+
+def test_nothing_owed_is_not_an_early_end():
+    """Full recovery closes the cycle on its own path. Reporting it as an
+    early end would confuse repaid with stood down."""
+    d = recovery_exit.decide(initial=2.00, deficit=0.0, wins=9)
+    assert not d.end_sizing and d.reason == ""
 
 
 def test_it_can_be_switched_off():
-    d = recovery_exit.decide(peak=2.0, deficit=0.5, wins=9, enabled=False)
-    assert not d.stand_down and "disabled" in d.reason
+    d = recovery_exit.decide(initial=2.0, deficit=0.5, wins=9, enabled=False)
+    assert not d.end_sizing and "disabled" in d.reason
 
 
-# ------------------------------------------- standing down is not repaying
+# ------------------------------------------------------------- the ledger
 
-def fold(store, amounts, start_ms=NOW):
-    """Realise a sequence of P&L amounts, one market each."""
-    for i, amount in enumerate(amounts):
+def realise(store, rows, start_ms=NOW):
+    """Realise (ticker, amount) pairs, net of fees as the ledger records."""
+    for i, (ticker, amount) in enumerate(rows):
         store.db.execute(
-            "INSERT INTO realised_events (event_id, ticker, amount, "
+            "INSERT OR IGNORE INTO realised_events (event_id, ticker, amount, "
             "realised_ms, source, recorded_ms) VALUES (?,?,?,?,?,?)",
-            (f"e{i}-{amount}", f"T{i}", amount, start_ms + i * 1000,
+            (f"{ticker}:{i}:{amount}", ticker, amount, start_ms + i * 1000,
              "settlement", start_ms + i * 1000),
         )
     store.db.commit()
-    return store.apply_realised_to_deficit(start_ms + 10_000)
+    return store.apply_realised_to_deficit(start_ms + 60_000)
 
 
-def test_a_loss_arms_recovery(tmp_path):
+def wins4(each=0.30):
+    return [(f"W{i}", each) for i in range(4)]
+
+
+def test_a_loss_opens_a_cycle(tmp_path):
     store = Store(str(tmp_path / "t.db"))
-    state = fold(store, [-2.00])
-    assert state.deficit == 2.00
-    assert state.active, "recovery arms on a realised loss"
-    assert state.peak == 2.00
+    state = realise(store, [("LOSS", -2.00)])
+    assert state.deficit == 2.00 and state.initial == 2.00
+    assert state.active and state.cycle_id
+    assert state.wins == 0
 
 
-def test_recovery_stands_down_at_halfway_but_still_owes(tmp_path):
-    """THE CENTRAL GUARANTEE. The upsize stops; the debt does not vanish."""
+def test_four_wins_and_half_back_ends_sizing_but_keeps_the_deficit(tmp_path):
+    """THE CENTRAL GUARANTEE."""
     store = Store(str(tmp_path / "t.db"))
-    state = fold(store, [-2.00, 1.10])
-    assert state.stood_down, "50% back is enough"
+    state = realise(store, [("LOSS", -2.00), *wins4(each=0.25)])
+    assert state.wins == 4
+    assert state.recovered_fraction == 0.5
+    assert state.base_only, "both conditions met"
     assert state.active is False, "active means MAY UPSIZE"
-    assert abs(state.deficit - 0.90) < 1e-9, "and 0.90 is still missing"
+    assert state.deficit == 1.00, "and 1.00 is still missing"
     assert state.owes, "the account is still down; the books must say so"
 
 
-def test_a_stood_down_epoch_keeps_reducing_on_base_size_wins(tmp_path):
+def test_four_wins_short_of_half_keeps_sizing_on(tmp_path):
     store = Store(str(tmp_path / "t.db"))
-    fold(store, [-2.00, 1.10])
-    state = fold(store, [0.40], start_ms=NOW + 100_000)
-    assert state.stood_down
-    assert abs(state.deficit - 0.50) < 1e-9
+    state = realise(store, [("LOSS", -2.00), *wins4(each=0.20)])
+    assert state.wins == 4 and abs(state.recovered_fraction - 0.4) < 1e-9
+    assert not state.base_only and state.active
 
 
-def test_clearing_the_deficit_resets_the_stand_down(tmp_path):
-    """Once the money is genuinely back the epoch ends, so a future loss arms
-    recovery again normally. Otherwise recovery would be off forever."""
+def test_half_back_on_three_markets_keeps_sizing_on(tmp_path):
     store = Store(str(tmp_path / "t.db"))
-    fold(store, [-2.00, 1.10])
-    state = fold(store, [0.95], start_ms=NOW + 100_000)
-    assert state.deficit == 0.0
-    assert not state.stood_down and not state.active
-    later = fold(store, [-1.00], start_ms=NOW + 200_000)
-    assert later.active, "a new loss arms recovery again"
-    assert later.peak == 1.00, "and the peak is the new hole, not the old one"
+    state = realise(store, [("LOSS", -2.00), ("A", 0.40), ("B", 0.40),
+                            ("C", 0.40)])
+    assert state.wins == 3 and state.recovered_fraction >= 0.5
+    assert not state.base_only and state.active
 
 
-def test_once_down_it_stays_down_for_the_epoch(tmp_path):
-    """Re-arming on the next loss is the loop this exists to break."""
+# ----------------------------------------------- counting markets, not fills
+
+def test_a_market_counts_once_however_many_times_it_settles(tmp_path):
+    """Base and add-on on one ticker are ONE position with one outcome.
+    Counting events would reach four on two markets."""
     store = Store(str(tmp_path / "t.db"))
-    fold(store, [-2.00, 1.10])              # stood down at 0.90 owed
-    state = fold(store, [-0.60], start_ms=NOW + 100_000)
-    assert state.deficit == 1.50, "the loss is still recorded in full"
-    assert state.stood_down and not state.active, "but the upsize stays off"
+    state = realise(store, [
+        ("LOSS", -2.00),
+        ("A", 0.30), ("A", 0.30),
+        ("B", 0.30), ("B", 0.30),
+    ])
+    assert state.wins == 2, "two markets, four fills"
+    assert not state.base_only
 
 
-def test_four_small_wins_stand_recovery_down(tmp_path):
-    """The patience branch, end to end: a grind that has not reached halfway."""
+def test_re_folding_the_same_events_changes_nothing(tmp_path):
+    """The service folds every poll. A second pass over events already
+    applied must not move the deficit or the count."""
     store = Store(str(tmp_path / "t.db"))
-    state = fold(store, [-2.00, 0.22, 0.22, 0.22, 0.22])
+    realise(store, [("LOSS", -2.00), *wins4(each=0.10)])
+    before = store.stored_deficit()
+    store.apply_realised_to_deficit(NOW + 70_000)
+    store.apply_realised_to_deficit(NOW + 80_000)
+    after = store.stored_deficit()
+    assert after.wins == before.wins == 4
+    assert abs(after.deficit - before.deficit) < 1e-9
+
+
+def test_a_duplicate_event_id_is_rejected_outright(tmp_path):
+    """A re-synced settlement arriving under the same id is ignored, so a
+    market cannot pay down the deficit twice."""
+    store = Store(str(tmp_path / "t.db"))
+    realise(store, [("LOSS", -2.00), ("A", 0.50)])
+    before = store.stored_deficit()
+    store.db.execute(
+        "INSERT OR IGNORE INTO realised_events (event_id, ticker, amount, "
+        "realised_ms, source, recorded_ms) VALUES (?,?,?,?,?,?)",
+        ("A:1:0.5", "A", 0.50, NOW + 1000, "settlement", NOW + 1000),
+    )
+    store.db.commit()
+    after = store.apply_realised_to_deficit(NOW + 70_000)
+    assert abs(after.deficit - before.deficit) < 1e-9
+    assert after.wins == before.wins
+
+
+def test_wins_need_not_be_consecutive(tmp_path):
+    """A loss in between does not reset the counter."""
+    store = Store(str(tmp_path / "t.db"))
+    state = realise(store, [
+        ("LOSS", -2.00),
+        ("A", 0.40), ("B", 0.40),
+        ("MID", -0.20),
+        ("C", 0.40), ("D", 0.40),
+    ])
+    assert state.wins == 4, "the loss did not reset the count"
+    assert abs(state.deficit - 0.60) < 1e-9
+    assert state.base_only
+
+
+def test_an_intervening_loss_lowers_the_measured_progress(tmp_path):
+    """"Net of subsequent realised losses" - the loss counts against the
+    percentage, it is not ignored because it came after the wins."""
+    store = Store(str(tmp_path / "t.db"))
+    state = realise(store, [
+        ("LOSS", -2.00), ("A", 0.30), ("B", 0.30), ("C", 0.30),
+        ("BIG", -0.80),
+        ("D", 0.30),
+    ])
     assert state.wins == 4
-    assert 0.40 <= state.recovered_fraction < 0.50
-    assert state.stood_down, "four wins and >=40% back is enough"
+    assert state.recovered_fraction < 0.5
+    assert not state.base_only, "four wins alone is not enough"
+    assert state.active
 
 
-def test_three_wins_short_of_halfway_keeps_recovery_on(tmp_path):
+# ------------------------------------------ base-only phase, no reactivation
+
+def test_a_loss_in_the_base_only_phase_does_not_reactivate_sizing(tmp_path):
+    """The loop this rule exists to break."""
     store = Store(str(tmp_path / "t.db"))
-    state = fold(store, [-2.00, 0.22, 0.22, 0.22])
-    assert state.wins == 3 and not state.stood_down
-    assert state.active, "still upsizing; the bar has not been met either way"
+    realise(store, [("LOSS", -2.00), *wins4(each=0.25)])
+    state = realise(store, [("NEW", -0.60)], start_ms=NOW + 100_000)
+    assert abs(state.deficit - 1.60) < 1e-9, "the loss is recorded in full"
+    assert state.base_only and not state.active, "but sizing stays off"
 
 
-def test_a_deeper_hole_moves_the_goalposts(tmp_path):
-    """Peak is a high-water mark. A fresh loss must not make the SAME dollars
-    owed look like more progress than before."""
+def test_a_loss_in_the_base_only_phase_does_not_reset_the_win_counter(tmp_path):
     store = Store(str(tmp_path / "t.db"))
-    fold(store, [-1.00])
-    state = fold(store, [-3.00], start_ms=NOW + 100_000)
-    assert state.peak == 4.00
-    assert state.recovered_fraction == 0.0
+    realise(store, [("LOSS", -2.00), *wins4(each=0.25)])
+    state = realise(store, [("NEW", -0.60)], start_ms=NOW + 100_000)
+    assert state.wins == 4
 
 
-def test_the_state_survives_a_restart(tmp_path):
+def test_base_size_profits_clear_the_remainder(tmp_path):
+    store = Store(str(tmp_path / "t.db"))
+    realise(store, [("LOSS", -2.00), *wins4(each=0.25)])
+    state = realise(store, [("E", 0.60)], start_ms=NOW + 100_000)
+    assert state.base_only
+    assert abs(state.deficit - 0.40) < 1e-9
+
+
+def test_reaching_zero_closes_the_cycle_and_a_later_loss_opens_a_new_one(tmp_path):
+    store = Store(str(tmp_path / "t.db"))
+    realise(store, [("LOSS", -2.00), *wins4(each=0.25)])
+    state = realise(store, [("E", 1.50)], start_ms=NOW + 100_000)
+    assert state.deficit == 0.0
+    assert not state.base_only and not state.active
+    assert state.wins == 0 and state.cycle_id == "", "the cycle is closed"
+    fresh = realise(store, [("LOSS2", -1.00)], start_ms=NOW + 200_000)
+    assert fresh.active and fresh.initial == 1.00
+    assert fresh.wins == 0, "a new cycle starts its own count"
+
+
+def test_full_recovery_ends_sizing_immediately_even_before_four_wins(tmp_path):
+    """Existing termination is unchanged: nothing left to size for."""
+    store = Store(str(tmp_path / "t.db"))
+    state = realise(store, [("LOSS", -2.00), ("A", 2.50)])
+    assert state.deficit == 0.0 and not state.active
+    assert state.wins == 0 and not state.base_only
+
+
+# ------------------------------------------------------------- persistence
+
+def test_the_cycle_survives_a_restart(tmp_path):
     path = str(tmp_path / "t.db")
     store = Store(path)
-    fold(store, [-2.00, 1.10])
+    realise(store, [("LOSS", -2.00), *wins4(each=0.25)])
+    cycle = store.stored_deficit().cycle_id
     store.db.close()
+
     reopened = Store(path)
     state = reopened.stored_deficit()
-    assert state.stood_down and abs(state.deficit - 0.90) < 1e-9
-    assert state.peak == 2.00 and state.wins == 1
-    assert not state.active, "a restart cannot hand back the upsize"
+    assert state.base_only and not state.active
+    assert abs(state.deficit - 1.00) < 1e-9
+    assert state.initial == 2.00 and state.wins == 4
+    assert state.cycle_id == cycle, "the same cycle, not a new one"
 
 
-# --------------------------------------------- it is visible and honest
+def test_a_restart_cannot_hand_back_the_upsize(tmp_path):
+    path = str(tmp_path / "t.db")
+    store = Store(path)
+    realise(store, [("LOSS", -2.00), *wins4(each=0.25)])
+    store.db.close()
+    assert not Store(path).recovery_is_active()
 
-def test_the_stand_down_announcement_does_not_claim_the_money_is_back(tmp_path):
-    """CLEARED says "deficit back to $0.00". Sending that on a stand-down
-    would tell the operator the account had recovered when it had not."""
-    from btc15_signal import messages
 
+# ------------------------------------------------------- the resting order
+
+def test_a_resting_add_is_cancelled_when_sizing_ends():
+    """And the reason does not claim the money came back."""
+    from btc15_signal.recovery_add import AddLimits, should_cancel
+
+    cancel, reason = should_cancel(
+        features=None, entry_side="UP", crossed_since_entry=False,
+        remaining_s=400, recovery_active=False, recovery_owes=True,
+        base_position_open=True, limits=AddLimits(),
+    )
+    assert cancel
+    assert "sizing ended" in reason and "outstanding" in reason
+    assert "completed" not in reason
+
+
+def test_a_genuinely_completed_recovery_still_says_completed():
+    from btc15_signal.recovery_add import AddLimits, should_cancel
+
+    cancel, reason = should_cancel(
+        features=None, entry_side="UP", crossed_since_entry=False,
+        remaining_s=400, recovery_active=False, recovery_owes=False,
+        base_position_open=True, limits=AddLimits(),
+    )
+    assert cancel and reason == "recovery completed"
+
+
+def test_a_fill_is_banked_before_any_cancellation_is_considered():
+    """The cancel/fill race: `_maintain` checks for a fill FIRST, so an order
+    that filled while we were deciding to pull it is banked, not lost."""
+    import inspect
+
+    from btc15_signal.recovery_add_runner import RecoveryAddRunner
+
+    source = inspect.getsource(RecoveryAddRunner._maintain)
+    assert source.index("_bank_if_filled") < source.index("should_cancel")
+
+
+def test_the_add_on_refuses_to_place_once_sizing_has_ended():
+    """Behavioural, not a source scan: an ended cycle is refused even when
+    every other condition would have allowed the add."""
+    from btc15_signal.recovery_add import AddLimits, evaluate
+    from btc15_signal.validation import kalshi_fee_charged
+
+    decision = evaluate(
+        features=None, entry_side="DOWN", entry_fill=0.75, current_ask=0.73,
+        crossed_since_entry=False, remaining_s=500, required_per_trade=0.25,
+        recovery_active=False, already_added=False, open_exposure=0.0,
+        limits=AddLimits(), fee=kalshi_fee_charged,
+    )
+    assert not decision.place
+    assert "not active" in decision.reason
+
+
+# --------------------------------------------------------------- reporting
+
+def test_the_transition_message_uses_the_real_counts(tmp_path):
+    """"4 winning trades - 50% recovered" printed on a cycle that reached
+    five wins and 63% would be a template, not a report."""
     store = Store(str(tmp_path / "t.db"))
-    state = fold(store, [-2.00, 1.10])
-    text = messages.recovery_stood_down(state, store.money_snapshot(NOW))
-    assert "STOOD DOWN" in text
-    assert "still outstanding" in text
-    assert "0.90" in text
-    assert "$0.00" not in text
+    state = realise(store, [("LOSS", -2.00), ("A", 0.35), ("B", 0.35),
+                            ("C", 0.35), ("D", 0.35)])
+    text = messages.recovery_size_ended(state)
+    assert "RECOVERY SIZE ENDED" in text
+    assert f"{state.wins} winning trades" in text
+    assert f"{state.recovered_fraction:.0%} recovered" in text
+    assert f"${state.deficit:,.2f}" in text
+    assert "Continuing at normal base size." in text
+    assert "$0.00" not in text, "it must not read as a full recovery"
 
 
-def test_the_transition_reports_stood_down_not_cleared(tmp_path):
-    """`active` going False now means either repaid OR stood down, and the
-    two must not share an event name."""
+def test_the_transition_fires_once_and_is_not_called_cleared(tmp_path):
     store = Store(str(tmp_path / "t.db"))
-    fold(store, [-2.00])
-    event, _ = store.recovery_transition(NOW)
-    assert event == "armed"
-    fold(store, [1.10], start_ms=NOW + 100_000)
+    realise(store, [("LOSS", -2.00)])
+    assert store.recovery_transition(NOW)[0] == "armed"
+    realise(store, wins4(each=0.25), start_ms=NOW + 100_000)
     event, state = store.recovery_transition(NOW + 110_000)
-    assert event == "stood_down", "not 'cleared' - money is still owed"
+    assert event == "size_ended", "not 'cleared' - money is still owed"
     assert state.owes
+    assert store.recovery_transition(NOW + 120_000)[0] is None, "once only"
 
 
 def test_a_genuine_repayment_still_reports_cleared(tmp_path):
     store = Store(str(tmp_path / "t.db"))
-    fold(store, [-2.00])
+    realise(store, [("LOSS", -2.00)])
     store.recovery_transition(NOW)
-    fold(store, [1.10], start_ms=NOW + 100_000)
-    store.recovery_transition(NOW + 110_000)          # stood_down
-    fold(store, [0.95], start_ms=NOW + 200_000)
+    realise(store, wins4(each=0.25), start_ms=NOW + 100_000)
+    store.recovery_transition(NOW + 110_000)
+    realise(store, [("E", 1.20)], start_ms=NOW + 200_000)
     event, state = store.recovery_transition(NOW + 210_000)
     assert event == "cleared" and state.deficit == 0.0
 
 
-def test_the_status_line_keeps_showing_the_debt_after_standing_down(tmp_path):
+def test_the_status_line_keeps_showing_the_debt(tmp_path):
     """Going silent would read as "paid back"."""
-    from btc15_signal import messages
-
     store = Store(str(tmp_path / "t.db"))
-    state = fold(store, [-2.00, 1.10])
+    state = realise(store, [("LOSS", -2.00), *wins4(each=0.25)])
     line = messages.recovery_line(state)
-    assert "stood down" in line.lower()
-    assert "0.90" in line
+    assert "size ended" in line.lower()
+    assert "1.00" in line and "4 winning" in line
 
 
 def test_the_thresholds_come_from_settings(tmp_path):
@@ -241,6 +390,14 @@ def test_the_thresholds_come_from_settings(tmp_path):
     settings = Settings()
     settings.recovery_partial_exit_enabled = False
     store.configure_recovery_exit(settings)
-    state = fold(store, [-2.00, 1.10])
-    assert not state.stood_down, "disabled means disabled"
-    assert state.active, "recovery keeps upsizing when the exit is off"
+    state = realise(store, [("LOSS", -2.00), *wins4(each=0.25)])
+    assert not state.base_only and state.active
+
+
+def test_the_deployed_default_is_fifty_percent_and_four_wins():
+    from btc15_signal.config import Settings
+
+    settings = Settings()
+    assert settings.recovery_exit_fraction == 0.50
+    assert settings.recovery_exit_required_wins == 4
+    assert settings.recovery_partial_exit_enabled is True

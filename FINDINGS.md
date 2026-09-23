@@ -3431,55 +3431,71 @@ No candidate row: the frozen candidate speaks only to
 unmatched candidate writes nothing, because a table of non-opinions buries the
 opinions.
 
-## 48. Recovery stands down early (2026-09-23)
+## 48. Recovery sizing ends before the deficit is repaid (2026-09-23)
 
-Recovery now stops UPSIZING before the deficit reaches zero:
+Recovery now stops UPSIZING when **both** hold:
 
-    HALFWAY    recovered >= 50% of the peak deficit
-    PATIENCE   4 wins into the epoch and recovered >= 40%
+    FOUR WINS   four profitable, fully closed markets since the cycle began
+    HALFWAY     >= 50% of the cycle's INITIAL deficit recovered, net of fees
+                and subsequent realised losses
 
-Operator instruction, stated as a requirement: *"Even after a 50% recovery of
-the initial loss, turn off recovery. That's enough, because we've seen that
-even regular size is able to recover on its own."* The reasoning is tail
-risk, not average return - late in a recovery the remaining deficit is small
-but the position is still double size, so one loss more than undoes the run
-of wins that got there, and arms recovery again deeper. Recover, lose bigger,
-recover.
+Both, not either. Four wins that have barely moved the deficit leave real
+ground to make up; half the money back after one lucky market says nothing
+about whether the run is stable. 50% is the default, tunable within the
+operator's 40-60% range - a value outside it raises rather than clamps,
+because a threshold nobody intended is worse than an error.
 
-**Standing down never zeroes the deficit.** The money is still missing and
-`deficit` still says so; only the upsize stops. `active` now means "may
-upsize", `owes` means "money is missing", and they are different questions.
-Telegram gets its own STOOD DOWN message rather than the CLEARED one, which
-would have reported a $0.00 deficit that was not $0.00.
+**It is an exposure-reduction rule, not a prediction.** Nothing in
+`recovery_exit` forecasts anything; it caps how long the account carries
+doubled size.
 
-Progress is measured against the epoch PEAK, not the opening deficit, so a
-fresh loss cannot make the percentage jump on arithmetic. Once down it stays
-down for the epoch; re-arming on the next loss would rebuild the loop.
+### Ending is not repaying
 
-### The evidence does not support it on this record
+The deficit is **preserved**. `active` now means "may upsize"; `owes` means
+"money is missing"; they are different questions and the code answers them
+separately. A base-only cycle keeps reporting what it owes, base-size wins
+keep paying it down, and Telegram gets its own **RECOVERY SIZE ENDED**
+message rather than the CLEARED one, which would have announced a $0.00
+deficit that was not $0.00.
+
+A loss during the base-only phase is recorded in full, does **not**
+reactivate sizing, and does **not** reset the win counter - reactivating is
+the loop the rule exists to break. Full recovery remains an immediate end in
+its own right, even before four wins: there is nothing left to size for.
+When the deficit truly reaches zero the cycle closes, and a later loss opens
+a fresh one with its own count.
+
+### Counting
+
+A **market** counts once. Base and add-on fills on one ticker are one
+position with one outcome, tracked in `recovery_cycle_wins` keyed by
+(cycle, ticker) - counting realised *events* would reach four on two markets
+that each settled twice. Wins need not be consecutive. Progress counts every
+realised trade, base-size or upsized alike.
+
+The denominator is the cycle's **initial** deficit, not its peak. A later
+loss raises what is outstanding and so lowers the percentage, which is what
+"net of subsequent realised losses" means.
+
+### What it would have done
 
 `scripts/measure_recovery_exit.py`, 153 realised events, 38 losses:
 
 | | trades armed | their net |
 |---|---:|---:|
-| recovery as it was | 149 | **+14.57** |
-| with the early stand-down | 66 | **+4.53** |
+| recovery as it was | 149 | +14.57 |
+| with the early end | 142 | +13.48 |
 
-The 83 trades the upsize would no longer ride netted **+10.04**: 65 wins
-(+32.13) against 18 losses (−22.09), a 78.3% win rate. On this history the
-upsize was riding winners, and standing down early would have cost money.
+Only **7** trades would have changed size, netting +1.09 (6 wins +2.79, one
+loss −1.70). Requiring both conditions makes the rule far more conservative
+than a 50%-alone trigger, which would have moved 83 trades.
 
-The tail it targets is real but was not decisive here: worst single loss
-−3.28 against a best single win +5.06, mean loss −1.23 against mean win
-+0.49. The loss tail is heavier per trade, which is the mechanism the rule
-describes; it simply did not outweigh 78% winners over 153 events.
-
-Three stand-downs would have fired. The third is the case the operator
-described exactly - **45 wins** into an epoch and still only 42% of a $13.32
-peak recovered, with $7.78 outstanding. A grind that long with the upsize
-riding every trade is the state where one loss hurts most, and no
-average-return measurement captures that.
+Two size-ends would have fired. The second is the operator's case exactly:
+`KXBTC15M-26SEP230300-00` - **89 winning markets**, 54% of an $8.68 opening
+deficit back, $3.97 still outstanding. An upsize riding 89 markets is the
+exposure the rule is about, and no average-return measurement captures what
+that costs when it breaks.
 
 Deployed as instructed, with the measurement recorded beside it rather than
-instead of it. Sizes and fills are not modelled - standing down changes size,
+instead of it. Sizes and fills are not modelled - ending sizing changes size,
 and a ledger of what happened cannot price what would have.

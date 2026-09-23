@@ -2971,12 +2971,8 @@ async def service() -> None:
                                 f"{last[0]} settled {last[1]:+.2f}" if last else "",
                             )
                         )
-                    elif event == "stood_down":
-                        await telegram.send(
-                            messages.recovery_stood_down(
-                                rstate, store.money_snapshot(now_ms)
-                            )
-                        )
+                    elif event == "size_ended":
+                        await telegram.send(messages.recovery_size_ended(rstate))
                     elif event == "cleared":
                         await telegram.send(
                             messages.recovery_cleared(store.money_snapshot(now_ms))
