@@ -90,7 +90,10 @@ def test_an_untraded_signal_reports_no_money_at_all(tmp_path):
     # No green tick that could be mistaken for a payday on a trade that never
     # happened - that is exactly how "WIN / No order was placed" read.
     assert "SIGNAL WON · NOT TRADED" in text
-    assert "Profit: $0.00" in text
+    # Not a PROFIT of zero either - the money line names the absence of a
+    # trade, so it cannot be read as a tiny win.
+    assert "Not traded · realised P&amp;L $0.00" in text
+    assert "Profit: $0.00" not in text
     assert "PROFIT" not in text
     assert "cost $" not in text
     assert "after fees" not in text

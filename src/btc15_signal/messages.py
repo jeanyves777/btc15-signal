@@ -740,6 +740,16 @@ def exit_alert(
     )
 
 
+def _cents(price: float) -> str:
+    """A contract price at the precision it actually traded at.
+
+    `0.997` shown as `100¢` claims a fill at a price the book does not offer.
+    """
+    value = price * 100
+    return (f"{value:.0f}¢" if abs(value - round(value)) < 0.05
+            else f"{value:.1f}¢")
+
+
 def settlement(
     *,
     head: str,
@@ -748,6 +758,11 @@ def settlement(
     winner: str,
     won: bool,
     target: float,
+    # THE SIDE THE SIGNAL CALLED, which is not always the side we held.
+    # `predictions` is written at ALERT time and keyed on the window, so when
+    # the reference flips before the order fills the call and the position are
+    # on opposite sides. Both are reported; neither is inferred from the other.
+    called_side: str = "",
     contract_price: float | None,
     pnl: float | None,
     qualified: bool,
@@ -787,8 +802,15 @@ def settlement(
     # would hide that the signal was wrong. Both are stated, on their own
     # lines, with their own ticks.
     chip_side = side_chip(side)
-    made_money = pnl is not None and pnl >= 0
-    money_tick = "✅\U0001f4b0" if made_money else "❌\U0001f4b8"
+    # THE VERDICT IS THE BROKER'S REALISED P&L AFTER FEES, and nothing else.
+    # Not `held side == winner`: an early exit can bank money on a position
+    # whose side later loses, and a position held through settlement can still
+    # be under water after fees. The money decides the money word.
+    flat = pnl is not None and abs(pnl) < 0.005
+    made_money = pnl is not None and pnl > 0
+    money_tick = (
+        "⚪" if flat else ("✅\U0001f4b0" if made_money else "❌\U0001f4b8")
+    )
     priced = f" at {contract_price * 100:.0f}¢" if contract_price else ""
 
     if paper:
@@ -807,7 +829,10 @@ def settlement(
             # rule refused, and only the first is a trade that got away.
             "\U0001f4a4 No order was executed · "
             + ("rule qualified it" if qualified else "rule declined it"),
-            f"\U0001f4b5 {'Profit' if won else 'Loss'}: $0.00",
+            # NOT A LOSS. Nothing was bought, so nothing was lost -
+            # "Loss: $0.00" under a red chip reads as a small defeat
+            # rather than the absence of a trade.
+            "💵 Not traded · realised P&amp;L $0.00",
         ]
         if record:
             lines.append(record)
@@ -844,16 +869,17 @@ def settlement(
             f"<code>{escape(ticker)}</code>",
             "",
             f"{chip_side} Bought <b>{side}</b>{priced}",
-            f"\U0001f4b5 Sold before expiry at {exited_at * 100:.0f}¢",
+            f"💵 Sold before expiry at {_cents(exited_at)}",
             f"\U0001f3c1 Market later settled <b>{winner}</b>",
-            f"{'✅' if won else '❌'} {side} prediction was "
-            f"{'correct' if won else 'wrong'}",
+            f"{'✅' if (called_side or side) == winner else '❌'} "
+            f"{escape(called_side or side)} prediction was "
+            f"{'correct' if (called_side or side) == winner else 'wrong'}",
         ]
-        if made_money and not won:
+        if made_money and (called_side or side) != winner:
             lines.append(
                 "✅ Trade remained profitable because it exited early"
             )
-        elif not made_money and won:
+        elif not made_money and (called_side or side) == winner:
             lines.append(
                 "❌ Trade still lost because it exited below cost"
             )
@@ -862,18 +888,43 @@ def settlement(
         # message carrying the same total reads as a total that has stalled.
         lines += ["", "🧾 <i>Profit was already counted at the sale.</i>"]
     else:
+        # BREAK-EVEN IS NOT A MARKET OUTCOME. The market settles UP or DOWN,
+        # always, and that is reported on its own line below. This word is
+        # about the TRADE's net after fees: exactly zero is "closed", not a
+        # third thing the market did.
+        headline = (
+            "CLOSED · $0.00 net" if flat
+            else f"{'WIN' if made_money else 'LOSS'} · {amount}"
+        )
         lines = [
-            f"{money_tick} <b>{'WIN' if made_money else 'LOSS'} · {amount}</b>",
+            f"{money_tick} <b>{headline}</b>",
             f"<code>{escape(ticker)}</code>",
             "",
             f"{chip_side} Bought <b>{side}</b>{priced}",
             f"\U0001f3c1 Market settled <b>{winner}</b>",
         ]
+        # THE CALL, on its own line, every time. It is a different fact from
+        # the money and it is the one that was silently inverted: the 12:15
+        # market on 2026-09-23 called DOWN, held UP, settled UP and paid
+        # +$0.1271, and the recap reported "Bought DOWN ... LOSS -$1.87".
+        call = called_side or side
+        call_right = call == winner
+        lines.append(
+            f"{'✅' if call_right else '❌'} {escape(call)} prediction was "
+            f"{'correct' if call_right else 'wrong'}"
+        )
+        if call != side:
+            lines.append(
+                f"\U0001f4e6 <i>Signal called {escape(call)}; the position "
+                f"held {escape(side)}</i>"
+            )
         if cost is not None and pnl is not None:
             # Cost, not max payout, is the money at risk - on a loss it IS the
             # loss, so it is named rather than left to be inferred.
             outcome = (
-                f"Profit ${pnl:,.2f}" if made_money else f"Lost ${abs(pnl):,.2f}"
+                "$0.00 net" if flat
+                else (f"Profit ${pnl:,.2f}" if made_money
+                      else f"Lost ${abs(pnl):,.2f}")
             )
             lines.append(f"\U0001f4b5 Cost ${cost:,.2f} · {outcome}")
         elif pnl is not None:

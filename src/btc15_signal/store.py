@@ -2612,6 +2612,26 @@ class Store:
             return 0.0
         return self.get_setting("day_boundary_carry", 0.0)
 
+    def realised_for_ticker(self, ticker: str | None) -> float | None:
+        """The broker's realised P&L for one market, or None if not booked.
+
+        READ, NEVER REBUILT. `daily_ledger` is the append-only realised record
+        synced from `/portfolio/settlements`; it holds one row per market, it
+        counts an early cash-out exactly once, and only the exchange may revise
+        it. A recap that recomputes the figure from fill prices and a `won`
+        flag can disagree with the account - which is exactly how a market that
+        paid out $2.00 came to be announced as a $1.87 loss.
+
+        None means "not booked yet", not zero. The caller keeps its provisional
+        figure rather than asserting a settlement that has not arrived.
+        """
+        if not ticker:
+            return None
+        row = self.db.execute(
+            "SELECT pnl FROM daily_ledger WHERE ticker = ?", (ticker,)
+        ).fetchone()
+        return None if row is None or row[0] is None else float(row[0])
+
     def ledger_today(self, now_ms: int | None = None) -> tuple[int, int, float]:
         """(markets, winners, dollars) realised today, from the ledger alone."""
         import time

@@ -2749,21 +2749,20 @@ async def report_settlement(
     winner = "UP" if result == "yes" else "DOWN"
 
     trade = store.trade_for_window(window_open)
-    # THE SIDE THAT OWNS THE MONEY IS THE SIDE WE HELD, NOT THE SIDE WE CALLED.
+    # THE MONEY BELONGS TO THE SIDE WE HELD, NOT THE SIDE WE CALLED.
     #
-    # `predictions` is keyed on `window_open` with INSERT OR IGNORE and is
-    # written at ALERT time, so it holds the FIRST side the reference named. If
-    # the reference flips before the order fills, the row keeps the old side
-    # while the position is on the other one - and this recap then computed
-    # `won = called_side == winner`, inverting the verdict.
+    # `predictions` is keyed on `window_open` with INSERT OR IGNORE and written
+    # at ALERT time, so it holds the FIRST side the reference named. If the
+    # reference flips before the order fills, that row keeps the old side while
+    # the position sits on the other one - and this function then computed
+    # `won = called_side == winner` and handed the inverted flag to
+    # `position_pnl`, which turned a paid-out win into a reported loss.
     #
-    # It happened twice on real money. On 2026-09-23 the 12:15 market filled 2
-    # contracts of UP at 93.2c, settled YES, and Kalshi paid out $2.00 for a
-    # profit of $0.1271 - and the message said "Bought DOWN ... LOSS -$1.87".
-    # The ledger was right throughout because it syncs from the broker; only
-    # the sentence was wrong, which is the harder kind to notice.
-    #
-    # `trade_for_window` already returns the side actually held. Use it.
+    # It reached the operator twice on real money, both times as a loss that
+    # was actually a win: 2026-09-21 (+$0.2821) and 2026-09-23 (+$0.1271, two
+    # contracts of UP at 93.2c, Kalshi paid $2.00). `daily_ledger` was correct
+    # throughout because it syncs from the broker, so the account never drifted
+    # - only the sentence did.
     side = (trade.get("side") or called_side) if trade else called_side
     won = side == winner
     if trade:
@@ -2789,6 +2788,13 @@ async def report_settlement(
         else:
             basis = f"{size:g} contract" + ("s" if size != 1 else "")
         contracts_shown, price_shown = size, trade["paid"]
+        # BROKER-RECONCILED, NOT REBUILT. `daily_ledger` is the append-only
+        # realised record synced from `/portfolio/settlements`; it counts an
+        # early cash-out exactly once and the exchange may revise it. The local
+        # reconstruction above stands in only until that row exists.
+        booked = store.realised_for_ticker(ticker)
+        if booked is not None:
+            pnl = booked
     else:
         pnl = None  # nothing was bought, so there is no money to report
         contracts_shown, price_shown = None, contract_price
@@ -2804,6 +2810,7 @@ async def report_settlement(
     surfaced = messages.result_message(
         side=side,
         ticker=ticker,
+        called_side=called_side,
         winner=winner,
         won=bool(won),
         traded=traded,
