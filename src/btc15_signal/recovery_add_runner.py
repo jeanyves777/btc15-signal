@@ -72,14 +72,16 @@ class RecoveryAddRunner:
 
     async def step(
         self, *, trader, contract, features, crossed, remaining_s: int,
-        now_ms: int, opened: int,
+        now_ms: int, opened: int, crossing_reason: str = "",
+        crossing_short_by_ms: int = 0,
     ) -> None:
         """One poll. Swallows its own errors, like every research path here."""
         try:
             await self._step(
                 trader=trader, contract=contract, features=features,
                 crossed=crossed, remaining_s=remaining_s, now_ms=now_ms,
-                opened=opened,
+                opened=opened, crossing_reason=crossing_reason,
+                crossing_short_by_ms=crossing_short_by_ms,
             )
         except Exception as exc:  # noqa: BLE001 - must never stop trading
             print(f"recovery add-on failed: {exc!r}", flush=True)
@@ -88,6 +90,7 @@ class RecoveryAddRunner:
 
     async def _step(
         self, *, trader, contract, features, crossed, remaining_s, now_ms, opened,
+        crossing_reason: str = "", crossing_short_by_ms: int = 0,
     ) -> None:
         if trader is not None and not self._reconciled:
             await self.reconcile(trader, now_ms)
@@ -108,14 +111,14 @@ class RecoveryAddRunner:
         side, paid, _count, ticker, _proposal = position
         await self._consider(
             trader, contract, ticker, side, paid, features, crossed,
-            remaining_s, now_ms, opened,
+            remaining_s, now_ms, opened, crossing_reason, crossing_short_by_ms,
         )
 
     # ------------------------------------------------------------- decide
 
     async def _consider(
         self, trader, contract, ticker, side, paid, features, crossed,
-        remaining_s, now_ms, opened,
+        remaining_s, now_ms, opened, crossing_reason="", crossing_short_by_ms=0,
     ) -> None:
         state = self._store.recovery_state(self._settings.recovery_steps)
         # FUNDS ARE CHECKED FRESH, EVERY ORDER, against the testing account.
@@ -188,17 +191,38 @@ class RecoveryAddRunner:
         deferred = False
         decision = judge(bool(crossed) if crossed is not None else True)
         if crossed is None:
+            # THE REASON COMES FROM THE COVERAGE CHECK, not from a fixed
+            # sentence. "BRTI is 1.4s behind the entry" and "there is no series
+            # at all" used to print identically, so a lag that clears itself on
+            # the next poll read the same as a feed that is down.
+            detail = crossing_reason or "crossing history unavailable"
+            if crossing_short_by_ms:
+                detail += f" (short by {crossing_short_by_ms / 1000:.1f}s)"
             without_crossing = judge(False)
             if without_crossing.place:
+                # ELIGIBILITY IS THE BOUND. `evaluate` refuses below
+                # `min_seconds_remaining`, so this can only repeat while the
+                # add could still be placed; the clock ends it, not a counter.
                 deferred = True
                 decision = type(decision)(
-                    False,
-                    "BRTI has no sample covering the entry instant yet; "
-                    "will re-ask next poll",
+                    False, f"data unavailable: {detail}; re-asking next poll",
                     without_crossing.price, decision.failed,
                 )
             else:
-                decision = without_crossing
+                # A REFUSAL THAT DOES NOT DEPEND ON THE CROSSING. It is real
+                # and terminal - but when the thing that ran out is the
+                # ELIGIBILITY PERIOD, the honest reason is both: we were still
+                # waiting for coverage when the deadline arrived.
+                past_deadline = remaining_s < self._limits.min_seconds_remaining
+                if past_deadline:
+                    decision = type(decision)(
+                        False,
+                        f"{without_crossing.reason}; still waiting on "
+                        f"{detail}",
+                        without_crossing.price, without_crossing.failed,
+                    )
+                else:
+                    decision = without_crossing
 
         conditions = json.dumps({
             "side": getattr(features, "side", None),
@@ -206,6 +230,10 @@ class RecoveryAddRunner:
             "momentum": getattr(features, "brti_momentum_bps", None),
             "stale": getattr(features, "stale", None),
             "crossed": crossed,
+            # WHY it is null, recorded beside it. Without this the archive
+            # cannot tell a one-second feed lag from a feed that is down.
+            "crossing_reason": crossing_reason or None,
+            "crossing_short_by_ms": crossing_short_by_ms or None,
             "remaining_s": remaining_s,
             "committed": committed,
             "resting": resting,

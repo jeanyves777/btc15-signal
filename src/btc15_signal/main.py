@@ -30,7 +30,7 @@ from .levels import confidence_points as level_points
 from .model import predict
 from .notify import Notifier
 from .recovery_add_runner import RecoveryAddRunner
-from .reference_shadow import ReferenceShadow
+from .reference_shadow import Crossing, ReferenceShadow
 from .regime import base_points as regime_base_points
 from .regime import confidence_points as regime_confidence_points
 from .regime import label_for as regime_label
@@ -1257,6 +1257,9 @@ POLL_MARKS: dict[str, int] = {}
 # Last successful settlement mirror, so the sync is throttled to once a
 # minute rather than running on every poll.
 SETTLEMENT_SYNC: dict[str, int] = {}
+# Which window we have already asked the broker to confirm an entry fill for.
+# One request per window, and only while the sweep has not delivered it.
+ENTRY_CONFIRM: dict[str, int] = {}
 
 
 def mark(name: str) -> None:
@@ -3717,16 +3720,43 @@ async def service() -> None:
                         # SINCE THE FILL, not since the window opened. The
                         # first live evaluation vetoed an add on a crossing
                         # that happened 4m42s BEFORE the position existed.
+                        #
+                        # CONFIRM THE INSTANT FROM THE BROKER. `fills` is
+                        # otherwise written only by the 60-second sweep, so for
+                        # up to a minute after an entry this measured from the
+                        # proposal's timestamp - when we ASKED, not when we
+                        # were filled. Asked once per window, only while the
+                        # broker's own fill is still missing.
+                        if trader is not None and not store.has_broker_fill(
+                            position[3]
+                        ) and ENTRY_CONFIRM.get("window") != opened:
+                            ENTRY_CONFIRM["window"] = opened
+                            try:
+                                store.record_fills(
+                                    await trader.fills_for(position[3]), now_ms
+                                )
+                            except Exception as exc:  # noqa: BLE001
+                                print(
+                                    f"entry fill confirm failed: {exc!r}",
+                                    flush=True,
+                                )
                         entry_ms = store.position_entry_ms(opened, position[3])
-                        crossed = (
-                            None if entry_ms is None
-                            else reference.crossed_since(entry_ms, position[0])
-                        )
+                        if entry_ms is None:
+                            crossing = Crossing(
+                                None, "the entry instant is not established"
+                            )
+                        else:
+                            crossing = reference.crossing_since(
+                                entry_ms, position[0], now_ms
+                            )
+                        crossed = crossing.crossed
                         await recovery_add.step(
                             trader=trader,
                             contract=contract,
                             features=brti,
                             crossed=crossed,
+                            crossing_reason=crossing.reason,
+                            crossing_short_by_ms=crossing.short_by_ms,
                             remaining_s=remaining,
                             now_ms=now_ms,
                             opened=opened,

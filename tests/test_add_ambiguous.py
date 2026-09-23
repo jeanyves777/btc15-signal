@@ -35,7 +35,9 @@ from test_recovery_add_runner import (  # noqa: E402
     NOW,
     TICKER,
     WINDOW,
+    FakeContract,
     FakeTrader,
+    features,
     make,
     run,
 )
@@ -318,3 +320,92 @@ def test_the_executed_line_names_the_liquidity_side(tmp_path, capsys):
     out = capsys.readouterr().out
     assert "recovery add EXECUTED" in out
     assert ("maker" in out) or ("taker" in out)
+
+
+# ------------------- data unavailable: named, bounded, terminated honestly
+
+def step_with(runner, trader, *, reason, short_by=0, remaining=500, feats=None):
+    """A poll where the crossing could not be established, with its reason."""
+    asyncio.run(runner.step(
+        trader=trader, contract=FakeContract(),
+        features=feats or features(), crossed=None,
+        crossing_reason=reason, crossing_short_by_ms=short_by,
+        remaining_s=remaining, now_ms=NOW, opened=WINDOW,
+    ))
+
+
+def test_the_deferral_names_the_actual_coverage_problem(tmp_path):
+    """Not a fixed sentence: "1.4s behind" and "no series at all" are
+    different situations and used to print identically."""
+    settings, store = make(tmp_path)
+    runner = RecoveryAddRunner(settings, store)
+    step_with(runner, FakeTrader(),
+              reason="BRTI has not published a sample covering the entry yet",
+              short_by=1400)
+    row = store.open_add(WINDOW)
+    assert row["state"] == AddState.DEFERRED
+    assert "data unavailable" in row["cancel_reason"]
+    assert "has not published" in row["cancel_reason"]
+    assert "short by 1.4s" in row["cancel_reason"]
+
+
+def test_a_feed_outage_reads_differently_from_a_lag(tmp_path):
+    settings, store = make(tmp_path)
+    runner = RecoveryAddRunner(settings, store)
+    step_with(runner, FakeTrader(), reason="BRTI series unavailable")
+    assert "series unavailable" in store.open_add(WINDOW)["cancel_reason"]
+
+
+def test_the_coverage_reason_is_recorded_in_the_evidence(tmp_path):
+    settings, store = make(tmp_path)
+    runner = RecoveryAddRunner(settings, store)
+    step_with(runner, FakeTrader(), reason="BRTI series is stale", short_by=22000)
+    import json
+    cond = json.loads(store.open_add(WINDOW)["conditions_at_placement"])
+    assert cond["crossed"] is None
+    assert cond["crossing_reason"] == "BRTI series is stale"
+    assert cond["crossing_short_by_ms"] == 22000
+
+
+def test_retries_are_bounded_by_the_eligibility_period(tmp_path):
+    """It defers only while the add could still be placed. The clock ends it,
+    and the terminal reason names BOTH what ran out and what we waited for."""
+    settings, store = make(tmp_path)
+    runner = RecoveryAddRunner(settings, store)
+    trader = FakeTrader()
+    for _ in range(5):
+        step_with(runner, trader, reason="BRTI series unavailable",
+                  remaining=500)
+        assert store.open_add(WINDOW)["state"] == AddState.DEFERRED
+
+    step_with(runner, trader, reason="BRTI series unavailable", remaining=30)
+    row = store.open_add(WINDOW)
+    assert row["state"] == AddState.SKIPPED
+    assert "deadline" in row["cancel_reason"]
+    assert "still waiting on" in row["cancel_reason"]
+    assert trader.placed == [], "nothing was ever placed on an unknown"
+
+
+def test_coverage_returning_resolves_the_deferral(tmp_path):
+    """The whole point: a lag is not a decision."""
+    settings, store = make(tmp_path)
+    runner = RecoveryAddRunner(settings, store)
+    trader = FakeTrader()
+    step_with(runner, trader,
+              reason="BRTI has not published a sample covering the entry yet",
+              short_by=1400)
+    assert store.open_add(WINDOW)["state"] == AddState.DEFERRED
+    run(runner, trader, crossed=False)
+    assert store.open_add(WINDOW)["state"] == AddState.PENDING
+    assert len(trader.placed) == 1
+
+
+def test_a_real_refusal_under_missing_coverage_is_not_a_data_problem(tmp_path):
+    settings, store = make(tmp_path)
+    runner = RecoveryAddRunner(settings, store)
+    step_with(runner, FakeTrader(), reason="BRTI series unavailable",
+              feats=features(distance=7.7))
+    row = store.open_add(WINDOW)
+    assert row["state"] == AddState.SKIPPED
+    assert "distance" in row["cancel_reason"]
+    assert "data unavailable" not in row["cancel_reason"]

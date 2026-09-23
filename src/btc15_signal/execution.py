@@ -500,6 +500,30 @@ class KalshiExecutionClient:
         """
         return await self._paginate("/portfolio/fills", "fills", limit)
 
+    async def fills_for(self, ticker: str, limit: int = 50) -> list[dict]:
+        """This market's executions only, for confirming ONE entry now.
+
+        `fills()` paginates the whole account, which is right for the ledger
+        sweep on its 60-second timer and far too heavy to sit on the add path.
+        The crossing gate has to measure from the instant the money went in,
+        and until this existed the only source of that instant was the sweep -
+        so for up to a minute after an entry the gate fell back to the
+        proposal's own timestamp, which is when we ASKED, not when we were
+        filled.
+
+        Never raises: an unreadable answer leaves the caller on its fallback.
+        """
+        try:
+            response = await self.client.get(
+                self.base_url + "/portfolio/fills",
+                params={"ticker": ticker, "limit": limit},
+                headers=self._headers("GET", "/portfolio/fills"),
+            )
+            response.raise_for_status()
+            return response.json().get("fills") or []
+        except (httpx.HTTPError, ValueError, KeyError):
+            return []
+
     async def _paginate(self, path: str, key: str, limit: int) -> list[dict]:
         """Kalshi caps a page at 200 and hands back a cursor."""
         out: list[dict] = []

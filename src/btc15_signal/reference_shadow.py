@@ -37,6 +37,7 @@ mistake section 40 exists to record.
 import contextlib
 import time
 import traceback
+from dataclasses import dataclass
 
 from .brti import KalshiBRTI, features_from_series
 from .config import Settings
@@ -52,6 +53,26 @@ from .reference_store import ReferenceStore
 
 def new_session_id() -> str:
     return f"ref-{int(time.time())}"
+
+
+@dataclass(frozen=True)
+class Crossing:
+    """A crossing verdict, with why it could not be reached when it could not.
+
+    `crossed` is True, False, or None for unknown - and None is never turned
+    into either of the others anywhere. `reason` is empty exactly when the
+    question was answered, and `short_by_ms` says how far the series falls
+    short, which is what tells a one-second feed lag apart from a feed that is
+    not running.
+    """
+
+    crossed: bool | None
+    reason: str = ""
+    short_by_ms: int = 0
+
+    @property
+    def answered(self) -> bool:
+        return self.crossed is not None
 
 
 class ReferenceShadow:
@@ -116,25 +137,74 @@ class ReferenceShadow:
         """
         return self._brti_features
 
-    def crossed_since(self, since_ms: int, side: str) -> bool | None:
+    def crossing_since(
+        self, since_ms: int, side: str, now_ms: int | None = None
+    ) -> Crossing:
         """Has BRTI been on the wrong side of the strike since `since_ms`?
 
-        None when it cannot be answered - no series, or the series does not
-        reach back that far. The caller must treat None as "unknown", never as
-        "no": an unanswerable safety question is not a pass.
+        THE ANSWER CARRIES ITS OWN COVERAGE. `None` used to come back bare
+        from four different situations, and the caller printed one sentence
+        over all of them - so "the feed is 1.4s behind" and "we have no series
+        at all" were the same message, and the first, which resolves itself on
+        the next poll, was recorded as a permanent refusal.
+
+        The series must cover the interval BOTH WAYS to answer:
+
+        * it must start at or before `since_ms`, or an earlier crossing could
+          have happened where we cannot see;
+        * it must reach `since_ms`, or there is no sample in the interval at
+          all - this is the routine one, BRTI publishes on whole seconds and
+          trails real time by a second or two, and the add is evaluated on the
+          same poll the entry fills;
+        * and it must reach close enough to NOW, or we would be answering "no
+          crossing" for an interval we stopped observing minutes ago. That
+          last one is new, and it makes the gate stricter, not looser: a stale
+          series used to return a confident False.
+
+        `crossed` is never inferred. Unknown stays unknown.
         """
         features = self._brti_features
-        if not self._brti_series or features is None or not features.target:
-            return None
-        window = [(t, v) for t, v in self._brti_series if t >= since_ms]
-        if not window:
-            return None
-        if self._brti_series[0][0] > since_ms:
-            return None  # series starts after entry; cannot rule a crossing out
+        series = self._brti_series
+        if not series or features is None or not features.target:
+            return Crossing(None, "BRTI series unavailable")
+        first_ms, last_ms = series[0][0], series[-1][0]
+        if first_ms > since_ms:
+            return Crossing(
+                None, "BRTI history starts after the entry",
+                int(first_ms - since_ms),
+            )
+        if last_ms < since_ms:
+            return Crossing(
+                None, "BRTI has not published a sample covering the entry yet",
+                int(since_ms - last_ms),
+            )
+        stale_ms = int(self._settings.reference_stale_ms)
+        if now_ms is not None:
+            # A SERIES SLIGHTLY AHEAD OF THE CLOCK IS NORMAL - BRTI timestamps
+            # run a second or two ahead of ours often enough that a plain
+            # `now_ms - last_ms` is routinely negative. A series an HOUR ahead
+            # is not drift, it is a units mistake, and it would silently
+            # disable the staleness check below by making the difference
+            # hugely negative rather than by raising anything.
+            if (last_ms - now_ms) > 3_600_000:
+                return Crossing(
+                    None, "the clock and the BRTI series disagree",
+                    int(last_ms - now_ms),
+                )
+            if (now_ms - last_ms) > stale_ms:
+                return Crossing(
+                    None, "BRTI series is stale", int(now_ms - last_ms),
+                )
         target = features.target
+        # Non-empty by construction: `last_ms >= since_ms` guarantees a sample.
+        window = [value for ts, value in series if ts >= since_ms]
         if side == "UP":
-            return any(value < target for _, value in window)
-        return any(value > target for _, value in window)
+            return Crossing(any(value < target for value in window))
+        return Crossing(any(value > target for value in window))
+
+    def crossed_since(self, since_ms: int, side: str) -> bool | None:
+        """The bare answer, for callers that only need the verdict."""
+        return self.crossing_since(since_ms, side).crossed
 
     # ------------------------------------------------------------- polling
 

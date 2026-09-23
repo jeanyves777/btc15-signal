@@ -2702,6 +2702,20 @@ class Store:
         ).fetchone()
         return int(row[0]) if row and row[0] else None
 
+    def has_broker_fill(self, ticker: str) -> bool:
+        """Is the exchange's own record of the entry here yet?
+
+        `position_entry_ms` prefers `fills.filled_ms` and falls back to the
+        proposal's `created_at` - when we ASKED, not when we were filled. This
+        is what tells the caller whether it is on the fallback, so it can go
+        and confirm the instant rather than measure the crossing gate from it.
+        """
+        row = self.db.execute(
+            "SELECT 1 FROM fills WHERE ticker = ? AND action = 'buy' LIMIT 1",
+            (ticker,),
+        ).fetchone()
+        return row is not None
+
     def recovery_epoch_ms(self) -> int:
         """When recovery accounting began. Markets older than this are history.
 
