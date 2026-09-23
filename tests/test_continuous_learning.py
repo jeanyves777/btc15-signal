@@ -1596,3 +1596,67 @@ def test_the_learning_snapshot_carries_the_revision(tmp_path):
     snap = LearningRunner(settings, store).snapshot(NOW)
     assert "revision" in snap
     assert snap["revision"]["fingerprint"]
+
+
+def test_a_policy_fitted_by_a_superseded_method_cannot_act(tmp_path):
+    """`feature_version` says what the numbers ARE; `model_version` says what
+    was DONE to them, and they fail the same way.
+
+    A delta fitted when confidence was sized from dollars per contract does not
+    mean what this build means by a delta - the field is the same integer
+    either way, which is exactly why it needs a version rather than an
+    inspection. Without this the corrected build would have kept applying the
+    old method's deltas until the next scheduled refit.
+    """
+    stale = intel.Policy(
+        version="kalshi-brti-1-old", model_version="arms-shrunk-2",
+        feature_version="brti-1", data_end_ms=NOW,
+        arms={f"{CTX}|accept": {"n": 300, "delta": -12, "action": "neutral"}},
+        feature_fingerprint=feature_contract.FINGERPRINT,
+        feature_definitions=feature_contract.CONTRACT.payload(),
+    )
+    ok, why = learning.policy_is_valid(
+        stale, fingerprint=feature_contract.FINGERPRINT,
+        feature_version="brti-1",
+    )
+    assert not ok
+    assert "superseded method" in why and "arms-shrunk-2" in why
+
+    # ...and a fresh fit carries the current method, so it passes.
+    fresh = learning.train(
+        rows_for(CTX, 400, qualified=True, win_rate=0.85, ask=0.80),
+        fingerprint=feature_contract.FINGERPRINT,
+        feature_definitions=feature_contract.CONTRACT.payload(),
+        feature_version="brti-1",
+    ).policy
+    assert fresh.model_version == learning.MODEL_VERSION
+    ok, why = learning.policy_is_valid(
+        fresh, fingerprint=feature_contract.FINGERPRINT,
+        feature_version="brti-1",
+    )
+    assert ok, why
+
+
+def test_the_stale_method_triggers_an_automatic_refit(tmp_path):
+    """The guard is not just a refusal: it makes a rebuild due."""
+    from btc15_signal.config import Settings
+    from btc15_signal.learning_runner import LearningRunner
+
+    store = make_store(tmp_path)
+    policy_path = tmp_path / "p.json"
+    intel.Policy(
+        version="kalshi-brti-1-old", model_version="arms-shrunk-2",
+        feature_version="brti-1", data_end_ms=NOW,
+        arms={f"{CTX}|accept": {"n": 300, "delta": -12, "action": "neutral"}},
+        feature_fingerprint=feature_contract.FINGERPRINT,
+        feature_definitions=feature_contract.CONTRACT.payload(),
+    ).save(policy_path)
+    settings = Settings(intelligence_policy_path=str(policy_path),
+                        database_path=str(tmp_path / "t.db"))
+    runner = LearningRunner(settings, store)
+    assert runner.due(NOW) == (True, "bootstrap")
+    # And meanwhile the stale deltas do not reach a decision.
+    snap = runner.snapshot(NOW)
+    assert snap["policy_valid"] is False
+    assert snap["adjusting_confidence"] is False
+    assert snap["active_adjustments"] == []

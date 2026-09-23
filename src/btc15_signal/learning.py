@@ -61,6 +61,23 @@ MIN_VALIDATE_N = 40        # enough for the out-of-sample leg to mean anything
 MIN_CONFIDENCE_N = 120     # enough to re-rate what the operator is shown
 MIN_WITHDRAWAL_N = 20      # enough forward changes to call an active arm bad
 
+# THE METHOD, named and versioned like the features.
+#
+# `feature_version` says what the numbers ARE; this says what was DONE to
+# them. They fail the same way: a delta fitted when confidence was sized
+# from dollars per contract does not mean what this build means by a delta,
+# even though both are integers in the same field and both look applied.
+# Bumped whenever the fitting method changes, and checked at runtime, so a
+# superseded artefact is refused rather than silently reinterpreted.
+#
+#   arms-shrunk-2      confidence sized from profit. WRONG: an expensive
+#                      contract that wins often loses money and is still a
+#                      high-confidence call.
+#   arms-calibrated-1  confidence sized from the calibration error,
+#                      validated out of sample. Profit drives execution.
+MODEL_VERSION = "arms-calibrated-1"
+SUPERSEDED_MODEL_VERSIONS = ("arms-shrunk-1", "arms-shrunk-2")
+
 TRAIN_FRACTION = 0.55
 VALIDATE_FRACTION = 0.25
 
@@ -493,7 +510,7 @@ def train(
 
     policy = Policy(
         version=f"kalshi-{feature_version}-{now_ms // 1000}",
-        model_version="arms-shrunk-2",
+        model_version=MODEL_VERSION,
         feature_version=feature_version,
         training_cutoff_ms=report.training_cutoff_ms,
         data_end_ms=report.data_end_ms,
@@ -811,6 +828,15 @@ def policy_is_valid(policy: Policy, *, fingerprint: str,
     if policy.feature_version != feature_version:
         return False, (
             f"feature version {policy.feature_version} != {feature_version}"
+        )
+    # THE METHOD, checked like the features. A policy fitted when confidence
+    # was sized from dollars carries deltas that this build would not have
+    # produced and cannot interpret - the field is the same integer either way,
+    # which is exactly why it needs a version rather than an inspection.
+    if policy.model_version in SUPERSEDED_MODEL_VERSIONS:
+        return False, (
+            f"fitted by superseded method {policy.model_version} "
+            f"(current {MODEL_VERSION})"
         )
     if policy.feature_fingerprint != fingerprint:
         return False, (
