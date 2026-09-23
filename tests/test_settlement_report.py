@@ -53,7 +53,11 @@ def test_reports_a_win_when_our_side_matches_the_result(tmp_path):
     assert "Market settled <b>UP</b>" in text
     assert "Bought <b>UP</b>" in text and "WIN" in text
     assert "WIN" in text  # the headline is about money, and money was made
-    assert "at 90¢" in text
+    # THE PRICE IS ON THE LEG LINE. A position can hold a base entry and a
+    # recovery add at different prices, and the single "Bought UP at 90c"
+    # phrasing had nowhere to put the second - which is how an add that
+    # filled came to be absent from the recap entirely.
+    assert "Base: 1 @ 90¢" in text
 
 
 def test_reports_a_loss_when_the_other_side_won(tmp_path):
@@ -78,10 +82,17 @@ def test_pnl_is_sized_by_what_was_actually_filled(tmp_path):
     """
     # 1 contract at 80c: fee 0.07*1*0.8*0.2 = 1.12c, charged as $0.0112.
     win = settle_and_report(tmp_path, "UP", "yes", price=0.80, traded=True)
-    assert "Cost $0.80 · Profit $0.19" in win
+    # The cost is now the reconciled total across every leg, and the size it
+    # covers is stated with it - which is the number this test exists to
+    # protect: reporting a size the bot never ordered announced a real -$0.85
+    # night as -$3.91.
+    assert "Base: 1 @ 80¢" in win
+    assert "Total cost $0.80 for 1 contract" in win
+    assert "Profit $0.19" in win
 
     loss = settle_and_report(tmp_path, "UP", "no", price=0.80, traded=True)
-    assert "Cost $0.80 · Lost $0.81" in loss
+    assert "Total cost $0.80 for 1 contract" in loss
+    assert "Lost $0.81" in loss
 
 
 def test_an_untraded_signal_reports_no_money_at_all(tmp_path):

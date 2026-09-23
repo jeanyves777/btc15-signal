@@ -37,6 +37,53 @@ def event_order(side: str, contract_price: float, exiting: bool = False) -> tupl
     return ("bid" if exiting else "ask"), 1 - contract_price
 
 
+def parse_fill(order: dict | None, side: str) -> dict | None:
+    """(count, price, fee, is_taker) from an order, or None if unfilled.
+
+    THE PRICE IS THE COST DIVIDED BY THE COUNT, because that is what was
+    actually paid. `yes_price_dollars` is the quote on the YES side, so on
+    a DOWN position it reads 0.1700 for an order that filled at 0.8300 -
+    the complement, silently, with no error anywhere.
+
+    A PENDING ORDER RETURNS None. `initial_count_fp` is what was asked
+    for; `fill_count_fp` is what happened, and only the second may ever be
+    treated as a position.
+    """
+    if not order:
+        return None
+
+    def num(key: str) -> float:
+        try:
+            return float(order.get(key) or 0)
+        except (TypeError, ValueError):
+            return 0.0
+
+    count = num("fill_count_fp")
+    if count <= 0:
+        count = max(0.0, num("initial_count_fp") - num("remaining_count_fp"))
+    if count <= 0:
+        return None
+    maker_cost, taker_cost = (num("maker_fill_cost_dollars"),
+                              num("taker_fill_cost_dollars"))
+    cost = maker_cost + taker_cost
+    fee = num("maker_fees_dollars") + num("taker_fees_dollars")
+    if cost > 0:
+        price = cost / count
+    else:
+        # No cost reported: fall back to the quote for OUR side, never the
+        # other one.
+        price = num("no_price_dollars" if side == "DOWN"
+                    else "yes_price_dollars")
+    return {
+        "count": count,
+        "price": round(price, 6),
+        "fee": round(fee, 6),
+        "is_taker": 1 if taker_cost > 0 else 0,
+        "status": order.get("status"),
+        "order_id": order.get("order_id"),
+    }
+
+
 class KalshiExecutionClient:
     def __init__(self, base_url: str, api_key_id: str, private_key_path: str) -> None:
         self.base_url = base_url.rstrip("/")
@@ -248,9 +295,21 @@ class KalshiExecutionClient:
         except (httpx.HTTPError, OSError) as exc:
             return False, f"{type(exc).__name__}: {exc}"[:160]
 
+    # The parser is a module function so a test double supplies an ORDER and
+    # the real parser reads it, rather than every double implementing its own.
+    parse_fill = staticmethod(parse_fill)
+
     async def order_status(self, order_id: str) -> dict | None:
-        """The order as Kalshi sees it, for reconciling a cancel/fill race."""
-        path = f"/portfolio/events/orders/{order_id}"
+        """The order as Kalshi sees it, for reconciling a cancel/fill race.
+
+        `/portfolio/orders/{id}`, NOT `/portfolio/events/orders/{id}`. The
+        create and cancel calls moved to the `events` family and this read was
+        moved with them, but the read never existed there: it returns 404 for
+        every order, so this returned None every time and the caller concluded
+        "not filled" on orders that had filled. `/portfolio/orders/{id}` is a
+        live GET and returns the order.
+        """
+        path = f"/portfolio/orders/{order_id}"
         try:
             response = await self.client.get(
                 self.base_url + path, headers=self._headers("GET", path)

@@ -2911,6 +2911,11 @@ async def report_settlement(
         called_side=called_side,
         qualified=bool(qualified),
         contracts=contracts_shown or 0.0,
+        # EVERY LEG, reconciled. A recovery add that filled used to be absent
+        # from the recap entirely, so the profit beside it - which the broker
+        # computes over the whole position - could not be derived from any
+        # number the message showed.
+        position=store.position_for_window(window_open) if trade else None,
         # The charged entry fee, so the recap's cost is the fill's cost.
         fee=(trade.get("fee") if trade else None),
         winner=winner,

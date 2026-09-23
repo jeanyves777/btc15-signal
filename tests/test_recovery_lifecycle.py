@@ -129,8 +129,17 @@ def test_placement_then_full_fill_is_recorded_with_fee_and_maker_flag(tmp_path):
     assert store.open_add(WINDOW)["state"] == AddState.PENDING
 
     broker.fill = {
-        "status": "executed", "maker_fill_count": 1, "taker_fill_count": 0,
-        "average_fill_price_dollars": 0.70, "fees_paid_dollars": 0.0,
+        "status": "executed",
+        "fill_count_fp": "1.0",
+        "initial_count_fp": "1.0",
+        "remaining_count_fp": "0.0",
+        "maker_fill_cost_dollars": "0.7",
+        "taker_fill_cost_dollars": "0.0",
+        "maker_fees_dollars": "0.0",
+        "taker_fees_dollars": "0.0",
+        "no_price_dollars": "0.7",
+        "yes_price_dollars": "0.3",
+        "outcome_side": "no",
     }
     step(runner, broker)
     row = store.open_add(WINDOW)
@@ -147,8 +156,17 @@ def test_a_partial_fill_is_banked_for_the_amount_filled(tmp_path):
     broker = Broker()
     step(runner, broker)
     broker.fill = {
-        "status": "resting", "maker_fill_count": 0.4, "taker_fill_count": 0,
-        "average_fill_price_dollars": 0.70, "fees_paid_dollars": 0.004,
+        "status": "resting",
+        "fill_count_fp": "0.4",
+        "initial_count_fp": "1.0",
+        "remaining_count_fp": "0.6",
+        "maker_fill_cost_dollars": "0.28",
+        "taker_fill_cost_dollars": "0.0",
+        "maker_fees_dollars": "0.004",
+        "taker_fees_dollars": "0.0",
+        "no_price_dollars": "0.7",
+        "yes_price_dollars": "0.3",
+        "outcome_side": "no",
     }
     step(runner, broker)
     row = store.open_add(WINDOW)
@@ -178,8 +196,17 @@ def test_cancel_racing_a_fill_banks_the_fill_not_the_cancel(tmp_path):
     step(runner, broker)
     broker.cancel_ok = False
     broker.fill = {
-        "status": "executed", "maker_fill_count": 1,
-        "average_fill_price_dollars": 0.70, "fees_paid_dollars": 0.0,
+        "status": "executed",
+        "fill_count_fp": "1.0",
+        "initial_count_fp": "1.0",
+        "remaining_count_fp": "0.0",
+        "maker_fill_cost_dollars": "0.7",
+        "taker_fill_cost_dollars": "0.0",
+        "maker_fees_dollars": "0.0",
+        "taker_fees_dollars": "0.0",
+        "no_price_dollars": "0.7",
+        "yes_price_dollars": "0.3",
+        "outcome_side": "no",
     }
     step(runner, broker, feats=features(side="DOWN"))
     assert store.open_add(WINDOW)["state"] == AddState.EXECUTED
@@ -238,8 +265,17 @@ def test_add_pnl_is_reported_separately_from_the_account(tmp_path):
     broker = Broker()
     step(runner, broker)
     broker.fill = {
-        "status": "executed", "maker_fill_count": 1,
-        "average_fill_price_dollars": 0.70, "fees_paid_dollars": 0.0,
+        "status": "executed",
+        "fill_count_fp": "1.0",
+        "initial_count_fp": "1.0",
+        "remaining_count_fp": "0.0",
+        "maker_fill_cost_dollars": "0.7",
+        "taker_fill_cost_dollars": "0.0",
+        "maker_fees_dollars": "0.0",
+        "taker_fees_dollars": "0.0",
+        "no_price_dollars": "0.7",
+        "yes_price_dollars": "0.3",
+        "outcome_side": "no",
     }
     step(runner, broker)
     store.update_add(

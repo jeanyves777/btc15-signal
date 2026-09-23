@@ -2041,11 +2041,23 @@ def session_close_message(*, session, day_snapshot, ny_day: str,
     )
 
 
+def _counted_line(exited_at, position) -> str:
+    """Which money the sale accounted for - all of it, or only its own part."""
+    if exited_at is None:
+        return ""
+    sold = float((position or {}).get("exit_count") or 0)
+    held = float((position or {}).get("contracts") or 0)
+    if sold and held and sold < held:
+        return surface.PART_COUNTED
+    return surface.ALREADY_COUNTED
+
+
 def result_message(*, side: str, ticker: str, winner: str, won: bool,
                    traded: bool, pnl: float | None, contracts: float = 0.0,
                    paid: float | None = None, fee: float | None = None,
                    exited_at: float | None = None,
                    called_side: str = "", qualified: bool | None = None,
+                   position: dict | None = None,
                    snapshot=None, insight: str = "", priority=None) -> str:
     """How a window closed. Three facts, never collapsed into one verdict.
 
@@ -2088,15 +2100,34 @@ def result_message(*, side: str, ticker: str, winner: str, won: bool,
         headline = (f"{'WIN' if made_money else 'LOSS'} · "
                     f"{surface._signed_dollars(pnl or 0.0)}")
 
+    # WITH A RECONCILED POSITION the price belongs on the leg lines, because
+    # there is more than one of them and averaging them away is how a
+    # recovery add came to be invisible. Without one, the single price stays.
+    legs = surface.position_block(position, side) if traded else []
     essentials = [
         f"{surface.side_icon(side)} "
         + ("Bought" if traded else "Signal:")
         + f" <b>{escape(side)}</b>"
-        + (f" at {surface.cents(paid)}" if paid is not None else ""),
+        + ("" if legs else
+           (f" at {surface.cents(paid)}" if paid is not None else "")),
     ]
+    essentials.extend(legs)
     if exited_at is not None:
+        # HOW MANY. An early exit need not close the whole position - two of
+        # three contracts were sold here and the third ran to settlement, so
+        # "Sold before expiry" on its own describes a flat position that was
+        # not flat.
+        sold = float((position or {}).get("exit_count") or 0)
+        held = float((position or {}).get("contracts") or 0)
+        detail = ""
+        if sold and held and sold < held:
+            detail = (f" \u00b7 {sold:g} of {held:g} \u00b7 "
+                      f"{held - sold:g} ran to settlement")
+        elif sold:
+            detail = f" \u00b7 all {sold:g}"
         essentials.append(
-            f"{surface.PRICE} Sold before expiry at {surface.cents(exited_at)}"
+            f"{surface.PRICE} Sold before expiry at "
+            f"{surface.cents(exited_at)}{detail}"
         )
     essentials.append(
         f"\U0001f3c1 Market{' later' if exited_at is not None else ''} "
@@ -2119,6 +2150,18 @@ def result_message(*, side: str, ticker: str, winner: str, won: bool,
                 + ("rule qualified it" if qualified else "rule declined it")
             )
         essentials.append(surface.NO_TRADE)
+    elif pnl is not None and position:
+        # THE RECONCILED TOTAL. `position_block` above has already printed the
+        # cost across every leg, so this states the outcome against it rather
+        # than repeating a figure computed from the base entry alone - which
+        # is what made a three-contract position report a two-contract cost.
+        outcome = ("$0.00 net" if flat
+                   else (f"Profit ${pnl:,.2f}" if made_money
+                         else f"Lost ${abs(pnl):,.2f}"))
+        essentials.append(
+            f"{surface.MONEY} Combined realised {outcome} "
+            f"<i>(net of fees, all legs)</i>"
+        )
     elif pnl is not None:
         # THE SAME COST THE FILL ANNOUNCED. The fill reports what left the
         # account - stake plus the charged entry fee - and this reported the
@@ -2156,7 +2199,7 @@ def result_message(*, side: str, ticker: str, winner: str, won: bool,
         ticker=ticker,
         essentials=essentials,
         checks=[],
-        status=surface.ALREADY_COUNTED if exited_at is not None else "",
+        status=_counted_line(exited_at, position),
         snapshot=snapshot,
         priority=priority,
         insight=insight,

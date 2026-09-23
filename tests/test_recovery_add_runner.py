@@ -57,9 +57,17 @@ class FakeTrader:
     async def order_status(self, order_id):
         if self.fill_on_status:
             return {
-                "order_id": order_id, "status": "executed",
-                "maker_fill_count": 1, "taker_fill_count": 0,
-                "average_fill_price_dollars": 0.79, "fees_paid_dollars": 0.0,
+                "status": "executed",
+                "fill_count_fp": "1.0",
+                "initial_count_fp": "1.0",
+                "remaining_count_fp": "0.0",
+                "maker_fill_cost_dollars": "0.79",
+                "taker_fill_cost_dollars": "0.0",
+                "maker_fees_dollars": "0.0",
+                "taker_fees_dollars": "0.0",
+                "no_price_dollars": "0.79",
+                "yes_price_dollars": "0.21",
+                "outcome_side": "no",
             }
         return {"order_id": order_id, "status": "resting"}
 

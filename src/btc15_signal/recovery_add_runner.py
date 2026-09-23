@@ -35,6 +35,7 @@ import traceback
 
 from .capital import CapitalController
 from .config import Settings
+from .execution import parse_fill
 from .recovery_add import (
     AddLimits,
     AddState,
@@ -334,27 +335,20 @@ class RecoveryAddRunner:
         self, trader, existing, now_ms, crossed, features
     ) -> bool:
         order = await trader.order_status(existing["order_id"])
-        if not order:
+        # ONE PARSER, on the broker's real field names. This read
+        # `taker_fill_count`/`maker_fill_count`/`filled_count` and
+        # `average_fill_price_dollars`, none of which Kalshi returns - and
+        # fell back to `yes_price_dollars`, which on a DOWN position is the
+        # COMPLEMENT of the price paid. It would have recorded 0.17 for a fill
+        # at 0.83.
+        detail = parse_fill(order, existing["side"])
+        if detail is None:
             return False
-        filled = float(
-            order.get("taker_fill_count") or 0
-        ) + float(order.get("maker_fill_count") or 0)
-        if filled <= 0:
-            filled = float(order.get("filled_count") or 0)
-        if filled <= 0:
-            return False
-        price = float(
-            order.get("average_fill_price_dollars")
-            or order.get("yes_price_dollars")
-            or existing["limit_price"]
-        )
-        if existing["side"] == "DOWN" and order.get("side") == "no":
-            pass  # already expressed in our side's terms by the API
-        maker = float(order.get("maker_fill_count") or 0) > 0
-        fee = float(order.get("fees_paid_dollars") or 0)
+        filled, price = detail["count"], detail["price"]
+        fee = detail["fee"]
         self._store.record_add_fill(
             existing["client_order_id"], filled, price, fee, now_ms,
-            is_taker=0 if maker else 1,
+            is_taker=detail["is_taker"],
             conditions=json.dumps({
                 "side": getattr(features, "side", None),
                 "distance": getattr(features, "brti_normalized_distance", None),

@@ -1177,6 +1177,111 @@ class Store:
         )
         return len(rows), wins, pnl
 
+    def reconcile_recovery_adds(self, window_open: int) -> int:
+        """Repair add rows the order poll failed to bank, from the fills.
+
+        `order_status` read an endpoint that 404s for every order, so
+        `_bank_if_filled` never banked anything and every add that filled was
+        written down as CANCELLED - with `cancel_reason` literally saying
+        "order not found (already filled, expired or cancelled)". The fills
+        sync had the truth all along.
+
+        Returns how many rows it corrected. It only ever moves a row from
+        not-filled to filled against a broker fill; it never invents a fill
+        and never edits the ledger.
+        """
+        rows = self._dicts(
+            "SELECT * FROM recovery_adds WHERE window_open_ms = ? "
+            "AND COALESCE(filled_count, 0) = 0 AND order_id IS NOT NULL",
+            (window_open,),
+        )
+        fixed = 0
+        for add in rows:
+            fills = self._dicts(
+                "SELECT count, yes_price, no_price, fee_cost, is_taker, "
+                "filled_ms FROM fills WHERE order_id = ?",
+                (add["order_id"],),
+            )
+            if not fills:
+                continue
+            count = sum(float(f["count"] or 0) for f in fills)
+            if count <= 0:
+                continue
+            # OUR SIDE'S PRICE. `yes_price` on a DOWN leg is the complement.
+            key = "no_price" if add["side"] == "DOWN" else "yes_price"
+            cost = sum(float(f["count"] or 0) * float(f[key] or 0) for f in fills)
+            fee = sum(float(f["fee_cost"] or 0) for f in fills)
+            self.db.execute(
+                "UPDATE recovery_adds SET state = ?, filled_count = ?, "
+                "fill_price = ?, fill_ms = ?, fee_paid = ?, is_taker = ?, "
+                "cancel_reason = ?, updated_ms = ? WHERE client_order_id = ?",
+                ("RECOVERY ADD EXECUTED", count, round(cost / count, 6),
+                 fills[0]["filled_ms"], fee, fills[0]["is_taker"],
+                 f"reconciled from broker fills; previously recorded as "
+                 f"{add['state']}"[:200],
+                 fills[0]["filled_ms"], add["client_order_id"]),
+            )
+            fixed += 1
+        if fixed:
+            self.db.commit()
+        return fixed
+
+    def position_for_window(self, window_open: int) -> dict | None:
+        """Every leg of one position, reconciled, with the legs kept apart.
+
+        A PENDING ORDER IS NOT A POSITION. Only `filled_count` counts; an add
+        that is resting, cancelled or expired is reported as such and
+        contributes nothing to quantity, cost or profit.
+        """
+        base = self.trade_for_window(window_open)
+        if base is None:
+            return None
+        self.reconcile_recovery_adds(window_open)
+        adds = self._dicts(
+            "SELECT * FROM recovery_adds WHERE window_open_ms = ?",
+            (window_open,),
+        )
+        # READ DEFENSIVELY. A caller may hand in a partial base - the
+        # settlement tests stub `trade_for_window` - and a missing optional
+        # key must not turn a reporting helper into a crash on the path that
+        # reports money.
+        legs = [{
+            "kind": "base",
+            "count": float(base.get("count") or 0),
+            "price": base.get("paid"),
+            "fee": float(base.get("fee") or 0),
+            "confirmed": base.get("confirmed", True),
+            "state": "filled",
+        }]
+        for add in adds:
+            filled = float(add["filled_count"] or 0)
+            legs.append({
+                "kind": "recovery",
+                "count": filled,
+                "price": add["fill_price"] if filled else add["limit_price"],
+                "fee": float(add["fee_paid"] or 0),
+                "confirmed": bool(filled),
+                "state": ("filled" if filled
+                          else ("cancelled" if add.get("cancelled_ms")
+                                else "pending")),
+                "reason": add.get("cancel_reason") or "",
+            })
+        held = [leg for leg in legs if leg["count"] > 0]
+        contracts = sum(leg["count"] for leg in held)
+        cost = sum(leg["count"] * (leg["price"] or 0.0) for leg in held)
+        fees = sum(leg["fee"] for leg in held)
+        return {
+            "legs": legs,
+            "contracts": contracts,
+            "cost": round(cost, 6),
+            "fees": round(fees, 6),
+            "total_cost": round(cost + fees, 6),
+            "side": base.get("side"),
+            "exit_price": base.get("exit_price"),
+            "exit_count": float(base.get("exit_count") or 0),
+            "exited": bool(base.get("exited")),
+        }
+
     def trade_for_window(self, window_open: int) -> dict | None:
         """The real order behind a signal, or None if it was never traded.
 

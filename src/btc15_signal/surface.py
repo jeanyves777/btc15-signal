@@ -428,6 +428,57 @@ def compose(*, header: str, ticker: str, essentials: list[str],
 # ----------------------------------------------------------- money wording
 
 
+def position_block(position: dict | None, side: str = "") -> list[str]:
+    """Base and recovery add as separate lines, then one total.
+
+    THE LEGS ARE NEVER MERGED into an average. Two contracts at 85c and one
+    at 83c is not three at 84.33c: the operator sized the second entry on a
+    rule with its own conditions, and averaging them away hides whether that
+    rule paid for itself.
+
+    A PENDING ORDER IS NOT A POSITION. An add that is resting, cancelled or
+    expired is shown as such and contributes nothing to the quantity or the
+    cost - the state is printed so it cannot simply vanish from the recap,
+    which is how a fill came to be invisible in the first place.
+    """
+    if not position:
+        return []
+    lines = []
+    for leg in position.get("legs", ()):
+        count, price = leg.get("count") or 0.0, leg.get("price")
+        if leg["kind"] == "base":
+            if count <= 0:
+                continue
+            lines.append(
+                f"{PACKAGE} Base: {count:g} @ {cents(price)}"
+                + ("" if leg.get("confirmed") else " <i>(unconfirmed)</i>")
+            )
+            continue
+        state = leg.get("state")
+        if state == "filled":
+            lines.append(
+                f"{RECOVERY} Recovery add: {count:g} @ {cents(price)}"
+            )
+        else:
+            # NAMED, NOT DROPPED. A reader who sees nothing cannot tell an add
+            # that never happened from one the message forgot.
+            detail = f" \u00b7 rested at {cents(price)}" if price else ""
+            lines.append(
+                f"{RECOVERY} Recovery add: <b>{escape(state)}</b>{detail}"
+            )
+    contracts = position.get("contracts") or 0.0
+    total = position.get("total_cost")
+    if contracts and total is not None:
+        fees = position.get("fees") or 0.0
+        charged = (f"${fees:,.2f}" if fees >= 0.005 else "under 1\u00a2")
+        lines.append(
+            f"{PRICE} Total cost ${total:,.2f} for {contracts:g} "
+            f"contract{'s' if contracts != 1 else ''} "
+            f"<i>(incl. {charged} fees)</i>"
+        )
+    return lines
+
+
 def entry_cost(contracts: float, paid: float, fee: float | None) -> str:
     """What was actually spent, and whether the figure includes fees.
 
@@ -476,3 +527,9 @@ def max_net_profit(contracts: float, paid: float, fee: float | None) -> str:
 
 NO_TRADE = f"{PRICE} Not traded \u00b7 realised P&amp;L $0.00"
 ALREADY_COUNTED = "\U0001f9fe <i>Already counted at the sale.</i>"
+# A PARTIAL EXIT IS NOT counted at the sale. Two of three
+# contracts were sold here and the third ran to settlement, so
+# part of the money arrived hours after the sale this line says
+# accounted for all of it.
+PART_COUNTED = ("\U0001f9fe" + " <i>The sale was counted when it happened; "
+                "the rest settled at expiry.</i>")
