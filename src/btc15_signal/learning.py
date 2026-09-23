@@ -248,12 +248,11 @@ def excludes_zero(low: float, high: float) -> bool:
     return low > 0 or high < 0
 
 
-def _survives_widening(low: float, high: float, widening: float) -> bool:
-    """Would this interval still exclude zero after a multiplicity correction?"""
-    if low == 0.0 and high == 0.0:
-        return False
-    mid, half = (high + low) / 2, (high - low) / 2 * widening
-    return mid - half > 0 or mid + half < 0
+# `_survives_widening` REMOVED. It widened a bootstrap interval by sqrt(k)
+# and called the result a multiplicity correction. It is not one: it has no
+# stated coverage, it is not a test, and it was far more conservative than
+# it looked - sqrt(7) is roughly a 99.6% interval. Both bars now use
+# `holm_bonferroni`, which controls a stated family-wise error rate.
 
 
 BUCKET_WIDTH = 10          # points per reliability bucket
@@ -449,6 +448,26 @@ class ArmFit:
     # The nested out-of-sample residual: the only thing a confidence
     # delta may be sized from.
     nested: dict = field(default_factory=dict)
+    # HOW THIS ARM CAME TO BE AUTHORISED, as fields rather than as a sentence
+    # inside `delta_reason`. An audit that has to parse prose is not an audit,
+    # and these serialise into the policy artefact beside the delta itself.
+    delta_method: str = ""
+    delta_p: float | None = None
+    delta_correction: str = ""
+    delta_cells_tested: int = 0
+    delta_folds: int = 0
+    delta_quantity: str = ""
+    # The execution bar's own evidence, recorded the same way.
+    execution_p: float | None = None
+    execution_cells_tested: int = 0
+    execution_correction: str = ""
+    # THE RAW ROWS BEHIND THE INTERVAL. `cluster_p` is only computed for the
+    # cells that actually propose an action, which is not known until every
+    # cell has been fitted - so the inputs have to survive the fit. Excluded
+    # from the serialised policy by `payload()`; they are working data, not
+    # evidence to publish.
+    values: list = field(default_factory=list)
+    days_of: list = field(default_factory=list)
     # THE MARKET's calibration: observed outcome minus the ask, which is what
     # Kalshi predicted. Reported, never applied - it says whether the PRICE is
     # right, which is a different claim from whether our confidence is.
@@ -497,6 +516,20 @@ class ArmFit:
             "calibration_low": round(self.calibration_low, 6),
             "calibration_high": round(self.calibration_high, 6),
             "calibration_n": self.calibration_n,
+            # WHAT AUTHORISED THIS ARM, as fields. It used to be a sentence
+            # inside `delta_reason`, so anything auditing which arms may act -
+            # and on what evidence - had to parse English.
+            "delta_quantity": self.delta_quantity,
+            "delta_method": self.delta_method,
+            "delta_correction": self.delta_correction,
+            "delta_p": self.delta_p,
+            "delta_cells_tested": self.delta_cells_tested,
+            "delta_folds": self.delta_folds,
+            # And the execution bar's own, which is a DIFFERENT quantity on a
+            # DIFFERENT family: P&L on the validation slice, not calibration.
+            "execution_p": self.execution_p,
+            "execution_cells_tested": self.execution_cells_tested,
+            "execution_correction": self.execution_correction,
             "nested": self.nested,
             "model_probability": round(self.model_probability, 6),
             "market_calibration": round(self.market_calibration, 6),
@@ -556,6 +589,7 @@ def fit_arms(rows: list[dict], reward, min_n: int = 1,
         model_days = [day_of(r["window_open"]) for r, _p in scored]
         gap_low, gap_high = cluster_ci(model_gaps, model_days)
         out[key] = ArmFit(
+            values=list(values), days_of=list(days),
             key=key, n=len(values),
             markets=len({r["window_open"] for r in items}),
             days=len(set(days)),
@@ -661,6 +695,11 @@ class TrainingReport:
     # does not apply it, and the honest way to hold a weaker bar is to publish
     # what the stronger one would have said.
     confidence_surviving_multiplicity: int = 0
+    # The execution family: how many cells were tested and how many survived
+    # Holm-Bonferroni on the validation slice. Published because "nothing was
+    # promoted" and "nothing was tested" look identical from outside.
+    execution_cells_tested: int = 0
+    execution_surviving: int = 0
     candidates_examined: int = 0
     promoted: int = 0
     baseline_accept: float = 0.0
@@ -784,7 +823,26 @@ def train(
         and _proposed_action(arm, priors) != NEUTRAL
     ]
     report.candidates_examined = len(examined)
-    widening = max(1.0, math.sqrt(max(1, len(examined))))
+    # HOLM-BONFERRONI, NOT sqrt(k). This path kept the widening after the
+    # confidence path moved off it, so the bar that decides whether a cell may
+    # change an ORDER was the one still using a method with no stated
+    # coverage. The family is the same one it always was - the cells examined
+    # as execution candidates - and the quantity is the validation slice's
+    # day-clustered mean, which is what `_propose_execution` tests.
+    #
+    # The p-value is computed only for the examined cells: it is a bootstrap
+    # per cell, and cells that propose nothing are not in the family.
+    execution_p = {}
+    for key in examined:
+        val = validate_arms.get(key)
+        if val is None or not val.values:
+            continue
+        execution_p[key] = cluster_p(val.values, val.days_of)
+    execution_survives = holm_bonferroni(execution_p)
+    report.execution_cells_tested = len(execution_p)
+    report.execution_surviving = sum(
+        1 for ok in execution_survives.values() if ok
+    )
 
     for key, arm in arms.items():
         val = validate_arms.get(key)
@@ -793,7 +851,8 @@ def train(
         arm.shrunk = shrink(arm.mean, arm.n, priors[arm.applies_to])
         _calibrate_confidence(arm, validate_arms, nested,
                               eligible_cells, survives)
-        _propose_execution(arm, priors, validate_arms, widening,
+        _propose_execution(arm, priors, validate_arms,
+                           execution_survives, execution_p,
                            forward or {}, min_evidence)
         _count_error_directions(arm, train_rows, validate_rows)
 
@@ -803,19 +862,27 @@ def train(
         if a.n >= MIN_CONFIDENCE_N and a.days >= 2
     ]
     report.arms_eligible_for_confidence = len(eligible)
-    confidence_widening = max(1.0, math.sqrt(max(1, len(eligible))))
+    # HOW MANY CONFIDENCE ARMS ALSO CLEAR THE EXECUTION BAR. This used to be
+    # computed by widening each arm's P&L interval by sqrt(k) - a method the
+    # operator ruled out, applied to a different quantity from the one the
+    # confidence bar tests, and then reported as though the two bars had
+    # disagreed about the same thing. It is the execution bar's own result.
     report.confidence_surviving_multiplicity = sum(
-        1 for a in eligible
-        if a.delta and _survives_widening(a.low, a.high, confidence_widening)
+        1 for a in eligible if a.delta and a.promoted
     )
     if report.arms_with_confidence and not report.confidence_surviving_multiplicity:
         report.notes.append(
-            f"{report.arms_with_confidence} confidence arm(s) clear their own "
-            f"day-clustered interval; NONE survives the multiplicity widening "
-            f"applied to execution decisions across "
-            f"{report.arms_eligible_for_confidence} eligible cells. Confidence "
-            f"is label-only and is not held to that bar, but the weaker "
-            f"standard is the reason it is active and the stronger one is not."
+            f"TWO BARS, TWO QUANTITIES. "
+            f"{report.arms_with_confidence} arm(s) pass the CONFIDENCE bar: "
+            f"nested out-of-sample CALIBRATION residual (observed win rate "
+            f"minus the probability the price implied), Holm-Bonferroni at "
+            f"FWER 0.05 across {report.nested_eligible_cells} testable cells "
+            f"over {report.nested_folds} chronological folds. NONE passes the "
+            f"EXECUTION bar: day-clustered P&L on the validation slice, "
+            f"Holm-Bonferroni at FWER 0.05 across "
+            f"{report.execution_cells_tested} examined cells. They are "
+            f"different measurements on different families - passing one says "
+            f"nothing about the other, and only the second can move an order."
         )
     promoted = [a for a in arms.values() if a.promoted]
     report.promoted = len(promoted)
@@ -981,6 +1048,15 @@ def _calibrate_confidence(arm: ArmFit, validate_arms: dict,
             f"nested residual {cell['mean']:+.4f} rounds to no change"
         )
     else:
+        arm.delta_quantity = (
+            "nested out-of-sample calibration residual "
+            "(observed win rate minus the probability the price implied)"
+        )
+        arm.delta_method = "nested chronological cross-validation"
+        arm.delta_correction = "Holm-Bonferroni, FWER 0.05"
+        arm.delta_p = cell["p"]
+        arm.delta_cells_tested = eligible_cells
+        arm.delta_folds = int((nested or {}).get("tested_folds", 0))
         arm.delta_reason = (
             f"SCORE adjustment (not a probability correction): nested "
             f"out-of-sample residual {cell['mean']:+.4f} "
@@ -996,7 +1072,8 @@ def _calibrate_confidence(arm: ArmFit, validate_arms: dict,
 
 
 def _propose_execution(arm: ArmFit, priors: dict,
-                       validate_arms: dict[str, ArmFit], widening: float,
+                       validate_arms: dict[str, ArmFit],
+                       survives: dict[str, bool], pvalues: dict[str, float],
                        forward: dict[str, dict], min_evidence: int) -> None:
     """May this cell refuse or admit an ORDER? The full bar, stated in one place.
 
@@ -1043,12 +1120,23 @@ def _propose_execution(arm: ArmFit, priors: dict,
             f"{val.mean:+.4f} disagree in sign"
         )
         return
-    mid = (val.high + val.low) / 2
-    half = (val.high - val.low) / 2 * widening
-    if not (mid - half > 0 or mid + half < 0):
+    # THE FAMILY-WISE TEST. Looking at k cells and keeping the best is k
+    # chances to be fooled, so the correction is applied across the whole
+    # examined family rather than to this cell alone.
+    if arm.key not in pvalues:
         arm.action_reason = (
-            f"{proposed} proposed; validation interval widened for "
-            f"multiplicity [{mid - half:+.4f},{mid + half:+.4f}] includes zero"
+            f"{proposed} proposed; no day-clustered p-value could be computed "
+            f"on the validation slice"
+        )
+        return
+    arm.execution_p = round(pvalues[arm.key], 6)
+    arm.execution_cells_tested = len(pvalues)
+    arm.execution_correction = "Holm-Bonferroni, FWER 0.05"
+    if not survives.get(arm.key):
+        arm.action_reason = (
+            f"{proposed} proposed; validation p={arm.execution_p:.4f} does "
+            f"not survive Holm-Bonferroni at FWER 0.05 across "
+            f"{len(pvalues)} examined cells"
         )
         return
     live = forward.get(arm.key) or {}

@@ -852,6 +852,7 @@ def archive_observation(
     opened: int,
     remaining: int,
     now_ms: int,
+    brti=None,
 ) -> None:
     """One row per poll, for the WHOLE window, whatever the rule thinks.
 
@@ -866,11 +867,37 @@ def archive_observation(
     try:
         from .features import _session, _weekday
 
-        rule = EntryRule.load(settings.strategy_path)
-        prediction = predict(snapshot)
-        our_ask = contract.ask(prediction.side)
-        rule_match, failed = rule.matches(prediction, snapshot, our_ask)
-        volatility = max(snapshot.volatility_5m_bps, 1.0)
+        # NEITHER THE BINANCE MODEL NOR THE BINANCE RULE RUNS HERE.
+        #
+        # This called `predict(snapshot)` and `EntryRule.matches(...)` on every
+        # poll regardless of instrument. Under `kalshi_only` the snapshot is
+        # built from BRTI, so that was Binance-fitted arithmetic over
+        # Kalshi-scaled inputs, written to `side`, `raw_probability`,
+        # `bucket`, `distance_bps` and `rule_match` - names that say nothing
+        # about which instrument produced them. It is also what crashed the
+        # service every fifteen minutes on the morning of 2026-09-23:
+        # `strategy.check_facts` compares `prediction.raw_probability`, which
+        # a Kalshi prediction does not have.
+        #
+        # A field we cannot fill from Kalshi is left NULL. A missing row is
+        # visible; a mislabelled one is not.
+        if settings.kalshi_only:
+            if brti is None:
+                return          # no reference, nothing honest to archive
+            prediction = kalshi_signal.prediction_from(brti)
+            our_ask = contract.ask(prediction.side)
+            rule_match, _facts, _failed_names = kalshi_signal.evaluate(
+                KalshiBRTIRule.load(settings.kalshi_strategy_path),
+                brti, our_ask, remaining,
+            )
+            failed = ()
+            volatility = max(brti.brti_volatility_bps, 1.0)
+        else:
+            rule = EntryRule.load(settings.strategy_path)
+            prediction = predict(snapshot)
+            our_ask = contract.ask(prediction.side)
+            rule_match, failed = rule.matches(prediction, snapshot, our_ask)
+            volatility = max(snapshot.volatility_5m_bps, 1.0)
 
         # What we could close for right now, and what we are sitting on.
         exit_bid = 1 - contract.ask("DOWN" if prediction.side == "UP" else "UP")
@@ -925,14 +952,34 @@ def archive_observation(
             ),
             "window_open": opened, "remaining_s": remaining, "observed_ms": now_ms,
             "ticker": contract.ticker, "target": snapshot.target, "btc": snapshot.price,
-            "side": prediction.side, "raw_probability": prediction.raw_probability,
-            "bucket": prediction.bucket, "our_ask": our_ask,
+            "side": prediction.side,
+            # NULL ON THE KALSHI PATH. There is no Kalshi-native model, so
+            # there is no probability and no bucket - and writing the Binance
+            # ones here is how a column comes to hold two different meanings.
+            "raw_probability": getattr(prediction, "raw_probability", None),
+            "bucket": getattr(prediction, "bucket", None),
+            "our_ask": our_ask,
             "yes_ask": contract.yes_ask, "no_ask": contract.no_ask,
             "exit_bid": exit_bid,
-            "momentum_5m_bps": snapshot.momentum_5m_bps,
-            "volatility_5m_bps": snapshot.volatility_5m_bps,
-            "distance_bps": prediction.distance_bps,
-            "normalized_distance": prediction.distance_bps / volatility,
+            # The reference's own numbers on the Kalshi path, the spot ones
+            # on the legacy path. They are not the same quantity and the
+            # thresholds measured for one do not transfer to the other.
+            "momentum_5m_bps": (
+                brti.brti_momentum_bps if settings.kalshi_only
+                else snapshot.momentum_5m_bps
+            ),
+            "volatility_5m_bps": (
+                brti.brti_volatility_bps if settings.kalshi_only
+                else snapshot.volatility_5m_bps
+            ),
+            "distance_bps": (
+                abs(brti.signed_distance_bps) if settings.kalshi_only
+                else prediction.distance_bps
+            ),
+            "normalized_distance": (
+                brti.brti_normalized_distance if settings.kalshi_only
+                else prediction.distance_bps / volatility
+            ),
             "spread_bps": snapshot.spread_bps,
             "futures_basis_bps": snapshot.futures_basis_bps,
             "taker_imbalance": snapshot.taker_imbalance,
@@ -2846,7 +2893,18 @@ async def report_settlement(
     exited_at = trade["exit_price"] if trade and trade.get("exit_count") else None
 
     notifier = Notifier(store=store, telegram=telegram, settings=settings)
+    # RECONCILE FIRST. The snapshot used to be taken the instant the window
+    # closed - before Kalshi publishes the settlement and before the ledger
+    # books it - so the recap announced a result its own totals did not yet
+    # contain. `realised_for_ticker` is the ledger's answer for THIS market:
+    # if it is there the totals include it, and if it is not, the footer says
+    # the totals are one reconciliation behind instead of pretending
+    # otherwise.
     snapshot = notifier.snapshot(now_ms)
+    if traded and store.realised_for_ticker(ticker) is None:
+        from dataclasses import replace as _replace
+
+        snapshot = _replace(snapshot, pending=True)
     surfaced = messages.result_message(
         side=side,
         ticker=ticker,
@@ -3575,7 +3633,12 @@ async def service() -> None:
                     print(f"Live market data connected: {contract.ticker}", flush=True)
                     last_ticker = contract.ticker
                 archive_observation(
-                    settings, store, contract, snapshot, opened, remaining, now_ms
+                    settings, store, contract, snapshot, opened, remaining,
+                    now_ms,
+                    # The SAME features the decision is taken on, so the
+                    # archive cannot describe a different instrument from the
+                    # one that traded.
+                    brti=(inputs[2] if settings.kalshi_only else None),
                 )
                 mark("archive")
                 # The last reference poll's BRTI, for the `brti-1` context

@@ -2005,12 +2005,38 @@ def test_multiplicity_applies_to_confidence_too():
     """Keeping whichever of k cells clears an interval is k chances to be
     fooled, however many cells were looked at. An earlier version argued
     confidence was exempt because a delta is computed for every cell; that is
-    wrong once a significance test decides which ones are non-zero."""
-    # An interval that clears zero on its own but not across seven candidates.
-    assert learning.excludes_zero(0.0090, 0.1112)
-    assert not learning._survives_widening(0.0090, 0.1112, 7 ** 0.5)
-    # ...and one wide enough to survive it.
-    assert learning._survives_widening(0.20, 0.40, 7 ** 0.5)
+    wrong once a significance test decides which ones are non-zero.
+
+    It is enforced by `holm_bonferroni` now, on BOTH bars. The previous
+    enforcement widened the interval by sqrt(k), which the operator ruled out:
+    it has no stated coverage and is not a test.
+    """
+    assert not hasattr(learning, "_survives_widening"),         "sqrt(k) widening must not come back"
+    # A p-value that clears 0.05 alone and does not clear it across seven.
+    alone = learning.holm_bonferroni({"a": 0.02})
+    assert alone["a"] is True
+    family = learning.holm_bonferroni(
+        {"a": 0.02, **{f"c{i}": 0.30 for i in range(6)}}
+    )
+    assert family["a"] is False, "0.02 must not survive 7 comparisons"
+    # ...and one small enough to survive the same family.
+    strong = learning.holm_bonferroni(
+        {"a": 0.0005, **{f"c{i}": 0.30 for i in range(6)}}
+    )
+    assert strong["a"] is True
+
+
+def test_both_bars_use_the_same_stated_correction():
+    """Holm reached the confidence path first and the execution path kept
+    sqrt(k) - so the bar that decides whether a cell may change an ORDER was
+    the one still using the method without stated coverage."""
+    import inspect
+
+    source = inspect.getsource(learning.train)
+    assert "holm_bonferroni(execution_p)" in source
+    gate = inspect.getsource(learning._propose_execution)
+    assert "Holm-Bonferroni" in gate
+    assert "widening" not in gate.lower()
 
 
 def test_a_score_delta_is_never_described_as_a_probability_correction():

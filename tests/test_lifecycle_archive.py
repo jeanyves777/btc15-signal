@@ -23,7 +23,28 @@ WINDOW_OPEN = 1_700_000_000_000
 CLOSE_MS = WINDOW_OPEN + 900_000
 
 
-def drive(store, *, remaining, spread_bps=1.0, ticker="KXBTC15M-DRIVE", **snap):
+def reference(target=84_000.0, value=84_100.0):
+    """The BRTI features the service always has on this path.
+
+    `archive_observation` will not fall back to the Binance model for a side,
+    a distance or a rule verdict, so under `kalshi_only` it needs these - and
+    the live call site has them, because the snapshot it passes was built
+    from them a few lines earlier.
+    """
+    from btc15_signal.brti import BRTIFeatures
+
+    return BRTIFeatures(
+        event_ticker="KXBTC15M-DRIVE", ts_ms=CLOSE_MS - 600_000,
+        target=target, value=value,
+        signed_distance_bps=11.9, brti_momentum_bps=5.0,
+        brti_volatility_bps=1.0, brti_normalized_distance=11.9,
+        samples=300, span_ms=300_000, stale=False,
+        settlement_projection=value,
+    )
+
+
+def drive(store, *, remaining, spread_bps=1.0, ticker="KXBTC15M-DRIVE",
+          brti=..., **snap):
     """Run the real archiver once and return the row it wrote, if any."""
     settings = Settings(microstructure_path="does-not-exist.db")
     contract = KalshiMarket(
@@ -40,6 +61,7 @@ def drive(store, *, remaining, spread_bps=1.0, ticker="KXBTC15M-DRIVE", **snap):
     archive_observation(
         settings, store, contract, MarketSnapshot(**fields),
         WINDOW_OPEN, remaining, CLOSE_MS - remaining * 1000,
+        brti=(reference() if brti is ... else brti),
     )
     rows = store.lifecycle(WINDOW_OPEN)
     return next((r for r in rows if r["remaining_s"] == remaining), None)
@@ -343,3 +365,32 @@ def test_a_window_holding_both_sides_settles_each_row_on_its_own_side(tmp_path):
     assert rows[600]["won"] == 1, "UP row, UP won"
     assert rows[500]["won"] == 0, "DOWN row in the same window must NOT win"
     assert rows[400]["won"] == 1
+
+
+def test_without_a_reference_no_row_is_invented(tmp_path):
+    """Under `kalshi_only` there is no Kalshi-native side, distance or rule
+    verdict without the reference, and the Binance model must not supply
+    them. Nothing is written rather than a row whose columns mean something
+    other than what they are named.
+
+    This does not occur in the service: the call site builds its snapshot
+    from these same features, so by the time the archiver runs they exist.
+    """
+    store = Store(str(tmp_path / "noref.db"))
+    assert drive(store, remaining=600, brti=None) is None
+
+
+def test_the_archived_features_are_the_reference_not_the_spot(tmp_path):
+    """The snapshot carries `volatility_5m_bps=10.0` and the reference
+    carries 1.0. A threshold measured on one does not transfer to the other,
+    so the archive must say which it holds."""
+    store = Store(str(tmp_path / "ref.db"))
+    row = drive(store, remaining=600)
+    assert row is not None
+    assert row["volatility_5m_bps"] == 1.0, "spot volatility leaked in"
+    assert row["raw_probability"] is None, "there is no Kalshi-native model"
+    # -1 is `KalshiPrediction`'s documented no-model sentinel, and it is not a
+    # bucket index - calibration is not consulted for it. What matters is that
+    # it is not a Binance bucket wearing a neutral column name.
+    assert row["bucket"] == -1
+    assert row["bucket"] not in range(0, 10)

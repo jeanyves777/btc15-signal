@@ -265,6 +265,18 @@ def money_footer(snapshot) -> list[str]:
 
     The daily line is labelled simply "Today". It is the exchange's own day
     boundary and saying so twice on every message earned nothing.
+
+    TODAY IS REALISED, AND ONLY REALISED. It used to print
+    `realised + open_mark` under that one word, so on a poll where a position
+    had just marked to zero the dollars moved while the count did not - and a
+    recap announcing a loss sat above a total that had absorbed the mark but
+    not the settlement. An open position is a different quantity from closed
+    money and gets its own line, labelled as the mark it is.
+
+    `pending` is set when the trade the message is ABOUT has not come back
+    from the broker yet. The totals are then correct as of the last
+    reconciliation and are SAID to be, rather than silently excluding the
+    trade printed directly above them.
     """
     if snapshot is None:
         return [f"{MONEY} <b>Live: nothing settled yet</b>"]
@@ -282,10 +294,29 @@ def money_footer(snapshot) -> list[str]:
     else:
         lines.append(f"{MONEY} <b>Live: nothing settled yet</b>")
     lines.append(
-        f"{TODAY} <b>Today: {_signed_dollars(snapshot.headline)}</b> · "
+        f"{TODAY} <b>Today: {_signed_dollars(snapshot.realised)}</b> · "
         f"{snapshot.markets} closed · "
-        f"{snapshot.winners}W–{snapshot.losers}L"
+        f"{snapshot.winners}W–{snapshot.losers}L "
+        f"<i>(realised)</i>"
     )
+    # AN OPEN POSITION IS NOT CLOSED MONEY. It used to be folded
+    # into the same figure, so the total moved when a position
+    # marked without any market having settled.
+    open_mark = getattr(snapshot, "open_mark", 0.0) or 0.0
+    if abs(open_mark) >= 0.005:
+        lines.append(
+            f"{PACKAGE} Open position: "
+            f"{_signed_dollars(open_mark)} "
+            f"<i>(marked at the bid, not yet realised)</i>"
+        )
+    # AND A TOTAL THAT DOES NOT YET INCLUDE THE TRADE ABOVE IT
+    # says so, rather than being quietly one settlement behind
+    # the headline it sits under.
+    if getattr(snapshot, "pending", False):
+        lines.append(
+            f"{WAITING} <i>Totals are as of the last broker "
+            f"reconciliation; this market is not in them yet.</i>"
+        )
     return lines
 
 

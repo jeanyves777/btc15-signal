@@ -159,6 +159,11 @@ class MoneySnapshot:
     # what it is doing without a second read that might disagree.
     recovery: object | None = None
     last_add: dict | None = None
+    # True when the message this snapshot is rendered into concerns a market
+    # the broker has not settled to us yet, so the totals genuinely do not
+    # include it. Set by the caller, which is the only thing that knows which
+    # market the message is about.
+    pending: bool = False
 
     @property
     def losers(self) -> int:
