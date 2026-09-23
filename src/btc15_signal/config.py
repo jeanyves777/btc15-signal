@@ -406,6 +406,9 @@ class Settings(BaseSettings):
     # gate, never a capital, exposure, loss or execution protection.
     intelligence_enabled: bool = True
     intelligence_policy_path: str = "runtime/intelligence_policy.json"
+    # Frozen candidates, evaluated forward on every eligible signal.
+    # They control nothing - this is how one earns the right to.
+    intelligence_candidates_path: str = "runtime/intelligence_candidates.json"
     # A policy older than this stops being applied. Stale evidence quietly
     # describing a market that has moved on is the failure mode here.
     intelligence_max_policy_age_ms: int = 30 * 86_400_000

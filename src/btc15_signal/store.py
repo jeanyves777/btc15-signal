@@ -540,6 +540,41 @@ class Store:
             "CREATE INDEX IF NOT EXISTS intelligence_window "
             "ON intelligence_decisions(window_open, decided_ms)"
         )
+        # FORWARD EVALUATION. What each frozen candidate WOULD have changed on
+        # a live signal, recorded beside what the unchanged strategy actually
+        # decided, and graded when the market settles.
+        #
+        # A candidate does not need permission to control an order to be worth
+        # watching. These rows are how one earns it: the same decision, taken
+        # prospectively, on data the candidate was not fitted to.
+        self.db.execute("""
+            CREATE TABLE IF NOT EXISTS candidate_evaluations (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                window_open INTEGER NOT NULL,
+                ticker TEXT,
+                decided_ms INTEGER NOT NULL,
+                candidate_id TEXT NOT NULL,
+                candidate_version TEXT NOT NULL,
+                context_key TEXT NOT NULL,
+                proposed_action TEXT NOT NULL,
+                baseline_qualified INTEGER NOT NULL,
+                would_change INTEGER NOT NULL,
+                side TEXT,
+                ask REAL,
+                remaining_s INTEGER,
+                feature_version TEXT,
+                -- graded after settlement
+                won INTEGER,
+                baseline_pnl REAL,
+                candidate_pnl REAL,
+                graded_ms INTEGER,
+                UNIQUE(window_open, candidate_id)
+            )
+        """)
+        self.db.execute(
+            "CREATE INDEX IF NOT EXISTS candidate_eval_lookup "
+            "ON candidate_evaluations(candidate_id, graded_ms)"
+        )
         # `settings` holds REAL only. The open mark has to be carried per
         # ticker, not as one total, so a position that has already been banked
         # can be excluded from it - which is the whole fix.
@@ -2693,6 +2728,63 @@ class Store:
             )
         return rows[0] if rows else None
 
+    def record_candidate_evaluations(self, rows: list[dict]) -> None:
+        """Log each candidate's prediction. Never raises; one per market."""
+        for row in rows:
+            try:
+                columns = ", ".join(row)
+                placeholders = ", ".join(f":{name}" for name in row)
+                self.db.execute(
+                    f"INSERT OR IGNORE INTO candidate_evaluations "
+                    f"({columns}) VALUES ({placeholders})",
+                    row,
+                )
+            except sqlite3.Error as exc:
+                print(f"candidate record failed: {exc!r}", flush=True)
+        self.db.commit()
+
+    def grade_candidates(self, window_open: int, winning_side: str,
+                         now_ms: int, reward) -> None:
+        """Attach the outcome and score baseline vs candidate on this market.
+
+        Scored on each ROW's own side, like `settle_shadow`. A market-level
+        `won` flag cannot be right for both sides, and the flag the caller
+        could supply - "did the winning side win?" - is true by construction,
+        so every row would grade as a winner: a veto would always look like it
+        blocked a winner and an admission like it caught one. A forward
+        evaluation that records a 100% win rate is measuring its own
+        arithmetic, not the market.
+        """
+        from .candidates import grade
+
+        rows = self._dicts(
+            "SELECT * FROM candidate_evaluations WHERE window_open = ? "
+            "AND graded_ms IS NULL",
+            (window_open,),
+        )
+        for row in rows:
+            won = row.get("side") == winning_side
+            baseline, candidate = grade(row, won, reward)
+            self.db.execute(
+                "UPDATE candidate_evaluations SET won=?, baseline_pnl=?, "
+                "candidate_pnl=?, graded_ms=? WHERE id=?",
+                (int(won), baseline, candidate, now_ms, row["id"]),
+            )
+        self.db.commit()
+
+    def candidate_scoreboard(self) -> list[dict]:
+        """Forward performance per candidate: only rows it actually changed."""
+        return self._dicts(
+            "SELECT candidate_id, candidate_version, proposed_action, "
+            "context_key, COUNT(*) AS seen, "
+            "COALESCE(SUM(would_change), 0) AS changes, "
+            "COALESCE(SUM(graded_ms IS NOT NULL), 0) AS graded, "
+            "COALESCE(SUM(CASE WHEN would_change THEN candidate_pnl - "
+            "baseline_pnl END), 0) AS incremental "
+            "FROM candidate_evaluations GROUP BY candidate_id, candidate_version "
+            "ORDER BY incremental DESC"
+        )
+
     def record_intelligence(self, row: dict) -> None:
         """Log one decision. Never raises - it sits on the order path."""
         try:
@@ -2707,18 +2799,24 @@ class Store:
         except sqlite3.Error as exc:
             print(f"intelligence record failed: {exc!r}", flush=True)
 
-    def grade_intelligence(self, window_open: int, won: bool, pnl: float,
-                           now_ms: int) -> None:
+    def grade_intelligence(self, window_open: int, winning_side: str,
+                           pnl: float, now_ms: int) -> None:
         """Attach the outcome to every decision taken on this market.
 
         A veto and a rejected signal are graded too, as counterfactuals - they
         are the evidence for whether the adjustment helped, and dropping them
         would leave only the cases that happened to trade.
+
+        `won` is per ROW, from that row's own side. One boolean for the market
+        cannot be right for both sides of a window the model flipped inside,
+        and the one the settlement loop had to hand was true by construction.
         """
         self.db.execute(
-            "UPDATE intelligence_decisions SET won=?, realised_pnl=?, graded_ms=? "
+            "UPDATE intelligence_decisions "
+            "SET won = CASE WHEN side=? THEN 1 ELSE 0 END, "
+            "realised_pnl=?, graded_ms=? "
             "WHERE window_open=? AND graded_ms IS NULL",
-            (int(won), pnl, now_ms, window_open),
+            (winning_side, pnl, now_ms, window_open),
         )
         self.db.commit()
 

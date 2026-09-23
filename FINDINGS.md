@@ -3042,3 +3042,76 @@ authority, and a fresh exposure check before each order. Keeping it separate
 from recovery is deliberate - two independent things that both change size are
 exactly how a cap gets exceeded by the sum of two rules each of which looked
 bounded.
+
+## 46. Forward evaluation on BRTI, and two defects that faked it (2026-09-22)
+
+The adaptive layer was rebuilt on the deployed BRTI features and given a
+forward-evaluation path, so a candidate adjustment accumulates evidence on
+data it was never fitted to **without** controlling any order. Promotion and
+forward-testing are separate bars:
+
+| | question | needs |
+|---|---|---|
+| candidate | worth watching forward? | n >= 60 |
+| promotion | may it change a live order? | n >= 120, validated, CI clear of zero |
+
+### The BRTI corpus
+
+The stride-3 backfill gave 2,143 markets and no cell reached n=60, so the
+earlier "zero candidates" result was a **dataset-size artefact, not a finding**.
+The full stride-1 backfill completed: **6,435 markets, 38,610 decision points,
+0 fetch failures**, yielding 6,428 usable rows - the same count as the Binance
+corpus, over the same 68 days.
+
+BRTI baseline on the training split: the rule **took +0.0128/ct over 679**
+and **refused -0.0522/ct over 2,856**. The gates remain right on average, and
+more clearly so than Binance measured them: the refused leg is twice as bad
+(-0.0522 vs -0.0244). The take figure matching Binance's +0.0128 to four
+decimals is coincidence on different samples - BRTI qualifies 1,282 markets
+where Binance qualifies 1,835.
+
+**One candidate frozen, zero promoted.** `c01 admit  us · low · bd5-10 · px<70`
+(reject leg): train n=61 over 22 days, +0.0166/ct shrunk, day-clustered CI
+[-0.0331, +0.1684]. The interval crosses zero and validation has only n=14, so
+it controls nothing. It is now recorded against every matching live signal.
+
+That cell fires **1.35 times a day**. Forward n=60 is ~44 days away and n=120
+~89 days. The loop is real and it is slow, and saying so is the point: a
+faster answer here would mean a smaller bar, not better evidence.
+
+### Two defects that would have faked the result
+
+Both are the same species - *code that runs clean while measuring nothing* -
+and neither would have shown up as an error.
+
+**1. Grading was a tautology.** The settlement loop passed
+`result == ("yes" if winning_side == "UP" else "no")` as `won`. `winning_side`
+is derived from `result` one line above, so the expression is true by
+construction. Every graded row scored a **win**: 21 of 21 to date. A veto
+would always look like it blocked a winner, an admission like it caught one.
+It happened to write nothing false yet only because the single settled window
+was on the winning side. Both `grade_candidates` and `grade_intelligence` now
+take the **winning side** and score each row on the side it was recorded on,
+the way `settle_shadow` already did.
+
+**2. Live and replay named different cells.** Candidates were frozen on BRTI
+bands (`bd5-10`) while the live path built its key from Binance distance bands
+(`dist1.5-3`) and Binance volatility thresholds (5/12 bps against BRTI's
+0.5/1.5). The key still formats. It simply names a pocket no artefact
+contains, so every candidate would have matched nothing and the table would
+have stayed empty **forever** while the logs reported the layer integrated.
+
+This is section 39's lesson recurring in a new guise - the first live decision
+keyed `"? · ? · ..."` because the live snapshot had no `session`. The fix then
+was to derive it the same way the corpus does; the fix now is stronger:
+`brti_context_of` lives in `adaptive.py` and **both** the training script and
+the live path call it. Two functions that agree by inspection is not the same
+as one function.
+
+The live key needs BRTI numbers, and the reference recorder polls *behind* the
+trading path by design (FINDINGS 22: ~2,000ms of pre-order work cost three
+fills). So the gate reads the **last** poll's features and `brti_context_row`
+checks what that costs: features absent, stale, or belonging to another window
+(`target` != this strike) all yield **no context and no row**. There is no
+fallback to the Binance-scale numbers - a missing row is visible in the log,
+a mislabelled one is not.

@@ -13,8 +13,9 @@ import httpx
 from . import autotrade, messages
 from . import brain as brain_mod
 from . import intelligence_policy as intel
-from .adaptive import context_of
+from .adaptive import brti_context_of, context_of
 from .binance import BinanceClient, MarketSnapshot
+from .candidates import CandidateSet
 from .capital import CapitalController, ny_day
 from .config import Settings
 from .decision import decision_facts
@@ -1432,6 +1433,10 @@ def shadow_read(
 # One policy object per process, loaded once. Reloaded only by a restart, so
 # candidate training can never change what is running.
 _POLICY: dict = {"loaded": None}
+_CANDIDATES: dict = {"loaded": None}
+# Last window we complained about a missing BRTI context, so the log
+# carries one line a window rather than one a poll.
+BRTI_CONTEXT_GAP: dict = {"window": None}
 
 
 def active_policy(settings) -> intel.Policy:
@@ -1447,9 +1452,63 @@ def active_policy(settings) -> intel.Policy:
     return _POLICY["loaded"]
 
 
+def active_candidates(settings) -> CandidateSet:
+    """Loaded once per process. A candidate that changed between making a
+    prediction and its grading would make the record meaningless, so the
+    artefact is frozen for the life of the run."""
+    if _CANDIDATES["loaded"] is None:
+        _CANDIDATES["loaded"] = CandidateSet.load(
+            settings.intelligence_candidates_path
+        )
+        cs = _CANDIDATES["loaded"]
+        print(
+            f"intelligence candidates: version={cs.version} "
+            f"features={cs.feature_version} n={len(cs.candidates)} "
+            f"(forward evaluation only - they control nothing)",
+            flush=True,
+        )
+    return _CANDIDATES["loaded"]
+
+
+def brti_context_row(snapshot, ask, opened, brti) -> tuple[dict | None, str]:
+    """The `brti-1` context row for this decision, or (None, why-not).
+
+    `brti` is the LAST reference poll's features. The reference deliberately
+    polls behind the trading path - a slow feed must never delay a fill - so
+    these are one poll old, and two things have to be checked before they can
+    label a cell:
+
+      * the features must not be stale, and
+      * they must belong to THIS market. `target` is the window's strike, so
+        a mismatch means the window rolled between the reference poll and
+        this decision and the numbers describe the market before it.
+
+    When either fails, this returns None and the caller records no context
+    rather than falling back to the Binance-scale numbers. That fallback is
+    the trap: the key would still format, it would just name a pocket nothing
+    was ever trained on, and the table would look healthy while measuring
+    noise. A missing row is visible; a mislabelled one is not.
+    """
+    if brti is None:
+        return None, "no brti features"
+    if getattr(brti, "stale", False):
+        return None, "brti stale"
+    target = getattr(snapshot, "target", None)
+    if not target or not getattr(brti, "target", None):
+        return None, "no strike"
+    if abs(brti.target - target) > 1e-6:
+        return None, "brti belongs to another window"
+    return {
+        "session": _session(opened),
+        "brti_volatility_bps": brti.brti_volatility_bps,
+        "brti_normalized_distance": brti.brti_normalized_distance,
+        "our_ask": ask,
+    }, ""
+
+
 def intelligence_verdict(
     settings, store, prediction, snapshot, ask, rule_match, failed_checks,
-    opened, remaining, now_ms,
+    opened, remaining, now_ms, brti=None,
 ):
     """Ask the shared decision function, record the answer, return it.
 
@@ -1513,6 +1572,41 @@ def intelligence_verdict(
             "training_cutoff_ms": verdict.training_cutoff_ms,
             "features_ok": int(features_ok),
         })
+        # FORWARD EVALUATION, alongside. Every frozen candidate that speaks to
+        # this context records what it WOULD have changed, beside what the
+        # unchanged strategy actually decided. None of them can alter the
+        # order; this is how one earns the right to, on data it was never
+        # fitted to.
+        try:
+            candidates = active_candidates(settings)
+            brti_row, why_not = brti_context_row(snapshot, ask, opened, brti)
+            if brti_row is None:
+                # Say so once per window rather than per poll - and say it at
+                # all. A forward evaluation that records nothing looks exactly
+                # like one where no candidate had an opinion.
+                if candidates.candidates and BRTI_CONTEXT_GAP["window"] != opened:
+                    BRTI_CONTEXT_GAP["window"] = opened
+                    print(
+                        f"candidate evaluation skipped [{why_not}] - no "
+                        f"{candidates.feature_version} context for this window",
+                        flush=True,
+                    )
+                return verdict
+            evaluations = candidates.evaluate(
+                context_key=str(brti_context_of(brti_row)),
+                qualified=bool(rule_match),
+            )
+            for item in evaluations:
+                item.update({
+                    "window_open": opened, "decided_ms": now_ms,
+                    "ticker": getattr(snapshot, "ticker", None),
+                    "side": getattr(prediction, "side", None), "ask": ask,
+                    "remaining_s": remaining,
+                })
+            if evaluations:
+                store.record_candidate_evaluations(evaluations)
+        except Exception as exc:  # noqa: BLE001 - evaluation is never fatal
+            print(f"candidate evaluation failed: {exc!r}", flush=True)
         return verdict
     except Exception as exc:  # noqa: BLE001 - never stop trading
         print(f"intelligence failed, falling back to strategy: {exc!r}", flush=True)
@@ -1534,6 +1628,7 @@ async def primary_signal(
     trader: KalshiExecutionClient | None = None,
     levels: LevelTracker | None = None,
     capital=None,
+    brti=None,
 ) -> None:
     rule = EntryRule.load(settings.strategy_path)
     # Read from the cache only. The tracker refreshes on its own slow clock
@@ -1568,7 +1663,7 @@ async def primary_signal(
     # orders afterwards.
     verdict = intelligence_verdict(
         settings, store, prediction, snapshot, contract_ask,
-        rule_match, failed_checks, opened, remaining, now_ms,
+        rule_match, failed_checks, opened, remaining, now_ms, brti,
     )
     if verdict.final_action == intel.VETO:
         rule_match = False
@@ -2784,10 +2879,19 @@ async def service() -> None:
                         # counterfactuals that say whether an adjustment
                         # helped, and they exist nowhere else.
                         try:
+                            # Pass the WINNING SIDE, not a market-level `won`.
+                            # Each row is scored against the side it was
+                            # recorded on; the flag this loop could form -
+                            # `result == ("yes" if winning_side == "UP" ...)` -
+                            # is a tautology, and it graded all 21 rows to date
+                            # as winners.
+                            store.grade_candidates(
+                                row[0], winning_side, now_ms,
+                                lambda ask, won: (1.0 if won else 0.0) - ask
+                                - kalshi_fee_charged(ask, 1),
+                            )
                             store.grade_intelligence(
-                                row[0], result == ("yes" if winning_side == "UP"
-                                                   else "no"),
-                                0.0, now_ms,
+                                row[0], winning_side, 0.0, now_ms,
                             )
                         except Exception as exc:  # noqa: BLE001
                             print(f"intelligence grading failed: {exc!r}", flush=True)
@@ -2903,9 +3007,17 @@ async def service() -> None:
                     settings, store, contract, snapshot, opened, remaining, now_ms
                 )
                 mark("archive")
+                # The last reference poll's BRTI, for the `brti-1` context
+                # key only. Reading the cache rather than fetching keeps the
+                # recorder behind the trading path, which is the whole reason
+                # it sits where it does: on 2026-09-21 three auto orders
+                # missed on ~2,000ms of pre-order work against a 200ms round
+                # trip. One poll of staleness is the price, and
+                # `brti_context_row` checks for it rather than assuming.
                 await primary_signal(
                     settings, store, telegram, contract, snapshot, opened, remaining,
                     now_ms, trader, levels, capital,
+                    reference.current_features() if reference else None,
                 )
                 await reversion_signal(
                     settings, store, telegram, contract, snapshot, opened, remaining, now_ms

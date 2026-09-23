@@ -206,9 +206,9 @@ def test_vetoed_and_rejected_signals_are_still_graded(tmp_path):
     for action in (intel.NEUTRAL, intel.VETO):
         store.record_intelligence({
             "window_open": 7, "decided_ms": NOW, "base_qualified": 1,
-            "final_action": action, "confidence_delta": 0,
+            "final_action": action, "confidence_delta": 0, "side": "UP",
         })
-    store.grade_intelligence(7, won=True, pnl=0.2, now_ms=NOW + 1)
+    store.grade_intelligence(7, "UP", pnl=0.2, now_ms=NOW + 1)
     rows = store._dicts("SELECT * FROM intelligence_decisions WHERE window_open=7")
     assert all(r["won"] == 1 for r in rows)
     assert all(r["graded_ms"] for r in rows)
@@ -218,12 +218,29 @@ def test_grading_is_not_applied_twice(tmp_path):
     store = Store(str(tmp_path / "s.db"))
     store.record_intelligence({
         "window_open": 9, "decided_ms": NOW, "base_qualified": 1,
-        "final_action": intel.NEUTRAL, "confidence_delta": 0,
+        "final_action": intel.NEUTRAL, "confidence_delta": 0, "side": "UP",
     })
-    store.grade_intelligence(9, True, 0.2, NOW + 1)
-    store.grade_intelligence(9, False, -9.9, NOW + 2)
+    store.grade_intelligence(9, "UP", 0.2, NOW + 1)
+    store.grade_intelligence(9, "DOWN", -9.9, NOW + 2)
     row = store._dicts("SELECT * FROM intelligence_decisions WHERE window_open=9")[0]
     assert row["won"] == 1 and row["realised_pnl"] == 0.2
+
+
+def test_a_losing_side_grades_as_a_loss(tmp_path):
+    """The defect this pins: the settlement loop had only a market-level flag,
+    and the one it could form - "did the winning side win?" - is true by
+    construction. Every graded row came back a winner, 21 for 21, which is
+    not a record any 15-minute strategy has ever had."""
+    store = Store(str(tmp_path / "s.db"))
+    for side in ("UP", "DOWN"):
+        store.record_intelligence({
+            "window_open": 11, "decided_ms": NOW, "base_qualified": 1,
+            "final_action": intel.NEUTRAL, "confidence_delta": 0, "side": side,
+        })
+    store.grade_intelligence(11, "UP", 0.0, NOW + 1)
+    graded = {r["side"]: r["won"] for r in store._dicts(
+        "SELECT side, won FROM intelligence_decisions WHERE window_open=11")}
+    assert graded == {"UP": 1, "DOWN": 0}
 
 
 # ------------------------------------------------------ no hindsight

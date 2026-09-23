@@ -76,6 +76,52 @@ def context_of(row: dict) -> Context:
     )
 
 
+# ---------------------------------------------------------------- brti-1
+#
+# THE BRTI CONTEXT, and the reason it is defined HERE rather than in the
+# training script.
+#
+# A BRTI distance is not a Binance distance. The reference is a 60-second
+# mean - a low-pass filter - so the same market reads 10-20 on BRTI where
+# Binance read 2-4, and BRTI volatility runs an order of magnitude lower
+# (FINDINGS 43). Bands calibrated on one instrument put the other in the
+# wrong cell every time, silently: the key still formats, it just names a
+# pocket the policy never saw.
+#
+# That already happened once in a different guise - the live snapshot had no
+# `session` or `vol_regime`, so the first real decision keyed "? · ? · ...".
+# The lesson was that replay and live must derive the key from the SAME
+# function, not from two that agree by inspection. So there is one function,
+# and both sides call it.
+BRTI_DISTANCE_BANDS = ((0.0, 5.0, "bd<5"), (5.0, 10.0, "bd5-10"),
+                       (10.0, 15.0, "bd10-15"), (15.0, 999.0, "bd15+"))
+BRTI_VOL_BANDS = ((0.0, 0.5, "low"), (0.5, 1.5, "mid"), (1.5, 9e9, "high"))
+
+BRTI_FEATURE_VERSION = "brti-1"
+
+
+def brti_vol_regime(volatility_bps: float) -> str:
+    return _band(volatility_bps or 0.0, BRTI_VOL_BANDS)
+
+
+def brti_context_of(row: dict) -> Context:
+    """The canonical `brti-1` context key.
+
+    `row` carries BRTI numbers under BRTI names - `brti_normalized_distance`
+    and `brti_volatility_bps` - deliberately distinct from the Binance ones so
+    a Binance row cannot be passed here by autocomplete and quietly produce a
+    key that looks right.
+    """
+    return Context(
+        session=row.get("session") or "?",
+        vol_regime=brti_vol_regime(row.get("brti_volatility_bps") or 0.0),
+        distance=_band(
+            abs(row.get("brti_normalized_distance") or 0.0), BRTI_DISTANCE_BANDS
+        ),
+        price=_band(row.get("our_ask") or 0.0, PRICE_BANDS),
+    )
+
+
 @dataclass
 class Arm:
     """One context, one action, and what it has been worth."""
