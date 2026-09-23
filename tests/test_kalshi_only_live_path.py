@@ -190,3 +190,15 @@ def test_the_gap_is_recorded_so_silence_is_explicable(tmp_path):
     summary = store.input_gap_summary()
     assert summary and summary[0]["reason"] == "kalshi brti stale"
     assert summary[0]["markets"] == 1
+
+
+def test_kalshi_only_requires_the_reference_to_be_enabled():
+    """With `kalshi_only` the reference is the SIGNAL SOURCE, not a shadow
+    recorder. Disabling it would make every poll record an input gap and the
+    bot go quiet in a way indistinguishable from a flat market, so the
+    service refuses to start instead."""
+    import inspect
+
+    source = inspect.getsource(m.service)
+    assert "kalshi_only requires reference_enabled" in source
+    assert "raise SystemExit" in source

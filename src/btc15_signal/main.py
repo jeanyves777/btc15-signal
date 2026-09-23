@@ -2876,6 +2876,16 @@ async def service() -> None:
     levels = None if settings.kalshi_only else LevelTracker()
     if settings.kalshi_only:
         from . import feature_contract
+        # Under Kalshi-only the reference IS the signal source, not a shadow
+        # recorder. With it off, every poll would record an input gap and the
+        # system would go quiet in a way that looks exactly like a flat
+        # market. Refuse to start rather than run silently useless.
+        if not reference:
+            raise SystemExit(
+                "kalshi_only requires reference_enabled: BRTI is the signal "
+                "source, not a shadow recorder. With it off the bot records "
+                "an input gap every poll and never trades."
+            )
         print(
             f"KALSHI ONLY: quotes, books, executions, settlements and BRTI "
             f"from Kalshi. Binance client not constructed. "
