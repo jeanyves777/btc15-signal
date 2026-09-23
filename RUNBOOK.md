@@ -471,6 +471,95 @@ A walk-forward trailing-20 basis correction cuts outcome disagreement from
 19.4% to **4.0%** (FINDINGS 41). It is stored as evidence and read by nothing.
 Do not wire it into a decision without measuring it as a decision first.
 
+## The recovery add-on: reading its lifecycle
+
+A recovery add is a SECOND contract, resting 2c below the base fill, placed
+only while the BRTI evidence still holds. It is one extra contract, never a
+doubling - see [sizing](FINDINGS.md) section 45.
+
+`recovery_adds` holds one row per attempt. The states:
+
+| state | meaning |
+|---|---|
+| `RECOVERY ADD SKIPPED` | never placed - the conditions did not hold |
+| `RECOVERY ADD PENDING` | resting at the broker, **not a position** |
+| `RECOVERY ADD EXECUTED` | filled; `filled_count`, `fill_price`, `fee_paid` are the broker's |
+| `RECOVERY ADD CANCELLED` | pulled before filling |
+
+**A cancel can lose the race to a fill.** The runner therefore re-reads the
+order before cancelling and banks a fill if it finds one. Until 2026-09-23
+that re-read used `/portfolio/events/orders/{id}`, which returns **404 for
+every order** - so it never banked anything and 7 of 7 filled adds were
+recorded as CANCELLED. The live read is:
+
+```bash
+GET /portfolio/orders/{order_id}
+```
+
+If an add's `cancel_reason` contains "order not found (already filled,
+expired or cancelled)", **the order probably filled**. Check the fills:
+
+```bash
+.venv/Scripts/python.exe -c "
+import sqlite3
+db=sqlite3.connect('file:btc15.db?mode=ro',uri=True); db.row_factory=sqlite3.Row
+q = ('SELECT a.ticker, a.state, a.order_id, f.count, f.no_price '
+     'FROM recovery_adds a JOIN fills f ON f.order_id = a.order_id '
+     'WHERE COALESCE(a.filled_count,0)=0')
+for r in db.execute(q):
+    print(dict(r))
+"
+```
+
+An INNER join, deliberately: a LEFT join also lists adds that were
+correctly cancelled and never filled, which is a false positive an
+operator would chase. **No output means nothing is mis-recorded.**
+
+Any row it does print is a mis-recorded add. Repair it - idempotent, never
+invents a fill, never touches the ledger, and charges the lifetime add budget
+the way a normal fill does:
+
+```bash
+.venv/Scripts/python.exe -c "
+import sys; sys.path.insert(0,'src')
+from btc15_signal.config import Settings
+from btc15_signal.store import Store
+st=Store(Settings().database_path)
+import sqlite3
+ws=[r[0] for r in st.db.execute('SELECT DISTINCT window_open_ms FROM recovery_adds')]
+print(sum(st.reconcile_recovery_adds(w) for w in ws), 'repaired')
+"
+```
+
+## Reading a money message
+
+**Check it against itself.** Entry price, quantity and exit must produce the
+stated P&L. On 2026-09-23 a recap read "Bought DOWN at 85c / Cost $1.72 /
+Profit +$0.45" - and 2 x (99.7c - 85c) is 29.4c, so it could not. The
+position was 2 @ 85c plus a recovery add of 1 @ 83c, with 2 sold early and 1
+run to settlement.
+
+A recap now shows every leg:
+
+```
+📦 Base: 2 @ 85¢
+🔧 Recovery add: 1 @ 83¢
+💵 Total cost $2.55 for 3 contracts (incl. $0.02 fees)
+💵 Sold before expiry at 99.7¢ · 2 of 3 · 1 ran to settlement
+💰 Combined realised Profit $0.45 (net of fees, all legs)
+```
+
+A pending or cancelled add is printed **by name**. A reader who sees nothing
+cannot tell an add that never happened from one the message forgot.
+
+**`Today` is realised money only.** An open position is a separate line,
+marked at the bid and labelled as not yet realised. If a recap's market has
+not come back from the broker, the footer says the totals are as of the last
+reconciliation rather than quietly excluding the trade above them.
+
+**The ledger is the broker's.** It reads `/portfolio/settlements` and is never
+rebuilt locally. When a message and the ledger disagree, the message is wrong.
+
 ## Known limits
 
 - **`bid_imbalance` is hard-coded to 0.0** in backtests. It has never been

@@ -4421,3 +4421,124 @@ FINDINGS 44-48 concern sizing, recovery and execution controls; they are
 untouched by this work and remain binding - no mode may change size, and
 `intel_mode.may_change_size` returns False for every mode with a test asserting
 it for each.
+
+## 50. Setup-first keying, and four defects that a full suite could not see (2026-09-23)
+
+Four releases shipped on 2026-09-23: setup-first learning (`brti-2`), the
+shared message surface, a delivery-tracking hotfix, and position
+reconciliation. Each was found by a different method, and only one of the four
+by a test.
+
+### The intelligence keys on the SETUP
+
+Arms key on distance band, price band and aligned momentum. Session and
+volatility regime are recorded beside every decision and key nothing.
+
+| keying | cells | at n>=120 | coverage |
+|---|---|---|---|
+| context-first (`brti-1`) | 139 | 18 | 58% |
+| setup-first (`brti-2`) | 30 | 13 | 93% |
+
+Session was splitting one setup's evidence four ways and calling the
+fragments different setups. The live policy `kalshi-brti-2-*` fits 29 arms
+over 6,428 markets.
+
+### TWO BARS, and they are not the same measurement
+
+This was reported once as a contradiction. It is not; the two tests differ in
+quantity, family and purpose, and the report note used the word "survives"
+for both.
+
+| | CONFIDENCE | EXECUTION |
+|---|---|---|
+| quantity | nested out-of-sample **calibration residual** (observed win rate minus the probability the price implied) | **P&L**, day-clustered, on the validation slice |
+| method | nested chronological cross-validation, 3 folds | day-clustered bootstrap |
+| correction | Holm-Bonferroni, FWER 0.05, 11 testable cells | Holm-Bonferroni, FWER 0.05, examined cells |
+| result | **3 arms pass** (p = 0.005, 0.002, 0.001) | **none passes** |
+| can it move an order? | no - it re-rates a displayed word | yes, and only with both switches on |
+
+The execution bar was still using `sqrt(k)` interval widening after the
+confidence path moved to Holm - so the bar deciding whether a cell may change
+an ORDER was the one still using a widening with no stated coverage. Both now
+use the same stated correction and `_survives_widening` is deleted. On the
+live corpus this changed nothing operationally: 2 cells examined, 0 survive,
+0 promoted. Each arm now carries `delta_method`, `delta_correction`,
+`delta_p`, `delta_cells_tested`, `delta_folds` and the execution bar's own
+`execution_p` as FIELDS rather than as a sentence inside `delta_reason`.
+
+### Binance was still running, and it was not the client
+
+The guards covered the network client and the policy artefact.
+`archive_observation` was calling `predict()` and `EntryRule.matches()` on
+**every poll**: Binance-fitted arithmetic over a BRTI-built snapshot, written
+to `side`, `raw_probability`, `bucket`, `distance_bps` and
+`normalized_distance` - column names that carry no instrument.
+
+    hour before the fix   296 archived rows, 296 with a Binance probability
+    after the fix         0
+
+It is also what crashed the service every fifteen minutes between 04:04 and
+05:04: `strategy.py` compares `prediction.raw_probability >=
+min_raw_probability` and a Kalshi prediction has none, so `None >= float`
+raised TypeError - inside an `except Exception`, so it failed silently and
+succeeded harmfully. Guard the MODEL and the RULE, not just the client.
+
+### A column that reached every fresh install and no live database
+
+`notifications.status` shipped inside `CREATE TABLE IF NOT EXISTS`, which adds
+nothing to a table that already exists. `begin_delivery` is the first
+statement `send_once` runs and sat OUTSIDE its try block, and the fill site
+catches `(httpx.HTTPError, OSError, RuntimeError, ValueError)` - of which
+`sqlite3.OperationalError` is none. The first message after the deploy would
+have raised straight out of the poll loop with a position open. Every test
+that builds its database from the current DDL passes regardless; the
+regression tests now start from the byte-for-byte pre-migration schema.
+
+### Seven filled orders recorded as cancelled
+
+A recap read "Bought DOWN at 85c / Cost $1.72 / Profit +$0.45". Two contracts
+from 85c to 99.7c is 29.4c gross, so +$0.4456 could not come from it. The
+position was really three contracts:
+
+| order | leg | qty | price | fee | type |
+|---|---|---|---|---|---|
+| `01a0cfde-71e8-` | base | 2 | 0.85 | 0.0179 | taker |
+| `01a0cfde-79b8-` | recovery add | 1 | 0.83 | 0.0 | maker |
+| `01a0cfe6-e9e0-` | exit | 2 | 0.997 | 0.0005 | taker |
+
+3 bought for 2.5479, 2 sold for 1.9935, 1 run to settlement for 1.00 =
+**+0.4456**, and Kalshi's settlement record agrees to the cent
+(`no_count_fp 3.00`, `no_total_cost_dollars 2.530000`).
+
+`order_status` read `/portfolio/events/orders/{id}`. CREATE and CANCEL
+legitimately moved to that family; the READ never existed there and returns
+404 for every order. So `_bank_if_filled` never banked anything and the
+cancel/fill race it was written for had **never once** been resolved. Across
+two days, **7 of 7** recovery adds that filled were recorded as CANCELLED,
+`cancel_reason` reading "order not found (already filled, expired or
+cancelled)" - true, and read as its opposite. `recovery_add_budget` was an
+empty table: $0 charged where $5.53 had gone out.
+
+The field names never matched either. Kalshi sends `fill_count_fp`,
+`maker_fill_cost_dollars`, `taker_fill_cost_dollars`, `*_fees_dollars`; the
+parser read `taker_fill_count`, `average_fill_price_dollars`,
+`fees_paid_dollars`, and fell back to `yes_price_dollars` - the COMPLEMENT on
+a DOWN leg, 0.1700 for a fill at 0.8300. **Take the price as cost / count.**
+
+**Why a full suite passed.** The test doubles returned the invented names, the
+parser read them, and the two agreed with each other and with nothing else.
+Order fixtures are now built from a captured live response.
+
+**The ledger was correct throughout**, because it reads
+`/portfolio/settlements`. The money was right and the message was wrong,
+which is the only ordering of those two that is recoverable.
+
+### The footer mixed two quantities under one label
+
+`Today` printed `realised + open_mark`, so on the poll where a position marked
+to zero the dollars moved while the count did not, and a recap announcing a
+loss sat above totals that had absorbed the mark but not the settlement.
+`Today` is realised only; an open position has its own line labelled as a
+mark; a recap whose market the broker has not settled says its totals are as
+of the last reconciliation.
+
