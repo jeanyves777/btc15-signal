@@ -91,8 +91,11 @@ def test_settlement_states_the_outcome_in_words_not_only_colour():
     )
     assert "rule declined it" in loss_paper
     # A signal nobody traded must carry no money figure, and no green tick that
-    # could be mistaken for a payday.
-    assert "Loss: $0.00" in loss_paper
+    # could be mistaken for a payday. It is also not a LOSS of zero: nothing
+    # was bought, so nothing was lost, and "Loss: $0.00" under a red chip read
+    # as a small defeat rather than the absence of a trade.
+    assert "Not traded · realised P&amp;L $0.00" in loss_paper
+    assert "Loss: $0.00" not in loss_paper
     assert "SIGNAL LOST · NOT TRADED" in loss_paper
 
 
