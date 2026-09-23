@@ -4661,13 +4661,20 @@ recorded inputs - distance, momentum, side, staleness, remaining seconds,
 deficit and fill, read back from `conditions_at_placement` - and the crossing
 answered the way the next poll would have answered it:
 
-    would have rested an add     9
-    recovery was not active     16
-    economics refused it         1
+    passed the replayed decision gates     9
+    recovery was not active               16
+    economics refused it                   1
 
-So the cost of the defect is **nine adds the rule wanted and did not get**,
-not twenty-six. A rested bid 2c under the fill is not a fill, so this counts
-decisions, not money.
+So **nine opportunities passed the replayed decision gates**, not twenty-six.
+
+**That is the ceiling, and it is a count of DECISIONS.** A replay establishes
+what `evaluate` would have returned on the recorded inputs and nothing else.
+It does not establish that Kalshi would have accepted the order, that a bid
+resting 2c under the fill would ever have been hit, or that the crossing check
+would still have passed on the later poll that actually placed it. The real
+number of adds is at most nine and could be zero. An earlier draft of this
+section said "nine adds the rule wanted and did not get", which claimed fills
+a replay cannot see.
 
 **The other sixteen are the second harm.** Those markets had no deficit at
 all - the honest reason was "recovery is not active" - but the old override
@@ -4736,3 +4743,131 @@ poll. The deficit cleared to $0.00 at 21:49Z, so no add has been evaluated
 under an active cycle since the deploy. It is covered by tests, not by
 evidence from the live system, and should be confirmed on the next cycle: a
 `RECOVERY ADD DEFERRED` row that resolves within a poll or two.
+
+## 52. The add-on's lifecycle: a step that was never written, and an orphan (2026-09-23)
+
+Verifying section 51 turned up four more defects in the same subsystem. Three
+of them were unreachable until section 51's fixes made adds actually rest, so
+they were shipped-but-dormant rather than new.
+
+### The settlement step did not exist
+
+`recovery_adds.settled` and `.realised_pnl` were declared, and
+`unsettled_filled_adds` was written to find the backlog. **Nothing ever called
+it, and nothing ever wrote either column.** All 7 filled adds sat at
+`settled = 0` with a NULL P&L, so `add_pnl_summary` reported **$0.00** for the
+add-on however much it had made. The one number the live test exists to
+produce - does the SECOND contract pay? - had never once been computed.
+
+Reconciled against `/portfolio/settlements`, the broker's own record:
+
+    KXBTC15M-26SEP221830-30  UP    1 @ 0.83  fee 0       yes   +0.1700
+    KXBTC15M-26SEP221845-45  UP    1 @ 0.72  fee 0       yes   +0.2800
+    KXBTC15M-26SEP221915-15  UP    1 @ 0.82  fee 0       yes   +0.1800
+    KXBTC15M-26SEP222115-15  UP    1 @ 0.84  fee 0       yes   +0.1600
+    KXBTC15M-26SEP222230-30  UP    1 @ 0.75  fee 0.0132  yes   +0.2368
+    KXBTC15M-26SEP230545-45  DOWN  1 @ 0.73  fee 0       no    +0.2700
+    KXBTC15M-26SEP231615-15  DOWN  1 @ 0.83  fee 0       no    +0.1700
+                                                       total  +1.4668
+
+Seven for seven, +$1.4668. Small numbers on one contract each, and far too few
+markets to conclude anything about the rule - but it is the first time the
+figure has existed at all.
+
+**The evidence is a settlement row, never a clock.** A market that merely
+stopped trading has settled nothing, and a result that cannot be read (void,
+blank) leaves the add open rather than guessed. **It moves no money:**
+`daily_ledger` already holds the broker's P&L for the WHOLE position and the
+deficit is already credited from it, so the figure written here is the add
+leg's own and is read only by reporting. Checked on a snapshot: the ledger,
+the deficit and the add budget are byte-identical before and after, and a
+second run closes nothing.
+
+One attribution, stated rather than assumed: an early exit is credited to the
+BASE first, so only an exit LARGER than the base reaches the add. On all seven
+the exit exactly equalled the base count, so the convention does not bite on
+any real row.
+
+### `NameError` on every successful fill
+
+    print(f"... fee {fee:.4f}, {'maker' if maker else 'taker'}")
+
+`maker` was never bound in `_bank_if_filled` - the parser returns `is_taker`.
+Every successful fill raised, AFTER the fill had been banked and the funds
+released, so the row was right while the caller saw an exception: the EXECUTED
+line was never logged and the rest of the poll was abandoned. It was
+unreachable only because `order_status` hit a route that 404s for every order,
+so `parse_fill` always returned None and the line was never executed. Fixing
+that route (section 50) armed it; adds that actually rest make it certain.
+
+Tests passed throughout because they call through `step`, which swallows it,
+and the DB write precedes the print. The regression asserts the RETURN VALUE.
+
+### The ambiguous submission, and the orphan it made
+
+The local row is written before the order is sent. A crash - or a dropped
+response - between the send and storing the broker's `order_id` leaves a row
+saying PENDING with `placed_ms` set and `order_id` NULL. Every repair path was
+keyed on `order_id`:
+
+* `adds_needing_reconciliation` filtered `order_id IS NOT NULL` - excluding
+  precisely the row that needed resolving;
+* `_maintain`'s fill check short-circuited on a falsy `order_id`, so the order
+  was never polled for a fill;
+* `_cancel` marked the row CANCELLED **without sending anything to Kalshi**.
+
+So an order that was really resting became an orphan: never watched, never
+cancelled, and if it filled, never banked, never charged to the budget and
+never in the add's P&L. The docstrings promised "`reconcile` resolves it
+against the broker"; for this row it could not.
+
+`client_order_id` is a pure function of (ticker, side, window), so it is the
+one key that survives the crash, and Kalshi returns it on the order object.
+`order_by_client_id` lists the ticker's orders and matches on it, which is the
+way back to the `order_id`. **A listing that could not be READ raises rather
+than returning "not found"**, because concluding "no such order" from a failed
+read is how a live order gets written off.
+
+### "I could not reach Kalshi" was recorded as "the order is gone"
+
+Two places collapsed an unreadable answer into a definite one:
+
+* `_cancel` wrote CANCELLED unconditionally after a failed cancel - a 500, a
+  429 or a timeout all landed there - leaving the order live at Kalshi under a
+  row saying it was gone. A CANCELLED row is never examined again. Only a 404,
+  which means the exchange has no such order, is proof; everything else now
+  leaves the row PENDING to retry.
+* `reconcile` folded `status is None` into the cancelled list, so one failed
+  GET at startup marked a live resting order CANCELLED, permanently.
+
+**The conservative cancellation rule is unchanged and is meant to stay:** an
+unverifiable crossing still pulls a resting order. What changed is only that
+an unverifiable ANSWER is no longer recorded as a verified one.
+
+### A deferred row could be stranded non-terminal
+
+DEFERRED (section 51) is re-entered only while the same window is open, the
+base position is still held and BRTI is available. `main.run` does not even
+call `step` once `open_position_detail` returns None, and `open_add` is keyed
+on the current window - so an exit, an input gap or a window roll left the row
+open forever, counted as undecided in the add-on's own statistics.
+`close_stale_deferred_adds` closes it on either definite condition - the
+window has closed, or the base position is gone - and can place nothing,
+because a deferred row never sent anything.
+
+### Still open, measured and not fixed
+
+* **A partial fill terminates the row while the remainder rests.**
+  `record_add_fill` writes EXECUTED for any `count > 0`, and `_step` then
+  returns on every later poll, so an unfilled remainder is never maintained
+  and never cancelled. The add is one contract, so a partial needs a
+  fractional fill, which Kalshi's `_fp` fields permit but which has not been
+  observed here. Named, untested, unfixed.
+* **`open_mark` is up to ~60s stale** where it feeds the add's exposure gate,
+  because it is written by the 60s settlement sync. It can under-count
+  exposure just after a fill and over-count just after an exit. Left alone:
+  changing it would move a trading gate, which is the operator's call.
+* **Transient BRTI conditions are terminal for a RESTING order.** The place
+  path gained DEFERRED for a briefly-behind feed; the maintain path has no
+  analogue, so a one-poll gap permanently ends the add. That direction is
+  safe - it cancels rather than buys - and it is left as designed.

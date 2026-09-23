@@ -3548,6 +3548,26 @@ async def service() -> None:
                         # A figure a cash-out banked locally is revised only
                         # here, and the revision is counted, never silent.
                         store.sync_ledger_from_settlements(now_ms)
+                        # THE ADD'S OWN LIFECYCLE, closed from the same
+                        # settlements the ledger just read. It writes only to
+                        # `recovery_adds` - the account total and the deficit
+                        # were both settled by the call above, from the whole
+                        # position, and this is the per-leg figure the live
+                        # test exists to produce. Idempotent, so running it
+                        # every sync costs one query once the backlog drains.
+                        closed = store.settle_filled_adds(now_ms)
+                        if closed:
+                            print(f"recovery adds settled: {closed}", flush=True)
+                        # DEFERRED rows whose question can no longer be asked.
+                        # `step` is not even called once the base position has
+                        # exited, and `open_add` is keyed on the current
+                        # window, so without this they stay open forever.
+                        stale = store.close_stale_deferred_adds(now_ms)
+                        if stale:
+                            print(
+                                f"recovery adds closed (deferred, expired): "
+                                f"{stale}", flush=True
+                            )
                         SETTLEMENT_SYNC["at"] = now_ms
                         mark("settlement_sync")
                     except Exception as exc:  # noqa: BLE001

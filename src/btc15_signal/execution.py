@@ -319,6 +319,46 @@ class KalshiExecutionClient:
         except (httpx.HTTPError, ValueError, KeyError):
             return None
 
+    async def order_by_client_id(
+        self, ticker: str, client_order_id: str
+    ) -> dict | None:
+        """The order OUR id owns, for a submission whose response was lost.
+
+        THE AMBIGUOUS CASE. The local row is written before the order is sent,
+        so a crash - or a dropped response - between the send and storing the
+        broker's `order_id` leaves a row that says PENDING with no id. Every
+        repair path here is keyed on `order_id`, and `fills` carries no client
+        id, so that row could never be resolved: the order kept resting at
+        Kalshi, unwatched, and a fill on it would never have been banked.
+
+        `client_order_id` is a pure function of (ticker, side, window), so it
+        is the one key that survives the crash. Kalshi returns it on the order
+        object, which makes the listing the way back to the `order_id`.
+
+        None means "no order is visible for that id", which the caller must
+        treat as UNKNOWN rather than as "nothing was placed" - a listing we
+        could not read looks identical to one with nothing in it, so the two
+        are separated by raising nothing and returning None only after a read
+        that actually succeeded. A failed read raises `LookupError`.
+        """
+        path = "/portfolio/orders"
+        try:
+            response = await self.client.get(
+                self.base_url + path,
+                params={"ticker": ticker, "limit": 200},
+                headers=self._headers("GET", path),
+            )
+            response.raise_for_status()
+            orders = response.json().get("orders") or []
+        except (httpx.HTTPError, ValueError, KeyError) as exc:
+            # UNREADABLE IS NOT EMPTY. Saying "not found" here would let the
+            # caller conclude the order never existed and write it off.
+            raise LookupError(f"could not list orders: {type(exc).__name__}") from exc
+        for order in orders:
+            if str(order.get("client_order_id") or "") == str(client_order_id):
+                return order
+        return None
+
     async def balance_dollars(self) -> float:
         """Cash on hand. Negative when it could not be read.
 

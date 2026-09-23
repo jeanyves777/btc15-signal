@@ -3302,16 +3302,157 @@ class Store:
         return rows[0] if rows else {}
 
     def adds_needing_reconciliation(self) -> list[dict]:
-        """Adds left mid-flight by a restart: placed, not resolved."""
+        """Adds left mid-flight by a restart: placed, not resolved.
+
+        `AND order_id IS NOT NULL` used to be part of this, which excluded the
+        one row that most needs resolving. The local row is written BEFORE the
+        order is sent, so a crash or a lost response between the send and
+        storing the broker's id leaves PENDING with `placed_ms` set and
+        `order_id` NULL - an order that may well be resting at Kalshi, which
+        nothing here could see. `placed_ms IS NOT NULL` is the honest test for
+        "we tried to send this", and the caller resolves the missing id from
+        the broker by `client_order_id`.
+        """
         return self._dicts(
             "SELECT * FROM recovery_adds WHERE state = 'RECOVERY ADD PENDING' "
-            "AND order_id IS NOT NULL"
+            "AND placed_ms IS NOT NULL"
         )
 
     def unsettled_filled_adds(self) -> list[dict]:
         return self._dicts(
             "SELECT * FROM recovery_adds WHERE filled_count > 0 AND settled = 0"
         )
+
+    def close_stale_deferred_adds(self, now_ms: int, window_ms: int = 900_000) -> int:
+        """A deferred question that can no longer be asked is CLOSED.
+
+        DEFERRED is the one state `_step` re-enters, and it re-enters it only
+        while the same window is open AND the base position is still held AND
+        BRTI features are available. Miss any of those and nothing ever touches
+        the row again: `main.run` does not even call `step` once
+        `open_position_detail` returns None, `open_add` is keyed on the current
+        window, and neither reconciliation query can see a row with no order id.
+        So an exit, an input gap or a window roll left a DEFERRED row open
+        forever - counted as undecided in the add-on's own statistics, which is
+        the one place those statistics are supposed to be trustworthy.
+
+        Two conditions, both meaning "this can never place":
+
+        * the window has closed, so the add deadline is long past - the same
+          refusal `evaluate` makes on the clock, just reached from outside; or
+        * the base position is no longer open, so there is nothing to add to.
+
+        NO ORDER CAN RESULT FROM THIS. It only writes a terminal state onto a
+        row that never sent anything - `placed_ms` and `order_id` are NULL on
+        every deferred row by construction. It is guarded on the state in SQL,
+        so it cannot disturb a PENDING, EXECUTED, CANCELLED or SKIPPED row.
+        """
+        closed = 0
+        for add in self._dicts(
+            "SELECT client_order_id, window_open_ms, ticker FROM recovery_adds "
+            "WHERE state = 'RECOVERY ADD DEFERRED'"
+        ):
+            expired = now_ms >= int(add["window_open_ms"]) + window_ms
+            held = self.open_position_detail(int(add["window_open_ms"]))
+            if not expired and held is not None:
+                continue  # still answerable; leave it for the next poll
+            reason = (
+                "window closed before the crossing could be established"
+                if expired else
+                "base position closed before the crossing could be established"
+            )
+            cursor = self.db.execute(
+                "UPDATE recovery_adds SET state = 'RECOVERY ADD SKIPPED', "
+                "cancel_reason = ?, updated_ms = ? WHERE client_order_id = ? "
+                "AND state = 'RECOVERY ADD DEFERRED'",
+                (reason, now_ms, add["client_order_id"]),
+            )
+            closed += cursor.rowcount
+        if closed:
+            self.db.commit()
+        return closed
+
+    def settle_filled_adds(self, now_ms: int) -> int:
+        """Close the lifecycle on a filled add, from the BROKER'S settlement.
+
+        This step did not exist. `settled` and `realised_pnl` were declared on
+        the table, `unsettled_filled_adds` was written to find the backlog, and
+        nothing ever called it or wrote either column - so all 7 filled adds sat
+        at `settled = 0` with a NULL P&L, and `add_pnl_summary` reported $0.00
+        for the add-on however much it had actually made. The whole point of
+        running the add live is to find out whether the SECOND contract pays,
+        and that number had never once been computed.
+
+        THE EVIDENCE IS A SETTLEMENT ROW, NOT A CLOCK. `settlements` comes from
+        `/portfolio/settlements` - the broker's own record - so an add is closed
+        here only when the exchange has actually settled its market and said
+        which way. A market that merely stopped trading settles nothing, and a
+        result we cannot read ('' or a void) is left open rather than guessed.
+
+        THIS TOUCHES NO MONEY. `daily_ledger` already holds the broker's P&L for
+        the WHOLE position, base and add together, and the deficit is already
+        credited from it (`recovery_applied`). The figure written here is the
+        add leg's own, is read only by `add_pnl_summary` for reporting, and is
+        never added to anything. Nothing here charges the add budget either -
+        `record_add_fill` did that once, at the fill.
+
+        THE ONE ATTRIBUTION, stated rather than assumed: an early exit is
+        credited to the BASE first, because the base was bought first and the
+        add is the marginal contract under test. Only an exit LARGER than the
+        base reaches the add. On all 7 rows the exit exactly equalled the base
+        count and the add ran to settlement, so the convention does not bite on
+        any real row - but the arithmetic needs a rule and this is it.
+
+        Idempotent: guarded on `settled = 0` in the UPDATE, so a second run
+        over the same rows changes nothing.
+        """
+        fixed = 0
+        for add in self.unsettled_filled_adds():
+            settlement = self.db.execute(
+                "SELECT market_result FROM settlements WHERE ticker = ?",
+                (add["ticker"],),
+            ).fetchone()
+            if settlement is None:
+                continue  # the broker has not settled it; nothing to close
+            result = str(settlement[0] or "").strip().lower()
+            if result not in ("yes", "no"):
+                continue  # void, or a result we cannot read - leave it open
+            # Our side won if the market resolved the way this leg was held.
+            won = (result == "yes") == (add["side"] == "UP")
+
+            base = self.db.execute(
+                "SELECT COALESCE(count, 0), COALESCE(exit_count, 0), exit_price "
+                "FROM trade_proposals WHERE window_open = ? AND ticker = ? "
+                "AND strategy = 'primary' AND status IN "
+                "('filled','protected','unprotected','exited') "
+                "ORDER BY created_at DESC LIMIT 1",
+                (add["window_open_ms"], add["ticker"]),
+            ).fetchone()
+            base_count = float(base[0]) if base else 0.0
+            sold = float(base[1]) if base else 0.0
+            exit_price = base[2] if base else None
+            # Only an exit bigger than the base reaches the add.
+            add_sold = max(0.0, sold - base_count)
+            filled = float(add["filled_count"] or 0)
+            realised = position_pnl(
+                paid=float(add["fill_price"] or 0),
+                count=filled,
+                entry_fee=float(add["fee_paid"] or 0),
+                exit_price=exit_price if add_sold else None,
+                exit_count=min(add_sold, filled) if add_sold else 0.0,
+                won=won,
+            )
+            if realised is None:
+                continue
+            cursor = self.db.execute(
+                "UPDATE recovery_adds SET settled = 1, realised_pnl = ?, "
+                "updated_ms = ? WHERE client_order_id = ? AND settled = 0",
+                (round(realised, 6), now_ms, add["client_order_id"]),
+            )
+            fixed += cursor.rowcount
+        if fixed:
+            self.db.commit()
+        return fixed
 
     def money_snapshot(self, now_ms: int | None = None) -> "MoneySnapshot":
         """Every money figure a message shows, computed ONCE, together.

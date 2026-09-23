@@ -342,6 +342,24 @@ class RecoveryAddRunner:
         position = self._store.open_position_detail(opened)
         state = self._store.recovery_state(self._settings.recovery_steps)
 
+        # THE ID FIRST. A row whose placement response was lost has no
+        # `order_id`, and the fill check below used to short-circuit on that -
+        # so an order that was resting at Kalshi was never polled for a fill.
+        # Recovering the id from the broker is what makes the rest of this
+        # method apply to it at all. An unreadable listing leaves the row
+        # exactly as it is, to be asked again next poll.
+        if trader is not None and not existing.get("order_id"):
+            try:
+                recovered = await self.resolve_order_id(trader, existing, now_ms)
+            except Exception as exc:  # noqa: BLE001 - unreadable, not absent
+                print(
+                    f"recovery add unresolved [{existing['ticker']}]: {exc!r}",
+                    flush=True,
+                )
+                return
+            if recovered:
+                existing = {**existing, "order_id": recovered}
+
         # A fill found here ends the lifecycle, so it is checked before any
         # cancellation is considered.
         if (
@@ -403,9 +421,18 @@ class RecoveryAddRunner:
         self._store.release_funds(
             f"add:{existing['window_open_ms']}", reason="filled"
         )
+        # `maker` was never a name here - the parser returns `is_taker`. This
+        # raised NameError on EVERY successful fill, after the fill had been
+        # banked and the funds released, so from `_maintain` it aborted the
+        # rest of the poll and from `_cancel` it skipped the row update. It
+        # was unreachable only because `order_status` hit a route that 404s
+        # for every order, so `parse_fill` always returned None and the line
+        # was never executed. Fixing that route made it reachable; adds that
+        # actually rest make it certain.
         print(
             f"recovery add EXECUTED [{existing['ticker']}] {filled:g} at "
-            f"{price:.4f}, fee {fee:.4f}, {'maker' if maker else 'taker'}",
+            f"{price:.4f}, fee {fee:.4f}, "
+            f"{'taker' if detail['is_taker'] else 'maker'}",
             flush=True,
         )
         return True
@@ -413,12 +440,38 @@ class RecoveryAddRunner:
     async def _cancel(
         self, trader, existing, reason, now_ms, crossed=None, features=None
     ) -> None:
-        if trader is None or not existing["order_id"]:
+        if trader is None:
             self._store.update_add(existing["client_order_id"], {
                 "state": AddState.CANCELLED, "cancel_reason": reason,
                 "cancelled_ms": now_ms, "updated_ms": now_ms,
             })
             return
+        if not existing["order_id"]:
+            # AN AMBIGUOUS SUBMISSION IS RESOLVED, NOT WRITTEN OFF. This used
+            # to mark the row CANCELLED without sending anything, which left a
+            # live resting order at Kalshi that nothing would ever watch,
+            # cancel or bank. Ask the broker whose order carries our id first.
+            try:
+                recovered = await self.resolve_order_id(trader, existing, now_ms)
+            except Exception as exc:  # noqa: BLE001 - unreadable, not absent
+                print(
+                    f"recovery add cancel deferred [{existing['ticker']}]: "
+                    f"could not resolve the order id ({exc!r}); left pending",
+                    flush=True,
+                )
+                return
+            if recovered is None:
+                self._store.update_add(existing["client_order_id"], {
+                    "state": AddState.CANCELLED,
+                    "cancel_reason": f"{reason} (never reached the exchange)",
+                    "cancelled_ms": now_ms, "updated_ms": now_ms,
+                })
+                self._store.release_funds(
+                    f"add:{existing['window_open_ms']}",
+                    reason="never reached the exchange",
+                )
+                return
+            existing = {**existing, "order_id": recovered}
         cancelled, note = await trader.cancel_order(existing["order_id"])
         # THE RACE. A cancel that failed may mean the order filled first, so
         # ask before recording a cancellation that did not happen - otherwise
@@ -427,6 +480,20 @@ class RecoveryAddRunner:
             trader, existing, now_ms, crossed, features
         ):
             return
+        if not cancelled:
+            # NOT ACKNOWLEDGED IS NOT CANCELLED. A 500, a timeout or a dropped
+            # connection all arrive here, and writing CANCELLED on one of them
+            # left the order live at Kalshi under a row that said it was gone -
+            # and a CANCELLED row is never examined again. Only a 404, which
+            # means the exchange has no such order, is proof it is gone.
+            gone = "not found" in note.lower()
+            if not gone:
+                print(
+                    f"recovery add cancel UNCONFIRMED [{existing['ticker']}]: "
+                    f"{note}; left pending to retry",
+                    flush=True,
+                )
+                return
         self._store.update_add(existing["client_order_id"], {
             "state": AddState.CANCELLED,
             "cancel_reason": f"{reason} ({note})",
@@ -443,19 +510,85 @@ class RecoveryAddRunner:
 
     # --------------------------------------------------------- reconcile
 
+    async def resolve_order_id(self, trader, existing, now_ms: int) -> str | None:
+        """Recover the broker id for a submission whose response was lost.
+
+        AMBIGUOUS SUBMISSIONS ARE RESOLVED BEFORE ANYTHING ELSE HAPPENS. A row
+        that says PENDING with `placed_ms` set and no `order_id` may own a live
+        resting order; acting on it without asking - cancelling it locally, or
+        placing again - is how a real order becomes an orphan nobody watches.
+
+        Returns the id when the broker shows one, None when the listing was
+        read successfully and our id is not in it (nothing reached the
+        exchange). A listing that could not be READ raises, and the caller
+        leaves the row alone rather than concluding anything from silence.
+        """
+        if existing.get("order_id"):
+            return str(existing["order_id"])
+        if not existing.get("placed_ms"):
+            return None  # never sent; there is nothing at the broker to find
+        order = await trader.order_by_client_id(
+            existing["ticker"], existing["client_order_id"]
+        )
+        order_id = (order or {}).get("order_id")
+        if order_id:
+            self._store.update_add(existing["client_order_id"], {
+                "order_id": order_id, "updated_ms": now_ms,
+            })
+            print(
+                f"recovery add id recovered [{existing['ticker']}]: "
+                f"{str(order_id)[:8]} (response was lost at placement)",
+                flush=True,
+            )
+        return order_id
+
     async def reconcile(self, trader, now_ms: int) -> None:
         """After a restart, ask the exchange what happened to anything pending."""
         for existing in self._store.adds_needing_reconciliation():
             try:
+                # The id first, or a lost response reads as "no such order".
+                order_id = await self.resolve_order_id(trader, existing, now_ms)
+                if order_id is None:
+                    # The listing was read and our id is not in it, so the
+                    # order never reached Kalshi. Nothing is resting.
+                    self._store.update_add(existing["client_order_id"], {
+                        "state": AddState.CANCELLED,
+                        "cancel_reason": "never reached the exchange "
+                                         "(not in the broker's orders)",
+                        "cancelled_ms": now_ms, "updated_ms": now_ms,
+                    })
+                    self._store.release_funds(
+                        f"add:{existing['window_open_ms']}",
+                        reason="never reached the exchange",
+                    )
+                    continue
+                existing = {**existing, "order_id": order_id}
                 if await self._bank_if_filled(trader, existing, now_ms, None, None):
                     continue
-                order = await trader.order_status(existing["order_id"])
+                order = await trader.order_status(order_id)
                 status = (order or {}).get("status")
-                if status in (None, "canceled", "cancelled", "expired"):
+                if order is None:
+                    # UNREADABLE IS NOT CANCELLED. This used to fold `None`
+                    # into the cancelled list, so one failed GET at startup
+                    # marked a live resting order CANCELLED - and a CANCELLED
+                    # row is never looked at again. Leave it PENDING; the next
+                    # poll's `_maintain` asks again.
+                    print(
+                        f"recovery add still unresolved [{existing['ticker']}]: "
+                        f"order unreadable, left pending",
+                        flush=True,
+                    )
+                    continue
+                if status in ("canceled", "cancelled", "expired"):
                     self._store.update_add(existing["client_order_id"], {
                         "state": AddState.CANCELLED,
                         "cancel_reason": f"reconciled after restart ({status})",
                         "cancelled_ms": now_ms, "updated_ms": now_ms,
                     })
+                    # The broker is no longer holding it, so neither do we.
+                    self._store.release_funds(
+                        f"add:{existing['window_open_ms']}",
+                        reason=f"broker reports {status}",
+                    )
             except Exception as exc:  # noqa: BLE001
                 print(f"recovery add reconcile failed: {exc!r}", flush=True)
