@@ -712,6 +712,17 @@ class Store:
             "session": "TEXT",
             "vol_regime": "TEXT",
             "band_hold_s": "INTEGER",
+            # THE TWO INDICATORS ADDED 2026-09-24, stored for the same reason
+            # the others are: the reversal threshold was chosen on 79 markets
+            # and can only be revisited from rows that recorded what it saw.
+            # A gate whose input is not archived can never be re-measured, and
+            # the one shipped here is explicitly provisional.
+            #
+            # brti_retrace GATES - it is the fifth check. brti_choppiness
+            # does not and must not; it is recorded beside it so the two can
+            # be compared against outcomes on equal footing.
+            "brti_retrace": "REAL",
+            "brti_choppiness": "REAL",
         })
         # FORWARD EVALUATION. What each frozen candidate WOULD have changed on
         # a live signal, recorded beside what the unchanged strategy actually

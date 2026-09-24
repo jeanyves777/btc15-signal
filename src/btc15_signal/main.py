@@ -1903,6 +1903,12 @@ def intelligence_verdict(
                 * (getattr(brti, "brti_momentum_bps", 0.0) or 0.0)
             ),
             "brti_volatility_bps": _feature(brti, "brti_volatility_bps"),
+            # THE TWO INDICATORS. Recorded on every decision, qualified or
+            # not, so the reversal threshold can be re-measured against
+            # outcomes rather than re-argued. One gates and one does not;
+            # both are archived the same way.
+            "brti_retrace": _feature(brti, "brti_retrace"),
+            "brti_choppiness": _feature(brti, "brti_choppiness"),
             # CONTEXT, recorded and not keyed on.
             "session": _session(opened),
             "vol_regime": (
