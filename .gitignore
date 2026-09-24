@@ -16,3 +16,6 @@ runtime/
 .env.bak*
 .env.*.bak
 *.env.backup
+.env.eth
+runtime-*/
+eth15.db*
