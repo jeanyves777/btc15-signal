@@ -23,16 +23,31 @@ from btc15_signal.store import Store  # noqa: E402
 W = 1_790_193_600_000
 
 
-def store_with(tmp_path, events):
-    """events: [(ticker, realised_ms, amount)] written to the real ledger."""
-    store = Store(str(tmp_path / "s.db"))
-    for i, (ticker, ms, amount) in enumerate(events):
+def store_with(tmp_path, events, name="s.db"):
+    """events: [(ticker, window_open, bot_leg_pnl)].
+
+    THE BOT'S OWN TRADES, because that is what the rule keys on. These used to
+    write `realised_events`, which holds one row per TICKER and therefore
+    blends every contract the ACCOUNT traded in that market - the operator's
+    manual fills included. See the 2026-09-24 case at the bottom of this file.
+    """
+    store = Store(str(tmp_path / name))
+    for i, (ticker, window, amount) in enumerate(events):
+        won = amount > 0
         store.db.execute(
-            "INSERT INTO realised_events (event_id, ticker, realised_ms, "
-            "amount, source, window_ms, applied, recorded_ms) "
-            "VALUES (?,?,?,?,?,?,?,?)",
-            (f"e{i}", ticker, ms, amount, "exchange", W, amount, ms),
-        )
+            "INSERT INTO trade_proposals (id, strategy, window_open, ticker,"
+            " side, entry_limit, take_profit, count, expires_at, close_ms,"
+            " status, created_at, fill_price, fee_paid) "
+            "VALUES (?,'primary',?,?,'UP',0.80,0,2,?,?,'filled',?,0.80,0.02)",
+            (f"p{i}", window, ticker, window + 60_000, window + 900_000,
+             window))
+        store.db.execute(
+            "INSERT INTO settlements (ticker, event_ticker, market_result,"
+            " yes_count, yes_cost, no_count, no_cost, revenue_cents, fee_cost,"
+            " pnl, settled_ms, synced_at, window_ms) "
+            "VALUES (?,?,?,0,0,0,0,0,0,?,?,?,?)",
+            (ticker, ticker, "yes" if won else "no", amount,
+             window + 900_000, window, window))
     store.db.commit()
     return store
 
@@ -46,43 +61,45 @@ def test_no_history_is_not_a_loss(tmp_path):
 
 
 def test_a_losing_market_reads_as_a_loss(tmp_path):
-    store = store_with(tmp_path, [("A", 1000, -0.80)])
+    store = store_with(tmp_path, [("A", 1_000_000, -0.80)])
     assert store.last_market_lost() is True
 
 
 def test_a_winning_market_resets_it(tmp_path):
-    store = store_with(tmp_path, [("A", 1000, -0.80), ("B", 2000, +0.19)])
+    store = store_with(tmp_path, [("A", 1_000_000, -0.80), ("B", 2_000_000, +0.19)])
     assert store.last_market_lost() is False
 
 
 def test_the_MOST_RECENT_market_decides_not_the_sum(tmp_path):
     """A win after two big losses resets the step, even deep underwater."""
     store = store_with(
-        tmp_path, [("A", 1000, -3.00), ("B", 2000, -3.00), ("C", 3000, +0.10)])
+        tmp_path, [("A", 1_000_000, -3.00), ("B", 2_000_000, -3.00), ("C", 3_000_000, +0.10)])
     assert store.last_market_lost() is False
 
 
-def test_a_partly_cashed_out_market_is_summed_not_split(tmp_path):
-    """THE ONE THAT BIT THE BACKTEST. A position sold early writes a cash_out
-    row AND an exchange row for the remainder. Either alone is a fraction of
-    the result; 10 of 199 live markets are like this."""
-    store = Store(str(tmp_path / "c.db"))
-    for i, (src, amt) in enumerate((("cash_out", -0.90), ("exchange", +1.05))):
-        store.db.execute(
-            "INSERT INTO realised_events (event_id, ticker, realised_ms, "
-            "amount, source, window_ms, applied, recorded_ms) "
-            "VALUES (?,?,?,?,?,?,?,?)",
-            (f"x{i}", "A", 1000 + i, amt, src, W, amt, 1000 + i),
-        )
+def test_a_market_the_bot_never_filled_is_skipped(tmp_path):
+    """An unfilled proposal is not a trade and cannot arm the step."""
+    store = store_with(tmp_path, [("A", 1_000_000, +0.19)])
+    store.db.execute(
+        "INSERT INTO trade_proposals (id, strategy, window_open, ticker, side,"
+        " entry_limit, take_profit, count, expires_at, close_ms, status,"
+        " created_at) VALUES ('later','primary',?, 'B','DOWN',0.68,0,1,?,?,"
+        "'pending',?)",
+        (2_000_000, 2_060_000, 2_900_000, 2_000_000))
+    store.db.execute(
+        "INSERT INTO settlements (ticker, event_ticker, market_result,"
+        " yes_count, yes_cost, no_count, no_cost, revenue_cents, fee_cost,"
+        " pnl, settled_ms, synced_at, window_ms) "
+        "VALUES ('B','B','yes',10,4.8,20,11.1,0,0.35,-6.2492,?,?,?)",
+        (2_900_000, 2_900_000, 2_000_000))
     store.db.commit()
-    # -0.90 + 1.05 = +0.15: a WIN. Reading only the last row says loss.
     assert store.last_market_lost() is False
 
 
 # --------------------------------------------------------------- the sizing
 
 def test_it_sizes_to_the_budget_after_a_loss(tmp_path):
-    store = store_with(tmp_path, [("A", 1000, -0.80)])
+    store = store_with(tmp_path, [("A", 1_000_000, -0.80)])
     s = Settings(loss_step_enabled=True, loss_step_budget=5.0)
     count, why = main.loss_step_size(store, s, 1, 0.82)
     assert count == 6, why           # int(5.00 / 0.82)
@@ -90,7 +107,7 @@ def test_it_sizes_to_the_budget_after_a_loss(tmp_path):
 
 
 def test_it_does_nothing_after_a_win(tmp_path):
-    store = store_with(tmp_path, [("A", 1000, +0.19)])
+    store = store_with(tmp_path, [("A", 1_000_000, +0.19)])
     s = Settings(loss_step_enabled=True, loss_step_budget=5.0)
     assert main.loss_step_size(store, s, 1, 0.82) == (1, "")
 
@@ -102,23 +119,33 @@ def test_it_does_nothing_with_no_history(tmp_path):
 
 
 def test_consecutive_losses_do_not_escalate(tmp_path):
-    """A step, not a martingale. The second loss is the same size as the
-    first - which is exactly what the backtest charged for it."""
-    s = Settings(loss_step_enabled=True, loss_step_budget=5.0)
-    one = store_with(tmp_path, [("A", 1000, -0.80)])
-    first = main.loss_step_size(one, s, 1, 0.80)[0]
-    one.db.execute(
-        "INSERT INTO realised_events (event_id, ticker, realised_ms, amount, "
-        "source, window_ms, applied, recorded_ms) VALUES (?,?,?,?,?,?,?,?)",
-        ("e9", "B", 2000, -4.00, "exchange", W, -4.00, 2000),
-    )
-    one.db.commit()
-    second = main.loss_step_size(one, s, 1, 0.80)[0]
+    """A step, not a martingale. The second loss is sized exactly like the
+    first - which is what the backtest charged for it, and the reason the
+    exposure is bounded whatever the streak length."""
+    st = Settings(loss_step_enabled=True, loss_step_budget=5.0)
+    store = store_with(tmp_path, [("A", 1_000_000, -0.80)])
+    first = main.loss_step_size(store, st, 1, 0.80)[0]
+    # a SECOND losing bot trade, after the first
+    store.db.execute(
+        "INSERT INTO trade_proposals (id, strategy, window_open, ticker, side,"
+        " entry_limit, take_profit, count, expires_at, close_ms, status,"
+        " created_at, fill_price, fee_paid) "
+        "VALUES ('p9','primary',?, 'B','UP',0.80,0,2,?,?,'filled',?,0.80,0.02)",
+        (2_000_000, 2_060_000, 2_900_000, 2_000_000))
+    store.db.execute(
+        "INSERT INTO settlements (ticker, event_ticker, market_result,"
+        " yes_count, yes_cost, no_count, no_cost, revenue_cents, fee_cost,"
+        " pnl, settled_ms, synced_at, window_ms) "
+        "VALUES ('B','B','no',0,0,0,0,0,0,-1.62,?,?,?)",
+        (2_900_000, 2_000_000, 2_000_000))
+    store.db.commit()
+    assert store.last_market_lost() is True
+    second = main.loss_step_size(store, st, 1, 0.80)[0]
     assert first == second == 6
 
 
 def test_the_flag_turns_it_off(tmp_path):
-    store = store_with(tmp_path, [("A", 1000, -0.80)])
+    store = store_with(tmp_path, [("A", 1_000_000, -0.80)])
     s = Settings(loss_step_enabled=False, loss_step_budget=5.0)
     assert main.loss_step_size(store, s, 1, 0.82) == (1, "")
 
@@ -126,7 +153,7 @@ def test_the_flag_turns_it_off(tmp_path):
 def test_it_never_sizes_DOWN(tmp_path):
     """It is an upsize or it is nothing. A base already above the budget's
     reach is left alone, with an empty reason so no line claims an upsize."""
-    store = store_with(tmp_path, [("A", 1000, -0.80)])
+    store = store_with(tmp_path, [("A", 1_000_000, -0.80)])
     s = Settings(loss_step_enabled=True, loss_step_budget=1.0)
     assert main.loss_step_size(store, s, 4, 0.82) == (4, "")
 
@@ -136,14 +163,14 @@ def test_it_never_sizes_DOWN(tmp_path):
 def test_the_cap_binds_at_a_cheap_ask(tmp_path):
     """A stale or mispriced ask is what turns a dollar budget into a position
     nobody chose. $5 at 1c would be 500 contracts."""
-    store = store_with(tmp_path, [("A", 1000, -0.80)])
+    store = store_with(tmp_path, [("A", 1_000_000, -0.80)])
     s = Settings(loss_step_enabled=True, loss_step_budget=5.0,
                  loss_step_max_contracts=8)
     assert main.loss_step_size(store, s, 1, 0.01)[0] == 8
 
 
 def test_the_cap_holds_across_the_whole_price_band(tmp_path):
-    store = store_with(tmp_path, [("A", 1000, -0.80)])
+    store = store_with(tmp_path, [("A", 1_000_000, -0.80)])
     s = Settings(loss_step_enabled=True, loss_step_budget=5.0,
                  loss_step_max_contracts=8)
     for ask in (0.70, 0.75, 0.80, 0.85, 0.90, 0.93, 0.95):
@@ -205,3 +232,77 @@ def test_it_cannot_create_a_trade():
     for forbidden in ("execute", "create_proposal", "rule_match", "order",
                       "place", "submit", "trader"):
         assert forbidden not in code, forbidden
+
+
+# ------------------------- the bot's OWN trade, not the account's market
+
+def proposal(store, *, window, ticker, side, count, fill, result,
+             status="filled", exit_price=None, exit_count=None):
+    store.db.execute(
+        "INSERT INTO trade_proposals (id, strategy, window_open, ticker, side,"
+        " entry_limit, take_profit, count, expires_at, close_ms, status,"
+        " created_at, fill_price, fee_paid, exit_price, exit_count) "
+        "VALUES (?,'primary',?,?,?,?,0,?,?,?,?,?,?,0.02,?,?)",
+        (f"p{window}", window, ticker, side, fill, count, window + 60_000,
+         window + 900_000, status, window, fill, exit_price, exit_count))
+    store.db.execute(
+        "INSERT INTO settlements (ticker, event_ticker, market_result,"
+        " yes_count, yes_cost, no_count, no_cost, revenue_cents, fee_cost,"
+        " pnl, settled_ms, synced_at, window_ms) "
+        "VALUES (?,?,?,0,0,0,0,0,0,?,?,?,?)",
+        (ticker, ticker[:-3], result, 0.0, window + 900_000, window, window))
+    store.db.commit()
+
+
+def test_a_market_the_bot_never_filled_does_not_arm_the_step(tmp_path):
+    """2026-09-24, KXBTC15M-26SEP241000-00. The bot's only proposal there was
+    1 contract DOWN at 0.68 and it stayed PENDING. The operator traded the
+    same market by hand - three 10-contract fills at 0.48-0.58, outside every
+    gate - and the ticker netted -6.2492. Keyed on the market, the next BOT
+    entry would have upsized to $5 on a loss that was not the bot's."""
+    store = Store(str(tmp_path / "m.db"))
+    proposal(store, window=1_000_000, ticker="T-WIN", side="UP", count=2,
+             fill=0.88, result="yes")
+    # the manual market: a settlement row and a proposal that never filled
+    store.db.execute(
+        "INSERT INTO trade_proposals (id, strategy, window_open, ticker, side,"
+        " entry_limit, take_profit, count, expires_at, close_ms, status,"
+        " created_at) VALUES ('manual','primary',?, 'T-MANUAL','DOWN',0.68,0,"
+        "1,?,?,'pending',?)",
+        (2_000_000, 2_060_000, 2_900_000, 2_000_000))
+    store.db.execute(
+        "INSERT INTO settlements (ticker, event_ticker, market_result,"
+        " yes_count, yes_cost, no_count, no_cost, revenue_cents, fee_cost,"
+        " pnl, settled_ms, synced_at, window_ms) "
+        "VALUES ('T-MANUAL','T-MAN','yes',10,4.8,20,11.1,0,0.35,-6.2492,?,?,?)",
+        (2_900_000, 2_900_000, 2_000_000))
+    store.db.commit()
+    # The bot's last FILLED trade won, so the step must not arm.
+    assert store.last_market_lost() is False
+
+
+def test_it_reads_the_bots_own_leg_not_the_ticker_total(tmp_path):
+    """Same market, bot leg wins, ticker total is deeply negative."""
+    store = Store(str(tmp_path / "n.db"))
+    proposal(store, window=1_000_000, ticker="T1", side="UP", count=2,
+             fill=0.80, result="yes")
+    store.db.execute("UPDATE settlements SET pnl = -9.99 WHERE ticker='T1'")
+    store.db.commit()
+    assert store.last_market_lost() is False
+
+
+def test_a_losing_bot_leg_still_arms_it(tmp_path):
+    store = Store(str(tmp_path / "o.db"))
+    proposal(store, window=1_000_000, ticker="T1", side="UP", count=2,
+             fill=0.80, result="no")
+    assert store.last_market_lost() is True
+
+
+def test_an_early_exit_is_priced_at_the_exit(tmp_path):
+    """A position sold at 0.997 on a market that then settled against us is a
+    WIN, and must not arm the step."""
+    store = Store(str(tmp_path / "p.db"))
+    proposal(store, window=1_000_000, ticker="T1", side="UP", count=2,
+             fill=0.80, result="no", status="exited",
+             exit_price=0.997, exit_count=2)
+    assert store.last_market_lost() is False

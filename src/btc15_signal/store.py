@@ -1806,14 +1806,42 @@ class Store:
         None, not False, when there is no history: a fresh database has not
         observed a win, and a rule that upsizes on "not a loss" would be the
         opposite of the one asked for.
+
+        THE BOT'S OWN POSITION, NOT THE MARKET'S. This read `realised_events`,
+        which holds one row per TICKER and therefore blends every contract the
+        account traded in that market - including the operator's own. On
+        2026-09-24 the 10:00 window held a 2-contract bot entry at 0.79 AND
+        three manual 10-contract trades at 0.48-0.58, far outside the gates;
+        the ticker netted -6.2492 and the next bot entry would have been
+        upsized to $5 on a loss that was mostly not the bot's.
+
+        The operator's rule is "every time a TRADE loses" - the bot's trade.
+        So the market is found through `trade_proposals`, and the result is
+        the bot's own leg priced from its own fill, which is the same
+        arithmetic that reconciled 146 of 154 filled proposals to the broker.
         """
         row = self.db.execute(
-            "SELECT SUM(amount) FROM realised_events "
-            "GROUP BY ticker ORDER BY MAX(realised_ms) DESC LIMIT 1"
+            "SELECT p.side, p.count, p.fill_price, p.fee_paid, p.status, "
+            "       p.exit_price, p.exit_count, s.market_result "
+            "  FROM trade_proposals p "
+            "  JOIN settlements s ON s.ticker = p.ticker "
+            " WHERE p.strategy = 'primary' AND p.fill_price IS NOT NULL "
+            "   AND s.market_result IN ('yes','no') "
+            " ORDER BY p.window_open DESC, p.created_at DESC LIMIT 1"
         ).fetchone()
-        if row is None or row[0] is None:
+        if row is None or not row[1]:
             return None
-        return float(row[0]) < 0.0
+        side, count, fill_price, fee_paid, status, exit_price, exit_count, \
+            result = row
+        won = (result == "yes") == (side == "UP")
+        spend = count * fill_price + (fee_paid or 0.0)
+        if status == "exited" and exit_price is not None and exit_count:
+            # Sold early: the part sold returns its price, the rest settles.
+            proceeds = (exit_count * exit_price
+                        + (count - exit_count) * (1.0 if won else 0.0))
+        else:
+            proceeds = count * (1.0 if won else 0.0)
+        return (proceeds - spend) < 0.0
 
     def recovery_state(
         self, plan_steps: int = DEFAULT_RECOVERY_STEPS, now_ms: int | None = None

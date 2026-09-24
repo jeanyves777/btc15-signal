@@ -549,7 +549,7 @@ ALREADY_COUNTED = "\U0001f9fe <i>Already counted at the sale.</i>"
 def confidence_note(*, points: int, high_at: int, checks: int, clock: int,
                     shield: int, intelligence: int = 0,
                     choppiness: float | None = None,
-                    choppiness_points: int = 0) -> str:
+                    choppiness_points: int = 0, failed: int = 0) -> str:
     """The confidence word as arithmetic, on the line under the word.
 
     WHY THIS EXISTS. KXBTC15M-26SEP240915-15 alerted "Confidence MEDIUM ·
@@ -576,6 +576,12 @@ def confidence_note(*, points: int, high_at: int, checks: int, clock: int,
         parts.append("chop n/a")
     else:
         parts.append(f"chop {choppiness_points:+d} ({choppiness * 100:.0f}%)")
+    if failed:
+        # The cap, said out loud. A score of 75 printed beside the word LOW
+        # is a contradiction unless the reason is on the same line.
+        return (f"{CHOP} Score {points}/100 · <b>capped LOW</b>: "
+                f"{failed} gate{'s' if failed != 1 else ''} failed · "
+                f"<i>{' · '.join(parts)}</i>")
     return (f"{CHOP} Score {points}/100 · HIGH at {high_at} · "
             f"<i>{' · '.join(parts)}</i>")
 # A PARTIAL EXIT IS NOT counted at the sale. Two of three

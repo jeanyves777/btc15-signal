@@ -204,19 +204,40 @@ def confidence_breakdown(facts: list[dict], opened: int,
     from .regime import weight_at
 
     agreeing = sum(1 for fact in facts if fact["passed"])
+    failed = len(facts) - agreeing
     checks = regime_base(agreeing)
     clock = regime_clock(weight_at(opened))
     shield = level_points(blocking_level is not None)
     points = max(0, min(100, checks + clock + shield
                         + int(intelligence_delta or 0)
                         + int(choppiness_delta or 0)))
+    label = regime_label(points)
+    # A REFUSED SETUP IS NOT A MEDIUM ONE. Operator, 2026-09-24, on
+    # KXBTC15M-26SEP241015-15: 65c against a 70-93c band and 3.5x against a
+    # 10x floor - two gates failed - and the header still read MEDIUM,
+    # because 3 of 5 agreeing scores 70 and the clock added 21 on top.
+    #
+    # The old rule was that confidence describes how good the setup LOOKS and
+    # says nothing about whether it may be traded. That reads as a
+    # contradiction on every refused signal, and the operator reads the word
+    # before the ticks. A setup a gate refused is LOW, whatever the
+    # arithmetic underneath says - and the arithmetic is still printed in
+    # full on the score line, so nothing is hidden by the cap.
+    #
+    # POINTS ARE NOT TOUCHED. `model_confidence_points` feeds the training
+    # corpus through the same `regime_model_points`, and moving it would
+    # silently re-score every row the calibration compares against. This caps
+    # the WORD only.
+    if failed:
+        label = "LOW"
     return {
         "points": points, "high_at": HIGH_AT, "checks": checks,
         "clock": clock, "shield": shield,
         "intelligence": int(intelligence_delta or 0),
         "choppiness": choppiness,
         "choppiness_points": int(choppiness_delta or 0),
-        "label": regime_label(points),
+        "failed": failed,
+        "label": label,
     }
 
 

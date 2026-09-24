@@ -154,3 +154,56 @@ def test_choppiness_still_appears_in_no_gate():
 
     fields = {f.name for f in dataclasses.fields(KalshiBRTIRule)}
     assert not any("chop" in n for n in fields), fields
+
+
+# ----------------------------- a refused setup is not a MEDIUM one
+
+def test_a_setup_that_failed_a_gate_is_capped_low():
+    """Operator, 2026-09-24, KXBTC15M-26SEP241015-15: 65c against a 70-93c
+    band and 3.5x against a 10x floor - two gates failed - and the header
+    still read MEDIUM, because 3 of 5 agreeing scores 70 and the clock added
+    21 on top."""
+    facts = [{"name": str(i), "passed": i < 3} for i in range(5)]
+    b = main.confidence_breakdown(facts, OPENED, None, 0, 0.63, -10)
+    assert b["failed"] == 2
+    assert b["label"] == "LOW"
+
+
+def test_one_failed_gate_is_enough():
+    facts = [{"name": str(i), "passed": i < 4} for i in range(5)]
+    assert main.confidence_breakdown(facts, OPENED, None)["label"] == "LOW"
+
+
+def test_a_clean_setup_is_not_capped():
+    b = main.confidence_breakdown(FIVE, OPENED, None, 0, 0.30, -5)
+    assert b["failed"] == 0
+    assert b["label"] in ("MEDIUM", "HIGH")
+
+
+def test_the_points_are_NOT_changed_by_the_cap():
+    """`model_confidence_points` feeds the training corpus through the same
+    `regime_model_points`; moving it would silently re-score every row the
+    calibration compares against. The cap is on the WORD only."""
+    facts = [{"name": str(i), "passed": i < 3} for i in range(5)]
+    b = main.confidence_breakdown(facts, OPENED, None)
+    assert b["points"] == main.model_confidence_points(facts, OPENED, None)
+
+
+def test_the_cap_is_explained_on_the_score_line():
+    """A score of 75 printed beside the word LOW is a contradiction unless
+    the reason is on the same line."""
+    facts = [{"name": str(i), "passed": i < 3} for i in range(5)]
+    b = main.confidence_breakdown(facts, OPENED, None, 0, 0.63, -10)
+    note = surface.confidence_note(**{k: v for k, v in b.items()
+                                      if k != "label"})
+    assert "capped LOW" in note
+    assert "2 gates failed" in note
+    assert "checks +70" in note          # the arithmetic is still shown
+
+
+def test_the_singular_reads_correctly():
+    facts = [{"name": str(i), "passed": i < 4} for i in range(5)]
+    b = main.confidence_breakdown(facts, OPENED, None)
+    note = surface.confidence_note(**{k: v for k, v in b.items()
+                                      if k != "label"})
+    assert "1 gate failed" in note
