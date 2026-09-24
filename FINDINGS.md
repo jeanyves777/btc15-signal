@@ -5195,3 +5195,101 @@ a migration. Verified: 2 wrong before, 24 relinked, 0 wrong after, second run
 
 That was mine, shipped the same evening, and found by reading the archive
 rather than by anything failing.
+
+## 57. What a bad day is, and why no recovery rule earned its place (2026-09-24)
+
+The operator asked for a better recovery system, backtested against what a bad
+day actually looks like. The measurements refuse the request, and the reason
+is worth more than the rule would have been.
+
+Reproduce with `scripts/measure_ask_margin.py`,
+`backtest_recovery_variants.py`, `measure_band_walk_forward.py` and
+`measure_recovery_paired.py`.
+
+### A bad day is not a low win rate
+
+The live record, by New York day:
+
+    09-19   7W- 9L (44%)   -1.03
+    09-20   9W-11L (45%)   -4.15
+    09-21  38W- 8L (83%)   +1.90
+    09-22  47W- 9L (84%)   +4.47
+    09-23  44W- 9L (83%)   -1.42   <- same win rate, lost money
+
+**09-23 won at 83% and still lost.** Because the break-even win rate is not a
+constant - it is set by the price paid:
+
+    day      win rate   break-even   margin
+    09-21      82.6%       78.9%      +3.7%
+    09-22      83.9%       77.1%      +6.9%
+    09-23      83.0%       84.4%      -1.4%
+
+The average loss on 09-23 was -1.65 against -0.87 and -0.90 on the two
+profitable days, while the average win rose only from +0.27 to +0.31.
+
+**Over the whole live record the margin is -0.07%**: break-even 76.0%, actual
+75.9%, payoff 3.16:1 against. The strategy runs on a knife edge of one to
+three points of win rate, and a "bad day" is any day the price it paid moved
+the bar above where the win rate landed.
+
+Two things this is NOT: wins are not being cut short (early exits capture
+**98%** of full-hold potential), and size is not the culprit (1-contract
+margin +1.1%, 2-contract +2.5% - the 2-contract trades simply ran at a higher
+average ask, 82c against 78c).
+
+### No recovery variant beat doing nothing, with evidence
+
+3,049 corpus markets in the deployed band, 68 days, one row per market at
+`remaining = 10`:
+
+    variant                        taken    total  per trade   max DD  worst day
+    A baseline: flat 1              3049   +21.92    +0.0072   -18.19     -5.55
+    B deployed: deficit upsize      3049   +14.70    +0.0048   -19.67     -5.55
+    C control: flat 2               3049   +43.98    +0.0144   -36.35    -11.10
+    D selective band after a loss    630   +20.43    +0.0324    -5.22     -1.71
+    E stand down after 2 losses/day  750    +5.90    +0.0079    -7.86     -1.54
+    G selective + flat 2             630   +40.90    +0.0649   -10.44     -3.43
+
+**C reproduces FINDINGS 32 exactly** - x2.01 profit against x2.00 drawdown -
+which validates the harness and restates the thing that keeps being true:
+size creates no edge, it scales both sides.
+
+**D and G looked like the answer and are overfit.** They select the
+0.85-0.90 aligned band, chosen by looking at this same corpus. Choosing the
+band on the FIRST half and scoring it on the second:
+
+    band chosen on train only : 0.75-0.80 aligned  (train edge +0.0690)
+    its out-of-sample result  : -0.0364 over 361 markets, CI SPANS ZERO
+    baseline on the same half : -0.0009
+
+The rankings reshuffle completely between halves and **not one band's
+out-of-sample interval clears zero**. The in-sample story - same profit at a
+third of the drawdown - was noise dressed as a rule.
+
+**B, the deployed rule, is the only fair comparison** - a fixed rule, same
+markets, so it can be paired. Day-clustered bootstrap over 68 days:
+
+    baseline +21.92   deployed +14.70   difference -7.21
+    95% CI [-18.35, +3.57]  -> SPANS ZERO
+    upsized on 156 of 3049 trades (5.1%); worse on 12 of 68 days
+    worst day identical under both (-5.55)
+
+So the deployed upsize **cannot be shown to help, and cannot be shown to
+harm**. It fires rarely and does not worsen the tail. Its point estimate is
+negative, and there is a mechanism for that - `2*(1-ask) >= deficit/4` upsizes
+preferentially into CHEAP asks, and the cheap band carries the weakest margin
+(+0.7% at 0.70-0.75) - but the evidence does not establish it. Left alone.
+
+### Why the request cannot be granted
+
+**The corpus baseline edge is not stable out of sample**: +0.0072/contract on
+the whole, **-0.0009 on the test half**. Recovery rules protect or amplify an
+edge; there is no stable edge here for one to act on, so every recovery
+variant is arithmetic applied to noise.
+
+The binding constraint is the ENTRY, not the recovery. A bad day is made by
+the break-even arithmetic - the price paid against the win rate achieved - and
+the only lever with a real mechanism behind it is paying less, not sizing more
+or recovering faster.
+
+**Nothing was changed.** The deployed recovery stays exactly as it is.
