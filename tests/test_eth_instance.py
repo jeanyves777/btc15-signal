@@ -33,9 +33,14 @@ def test_no_instance_keeps_the_original_runtime_paths():
     assert 'os.environ.get("BTC15_INSTANCE")' in source
 
 
-def test_the_btc_strategy_file_is_unchanged():
+def test_the_btc_floor_is_the_measured_one():
+    """7x, operator's decision 2026-09-24 on FINDINGS 64. The 10x floor was
+    refusing setups worth +0.0628/trade with an interval clear of zero; 7x
+    roughly triples the trade count while keeping per-trade edge within
+    ~2.5c. Not 3x, which earns more on the corpus but ignores the
+    one-position slot, fill risk on marginal setups, and fees."""
     rule = json.loads((ROOT / "strategy_kalshi.json").read_text())
-    assert rule["min_brti_normalized_distance"] == 10.0
+    assert rule["min_brti_normalized_distance"] == 7.0
     assert rule["min_ask"] == 0.70
     assert rule["max_ask"] == 0.93
 
@@ -59,9 +64,11 @@ def test_the_eth_floor_is_measured_not_inherited():
 
     eth = KalshiBRTIRule.load(str(ROOT / "strategy_kalshi_eth.json"))
     btc = KalshiBRTIRule.load(str(ROOT / "strategy_kalshi.json"))
+    # Each measured on its OWN sweep: 8x was ETH's best cell (FINDINGS 63),
+    # 7x the operator's choice for BTC (FINDINGS 64). They are close because
+    # the instruments are similar, not because either was copied.
     assert eth.min_brti_normalized_distance == 8.0
-    assert btc.min_brti_normalized_distance == 10.0
-    assert eth.min_brti_normalized_distance != btc.min_brti_normalized_distance
+    assert btc.min_brti_normalized_distance == 7.0
 
 
 def test_the_reversal_gate_is_carried_over_deliberately():
