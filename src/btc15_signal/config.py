@@ -118,6 +118,11 @@ class Settings(BaseSettings):
     # `scripts/promotion_report.py`, and `intelligence_authorised` must be set
     # in the same breath - two independent switches, so a single stray edit or
     # a copied .env cannot hand a shadow model control of real money.
+    # How long the exchange may list NO market before the operator is told.
+    # A normal window boundary is seconds; on 2026-09-24 Kalshi listed nothing
+    # for TWO HOURS and the only symptom was Telegram going quiet, which is
+    # the silent stop this system is most exposed to.
+    market_gap_alert_s: int = 600
     intelligence_mode: str = "shadow"
     intelligence_authorised: bool = False
     # How far above the quoted ask the entry limit is set. An IOC limit fills

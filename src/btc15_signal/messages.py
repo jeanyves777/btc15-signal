@@ -2241,3 +2241,44 @@ def learning_update(*, markets: int, confidence_changes: int,
         lines.append(detail)
     lines.append("\U0001f504 Automatic learning continues.")
     return "\n".join(lines)
+
+
+def _duration(seconds: float) -> str:
+    """"2h 05m", "18m". Hours matter; seconds never do at this scale."""
+    minutes = int(seconds // 60)
+    hours, minutes = divmod(minutes, 60)
+    return f"{hours}h {minutes:02d}m" if hours else f"{minutes}m"
+
+
+def market_gap_message(gap_s: float) -> str:
+    """The exchange is listing no market, and has not been for a while.
+
+    THE SILENT STOP, NAMED. A window boundary is seconds. On 2026-09-24 Kalshi
+    listed nothing for TWO HOURS while the service was entirely healthy
+    throughout - polling, recording, reconciling - so the only thing the
+    operator could see was that the messages had stopped. The absence of
+    alerts is not an alert, and this system's worst failure mode is silence.
+
+    It says what is NOT wrong as prominently as what is, because "no market"
+    read on a phone at 3am looks exactly like the bot having died.
+    """
+    return "\n".join([
+        f"{surface.WARN} <b>NO MARKET AT THE EXCHANGE</b>",
+        f"{surface.WAITING} Kalshi has listed no 15-minute market for "
+        f"<b>{_duration(gap_s)}</b>",
+        "",
+        "<i>The service is running normally - polling, recording and "
+        "reconciling. There is simply nothing to trade, so no signals and no "
+        "alerts will arrive until a market is listed again.</i>",
+        "<i>Any open position is unaffected: it lives at Kalshi and settles "
+        "at expiry.</i>",
+    ])
+
+
+def market_back_message(gap_s: float, ticker: str) -> str:
+    """The all-clear. A gap that gets reported must also get closed."""
+    return "\n".join([
+        f"{surface.PASS} <b>MARKETS ARE BACK</b>",
+        f"{surface.TARGET} Trading resumed on <code>{escape(ticker)}</code>",
+        f"<i>The exchange listed nothing for {_duration(gap_s)}.</i>",
+    ])

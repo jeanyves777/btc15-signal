@@ -1257,6 +1257,10 @@ POLL_MARKS: dict[str, int] = {}
 # Last successful settlement mirror, so the sync is throttled to once a
 # minute rather than running on every poll.
 SETTLEMENT_SYNC: dict[str, int] = {}
+# When the exchange last had no market, and whether that has been reported.
+# A gap of seconds is the normal shape of a window boundary; a gap of hours is
+# an outage whose only symptom is silence.
+MARKET_GAP: dict[str, int] = {}
 # Which window we have already asked the broker to confirm an entry fill for.
 # One request per window, and only while the sweep has not delivered it.
 ENTRY_CONFIRM: dict[str, int] = {}
@@ -3617,6 +3621,23 @@ async def service() -> None:
                     if last_ticker is not None:
                         print("between windows; waiting for the next market", flush=True)
                         last_ticker = None
+                    # AN OUTAGE IS NOT A BOUNDARY. Kalshi flips windows in
+                    # seconds; on 2026-09-24 it listed nothing for two hours
+                    # and nothing said so - the service was healthy, the poll
+                    # loop was turning, and the only symptom the operator had
+                    # was Telegram going quiet. Reported once per gap.
+                    MARKET_GAP.setdefault("since", now_ms)
+                    gap_s = (now_ms - MARKET_GAP["since"]) / 1000
+                    if (gap_s >= settings.market_gap_alert_s
+                            and not MARKET_GAP.get("told")):
+                        MARKET_GAP["told"] = 1
+                        try:
+                            await Notifier(telegram, store, settings).send_once(
+                                "market_gap", str(MARKET_GAP["since"]),
+                                messages.market_gap_message(gap_s), now_ms,
+                            )
+                        except Exception as exc:  # noqa: BLE001
+                            print(f"market gap alert failed: {exc!r}", flush=True)
                     # The shadow archive still runs between windows - that is
                     # why this block used to sit ahead of the lookup. It now
                     # runs on BOTH paths instead, so the gap is still covered
@@ -3633,6 +3654,20 @@ async def service() -> None:
                         await reference.reconcile(now_ms)
                     await asyncio.sleep(settings.poll_seconds)
                     continue
+                if MARKET_GAP.get("since"):
+                    gap_s = (now_ms - MARKET_GAP["since"]) / 1000
+                    told = MARKET_GAP.pop("told", None)
+                    started = MARKET_GAP.pop("since")
+                    if told:
+                        try:
+                            await Notifier(telegram, store, settings).send_once(
+                                "market_gap_over", str(started),
+                                messages.market_back_message(
+                                    gap_s, contract.ticker), now_ms,
+                            )
+                        except Exception as exc:  # noqa: BLE001
+                            print(f"market return alert failed: {exc!r}",
+                                  flush=True)
                 opened = contract.open_ms
                 remaining = (contract.close_ms - now_ms) // 1000
                 if settings.kalshi_only:

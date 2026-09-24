@@ -3440,12 +3440,29 @@ class Store:
         `filled` here means "this market was traded", not "this poll placed
         it" - the second is not a fact any single row can carry.
 
-        Idempotent and cheap: only rows with a NULL `filled` are considered,
-        so once the archive is linked this costs one indexed scan and stops.
+        ONLY SETTLED WINDOWS, because before settlement the answer can still
+        change. The first version linked on every 60-second sync and wrote
+        `filled = 0` for a window whose order had not filled YET - then never
+        looked again, because it only revisited NULLs. Two windows carried a
+        false 0 within hours of shipping. Grading happens at settlement, so
+        `graded_ms` is the mark that says the trade's outcome is final.
+
+        SELF-HEALING for those two and anything like them: a window whose rows
+        say `filled = 0` while a filled order exists for it is re-linked. That
+        keeps this idempotent - the second pass over a correct archive changes
+        nothing - without needing a migration.
         """
         windows = self._dicts(
-            "SELECT DISTINCT window_open FROM intelligence_decisions "
-            "WHERE filled IS NULL ORDER BY window_open DESC LIMIT ?",
+            "SELECT DISTINCT d.window_open FROM intelligence_decisions d "
+            "WHERE d.graded_ms IS NOT NULL AND ("
+            "  d.filled IS NULL"
+            "  OR (d.filled = 0 AND EXISTS ("
+            "        SELECT 1 FROM trade_proposals p"
+            "         WHERE p.window_open = d.window_open"
+            "           AND p.strategy = 'primary'"
+            "           AND p.status IN ('filled','protected','unprotected','exited')"
+            "     ))"
+            ") ORDER BY d.window_open DESC LIMIT ?",
             (limit,),
         )
         linked = 0
@@ -3461,7 +3478,7 @@ class Store:
             order_id = trade[0] if trade else None
             cursor = self.db.execute(
                 "UPDATE intelligence_decisions SET order_id = ?, filled = ? "
-                "WHERE window_open = ? AND filled IS NULL",
+                "WHERE window_open = ? AND (filled IS NULL OR filled = 0)",
                 (order_id, 1 if trade else 0, window),
             )
             linked += cursor.rowcount

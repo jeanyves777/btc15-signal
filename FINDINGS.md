@@ -5142,3 +5142,56 @@ the +24 trigger - where a naive `COUNT(DISTINCT ticker) FROM daily_ledger`
 suggested +97. The ledger counts every settled market; the learner counts what
 its own corpus can use. Use the learner's number when asking whether a fit is
 due.
+
+## 56. Two hours with no market, and nobody told (2026-09-24)
+
+The operator: *"The telegram stopped two hours ago."*
+
+### What actually happened
+
+Kalshi listed **no 15-minute market between 07:00Z and 09:00Z**. Observations
+per hour, from the archive:
+
+    06:07-07:07Z   258   4 markets     normal
+    07:07-08:07Z     0   0 markets     <- nothing listed
+    08:07-09:07Z    37   1 market      recovering
+
+The service was healthy throughout - the poll loop turned, the reference
+recorder kept writing, settlements reconciled, the log was written 0.9 minutes
+before the check. It did exactly the right thing and said so **once**:
+
+    03:00:03  between windows; waiting for the next market
+    05:00:28  Live market data connected: KXBTC15M-26SEP240515-15
+
+and then nothing for two hours. A direct query confirmed the exchange had a
+live market again by the time it was investigated, with quotes - so this was
+an upstream listing gap, not a discovery bug.
+
+**The defect is that it was silent.** A window boundary is SECONDS; two hours
+is an outage. The operator's only symptom was that Telegram had gone quiet,
+and the absence of alerts is not an alert - it is indistinguishable from a
+dead bot, a broken token or a crashed service. This is the silent stop this
+system is most exposed to, and it went unreported for its whole duration.
+
+Now: past `market_gap_alert_s` (600s, far above any real boundary) the gap is
+reported once, keyed on when it started, and an all-clear follows when a
+market returns. The alert says what is NOT wrong as prominently as what is,
+because "no market" read on a phone at 3am looks exactly like a dead bot, and
+it states that an open position is unaffected.
+
+### The linker wrote a false zero, within hours of shipping
+
+`link_intelligence_orders` (55b) ran on every 60-second settlement sync,
+including for windows whose order had not filled YET. It wrote `filled = 0`,
+and then never revisited, because it only considered rows where `filled IS
+NULL`. Two windows carried a false zero against orders that really traded
+(`01a0d189-...` exited, `01a0d1dd-...` filled).
+
+It now links only windows whose decisions are GRADED - settlement has
+happened, so the answer can no longer change - and self-heals any window whose
+rows say `filled = 0` while a filled order exists, which repaired both without
+a migration. Verified: 2 wrong before, 24 relinked, 0 wrong after, second run
+0.
+
+That was mine, shipped the same evening, and found by reading the archive
+rather than by anything failing.

@@ -198,6 +198,11 @@ def test_the_runner_asks_for_the_running_contract(tmp_path):
 
 # ------------------------------- joining a decision to the order it caused
 
+def settle(store, window=W, winner="UP"):
+    """Linking waits for settlement: before it, `filled` can still change."""
+    store.grade_intelligence(window, winner, None, NOW)
+
+
 def traded(store, window, order_id="ord-1"):
     store.db.execute(
         "INSERT INTO trade_proposals (id, strategy, window_open, ticker, side,"
@@ -217,6 +222,7 @@ def test_a_traded_market_links_every_decision_row_to_its_order(tmp_path):
     decision(store, "T", "UP", 0.80, rid="a")
     decision(store, "T", "UP", 0.81, rid="b")
     traded(store, W, "ord-xyz")
+    settle(store)
     assert store.link_intelligence_orders() == 2
     rows = store._dicts("SELECT order_id, filled FROM intelligence_decisions")
     assert all(r["order_id"] == "ord-xyz" for r in rows)
@@ -227,6 +233,7 @@ def test_an_untraded_market_is_marked_not_filled(tmp_path):
     """Zero, not NULL. "We did not trade this" is a fact worth recording."""
     store = Store(str(tmp_path / "l2.db"))
     decision(store, "T", "UP", 0.80)
+    settle(store)
     assert store.link_intelligence_orders() == 1
     row = store._dicts("SELECT order_id, filled FROM intelligence_decisions")[0]
     assert row["filled"] == 0
@@ -237,6 +244,7 @@ def test_linking_is_idempotent(tmp_path):
     store = Store(str(tmp_path / "l3.db"))
     decision(store, "T", "UP", 0.80)
     traded(store, W)
+    settle(store)
     assert store.link_intelligence_orders() == 1
     assert store.link_intelligence_orders() == 0, "already linked; stop"
 
@@ -253,6 +261,7 @@ def test_an_unfilled_proposal_does_not_count_as_traded(tmp_path):
         (W, "T"),
     )
     store.db.commit()
+    settle(store)
     store.link_intelligence_orders()
     row = store._dicts("SELECT order_id, filled FROM intelligence_decisions")[0]
     assert row["filled"] == 0
@@ -265,7 +274,35 @@ def test_each_window_links_to_its_own_order(tmp_path):
     decision(store, "T2", "UP", 0.80, window=W + 900_000, rid="y")
     traded(store, W, "ord-first")
     traded(store, W + 900_000, "ord-second")
+    settle(store, W)
+    settle(store, W + 900_000)
     store.link_intelligence_orders()
     got = {r["ticker"]: r["order_id"] for r in store._dicts(
         "SELECT ticker, order_id FROM intelligence_decisions")}
     assert got == {"T1": "ord-first", "T2": "ord-second"}
+
+
+def test_a_window_is_not_linked_before_it_settles(tmp_path):
+    """The bug this caused: the linker ran on the 60-second sync BEFORE the
+    order filled, wrote `filled = 0`, and never looked again because it only
+    revisited NULLs. Two live windows carried a false 0 within hours."""
+    store = Store(str(tmp_path / "l6.db"))
+    decision(store, "T", "UP", 0.80)
+    assert store.link_intelligence_orders() == 0, "ungraded: leave it alone"
+    assert store._dicts(
+        "SELECT filled FROM intelligence_decisions")[0]["filled"] is None
+
+
+def test_a_false_zero_is_repaired(tmp_path):
+    """Self-healing, so the two rows already wrong did not need a migration."""
+    store = Store(str(tmp_path / "l7.db"))
+    decision(store, "T", "UP", 0.80)
+    settle(store)
+    store.db.execute("UPDATE intelligence_decisions SET filled = 0")
+    store.db.commit()
+    traded(store, W, "ord-late")
+    assert store.link_intelligence_orders() == 1
+    row = store._dicts("SELECT order_id, filled FROM intelligence_decisions")[0]
+    assert row["filled"] == 1
+    assert row["order_id"] == "ord-late"
+    assert store.link_intelligence_orders() == 0
