@@ -110,3 +110,54 @@ def test_refused_setups_are_archived_too():
     source = inspect.getsource(main.intelligence_verdict)
     assert "base_qualified" in source
     assert "record_intelligence" in source
+
+
+# ------------------------- the hourly ladder records under Kalshi-only
+
+def test_the_hourly_shadow_is_not_gated_on_binance():
+    """It stopped at 09-23 02:59 with 36 chains and 35 settlements - 34
+    consecutive hours - because it was gated on `not kalshi_only`. The ladder
+    is a KALSHI product; Binance was only ever its spot CONTEXT, three numbers
+    BRTIFeatures carries natively. Removing Binance switched off a Kalshi
+    shadow, and FINDINGS 62 could not be judged for lack of data."""
+    import inspect
+
+    from btc15_signal import main
+
+    source = inspect.getsource(main.service)
+    at = source.index("hourly = HourlyShadow")
+    line = source[at:at + 120]
+    assert "kalshi_only" not in line, line
+
+
+def test_the_poll_takes_brti_as_its_spot_context():
+    import inspect
+
+    from btc15_signal import hourly_shadow, main
+
+    assert "brti" in inspect.signature(hourly_shadow.HourlyShadow.poll).parameters
+    source = inspect.getsource(main.service)
+    assert source.count("brti=(reference.current_features()") == 2
+
+
+def test_brti_supplies_every_field_the_snapshot_did():
+    """price, 5m momentum, 5m volatility - the only three ever read."""
+    import dataclasses
+
+    from btc15_signal.brti import BRTIFeatures
+
+    fields = {f.name for f in dataclasses.fields(BRTIFeatures)}
+    assert {"value", "brti_momentum_bps", "brti_volatility_bps"} <= fields
+
+
+def test_a_poll_with_no_context_still_records_the_ladder():
+    """The quotes ARE the data. No spot means archive every rung rather than
+    the ones near a price we do not have - it must not skip the snapshot."""
+    import inspect
+
+    from btc15_signal import hourly_shadow
+
+    source = inspect.getsource(hourly_shadow.HourlyShadow.poll)
+    at = source.index("spot = momentum = volatility = None")
+    after = source[at:at + 400]
+    assert "record_snapshot" in after or "return" not in after.split("\n")[1]

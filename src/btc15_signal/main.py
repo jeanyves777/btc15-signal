@@ -3562,10 +3562,13 @@ async def service() -> None:
     # The hourly ladder takes its OWN Binance reading (see HourlyShadow.poll),
     # so although it never trades it IS an active Binance request. Under
     # Kalshi-only it does not run. Its archive stays readable as history.
-    hourly = (
-        HourlyShadow(settings)
-        if settings.hourly_enabled and not settings.kalshi_only else None
-    )
+    # THE LADDER IS A KALSHI PRODUCT AND RUNS UNDER KALSHI-ONLY. It was gated
+    # on `not kalshi_only` because its spot CONTEXT came from Binance - three
+    # numbers the BRTI reference carries natively - so removing Binance
+    # silently switched off a Kalshi shadow. It stopped at 09-23 02:59 with 36
+    # chains and 35 settlements, which is 34 consecutive hours: not enough to
+    # judge any ladder strategy, and the reason FINDINGS 62 could not.
+    hourly = HourlyShadow(settings) if settings.hourly_enabled else None
     reference = ReferenceShadow(settings) if settings.reference_enabled else None
     recovery_add = RecoveryAddRunner(settings, store, telegram)
     capital = CapitalController(settings, store)
@@ -3928,7 +3931,13 @@ async def service() -> None:
                     # runs on BOTH paths instead, so the gap is still covered
                     # without the recorder standing in front of a live order.
                     if hourly:
-                        await hourly.poll(now_ms, market)
+                        # BRTI is the spot context under Kalshi-only, and it
+                        # is the reference these contracts settle on.
+                        await hourly.poll(
+                            now_ms, market,
+                            brti=(reference.current_features()
+                                  if reference is not None else None),
+                        )
                         await hourly.settle(now_ms)
                     # The reference recorder covers the gap between windows
                     # too: the 60 seconds a market settles on straddle the
@@ -4034,7 +4043,11 @@ async def service() -> None:
                 # ran before every one of them. Both calls swallow their own
                 # errors, so a slow ladder cannot break the trading loop.
                 if hourly:
-                    await hourly.poll(now_ms, market)
+                    await hourly.poll(
+                        now_ms, market,
+                        brti=(reference.current_features()
+                              if reference is not None else None),
+                    )
                     await hourly.settle(now_ms)
                 # Settlement reference, same contract as the hourly shadow and
                 # for the same reason: it records, it never orders, and it sits

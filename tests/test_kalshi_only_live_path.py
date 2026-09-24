@@ -229,10 +229,32 @@ def test_no_component_that_needs_binance_is_constructed_under_kalshi_only():
         stripped = line.strip()
         if re.search(r"\bmarket\.", stripped) and "live_market" not in stripped:
             assert "if market is not None" in source, stripped
-        if "hourly.poll(now_ms, market)" in stripped:
+        if "hourly.poll(" in stripped:
             assert "if hourly:" in source, "hourly.poll must be guarded"
-    # And the ladder is not built at all
-    assert "settings.hourly_enabled and not settings.kalshi_only" in source
+    # THE LADDER IS BUILT UNDER KALSHI-ONLY, and takes BRTI as its context.
+    #
+    # This used to assert the opposite - that the hourly shadow was not
+    # constructed at all. That was the wrong guard: the ladder is a KALSHI
+    # product, and Binance was only ever its spot CONTEXT, three numbers
+    # (price, 5m momentum, 5m volatility) that `BRTIFeatures` carries
+    # natively. Gating it on `not kalshi_only` switched off a Kalshi shadow
+    # because of where its context came from, and the ladder stopped
+    # recording on 09-23 02:59 with 36 chains to its name.
+    #
+    # The real requirement is unchanged and is what is asserted now: nothing
+    # under Kalshi-only may DEPEND on the Binance client. `poll` takes
+    # `market` positionally and it is None under Kalshi-only, so the BRTI
+    # branch must be the one that runs.
+    assert "hourly = HourlyShadow(settings) if settings.hourly_enabled" in source
+    assert "brti=(reference.current_features()" in source
+    poll = inspect.getsource(
+        __import__("btc15_signal.hourly_shadow", fromlist=["HourlyShadow"])
+        .HourlyShadow.poll
+    )
+    assert "if brti is not None:" in poll
+    assert poll.index("if brti is not None:") < poll.index("market.snapshot"), (
+        "BRTI must be preferred over the Binance snapshot, not fall back to it"
+    )
 
 
 def test_the_crash_handler_reports_where_not_only_the_type():

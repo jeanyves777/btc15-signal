@@ -51,8 +51,18 @@ class HourlyShadow:
             >= self._settings.hourly_poll_seconds * 1000
         )
 
-    async def poll(self, now_ms: int, market) -> None:
+    async def poll(self, now_ms: int, market=None, *, brti=None) -> None:
         """Record one ladder snapshot. Never raises.
+
+        SPOT COMES FROM BRTI UNDER KALSHI-ONLY. The ladder itself is a Kalshi
+        product and never needed Binance; the snapshot was only ever read for
+        three numbers - price, 5m momentum and 5m volatility - and
+        `BRTIFeatures` carries all three. Gating the whole recorder on
+        `not kalshi_only` therefore switched off a Kalshi shadow because its
+        CONTEXT happened to come from elsewhere, and the ladder stopped
+        recording at 09-23 02:59 with 36 chains and 35 settlements to its
+        name. BRTI is also the better input: it is the reference these
+        contracts actually settle on.
 
         Takes its OWN Binance reading anchored to the hour's open rather than
         reusing the trading loop's. The two are not interchangeable: the
@@ -73,8 +83,20 @@ class HourlyShadow:
                     self._last_chain = None
                 return
 
-            snapshot = await market.snapshot(chain.open_ms)
-            spot = snapshot.price if snapshot else None
+            if brti is not None:
+                spot = getattr(brti, "value", None)
+                momentum = getattr(brti, "brti_momentum_bps", None)
+                volatility = getattr(brti, "brti_volatility_bps", None)
+            elif market is not None:
+                snapshot = await market.snapshot(chain.open_ms)
+                spot = snapshot.price if snapshot else None
+                momentum = snapshot.momentum_5m_bps if snapshot else None
+                volatility = snapshot.volatility_5m_bps if snapshot else None
+            else:
+                # No context available. The LADDER is still worth recording -
+                # the quotes are the data - so this archives every rung rather
+                # than the ones near a price it does not have.
+                spot = momentum = volatility = None
             integrity = check_integrity(
                 chain, spot, now_ms, self._quote_age(chain, now_ms)
             )
@@ -87,8 +109,8 @@ class HourlyShadow:
                 chain,
                 integrity,
                 spot=spot,
-                momentum_5m_bps=snapshot.momentum_5m_bps if snapshot else None,
-                volatility_5m_bps=snapshot.volatility_5m_bps if snapshot else None,
+                momentum_5m_bps=momentum,
+                volatility_5m_bps=volatility,
                 archived=archived,
                 session_id=self._session_id,
             )
