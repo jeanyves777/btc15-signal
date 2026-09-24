@@ -127,6 +127,21 @@ class Settings(BaseSettings):
     # for TWO HOURS and the only symptom was Telegram going quiet, which is
     # the silent stop this system is most exposed to.
     market_gap_alert_s: int = 600
+    # THE REVERSAL GATE. Refuse an entry standing on a move that has already
+    # turned over. Shipped as a BLOCKING gate on the operator's explicit
+    # instruction, with the evidence recorded beside it in FINDINGS 58:
+    # 79 markets, stable entries 85.5% against reversed 70-75%, separation
+    # +13.3% at this window and threshold - and every band's interval overlaps
+    # every other, with the separation collapsing at a 180s window. The
+    # mechanism is sound and the parameters are not yet established.
+    # CHOPPINESS. Confidence only, by the operator's instruction - it has no
+    # threshold and appears in no gate. `choppiness_penalty` is on the same
+    # 0-100 point scale `confidence_label` works in, applied in proportion to
+    # how choppy the window was, and clamped with everything else.
+    choppiness_window_s: int = 900
+    choppiness_penalty: int = 15
+    reversal_window_s: int = 120
+    reversal_max_retrace: float = 0.60
     intelligence_mode: str = "shadow"
     intelligence_authorised: bool = False
     # How far above the quoted ask the entry limit is set. An IOC limit fills

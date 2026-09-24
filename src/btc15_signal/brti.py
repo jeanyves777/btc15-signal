@@ -95,6 +95,30 @@ class BRTIFeatures:
     # the same number as `value` - that is the point, and the reason it is
     # named separately is that this is the one a close-call decision wants.
     settlement_projection: float
+    # HOW MUCH OF THE RECENT MOVE HAS ALREADY BEEN HANDED BACK, 0.0 to 1.0,
+    # measured in the direction the setup is taking. The deployed gates cannot
+    # see this: momentum reads POSITIVE on a run-up that has already peaked,
+    # because the five-minute window still contains the run. On 2026-09-24 a
+    # market ran to 83,340 against a target of 83,234, the position was taken
+    # UP, and BRTI then collapsed to 83,191. Every gate was green.
+    #
+    # 1.0 means the whole advance is gone. None means it could not be computed
+    # - too few samples, or no advance to give back - and None is never read as
+    # a pass.
+    brti_retrace: float | None = None
+    # HOW MUCH OF THE PATH WENT NOWHERE, 0.0 to 1.0. The ratio of net movement
+    # to total distance travelled: 0.0 is a straight line, 1.0 is pure
+    # thrashing that ends where it began. On 2026-09-24 06:45 BRTI crossed the
+    # strike six times in an hour and finished $11.74 from it - a market whose
+    # outcome is a coin toss however far the last print happens to be from the
+    # target, and no deployed gate can tell it from a clean trend.
+    #
+    # IT IS NOT A GATE AND MUST NEVER BECOME ONE. The operator was explicit:
+    # choppiness influences CONFIDENCE only. It is absent from `check_facts`
+    # by construction, so there is no threshold for it to fail and no way for
+    # it to refuse or admit a setup. It moves the header word; that is all the
+    # authority it has.
+    brti_choppiness: float | None = None
 
     @property
     def side(self) -> str:
@@ -110,6 +134,8 @@ def features_from_series(
     momentum_window_s: int = 300,
     volatility_window_s: int = 300,
     stale_limit_ms: int = 15_000,
+    retrace_window_s: int = 120,
+    choppiness_window_s: int = 900,
 ) -> BRTIFeatures | None:
     """Gate inputs from a BRTI series. Returns None rather than guessing.
 
@@ -142,6 +168,38 @@ def features_from_series(
         volatility = 0.0
 
     signed = (value / target - 1) * 10_000
+
+    # THE REVERSAL MEASURE, in the direction this setup would be taken.
+    # `side` is whichever way BRTI already sits relative to the strike, which
+    # is the side the strategy takes, so the advance is measured that way.
+    side_up = signed >= 0
+    seg = [v for t, v in ordered if t >= ts_ms - retrace_window_s * 1000]
+    retrace = None
+    if len(seg) >= 4:
+        start = seg[0]
+        if side_up:
+            extreme = max(seg)
+            advance, given = extreme - start, extreme - value
+        else:
+            extreme = min(seg)
+            advance, given = start - extreme, value - extreme
+        if advance > 0:
+            # Clamped: a price now BETTER than the extreme is not a negative
+            # retrace, it is simply no retrace at all.
+            retrace = max(0.0, min(1.0, given / advance))
+
+    # CHOPPINESS, over the whole window rather than the reversal's short one:
+    # thrashing is a property of the session, not of the last two minutes.
+    chop_seg = [v for t, v in ordered if t >= ts_ms - choppiness_window_s * 1000]
+    choppiness = None
+    if len(chop_seg) >= 10:
+        travelled = sum(abs(chop_seg[i + 1] - chop_seg[i])
+                        for i in range(len(chop_seg) - 1))
+        net = abs(chop_seg[-1] - chop_seg[0])
+        if travelled > 0:
+            # 0.0 straight line, 1.0 ended where it started having moved a lot.
+            choppiness = max(0.0, min(1.0, 1.0 - net / travelled))
+
     return BRTIFeatures(
         event_ticker=event_ticker,
         ts_ms=ts_ms,
@@ -153,6 +211,8 @@ def features_from_series(
         brti_normalized_distance=abs(signed) / max(volatility, 1e-9),
         samples=len(ordered),
         span_ms=ordered[-1][0] - ordered[0][0],
+        brti_retrace=retrace,
+        brti_choppiness=choppiness,
         stale=(now_ms - ts_ms) > stale_limit_ms,
         settlement_projection=value,
     )

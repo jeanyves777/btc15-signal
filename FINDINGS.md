@@ -5293,3 +5293,84 @@ the only lever with a real mechanism behind it is paying less, not sizing more
 or recovering faster.
 
 **Nothing was changed.** The deployed recovery stays exactly as it is.
+
+## 58. Two indicators the gates could not see (2026-09-24)
+
+The operator brought two charts. Both show a market the four deployed gates
+call clean and the outcome calls a coin toss.
+
+### The reversal — SHIPPED AS A BLOCKING GATE, on the operator's decision
+
+06:08. Target 83,234. BRTI ran to ~83,340, comfortably above; the position was
+taken UP at 51c; BRTI collapsed to 83,191. The trade lost $0.62 with every
+check green:
+
+    Confidence HIGH · Entry checks 4/4
+    Price 92c · Distance 20.3x · Momentum +41.6 bps · Reference fresh
+    Band held 187s
+
+None of them can see it. Momentum reads POSITIVE because the five-minute
+window still contains the run-up. Distance is large because BRTI is far from
+the strike - on its way back through it. The gates describe where the price
+IS; none asks whether the move that put it there is still alive.
+
+`brti_retrace` is how much of the recent advance has been handed back, in the
+direction the setup is taken. 0.0 at the high-water mark, 1.0 when the whole
+move is gone.
+
+**THE EVIDENCE, stated beside the decision.** 79 markets with a Kalshi BRTI
+path and a settled outcome, entry at 600s:
+
+    retrace band        n    W   L   win rate        95% CI
+    0-25% (stable)     55   47   8     85.5%   [73.8%, 92.4%]
+    25-50%              6    4   2     66.7%   [30.0%, 90.3%]
+    50-75%              7    5   2     71.4%   [35.9%, 91.8%]
+    75%+ (reversed)     8    6   2     75.0%   [40.9%, 92.9%]
+
+    as a gate at 0.60: kept 83.9% vs refused 70.6%, separation +13.3%
+
+**And the caveats, equally plainly.** Every band's interval overlaps every
+other. The cells are n=6, 7, 8. At a 180-second window the separation
+collapses to +2.5% and goes NEGATIVE at two thresholds - same data, one
+parameter changed, which is the signature of a fitted choice. This session
+has already watched three in-sample winners fail out of sample.
+
+The recommendation was to record it first and gate later. **The operator chose
+to gate now**, and that is their call: the mechanism is sound, the gate only
+ever refuses, and the downside is bounded. The threshold is chosen from 79
+markets and should be revisited when there are hundreds.
+
+Unmeasurable is NOT a pass: a setup whose recent path cannot be computed fails
+the gate, because "looks fine" and "was checked" are different states.
+
+### Choppiness — CONFIDENCE ONLY, by instruction
+
+06:45. Target 83,232.53. Over the hour BRTI crossed the strike six times,
+printed four peaks, and finished $11.74 away. That market is a coin toss
+however far the last print sits from the target.
+
+`brti_choppiness` is net movement over distance travelled: 0.0 a straight
+line, 1.0 thrashing that ends where it began. Measured over the 15-minute
+window rather than the reversal's two minutes - thrashing is a property of the
+session. On synthetic paths: clean trend 0.000, trend with noise 0.000, pure
+oscillation 0.957.
+
+**It is not a gate and the tests exist to keep it that way.** The operator was
+explicit that choppiness influences confidence only, so it appears in no
+`check_facts` list, `KalshiBRTIRule` carries no threshold for it, and the
+suite asserts that the choppiest possible window still qualifies. It enters
+`confidence_label` as points on the same 0-100 scale as the learned
+calibration, proportional rather than stepped, and can only ever LOWER the
+word - the same authority a confidence adjustment has always had.
+
+### What adding a fifth gate did to the confidence scale
+
+`base_points` is a five-entry table clamping at four agreeing checks, so
+`agreeing=5` scores 100 exactly as `agreeing=4` did. A TRADED setup therefore
+scores identically on the live path and in the training corpus, which is what
+the calibration compares. The corpus cannot reconstruct the retrace at all - a
+corpus row carries no intra-window path - and `agreeing = 4 - failures` is
+left unchanged deliberately for that reason. A setup failing only the reversal
+gate is never traded and is recorded with `rule_match = 0` regardless.
+
+1,213 tests pass.

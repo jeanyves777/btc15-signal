@@ -131,8 +131,27 @@ def samples_needed(store: Store, effect: float = 0.01) -> int:
     return int((1.96 * (variance ** 0.5) / effect) ** 2) if variance else 0
 
 
+def choppiness_points(choppiness: float | None, penalty: int) -> int:
+    """Confidence points to subtract for a window that went nowhere.
+
+    CONFIDENCE ONLY. The operator's instruction was explicit - choppiness
+    influences confidence and nothing else - so this returns POINTS, it is
+    consumed by `confidence_label`, and it appears in no `check_facts` list.
+    There is no threshold for a setup to fail on it and no branch anywhere
+    that can turn it into a refusal. A number that cannot reach a gate cannot
+    accidentally become one.
+
+    Proportional rather than stepped: a 0.9 window is not the same as a 0.5
+    one, and a cliff would make the word flip on a rounding change.
+    """
+    if choppiness is None:
+        return 0
+    return -int(round(max(0.0, min(1.0, choppiness)) * max(0, penalty)))
+
+
 def confidence_label(facts: list[dict], opened: int, blocking_level: float | None,
-                     intelligence_delta: int = 0) -> str:
+                     intelligence_delta: int = 0,
+                     choppiness_delta: int = 0) -> str:
     """HIGH / MEDIUM / LOW for the signal header.
 
     Scored from the SAME facts the checks are rendered from, so the word and
@@ -153,10 +172,16 @@ def confidence_label(facts: list[dict], opened: int, blocking_level: float | Non
     everything else, and it can only move the LABEL - it reaches no gate, no
     order and no size, which is the whole of a confidence adjustment's
     authority.
+
+    `choppiness_delta` is the second such adjustment and carries exactly the
+    same authority: none beyond the word. A window that crossed the strike six
+    times and finished where it started is a coin toss whatever the gates say,
+    and this is where that gets said - not in a refusal.
     """
     return regime_label(
         max(0, min(100, model_confidence_points(facts, opened, blocking_level)
-                   + int(intelligence_delta or 0)))
+                   + int(intelligence_delta or 0)
+                   + int(choppiness_delta or 0)))
     )
 
 
@@ -2629,8 +2654,16 @@ async def primary_signal(
     # when the layer changed nothing - silence is the right output for "the
     # pattern supports the existing decision", and narrating every neutral
     # trains the reader to skip the one that matters.
+    # CHOPPINESS LANDS HERE AND NOWHERE ELSE. It is computed from the same
+    # BRTI window the gates read, and it is passed to the LABEL - not to
+    # rule_match, not to check_facts, not to sizing. A window that went
+    # nowhere lowers the word and refuses nothing.
     confidence = confidence_label(
-        facts, opened, blocking_level, intel_verdict.confidence_delta
+        facts, opened, blocking_level, intel_verdict.confidence_delta,
+        choppiness_points(
+            getattr(brti, "brti_choppiness", None) if brti is not None else None,
+            settings.choppiness_penalty,
+        ),
     )
     policy_note = messages.policy_line(intel_verdict)
     if policy_note:

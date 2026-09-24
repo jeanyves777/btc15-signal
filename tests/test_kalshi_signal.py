@@ -25,6 +25,10 @@ def features(**over) -> BRTIFeatures:
         brti_volatility_bps=1.0, brti_normalized_distance=15.0,
         samples=900, span_ms=900_000, stale=False,
         settlement_projection=100_150.0,
+        # The reversal gate shipped after this fixture was written. A
+        # QUALIFYING setup is one whose move is still intact, so the default
+        # is a stable path; tests that want a reversal pass it explicitly.
+        brti_retrace=0.0,
     )
     base.update(over)
     return BRTIFeatures(**base)
@@ -161,7 +165,7 @@ def test_every_gate_reads_kalshi_only():
     blob = repr(facts).lower()
     assert "binance" not in blob
     assert any("BRTI" in f["name"] for f in facts)
-    assert len(facts) == 4, "ask, distance, momentum, reference"
+    assert len(facts) == 5, "ask, distance, momentum, stability, reference"
 
 
 def test_the_module_imports_nothing_from_binance():

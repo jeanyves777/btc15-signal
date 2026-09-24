@@ -194,10 +194,17 @@ def _minute_row(point: dict, quote: tuple, distance_floor: float,
 
     window_ms = point["close_ms"] - 900_000
     # THE MODEL'S OWN SCORE for this decision, from the same function the live
-    # path calls. `check_facts` returns FOUR facts; the fourth is the reference
-    # freshness check, which passes by construction on a backfilled BRTI point
-    # - the row exists because the reference was there. The other three are the
-    # gates computed above, so agreeing = 4 - failures.
+    # path calls. `check_facts` returns FIVE facts since the reversal gate
+    # shipped. Reference freshness passes by construction on a backfilled BRTI
+    # point - the row exists because the reference was there - and the
+    # reversal retrace CANNOT be reconstructed here at all, because a corpus
+    # row carries no intra-window path. So this counts the three gates it can
+    # compute, and `agreeing = 4 - failures` is left unchanged DELIBERATELY:
+    # `base_points` clamps at four, so a live setup with all five green scores
+    # 100 and a corpus row with all four scores 100. They agree on exactly the
+    # rows that matter - the traded ones - which is what the calibration
+    # compares. A row that fails only the reversal gate is never traded and is
+    # recorded with rule_match = 0 regardless.
     #
     # THE LEVEL TERM IS NOT ZERO. Under Kalshi-only no protective level is
     # computed, so the live path calls `level_points(False)` - which is -6, not

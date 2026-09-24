@@ -58,6 +58,10 @@ class KalshiBRTIRule:
     # The measured floor. NOT `min_normalized_distance` - that name belongs to
     # the Binance quantity and means something six times smaller.
     min_brti_normalized_distance: float = 10.0
+    # THE REVERSAL GATE. 1.0 means the whole recent advance has been
+    # handed back. Shipped blocking on the operator's instruction; the
+    # evidence behind the threshold is in FINDINGS 58 and is thin.
+    max_brti_retrace: float = 0.60
     # Momentum is UNGATED until it is measured on BRTI. A 60-second mean lags
     # the raw series, so the Binance momentum thresholds describe a different
     # quantity here too, and an unmeasured gate is worse than no gate because
@@ -127,6 +131,30 @@ class KalshiBRTIRule:
                 "pass_text": f"{aligned:+.1f} bps",
                 "fail_text": f"{aligned:+.1f} bps - not aligned",
                 "value": aligned,
+            },
+            {
+                "name": "BRTI stability",
+                # None is NOT a pass. A setup whose recent path cannot be
+                # measured is one we cannot say is stable, and the whole point
+                # of this gate is that "looks fine" and "was checked" are
+                # different states.
+                "passed": (
+                    features.brti_retrace is not None
+                    and features.brti_retrace <= self.max_brti_retrace
+                ),
+                "pass_text": (
+                    "holding"
+                    if features.brti_retrace is None
+                    else f"{features.brti_retrace * 100:.0f}% given back "
+                         f"(max {self.max_brti_retrace * 100:.0f}%)"
+                ),
+                "fail_text": (
+                    "recent move not measurable"
+                    if features.brti_retrace is None
+                    else f"{features.brti_retrace * 100:.0f}% of the move "
+                         f"already reversed"
+                ),
+                "value": features.brti_retrace,
             },
             {
                 "name": "Reference",
