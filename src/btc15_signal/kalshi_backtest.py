@@ -9,7 +9,7 @@ from pathlib import Path
 import httpx
 
 from .backtest import Candle, fetch_klines
-from .binance import MarketSnapshot
+from .snapshot import MarketSnapshot
 from .kalshi import iso_ms
 from .model import predict
 from .store import wilson_lower

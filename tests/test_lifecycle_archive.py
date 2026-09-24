@@ -7,7 +7,7 @@ the moments the spread was too wide to trade. Each test below pins one of those.
 
 from pathlib import Path
 
-from btc15_signal.binance import MarketSnapshot
+from btc15_signal.snapshot import MarketSnapshot
 from btc15_signal.config import Settings
 from btc15_signal.kalshi import KalshiMarket
 from btc15_signal.main import archive_observation

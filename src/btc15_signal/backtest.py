@@ -8,7 +8,7 @@ from pathlib import Path
 
 import httpx
 
-from .binance import MarketSnapshot
+from .snapshot import MarketSnapshot
 from .model import Prediction, predict
 from .store import wilson_lower
 

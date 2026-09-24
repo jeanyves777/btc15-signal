@@ -4,9 +4,13 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 
+    # NO SECOND PRICE SOURCE. The Binance spot and futures endpoints that used
+    # to sit here are gone, along with the client that read them: a URL in a
+    # settings file is a URL somebody can turn back on, and this system has
+    # already shipped a retired Binance artefact answering live decisions
+    # (FINDINGS 49). Kalshi serves the book, the executions, the settlements
+    # and BRTI itself, so there is nothing left for a second feed to do.
     symbol: str = "BTCUSDT"
-    spot_base_url: str = "https://data-api.binance.vision"
-    futures_base_url: str = "https://fapi.binance.com"
     kalshi_base_url: str = "https://external-api.kalshi.com/trade-api/v2"
     kalshi_series: str = "KXBTC15M"
     poll_seconds: int = 10

@@ -44,7 +44,7 @@ import math
 import random
 from dataclasses import asdict, dataclass
 
-from .binance import MarketSnapshot
+from .snapshot import MarketSnapshot
 from .features import Snapshot
 from .gridsearch import MATCHERS, Candidate, GridIndex, max_exit_after
 from .model import predict

@@ -42,7 +42,6 @@ from dataclasses import dataclass
 from .brti import KalshiBRTI, features_from_series
 from .config import Settings
 from .reference import (
-    BinanceSeconds,
     KalshiOfficial,
     Observation,
     basis_bps,
@@ -87,17 +86,15 @@ class ReferenceShadow:
         self._brti_series: list[tuple[int, float]] = []
         self._brti_event: str | None = None
         self._brti_features = None
-        # ARCHIVE ONLY, AND OFF UNDER KALSHI-ONLY. The Binance column existed
-        # to decompose feed basis from time aggregation (FINDINGS 41/43).
-        # That measurement is finished and its rows stay readable as history,
-        # but the client still made a live request every poll - which is an
-        # active Binance dependency however it is labelled. A netstat against
-        # the running service found the connection open, which is why this is
-        # `None` rather than merely unread.
-        self._binance = (
-            None if settings.kalshi_only
-            else BinanceSeconds(settings.spot_base_url, settings.symbol)
-        )
+        # PERMANENTLY NONE, AND THERE IS NO LONGER A CLIENT TO CONSTRUCT.
+        # This was `None if kalshi_only else BinanceSeconds(...)`, so a single
+        # settings flag stood between the recorder and a live Binance request -
+        # and a netstat against the running service once found that connection
+        # open while every surface said Kalshi-only. The comparison it fed
+        # (feed basis vs time aggregation, FINDINGS 41/43) is finished. The
+        # `binance_*` columns stay so the rows already written remain readable
+        # as history; nothing writes them again.
+        self._binance = None
         self._kalshi = KalshiOfficial(settings.kalshi_base_url, settings.kalshi_series)
         self._session_id = new_session_id()
         self._last_poll_ms = 0

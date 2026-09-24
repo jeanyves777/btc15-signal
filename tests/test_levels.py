@@ -10,7 +10,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from btc15_signal.binance import MarketSnapshot  # noqa: E402
+from btc15_signal.snapshot import MarketSnapshot  # noqa: E402
 from btc15_signal.levels import (  # noqa: E402
     LevelTracker,
     blocking_level,

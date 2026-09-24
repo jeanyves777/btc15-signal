@@ -1,4 +1,4 @@
-from btc15_signal.binance import MarketSnapshot
+from btc15_signal.snapshot import MarketSnapshot
 from btc15_signal.model import predict
 from btc15_signal.store import Store, wilson_lower
 from btc15_signal.strategy import ReversionRule

@@ -1,7 +1,7 @@
 from dataclasses import dataclass
 from math import exp
 
-from .binance import MarketSnapshot
+from .snapshot import MarketSnapshot
 
 
 @dataclass(frozen=True)

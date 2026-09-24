@@ -12,8 +12,13 @@ Three sources, and the distinction between them is the entire point:
 * ``KalshiOfficial``   Kalshi's own published 60-second BRTI averages, read
                        from the API's ``floor_strike`` and ``expiration_value``.
                        Official, free, and available for every settled market.
-* ``BinanceSeconds``   Per-second Binance spot, recorded ALONGSIDE so the feed
-                       basis can be measured rather than guessed.
+There is NO second price source. A ``BinanceSeconds`` reader used to sit here
+recording per-second spot alongside, so the feed basis could be measured
+rather than guessed. That measurement is finished (FINDINGS 41/43) and the
+reader is deleted: a client that exists is a client that can be switched back
+on, and this system has already shipped one Binance artefact that went on
+answering live decisions after it was supposedly retired (FINDINGS 49). The
+``binance_*`` columns remain so the rows already written stay readable.
 
 **No source substitutes for another.** If BRTI is unavailable the recorder
 writes a gap and carries on; it does not quietly put Coinbase, Kraken or
@@ -56,65 +61,6 @@ class Observation:
     def is_stale(self, limit_ms: int) -> bool:
         age = self.age_ms
         return age is not None and age > limit_ms
-
-
-class BinanceSeconds:
-    """Per-second Binance spot, recorded beside the reference - never as it.
-
-    One-second klines are used rather than the book ticker because a 60-second
-    mean has to be built from evenly spaced observations to be comparable with
-    a 60-observation BRTI average; a poll every 10 seconds would compare a
-    6-sample mean with a 60-sample one and call the difference basis.
-    """
-
-    def __init__(self, base_url: str, symbol: str) -> None:
-        self.base_url = base_url.rstrip("/")
-        self.symbol = symbol
-        self.client = httpx.AsyncClient(timeout=10)
-
-    async def close(self) -> None:
-        await self.client.aclose()
-
-    async def seconds(self, start_ms: int, end_ms: int) -> list[tuple[int, float]]:
-        """Closing price of each 1-second bar in [start_ms, end_ms)."""
-        out: list[tuple[int, float]] = []
-        cursor = start_ms
-        while cursor < end_ms:
-            response = await self.client.get(
-                self.base_url + "/api/v3/klines",
-                params={
-                    "symbol": self.symbol, "interval": "1s",
-                    "startTime": cursor, "endTime": end_ms - 1, "limit": 1000,
-                },
-            )
-            response.raise_for_status()
-            rows = response.json()
-            if not rows:
-                break
-            out.extend((int(row[0]), float(row[4])) for row in rows)
-            cursor = int(rows[-1][0]) + 1000
-            if len(rows) < 1000:
-                break
-        return out
-
-    async def latest(self, now_ms: int) -> Observation:
-        try:
-            response = await self.client.get(
-                self.base_url + "/api/v3/ticker/bookTicker",
-                params={"symbol": self.symbol},
-            )
-            response.raise_for_status()
-            book = response.json()
-            mid = (float(book["bidPrice"]) + float(book["askPrice"])) / 2
-            return Observation(
-                source="binance_spot", status="ok", raw_price=mid,
-                event_ms=now_ms, received_ms=now_ms,
-            )
-        except (httpx.HTTPError, ValueError, KeyError) as exc:
-            return Observation(
-                source="binance_spot", status="error", received_ms=now_ms,
-                error=f"{type(exc).__name__}: {exc}"[:200],
-            )
 
 
 class KalshiOfficial:

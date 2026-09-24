@@ -14,7 +14,7 @@ from . import autotrade, intel_mode, kalshi_signal, messages, revision, surface
 from . import brain as brain_mod
 from . import intelligence_policy as intel
 from .adaptive import brti_vol_regime, context_of, setup_context_of
-from .binance import BinanceClient, MarketSnapshot
+from .snapshot import MarketSnapshot
 from .candidates import CandidateSet
 from .capital import CapitalController, ny_day
 from .config import Settings
@@ -1579,7 +1579,7 @@ def kalshi_snapshot(features, contract, opened: int, now_ms: int):
     honest here - it means "this instrument does not publish it", which is
     why the value is never read rather than merely never gated.
     """
-    from .binance import MarketSnapshot
+    from .snapshot import MarketSnapshot
 
     yes_bid = getattr(contract, "yes_bid", 0.0) or 0.0
     yes_ask = getattr(contract, "yes_ask", 0.0) or 0.0
@@ -3259,11 +3259,13 @@ async def service() -> None:
     # KALSHI ONLY. The Binance client is not CONSTRUCTED under `kalshi_only`,
     # so no active code path can reach it even by mistake - a flag checked at
     # each call site is a flag someone eventually forgets.
-    market = (
-        None if settings.kalshi_only
-        else BinanceClient(settings.symbol, settings.spot_base_url,
-                           settings.futures_base_url)
-    )
+    # NO SECOND PRICE SOURCE EXISTS. This used to construct a Binance client
+    # whenever `kalshi_only` was false, so the flag was the only thing between
+    # the system and a feed that disagrees with the settlement index on 19% of
+    # markets (FINDINGS 42). The client is gone, the flag no longer guards
+    # anything, and there is no code path that can fetch a price from anywhere
+    # but Kalshi. `market` stays as the name the shadow recorders read.
+    market = None
     kalshi = KalshiClient(settings.kalshi_base_url, settings.kalshi_series)
     store = Store(settings.database_path)
     store.configure_recovery_exit(settings)

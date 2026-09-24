@@ -2,7 +2,7 @@ import json
 from dataclasses import dataclass, fields
 from pathlib import Path
 
-from .binance import MarketSnapshot
+from .snapshot import MarketSnapshot
 from .model import Prediction
 
 

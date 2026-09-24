@@ -33,7 +33,7 @@ from array import array
 from bisect import bisect_left
 from dataclasses import dataclass
 
-from .binance import MarketSnapshot
+from .snapshot import MarketSnapshot
 from .datasource import ContractCandle
 from .features import Snapshot
 from .lifecycle import exit_quotes
