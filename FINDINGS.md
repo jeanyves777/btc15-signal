@@ -5852,3 +5852,91 @@ the same harness. The honest next step is not to trade it but to record it -
 book snapshots and a reference series at live resolution - so the distance
 floor can be measured on ETH's own distribution and the reversal gate tested
 at a granularity that can see it. SOL is not a candidate on this evidence.
+
+## 64. The distance floor refuses setups that were worth taking (2026-09-24)
+
+Operator's observation: KXBTC15M-26SEP241445-45 was refused at 5.5x against a
+10x floor, priced 73c, and settled DOWN. The signal was right and no order
+went out. They report seeing this often and asked whether it is studied.
+
+**It is archived** - 16,962 refused live setups carry a known outcome, plus
+the whole 6,435-market corpus scored against the deployed gates. So the
+question is answerable rather than anecdotal.
+
+### A refused winner is not evidence of anything on its own
+
+A 73c contract that wins is the EXPECTED case: 73c is the market's claim that
+it wins 73% of the time. What matters is whether refused setups win MORE than
+their price implies - a calibration residual, not a win count.
+
+### They do
+
+The setups the 10x floor turns away, everything else at deployed values:
+
+```
+setups refused by the 10x floor : 2,696
+they won                        : 86.3%
+their price implied             : 80.0%
+calibration residual            : +6.3%
+edge per trade                  : +0.0628
+day-clustered 95% CI            : [+0.0485, +0.0768]   excludes zero
+```
+
+### And the whole floor is a plateau, not a cliff
+
+```
+ floor  trades   rate     win     ask  edge/trade            95% CI   walk-fwd
+     3    2955  45.9%   86.7%   0.798     +0.0690  [+0.0560, +0.0820]    +0.0811
+     5    1652  25.7%   88.7%   0.813     +0.0739  [+0.0586, +0.0889]    +0.0970
+     7     788  12.2%   89.3%   0.814     +0.0797  [+0.0568, +0.1005]    +0.1061
+    10     259   4.0%   91.1%   0.802     +0.1088  [+0.0767, +0.1415]    +0.1016
+    15      92   1.4%   87.0%   0.783     +0.0864  [+0.0372, +0.1317]    +0.0835
+```
+
+**Every floor from 3x to 20x clears both bars** - a day-clustered interval
+excluding zero AND a chronological split whose out-of-sample half stays
+positive. This is not an in-sample artefact.
+
+### What the floor is actually buying
+
+Per-trade edge RISES with the floor: +0.069 at 3x against +0.109 at 10x. The
+gate is doing its job - it selects better setups. What it costs is volume:
+
+```
+ 10x   259 trades x +0.1088  =  +28.2 total
+  3x  2955 trades x +0.0690  = +203.9 total
+```
+
+So the floor is a quality-versus-quantity trade, and on this corpus the
+quantity side wins by 7x on total dollars while every individual trade is
+worth less.
+
+### Three reasons not to simply lower it
+
+**One position at a time.** The account holds a single position, so a 5x
+setup taken at 10:00 can block a 12x setup at 10:10. A lower floor does not
+only ADD trades, it can spend the slot on the weaker one. Nothing in this
+measurement models that, because the corpus scores every market
+independently.
+
+**The harness is generous.** It returned +0.1088/trade for BTC at 10x against
++0.0193/contract the live system has actually made - about 5.6x. Minute
+candles, no 60s band-hold timer, the minute-close ask assumed fillable, no
+slippage and no missed fills. Scaled, 3x's +0.069 is nearer +0.012 live.
+
+**Marginal setups are the ones that miss.** The lower the distance, the
+thinner the case, and FINDINGS 22 measured that decision-to-submit latency
+already costs fills on setups that DID qualify. A 3x setup is more likely to
+move before the order lands, which the corpus cannot see.
+
+### Decision
+
+**Nothing changed.** The 10x floor was set on FINDINGS 43 and this does not
+overturn it - it quantifies its cost, which had not been measured before. The
+operator now has the number: the refused band is worth +0.0628/trade with an
+interval clear of zero, against +0.1088 for what is taken.
+
+The honest next step is not to move the floor but to test a MIDDLE one live -
+7x or 8x roughly triples the trade count while keeping per-trade edge within
+a cent of 10x - and to measure it against the position slot it actually has
+to compete for. ETH already runs 8x for exactly this reason (FINDINGS 63).
