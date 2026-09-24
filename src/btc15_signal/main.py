@@ -2877,8 +2877,37 @@ async def primary_signal(
         elif qualified:
             status = "✅ Auto will take this"
         else:
-            failed = sum(1 for fact in facts if not fact["passed"])
-            status = f"\U0001f916 Auto declined: {failed} check{'s' if failed != 1 else ''} failed"
+            # EVERYTHING AUTO RESPECTS, not only the five gates. This counted
+            # failed checks and said nothing else, so a signal blocked by the
+            # band-hold timer AND two gates reported "2 checks failed" - and
+            # KXBTC15M-26SEP241030-30 showed "Band held: 0s of 60s" right
+            # above a line that did not mention it. The operator reasonably
+            # read the message as saying the five checks were the whole test.
+            #
+            # `auto_blocked` above is computed only when the gates already
+            # passed, because that branch is the order path. The conditions
+            # are re-read here - on the ALERTING path, where an extra query
+            # cannot cost a fill - so a refused signal names all of them.
+            unmet = [str(fact["name"]) for fact in facts if not fact["passed"]]
+            if settled_s < settings.entry_band_settle_s:
+                unmet.append(
+                    f"band held {settled_s:.0f}s of "
+                    f"{settings.entry_band_settle_s}s"
+                )
+            other = autotrade.auto_block_reason(
+                auto_limits(store, settings),
+                autotrade.AutoState(*store.auto_state(now_ms)),
+                contract_ask, enabled=execution_configured(settings),
+            )
+            if other:
+                unmet.append(other)
+            if intel_verdict.final_action == intel.VETO:
+                unmet.append("intelligence veto")
+            status = (
+                f"\U0001f916 Auto declined: {len(unmet)} condition"
+                f"{'s' if len(unmet) != 1 else ''} unmet · "
+                + " · ".join(unmet)
+            )
         missing = missing_for_execution(settings)
         if missing:
             status += f"\n⚙️ A press will be refused — still needed: {missing}"

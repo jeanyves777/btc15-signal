@@ -207,3 +207,43 @@ def test_the_singular_reads_correctly():
     note = surface.confidence_note(**{k: v for k, v in b.items()
                                       if k != "label"})
     assert "1 gate failed" in note
+
+
+# --------------- the status line names EVERY condition, not just the gates
+
+def test_the_declined_status_reports_more_than_the_checks():
+    """Operator, 2026-09-24, KXBTC15M-26SEP241030-30. The alert showed
+    "Band held: 0s of 60s" and, directly beneath it, "Auto declined: 2 checks
+    failed" - a line that did not mention the band-hold timer at all. Read
+    together they say the five checks are the whole test, and they are not:
+    the timer, the account limits, the one-position guard and an
+    intelligence veto all refuse a setup the gates accepted."""
+    import inspect
+
+    source = inspect.getsource(main.primary_signal)
+    at = source.index("Auto declined:")
+    # walk back to the branch that builds it
+    branch = source[max(0, at - 1800):at + 400]
+    assert "entry_band_settle_s" in branch, "band-hold timer not reported"
+    assert "auto_block_reason" in branch, "account limits not reported"
+    assert "intelligence veto" in branch, "veto not reported"
+
+
+def test_the_declined_status_counts_conditions_not_checks():
+    import inspect
+
+    source = inspect.getsource(main.primary_signal)
+    at = source.index("Auto declined:")
+    assert "condition" in source[at:at + 200]
+
+
+def test_the_extra_reads_are_on_the_alerting_path_only():
+    """They cost a query. That is affordable where a message is composed and
+    not where an order goes out - the gap between decision and submit is the
+    largest known cause of missed fills (FINDINGS 22)."""
+    import inspect
+
+    source = inspect.getsource(main.primary_signal)
+    declined = source.index("Auto declined:")
+    submit = source.index("execute_with_take_profit")
+    assert submit < declined, "the status block must sit after the order path"
