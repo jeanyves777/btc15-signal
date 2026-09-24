@@ -363,6 +363,15 @@ class Settings(BaseSettings):
     # alerts, it just does not consume the command stream. Controlling that
     # instance is then a deliberate act rather than a coin toss - see ETH.md.
     telegram_commands_enabled: bool = True
+    # THE LEARNING CORPUS, per instrument. These were function defaults inside
+    # `learning_data` - not settings at all - so every instance fitted on BTC
+    # whatever it traded. An arm is a statement about one instrument's
+    # distribution, the same as a threshold (FINDINGS 43, 63), and
+    # `_corpus_mismatch` now refuses a fit whose rows disagree with the series.
+    # These are what let a second instance satisfy that guard rather than
+    # simply being blocked by it.
+    corpus_brti_path: str = "data/brti_history.db"
+    corpus_market_path: str = "data/market_data.db"
     kalshi_api_key_id: str = ""
     kalshi_private_key_path: str = ""
     execution_enabled: bool = False

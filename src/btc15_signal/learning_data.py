@@ -793,7 +793,10 @@ def _as_float(value) -> float | None:
 
 
 def combined_rows(db: sqlite3.Connection | None, *, fingerprint: str,
-                  corpus: list[dict] | None = None) -> tuple[list[dict], Provenance]:
+                  corpus: list[dict] | None = None,
+                  brti_path: str | None = None,
+                  market_path: str | None = None,
+                  ) -> tuple[list[dict], Provenance]:
     """Corpus + live, chronological, deduplicated by (market, side).
 
     The live leg WINS on a collision. Where both describe the same window, the
@@ -801,9 +804,19 @@ def combined_rows(db: sqlite3.Connection | None, *, fingerprint: str,
     is a reconstruction of what it would have seen. Preferring the
     reconstruction would be preferring a model of ourselves to the record.
     """
-    rows = list(corpus if corpus is not None else load_policy_rows())
+    # PER-INSTRUMENT CORPUS. These defaulted to BTC inside `_load`, so every
+    # instance fitted on BTC whatever it traded. Reported in `sources` as the
+    # paths actually read, not as a constant pair, because provenance that
+    # names files nobody opened is worse than none.
+    paths = {}
+    if brti_path:
+        paths["brti_path"] = brti_path
+    if market_path:
+        paths["market_path"] = market_path
+    rows = list(corpus if corpus is not None else load_policy_rows(**paths))
     prov = Provenance(
-        sources=("data/brti_history.db", "data/market_data.db"),
+        sources=(brti_path or "data/brti_history.db",
+                 market_path or "data/market_data.db"),
         feature_fingerprint=fingerprint,
     )
     prov.corpus_decisions = len(rows)

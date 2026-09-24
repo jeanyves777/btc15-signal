@@ -361,6 +361,8 @@ class LearningRunner:
             )
             rows, provenance = learning_data.combined_rows(
                 db, fingerprint=feature_contract.FINGERPRINT,
+                brti_path=self.settings.corpus_brti_path,
+                market_path=self.settings.corpus_market_path,
             )
             outcome.provenance = provenance.payload()
             if not rows:

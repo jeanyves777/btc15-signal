@@ -48,17 +48,20 @@ $env:TELEGRAM_COMMANDS_ENABLED = "false"
 $env:INTELLIGENCE_POLICY_PATH     = "runtime-eth/intelligence_policy.json"
 $env:INTELLIGENCE_CANDIDATES_PATH = "runtime-eth/intelligence_candidates.json"
 
-# LEARNING IS OFF FOR ETH UNTIL IT HAS AN ETH CORPUS.
+# ITS OWN CORPUS. These defaulted to BTC inside learning_data - not settings
+# at all - so every instance fitted on BTC whatever it traded.
+# data/brti_history_eth.db is 7,674 BRTI decision points across 1,279 settled
+# ETH markets, backfilled from the same /live_data/events endpoint the live
+# path reads, at the same per-second resolution.
 #
-# The corpus is data/brti_history.db + data/market_data.db - both BTC, and
-# both function defaults rather than settings. Fitting ETH arms on BTC rows
-# is the instrument-transfer mistake of FINDINGS 43 and 63, done silently.
-# `_corpus_mismatch` in learning_runner.py now REFUSES that fit outright, so
-# this flag is belt and braces rather than the only protection.
-#
-# ETH intelligence still RECORDS every decision. It simply has no arms to
-# apply, which is the honest state: no ETH policy has ever been fitted.
-$env:LEARNING_ENABLED = "false"
+# `_corpus_mismatch` in learning_runner.py independently refuses any fit whose
+# rows disagree with KALSHI_SERIES, so a wrong path here is caught rather than
+# silently trained on.
+$env:CORPUS_BRTI_PATH   = "data/brti_history_eth.db"
+$env:CORPUS_MARKET_PATH = "data/market_data_kxeth15m.db"
+
+# Learning ON: ETH now has an instrument-correct corpus to fit.
+$env:LEARNING_ENABLED = "true"
 
 New-Item -ItemType Directory -Force runtime-eth | Out-Null
 & .venv\Scripts\pythonw.exe scripts\run_service.py

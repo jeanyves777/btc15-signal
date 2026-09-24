@@ -30,7 +30,12 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from btc15_signal.brti import KalshiBRTI, features_from_series  # noqa: E402
 from btc15_signal.config import Settings  # noqa: E402
 
-OUT = "data/brti_history.db"
+# PER-INSTRUMENT. Both of these were hardcoded to BTC, which is how the ETH
+# instance came to have no corpus of its own at all - and why a fit there
+# would have been built from BTC rows. A threshold, and an arm, is a
+# statement about ONE instrument's distribution (FINDINGS 43, 63).
+DEFAULT_OUT = "data/brti_history.db"
+DEFAULT_MARKETS = "data/market_data.db"
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS brti_decision_points (
@@ -59,8 +64,9 @@ CREATE TABLE IF NOT EXISTS brti_fetched (
 DECISION_SECONDS = (660, 600, 540, 480, 420, 360)
 
 
-def markets(limit: int, stride: int, done: set[str]) -> list[dict]:
-    db = sqlite3.connect("file:data/market_data.db?mode=ro", uri=True)
+def markets(limit: int, stride: int, done: set[str],
+            market_db: str = DEFAULT_MARKETS) -> list[dict]:
+    db = sqlite3.connect(f"file:{market_db}?mode=ro", uri=True)
     db.row_factory = sqlite3.Row
     rows = [
         dict(r) for r in db.execute(
@@ -77,12 +83,14 @@ def markets(limit: int, stride: int, done: set[str]) -> list[dict]:
 async def run(args) -> None:
     settings = Settings()
     Path("data").mkdir(exist_ok=True)
-    out = sqlite3.connect(OUT)
+    out = sqlite3.connect(args.out)
     out.executescript(SCHEMA)
     done = {r[0] for r in out.execute("SELECT ticker FROM brti_fetched")}
 
-    todo = markets(args.limit, args.stride, done)
-    print(f"{len(todo)} markets to fetch ({len(done)} already stored) -> {OUT}")
+    todo = markets(args.limit, args.stride, done, args.market_db)
+    print(f"{len(todo)} markets to fetch ({len(done)} already stored)")
+    print(f"  from {args.market_db}")
+    print(f"  ->   {args.out}")
 
     client = KalshiBRTI(settings.kalshi_base_url, timeout=25)
     written = failed = 0
@@ -160,6 +168,10 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--limit", type=int, default=1200)
     parser.add_argument("--stride", type=int, default=5)
+    parser.add_argument("--market-db", default=DEFAULT_MARKETS,
+                        help="settled markets to backfill against")
+    parser.add_argument("--out", default=DEFAULT_OUT,
+                        help="BRTI decision points database to write")
     asyncio.run(run(parser.parse_args()))
 
 

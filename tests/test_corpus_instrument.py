@@ -135,9 +135,17 @@ def test_eth_has_its_own_policy_artefacts():
     assert "runtime-eth/intelligence_candidates.json" in launcher
 
 
-def test_eth_learning_is_off_until_it_has_a_corpus():
+def test_eth_learns_only_because_it_now_has_its_own_corpus():
+    """Learning was off while the only corpus was BTC's. It is on now, and
+    the two facts must stay tied together: enabling it without pointing at
+    an ETH corpus would hand `_corpus_mismatch` a fit to refuse every six
+    hours, which is a loop that looks like learning and never learns."""
     launcher = (ROOT / "scripts" / "run_eth.ps1").read_text(encoding="utf-8")
-    assert 'LEARNING_ENABLED = "false"' in launcher
+    if 'LEARNING_ENABLED = "true"' in launcher:
+        assert "data/brti_history_eth.db" in launcher
+        assert "data/market_data_kxeth15m.db" in launcher
+    else:
+        assert 'LEARNING_ENABLED = "false"' in launcher
 
 
 def test_btc_keeps_learning_and_its_own_paths():

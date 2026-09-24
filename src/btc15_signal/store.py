@@ -2591,15 +2591,42 @@ class Store:
         return _capital(rows[0]) if rows else None
 
     def open_position_cost(self) -> float:
-        """What open positions COST, not what they are marked at.
+        """What OPEN positions COST, not what they are marked at.
 
         Capital for sizing includes committed money at its cost basis, so a
         winning position cannot inflate tomorrow's tier on a gain that has not
         settled. `open_mark` is the mark and is deliberately not used here.
+
+        A SETTLED MARKET IS NOT AN OPEN POSITION, and this counted them.
+        `trade_proposals.status` does not reliably reach a terminal value -
+        the RUNBOOK and FINDINGS 34 both record it, and 71 rows sat at
+        `pending` on 2026-09-21 alone - so rows stay at `filled` for ever and
+        this summed every trade the bot had EVER made.
+
+        On 2026-09-24 that was 102 rows and $141.25 of "committed capital",
+        of which $139.51 had already been settled and paid by the broker,
+        the oldest three days earlier. Exactly $1.74 was genuinely open.
+
+        The consequence was not cosmetic. Capital for the tier is
+        cash + exposure, so the phantom exposure grew by about $1.70 every
+        time the bot traded and RATCHETED THE SIZE UP on money that did not
+        exist: settled cash was flat at $32-35 from 09-22 to 09-24 while the
+        computed capital went 32 -> 83 -> 155 and the tier went 1 -> 2. The
+        operator noticed the account was in one-contract range while the bot
+        was buying two.
+
+        The broker's settlement record is the authority, the same as
+        everywhere else money is concerned: a market Kalshi has settled is
+        closed, whatever the local status column says. A position whose
+        market has closed but not yet settled still counts - the money is
+        committed until it pays out.
         """
         row = self.db.execute(
-            f"SELECT COALESCE(SUM(count * COALESCE(fill_price, entry_limit)), 0) "
-            f"FROM trade_proposals WHERE status IN {HELD_SQL}"
+            "SELECT COALESCE(SUM(p.count * COALESCE(p.fill_price, "
+            "p.entry_limit)), 0) FROM trade_proposals p "
+            f"WHERE p.status IN {HELD_SQL} AND NOT EXISTS ("
+            "  SELECT 1 FROM settlements s WHERE s.ticker = p.ticker"
+            ")"
         ).fetchone()
         return round(float(row[0] or 0.0), 6)
 
