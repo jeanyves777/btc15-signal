@@ -113,3 +113,60 @@ def test_the_exposure_change_is_documented():
     assert "two open positions" in doc
     assert "two daily loss floors" in doc.lower() or "$40" in doc
     assert "AUTO_DAILY_LOSS_LIMIT" in doc
+
+
+# ------------------------------------- only one instance owns the commands
+
+def test_only_one_instance_consumes_the_command_stream():
+    """Telegram getUpdates is DESTRUCTIVE: it acknowledges with an offset, so
+    two processes on one bot token race for every message and the loser never
+    sees it. The message they race for could be the kill switch. Found live
+    on 2026-09-24 within minutes of starting the ETH instance beside BTC."""
+    import inspect
+
+    from btc15_signal import main
+
+    source = inspect.getsource(main.process_telegram)
+    assert "settings.telegram_commands_enabled" in source
+    # the guard must come BEFORE anything consumes an update
+    assert source.index("telegram_commands_enabled") < source.index(
+        "telegram.updates()")
+
+
+def test_btc_keeps_the_command_stream_by_default():
+    from btc15_signal.config import Settings
+
+    assert Settings().telegram_commands_enabled is True
+
+
+def test_the_eth_launcher_gives_up_the_command_stream():
+    launcher = (ROOT / "scripts" / "run_eth.ps1").read_text(encoding="utf-8")
+    assert 'TELEGRAM_COMMANDS_ENABLED = "false"' in launcher
+
+
+def test_a_silent_instance_still_sends_alerts():
+    """It gives up LISTENING, not reporting. An instance that traded without
+    saying so is the failure mode this whole system is built against.
+
+    Asserted structurally: the flag is read in exactly ONE place - the
+    command loop - so no send path can be gated by it however the file is
+    later edited."""
+    import inspect
+
+    from btc15_signal import main
+
+    whole = inspect.getsource(main)
+    uses = whole.count("settings.telegram_commands_enabled")
+    assert uses == 1, f"read in {uses} places; it must gate only the commands"
+    command_loop = inspect.getsource(main.process_telegram)
+    assert "settings.telegram_commands_enabled" in command_loop
+    # and the entry/fill alert paths are untouched by it
+    for fn in (main.primary_signal, main.cash_out_exit):
+        assert "telegram_commands_enabled" not in inspect.getsource(fn)
+
+
+def test_the_eth_launcher_halves_the_daily_floor():
+    """Two processes do not share account guards, so leaving this out would
+    silently turn a $20 floor into $40."""
+    launcher = (ROOT / "scripts" / "run_eth.ps1").read_text(encoding="utf-8")
+    assert 'AUTO_DAILY_LOSS_LIMIT = "10"' in launcher

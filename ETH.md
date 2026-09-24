@@ -63,8 +63,31 @@ database. The practical effect:
 * trades-per-hour and per-day caps apply per instrument
 * recovery, the deficit and the loss step are tracked per instrument
 
-Set `AUTO_DAILY_LOSS_LIMIT=10` in both env files to keep the combined floor
-at $20.
+`run_eth.ps1` sets `AUTO_DAILY_LOSS_LIMIT=10` so the COMBINED floor stays at
+the $20 already configured, rather than silently becoming $40.
+
+## Only one instance listens for commands
+
+Telegram's `getUpdates` is **destructive**: it acknowledges with an offset, so
+whichever process polls first consumes the update and the other never sees
+it. Two instances on one bot token race for every message — including the
+kill switch, the one message that must never be lost. This was found live,
+within minutes of first starting ETH beside BTC.
+
+**BTC keeps the command stream.** `run_eth.ps1` sets
+`TELEGRAM_COMMANDS_ENABLED=false`, so ETH still SENDS every alert it would
+have sent and simply does not consume commands.
+
+To control the ETH instance, either set its auto state in `eth15.db`
+directly, or give it its own bot token and turn the flag back on.
+
+## ETH auto-trading starts OFF
+
+`eth15.db` is a fresh database with no `auto_trade_enabled` row, so it falls
+back to the config default of `false`. ETH will evaluate, alert and record
+from its first minute and place **no orders** until that is deliberately
+turned on. That is the intended sequence: let it run visibly for a while
+against live ETH quotes before it risks anything.
 
 ## What the backtest did NOT establish
 

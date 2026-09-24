@@ -475,6 +475,13 @@ async def process_telegram(
     trader: KalshiExecutionClient | None,
     settings: Settings,
 ) -> None:
+    # ONLY ONE INSTANCE MAY CONSUME THE COMMAND STREAM. getUpdates
+    # acknowledges with an offset, so a second process polling the same bot
+    # token silently steals messages from the first - and the message it
+    # steals could be the kill switch. A non-listening instance still sends
+    # every alert it would have sent.
+    if not settings.telegram_commands_enabled:
+        return
     for update in await telegram.updates():
         message = update.get("message")
         command = message.get("text", "").split("@")[0] if message else ""

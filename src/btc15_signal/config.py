@@ -352,6 +352,17 @@ class Settings(BaseSettings):
     telegram_bot_token: str = ""
     telegram_chat_id: str = ""
     telegram_authorized_user_id: int = 0
+    # WHO LISTENS FOR COMMANDS. Telegram's getUpdates is DESTRUCTIVE: it
+    # acknowledges with an offset, so whichever process polls first consumes
+    # the update and every other process never sees it. Two instances sharing
+    # one bot token therefore race for every command - including the kill
+    # switch, which is the one message that must never be lost.
+    #
+    # So exactly one instance listens. The BTC service keeps the default and
+    # is unchanged; a second instance sets this false and still SENDS its
+    # alerts, it just does not consume the command stream. Controlling that
+    # instance is then a deliberate act rather than a coin toss - see ETH.md.
+    telegram_commands_enabled: bool = True
     kalshi_api_key_id: str = ""
     kalshi_private_key_path: str = ""
     execution_enabled: bool = False

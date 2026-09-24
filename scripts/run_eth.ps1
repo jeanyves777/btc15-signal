@@ -30,5 +30,14 @@ $env:HOURLY_ENABLED          = "false"   # the ladder is a BTC product
 # becoming $40. Raise deliberately, not by leaving this out.
 $env:AUTO_DAILY_LOSS_LIMIT = "10"
 
+# EXACTLY ONE INSTANCE LISTENS FOR COMMANDS. Telegram getUpdates is
+# destructive - it acknowledges with an offset - so two processes on one bot
+# token race for every message, and the one they race for could be the kill
+# switch. BTC keeps the command stream; ETH still SENDS all of its alerts.
+#
+# To control this instance, set its auto state in eth15.db directly, or give
+# it its own bot token and turn this back on.
+$env:TELEGRAM_COMMANDS_ENABLED = "false"
+
 New-Item -ItemType Directory -Force runtime-eth | Out-Null
 & .venv\Scripts\pythonw.exe scripts\run_service.py
