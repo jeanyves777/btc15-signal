@@ -408,14 +408,53 @@ def recovery_line(state) -> str:
 # ------------------------------------------------------------ the assembler
 
 
+# WHICH INSTRUMENT THIS PROCESS IS. Two instances now send to one Telegram
+# chat, so a message that does not say what it is about is ambiguous - and
+# the ambiguous ones are the dangerous ones: RECOVERY ARMED and the money
+# summaries carry no ticker at all. Set once at startup from the configured
+# series; the empty default keeps a single-instance deployment unchanged.
+_INSTRUMENT = ""
+
+
+def set_instrument(series: str) -> None:
+    """Called once at service startup with `settings.kalshi_series`."""
+    global _INSTRUMENT
+    _INSTRUMENT = asset(series)
+
+
+def asset(ticker: str) -> str:
+    """BTC / ETH / SOL from a Kalshi ticker or series, or "" if unknown.
+
+    Derived rather than configured, so a third instrument needs no change
+    here. `KXBTC15M-26SEP241015-15` and `KXBTCD-26SEP2412` both give BTC.
+    """
+    if not ticker:
+        return ""
+    head = ticker.split("-", 1)[0].upper()
+    if not head.startswith("KX"):
+        return ""
+    body = head[2:]
+    for name in ("BTC", "ETH", "SOL", "XRP", "DOGE"):
+        if body.startswith(name):
+            return name
+    return ""
+
+
 def compose(*, header: str, ticker: str, essentials: list[str],
             checks: list[str], status: str, snapshot=None,
             priority: list[str] | None = None, insight: str = "") -> str:
     """Assemble one message in the fixed order. The only assembler.
 
     Every trading message goes through here so the order, the spacing and the
-    single divider cannot drift apart between builders.
+    single divider cannot drift apart between builders - which is why the
+    instrument label is applied HERE and not in each builder. Two instances
+    write to one chat, and a label that only some messages carried would be
+    worse than none: the reader would learn to assume the unlabelled ones
+    were the other instrument.
     """
+    label = asset(ticker) or _INSTRUMENT
+    if label:
+        header = f"<b>{label}</b> · {header}"
     lines = [header]
     if ticker:
         lines.append(f"<code>{escape(ticker)}</code>")

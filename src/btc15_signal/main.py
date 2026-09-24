@@ -3616,6 +3616,14 @@ async def service() -> None:
             f"features {feature_contract.describe()}",
             flush=True,
         )
+    # WHICH INSTRUMENT EVERY MESSAGE FROM THIS PROCESS IS ABOUT. Set once,
+    # here, so `surface.compose` can label messages that carry no ticker -
+    # RECOVERY ARMED and the money summaries - which are exactly the ones
+    # that would otherwise be ambiguous between two instances in one chat.
+    surface.set_instrument(settings.kalshi_series)
+    print(f"instrument: {surface.asset(settings.kalshi_series) or '?'} "
+          f"({settings.kalshi_series}) -> messages are labelled",
+          flush=True)
     if hourly:
         print(f"hourly ladder recording (shadow) -> {settings.hourly_database_path}",
               flush=True)
