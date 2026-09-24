@@ -208,9 +208,27 @@ def confidence_breakdown(facts: list[dict], opened: int,
     checks = regime_base(agreeing)
     clock = regime_clock(weight_at(opened))
     shield = level_points(blocking_level is not None)
-    points = max(0, min(100, checks + clock + shield
-                        + int(intelligence_delta or 0)
-                        + int(choppiness_delta or 0)))
+    # A PENALTY MUST NOT BE ABSORBED BY THE CLAMP ON THE BONUSES.
+    #
+    # This summed everything and clamped once, so a setup whose positive
+    # terms already exceeded 100 paid nothing for being choppy. On
+    # 2026-09-24 both instruments took the 16:00 window at 5/5 and
+    # "Score 100/100 · HIGH": BTC with choppiness 0.94 and a -14 penalty,
+    # ETH with 0.87 and -13. Both sums were 104 and 114 before the clamp, so
+    # BOTH PENALTIES COST NOTHING and a 94%-choppy market scored exactly what
+    # a perfectly clean one would. Both lost.
+    #
+    # That is the opposite of what choppiness is for. It exists to mark the
+    # windows that went nowhere, and the strongest-looking setups are
+    # precisely where a false HIGH is most expensive.
+    #
+    # So the bonuses are clamped FIRST and the penalty applied after. The
+    # archive says it earns its place: BTC qualified setups at choppiness
+    # >= 0.90 won 45.0% against an 86.1% price, a -41.1% residual over 20
+    # decisions, while the 0.50-0.75 band returned +9.8%.
+    base = max(0, min(100, checks + clock + shield
+                      + int(intelligence_delta or 0)))
+    points = max(0, min(100, base + int(choppiness_delta or 0)))
     label = regime_label(points)
     # A REFUSED SETUP IS NOT A MEDIUM ONE. Operator, 2026-09-24, on
     # KXBTC15M-26SEP241015-15: 65c against a 70-93c band and 3.5x against a
