@@ -34,13 +34,16 @@ def test_no_instance_keeps_the_original_runtime_paths():
 
 
 def test_the_btc_floor_is_the_measured_one():
-    """7x, operator's decision 2026-09-24 on FINDINGS 64. The 10x floor was
-    refusing setups worth +0.0628/trade with an interval clear of zero; 7x
-    roughly triples the trade count while keeping per-trade edge within
-    ~2.5c. Not 3x, which earns more on the corpus but ignores the
-    one-position slot, fill risk on marginal setups, and fees."""
+    """10x, from FINDINGS 43, measured on `brti_normalized_distance`.
+
+    It was briefly set to 7x on FINDINGS 64 and reverted the same hour:
+    that sweep computed distance from minute-kline volatility, which is a
+    DIFFERENT quantity - "10x" selects 4% of markets on the kline scale and
+    23% on the BRTI scale the gate actually reads. Swept correctly, the edge
+    RISES with the floor and the setups 10x refuses lose -0.1184/trade.
+    See section 65."""
     rule = json.loads((ROOT / "strategy_kalshi.json").read_text())
-    assert rule["min_brti_normalized_distance"] == 7.0
+    assert rule["min_brti_normalized_distance"] == 10.0
     assert rule["min_ask"] == 0.70
     assert rule["max_ask"] == 0.93
 
@@ -56,19 +59,20 @@ def test_the_eth_rule_exists_and_loads():
     assert rule.max_ask == 0.93
 
 
-def test_the_eth_floor_is_measured_not_inherited():
-    """10x is a statement about BTC's volatility distribution. On ETH it
-    admits 1.8% of markets against BTC's 4.0% - a rarer tail, not the same
-    setup. 8x was swept on ETH's own 6,395 settled markets."""
+def test_the_eth_floor_is_recorded_as_provisional():
+    """8x came from FINDINGS 63, which is withdrawn - it swept the same
+    minute-kline quantity as 64. On ETH's own corpus with real BRTI features
+    every floor from 4x to 15x returns a per-trade edge within 0.003 of zero
+    with an interval spanning zero, so 8x is not a MEASURED floor, it is a
+    placeholder pending a correct sweep. Pinned so the number cannot be
+    quoted as evidence."""
     from btc15_signal.kalshi_brti import KalshiBRTIRule
 
     eth = KalshiBRTIRule.load(str(ROOT / "strategy_kalshi_eth.json"))
-    btc = KalshiBRTIRule.load(str(ROOT / "strategy_kalshi.json"))
-    # Each measured on its OWN sweep: 8x was ETH's best cell (FINDINGS 63),
-    # 7x the operator's choice for BTC (FINDINGS 64). They are close because
-    # the instruments are similar, not because either was copied.
     assert eth.min_brti_normalized_distance == 8.0
-    assert btc.min_brti_normalized_distance == 7.0
+    doc = (ROOT / "ETH.md").read_text(encoding="utf-8")
+    assert "65" in doc or "withdrawn" in doc.lower(), (
+        "ETH.md still presents the withdrawn 63 numbers as evidence")
 
 
 def test_the_reversal_gate_is_carried_over_deliberately():

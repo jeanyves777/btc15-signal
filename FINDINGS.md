@@ -5768,6 +5768,12 @@ regimes, not 34 hours of one quiet stretch.
 
 ## 63. The deployed rule on ETH and SOL, with BTC as the control (2026-09-24)
 
+> **WITHDRAWN - see section 65.** The distance here is computed from
+> minute-kline volatility, not `brti_normalized_distance`, which is what the
+> deployed gate compares. Different quantity, different scale: "10x" selects
+> 4% of markets on this scale and 23% on the gate's. Every number below that
+> depends on the floor is unusable.
+
 Operator's request: backtest the current live strategy, all features, on ETH
 and SOL. No fees, by their standing instruction.
 
@@ -5855,6 +5861,12 @@ at a granularity that can see it. SOL is not a candidate on this evidence.
 
 ## 64. The distance floor refuses setups that were worth taking (2026-09-24)
 
+> **WITHDRAWN - see section 65.** The distance here is computed from
+> minute-kline volatility, not `brti_normalized_distance`, which is what the
+> deployed gate compares. Different quantity, different scale: "10x" selects
+> 4% of markets on this scale and 23% on the gate's. Every number below that
+> depends on the floor is unusable.
+
 Operator's observation: KXBTC15M-26SEP241445-45 was refused at 5.5x against a
 10x floor, priced 73c, and settled DOWN. The signal was right and no order
 went out. They report seeing this often and asked whether it is studied.
@@ -5940,3 +5952,88 @@ The honest next step is not to move the floor but to test a MIDDLE one live -
 7x or 8x roughly triples the trade count while keeping per-trade edge within
 a cent of 10x - and to measure it against the position slot it actually has
 to compete for. ETH already runs 8x for exactly this reason (FINDINGS 63).
+
+## 65. CORRECTION: findings 63 and 64 measured the wrong quantity (2026-09-24)
+
+**Sections 63 and 64 are withdrawn. The floor they recommended was briefly
+shipped to BTC and is reverted. No trade was taken under it.**
+
+### The error
+
+`cross_asset.py` computed `normalized_distance` as distance in bps over a
+volatility estimated from **minute klines**. The deployed gate compares
+`brti_normalized_distance`, computed from the per-second BRTI series by
+`features_from_series`. These are different quantities:
+
+```
+                                    median   >=10x    >=7x
+corpus, real BRTI (what gates read)    5.7   22.9%   39.8%
+my harness, minute-kline volatility    3.1    4.1%   11.9%
+```
+
+FINDINGS 43 had already recorded exactly this trap in its own words -
+"reads 15-22 on BRTI where Binance reads 2-4" - and the same mistake was
+made again with klines in place of Binance. A floor of "10x" selects 4% of
+markets on one scale and 23% on the other. Setting the live gate to 7x on
+the harness's evidence was therefore a far larger loosening than anything
+measured, and it reached production for about forty minutes.
+
+### What the right measurement says
+
+Swept with `load_policy_rows(distance_floor=...)` - the loader the TRAINER
+uses, on the quantity the gate reads:
+
+```
+ floor   taken   rate     win     ask  residual  per trade            95% CI
+     6    4963  77.2%   80.9%   0.794     +1.5%    +0.0041  [-0.0063, +0.0143]
+     8    4264  66.3%   82.8%   0.810     +1.7%    +0.0066  [-0.0045, +0.0177]
+    10    3495  54.4%   84.5%   0.825     +2.0%    +0.0101  [-0.0007, +0.0210]
+    12    2738  42.6%   85.9%   0.837     +2.3%    +0.0132  [+0.0010, +0.0255]
+    15    1764  27.4%   88.0%   0.852     +2.8%    +0.0197  [+0.0033, +0.0353]
+```
+
+**The floor is too LOW, not too high.** Edge rises monotonically with it, and
+the interval only clears zero at 12x and above. And the setups 10x refuses
+for distance alone are a losing class, not a missed one:
+
+```
+refused for DISTANCE ALONE : 547
+they won                   : 65.4%
+their price implied        : 76.0%
+residual                   : -10.6%
+per trade if taken         : -0.1184
+```
+
+That reconciles with the thing that should have caught this immediately:
+**all 21 reject-leg arms in the live policy carry a negative mean.** The
+intelligence layer had already measured the refused band on the correct
+features and correctly refused to propose a single ADMIT. Section 64
+contradicted the running policy and that contradiction was not checked.
+
+### ETH is affected too
+
+FINDINGS 63 chose ETH's 8x floor from the same harness. On ETH's own corpus
+with real BRTI features, every floor from 4x to 15x returns a per-trade edge
+within 0.003 of zero with an interval spanning zero at all of them. **ETH has
+no measurable edge on this evidence at any floor**, which is a different
+statement from 63's +0.1034 and supersedes it.
+
+ETH is live and auto-trading. Its record so far is +0.1419, -0.878, +1.2222
+across three auto trades - real money, and too few trades to mean anything
+either way.
+
+### What was actually wrong with the method
+
+The harness was validated against a control - BTC ran through it beside ETH
+and SOL - and the control PASSED, which is what made it feel safe. But a
+control only tests the things that differ between arms. Every arm shared the
+same wrong volatility, so the comparison between instruments was internally
+consistent and the comparison against the deployed gate was meaningless. A
+harness must be reconciled against the SYSTEM it models, not only against
+itself: BTC returned +0.1088/trade through it against +0.0193/contract live,
+a 5.6x gap that was noticed, written down in 63, and then not treated as the
+falsification it was.
+
+**The rule this leaves:** when a measurement contradicts a deployed
+artefact - the live policy's own arms, in this case - reconcile them before
+shipping, not after.

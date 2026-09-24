@@ -1,8 +1,8 @@
 {
   "enabled": true,
-  "min_ask": 0.70,
+  "min_ask": 0.7,
   "max_ask": 0.93,
-  "min_brti_normalized_distance": 7.0,
+  "min_brti_normalized_distance": 10.0,
   "min_brti_momentum_bps": 0.0,
   "require_momentum_alignment": false,
   "entry_from_seconds": 660,

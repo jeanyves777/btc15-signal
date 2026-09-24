@@ -3,6 +3,15 @@
 ETH runs as a **separate service process against its own database**, not as a
 second loop inside the BTC service.
 
+> **The 8x floor is provisional, not measured.** It came from FINDINGS 63,
+> which is **withdrawn** — that sweep computed distance from minute-kline
+> volatility rather than `brti_normalized_distance`, a different quantity on
+> a different scale. Swept correctly on ETH's own corpus, every floor from
+> 4x to 15x returns a per-trade edge within 0.003 of zero with an interval
+> spanning zero: **ETH has no measurable edge on this evidence at any
+> floor.** See section 65. The numbers in the table below are from the
+> withdrawn sweep and are kept only to show what was believed at the time.
+
 ## Why a second process, not a second series
 
 Every window-keyed query in `store.py` — 153 of them — assumes one series.
