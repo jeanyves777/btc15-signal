@@ -730,6 +730,15 @@ class Store:
             # so or because the operator had not granted the permission, and
             # those are opposite facts about the same row.
             "authority_granted": "TEXT",
+            # THE THREE LEVEL-HOLDING MEASURES, archived on every decision
+            # the same way the reversal and choppiness indicators were: the
+            # refused setups are the counterfactual any threshold has to be
+            # judged against, and a gate whose input is not archived can
+            # never be re-measured, only re-argued.
+            "brti_rsi": "REAL",
+            "brti_accel": "REAL",
+            "brti_held_s": "REAL",
+            "brti_rejections": "INTEGER",
         })
         # FORWARD EVALUATION. What each frozen candidate WOULD have changed on
         # a live signal, recorded beside what the unchanged strategy actually

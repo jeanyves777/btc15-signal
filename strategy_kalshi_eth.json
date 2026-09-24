@@ -9,5 +9,8 @@
   "entry_from_seconds": 660,
   "entry_to_seconds": 360,
   "calm_momentum_bps": 5.0,
-  "moving_min_brti_normalized_distance": 12.0
+  "moving_min_brti_normalized_distance": 12.0,
+  "min_brti_accel": -5.0,
+  "min_brti_held_s": 120.0,
+  "min_brti_rejections": 2
 }

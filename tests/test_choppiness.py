@@ -123,9 +123,13 @@ def test_the_choppiest_possible_window_refuses_nothing():
     the confidence word says so."""
     from btc15_signal import kalshi_signal
 
+    # The three level-holding gates are neutralised HERE because this test
+    # is about choppiness and nothing else: it must fail if CHOPPINESS
+    # refuses, not because a synthetic window never tested its strike.
     rule = KalshiBRTIRule(min_brti_normalized_distance=0.0,
                           require_momentum_alignment=False,
-                          max_brti_retrace=1.0)
+                          max_brti_retrace=1.0,
+                          min_brti_accel=-1e9, min_brti_held_s=0, min_brti_rejections=0)
     f = feats(CHOP)
     assert f.brti_choppiness > 0.9
     ok, _facts, failed = kalshi_signal.evaluate(rule, f, 0.80, 600)

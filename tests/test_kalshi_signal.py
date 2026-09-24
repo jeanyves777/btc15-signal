@@ -165,7 +165,14 @@ def test_every_gate_reads_kalshi_only():
     blob = repr(facts).lower()
     assert "binance" not in blob
     assert any("BRTI" in f["name"] for f in facts)
-    assert len(facts) == 5, "ask, distance, momentum, stability, reference"
+    assert len(facts) == 8, (
+        "ask, distance, move-still-working, level-held, level-tested, "
+        "momentum, stability, reference")
+    # THE POINT OF THIS TEST is that every gate reads Kalshi, not how many
+    # there are - but the count is pinned so a new gate has to be looked at
+    # here rather than slipping in unnoticed.
+    assert {f["name"] for f in facts} >= {
+        "Move still working", "Level held", "Level tested"}
 
 
 def test_the_module_imports_nothing_from_binance():

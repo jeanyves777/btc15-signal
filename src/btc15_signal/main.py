@@ -2065,6 +2065,13 @@ def intelligence_verdict(
             # both are archived the same way.
             "brti_retrace": _feature(brti, "brti_retrace"),
             "brti_choppiness": _feature(brti, "brti_choppiness"),
+            # THE LEVEL-HOLDING MEASURES. Recorded on every decision,
+            # qualified or refused, because the refused ones are exactly the
+            # counterfactual a threshold has to be judged on.
+            "brti_rsi": _feature(brti, "brti_rsi"),
+            "brti_accel": _feature(brti, "brti_accel"),
+            "brti_held_s": _feature(brti, "brti_held_s"),
+            "brti_rejections": _feature(brti, "brti_rejections"),
             # CONTEXT, recorded and not keyed on.
             "session": _session(opened),
             "vol_regime": (

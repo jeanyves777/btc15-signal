@@ -53,6 +53,10 @@ CREATE TABLE IF NOT EXISTS brti_decision_points (
     brti_normalized_distance REAL,
     brti_side TEXT,
     samples INTEGER,
+    brti_rsi REAL,
+    brti_accel REAL,
+    brti_held_s REAL,
+    brti_rejections INTEGER,
     PRIMARY KEY (ticker, remaining_s)
 );
 CREATE TABLE IF NOT EXISTS brti_fetched (
@@ -85,6 +89,18 @@ async def run(args) -> None:
     Path("data").mkdir(exist_ok=True)
     out = sqlite3.connect(args.out)
     out.executescript(SCHEMA)
+    # A bare CREATE TABLE IF NOT EXISTS adds nothing to a table that already
+    # exists, which is how every column has reached a fresh install and no
+    # live database before.
+    have = {r[1] for r in out.execute("PRAGMA table_info(brti_decision_points)")}
+    for column, kind in (("brti_rsi", "REAL"), ("brti_accel", "REAL"),
+                         ("brti_held_s", "REAL"),
+                         ("brti_rejections", "INTEGER")):
+        if column not in have:
+            out.execute(
+                f"ALTER TABLE brti_decision_points ADD COLUMN {column} {kind}")
+            out.commit()
+            print(f"  migrated: {column} added")
     done = {r[0] for r in out.execute("SELECT ticker FROM brti_fetched")}
 
     todo = markets(args.limit, args.stride, done, args.market_db)
@@ -133,6 +149,10 @@ async def run(args) -> None:
                     "brti_normalized_distance": f.brti_normalized_distance,
                     "brti_side": f.side,
                     "samples": f.samples,
+                    "brti_rsi": f.brti_rsi,
+                    "brti_accel": f.brti_accel,
+                    "brti_held_s": f.brti_held_s,
+                    "brti_rejections": f.brti_rejections,
                 })
             if rows:
                 out.executemany(
@@ -140,11 +160,11 @@ async def run(args) -> None:
                     "(ticker, remaining_s, open_ms, close_ms, target, "
                     " expiration_value, result, brti_value, signed_distance_bps, "
                     " brti_momentum_bps, brti_volatility_bps, "
-                    " brti_normalized_distance, brti_side, samples) "
+                    " brti_normalized_distance, brti_side, samples, brti_rsi, brti_accel, brti_held_s, brti_rejections) "
                     "VALUES (:ticker, :remaining_s, :open_ms, :close_ms, :target, "
                     " :expiration_value, :result, :brti_value, :signed_distance_bps, "
                     " :brti_momentum_bps, :brti_volatility_bps, "
-                    " :brti_normalized_distance, :brti_side, :samples)",
+                    " :brti_normalized_distance, :brti_side, :samples, :brti_rsi, :brti_accel, :brti_held_s, :brti_rejections)",
                     rows,
                 )
             out.execute(

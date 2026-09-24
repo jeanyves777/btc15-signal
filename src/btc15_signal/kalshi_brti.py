@@ -93,6 +93,33 @@ class KalshiBRTIRule:
     # does not reproduce. Magnitude is the thing that carries; direction is not.
     calm_momentum_bps: float = 5.0
     moving_min_brti_normalized_distance: float = 15.0
+    # THE THREE LEVEL-HOLDING GATES. Operator's decision, 2026-09-24, after
+    # RSI failed: "we are mostly already in the money; will price stay above
+    # the level we need it to stay". Direction at 15 minutes is already in
+    # the price - whether the STRIKE is being defended is not.
+    #
+    # Measured on the bot's own 176 in-the-money executed trades, priced on
+    # Kalshi's settlement P&L. Each alone:
+    #
+    #   accel >= -5       keeps 91%   +5.09 against +1.07 actual
+    #   rejections >= 2   keeps 38%   +5.75
+    #   held_s >= 300     keeps 27%   +5.00
+    #
+    # and together at the shipped settings: keeps 34%, 89.8% win, +9.21.
+    #
+    # HELD_S IS NOT MONOTONIC and the threshold is chosen knowing it: alone
+    # at 120s and 180s it HURTS (-1.38, -2.75) and only helps at 300s. It
+    # earns its place here in combination, not on its own, which is recorded
+    # against it rather than hidden.
+    #
+    # THE SAMPLE IS 176 TRADES OVER 5 DAYS and the cell is the best of 36
+    # swept combinations, with a trade-level rather than day-clustered
+    # interval. That is weaker evidence than the distance floor rests on.
+    # Shipped on the operator's decision with the weakness stated; the
+    # features are archived on every decision so this is re-measurable.
+    min_brti_accel: float = -5.0
+    min_brti_held_s: float = 120.0
+    min_brti_rejections: int = 2
     entry_from_seconds: int = 660
     entry_to_seconds: int = 360
 
@@ -169,6 +196,61 @@ class KalshiBRTIRule:
                     f"{abs(features.brti_momentum_bps or 0.0):.1f} bps)"
                 ),
                 "value": features.brti_normalized_distance,
+            },
+            {
+                # THE MOVE THAT BUILT THE CUSHION - still building, or spent?
+                # The trades this refuses won 40 of 55 and still lost 6.93:
+                # they win often and lose big.
+                "name": "Move still working",
+                "passed": (features.brti_accel is None
+                           or features.brti_accel >= self.min_brti_accel),
+                "pass_text": (
+                    f"{features.brti_accel:+.1f} bps accel"
+                    if features.brti_accel is not None else "not measurable"
+                ),
+                "fail_text": (
+                    f"{features.brti_accel:+.1f} bps - the move is decaying "
+                    f"(needs {self.min_brti_accel:+.0f})"
+                    if features.brti_accel is not None else "not measurable"
+                ),
+                "value": features.brti_accel,
+            },
+            {
+                # HOW LONG THE LEVEL HAS ACTUALLY HELD.
+                "name": "Level held",
+                "passed": (features.brti_held_s is None
+                           or features.brti_held_s >= self.min_brti_held_s),
+                "pass_text": (
+                    f"{features.brti_held_s:.0f}s on side "
+                    f"(needs {self.min_brti_held_s:.0f}s)"
+                    if features.brti_held_s is not None else "not measurable"
+                ),
+                "fail_text": (
+                    f"only {features.brti_held_s:.0f}s on side - needs "
+                    f"{self.min_brti_held_s:.0f}s"
+                    if features.brti_held_s is not None else "not measurable"
+                ),
+                "value": features.brti_held_s,
+            },
+            {
+                # TESTED AND HELD beats never approached: a level price has
+                # turned back from is evidence, one it never reached is not.
+                "name": "Level tested",
+                "passed": (features.brti_rejections is None
+                           or features.brti_rejections
+                           >= self.min_brti_rejections),
+                "pass_text": (
+                    f"{features.brti_rejections} rejection(s) held"
+                    if features.brti_rejections is not None
+                    else "not measurable"
+                ),
+                "fail_text": (
+                    f"{features.brti_rejections} rejection(s) - needs "
+                    f"{self.min_brti_rejections}"
+                    if features.brti_rejections is not None
+                    else "not measurable"
+                ),
+                "value": features.brti_rejections,
             },
             {
                 "name": "BRTI momentum",
