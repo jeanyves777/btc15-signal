@@ -410,6 +410,31 @@ def _bucket_bias(rows: list[dict], curve: dict) -> dict:
 # --------------------------------------------------------------- fitting
 
 
+def _session_counts(items: list[dict]) -> dict:
+    """{session: {n, wins}} over the rows that built an arm.
+
+    CONTEXT, NOT A KEY. A cell pooled across sessions can be carried entirely
+    by one of them: on 2026-09-23 `bd10-15 · px70-85 · mom5+` read n=431
+    "pattern supports the existing decision" while its `asia` slice was 0W-2L
+    and every bit of the support came from us and late-us. Two entries lost
+    back to back on it.
+
+    Keying on session instead would fragment the cell below the point where it
+    can speak, which is exactly why session was removed from the key. So the
+    counts ride BESIDE the evidence rather than cutting it up, and `decide`
+    uses them only to withhold an action - never to create one.
+    """
+    out: dict[str, dict] = {}
+    for row in items:
+        name = str(row.get("session") or "")
+        if not name:
+            continue
+        entry = out.setdefault(name, {"n": 0, "wins": 0})
+        entry["n"] += 1
+        entry["wins"] += 1 if row.get("won") else 0
+    return out
+
+
 @dataclass
 class ArmFit:
     """One context-action cell and everything measured about it."""
@@ -492,6 +517,11 @@ class ArmFit:
     # Which way a proposed change would have got it wrong, in markets.
     winners_blocked: int = 0
     losers_blocked: int = 0
+    # PER-SESSION COUNTS, recorded and NOT keyed on. The key stays
+    # `distance · price · momentum`, so `n` and the validation bar are
+    # unchanged - this only lets a decision ask whether the session it is
+    # about to trade is actually represented in the cell it is spending.
+    by_session: dict = field(default_factory=dict)
     winners_admitted: int = 0
     losers_admitted: int = 0
 
@@ -507,6 +537,8 @@ class ArmFit:
         """The shape `intelligence_policy.Policy` reads back."""
         return {
             "n": self.n, "markets": self.markets, "days": self.days,
+            "by_session": {k: {"n": v["n"], "wins": v["wins"]}
+                           for k, v in sorted(self.by_session.items())},
             "mean": round(self.shrunk, 6),
             "observed_mean": round(self.mean, 6),
             "low": round(self.low, 6), "high": round(self.high, 6),
@@ -593,6 +625,7 @@ def fit_arms(rows: list[dict], reward, min_n: int = 1,
             key=key, n=len(values),
             markets=len({r["window_open"] for r in items}),
             days=len(set(days)),
+            by_session=_session_counts(items),
             mean=sum(values) / len(values), low=low, high=high,
             wins=wins, win_rate=wins / len(items),
             mean_ask=sum(float(r["our_ask"]) for r in items) / len(items),

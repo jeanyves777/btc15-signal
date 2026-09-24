@@ -1809,6 +1809,10 @@ def intelligence_verdict(
             failed_gates=gates, ask=ask, policy=policy,
             enabled=settings.intelligence_enabled, features_ok=features_ok,
             now_ms=now_ms, max_age_ms=settings.intelligence_max_policy_age_ms,
+            # THE SESSION THIS DECISION IS BEING MADE IN. The cell is pooled
+            # across sessions by design; this is what lets `decide` refuse to
+            # spend another session's evidence here.
+            session=_session(opened),
         )
         # THE SECOND GATE, and the one the operator holds. `decide` answered
         # "was this validated?"; this answers "am I allowed to?", from two

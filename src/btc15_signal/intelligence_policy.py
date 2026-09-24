@@ -212,6 +212,46 @@ class Policy:
         return keyed != "unknown" and keyed != self.declared_feature_family
 
 
+# How many observations from THIS session a pooled cell must hold before an
+# EXECUTION action may be taken on it. Not a promotion bar and not a
+# replacement for one: the cell must already have cleared validation and the
+# multiplicity correction to carry an action at all. This only asks whether
+# the session about to be traded is represented in the evidence being spent.
+MIN_SESSION_EVIDENCE = 30
+
+
+def _key_names_session(context_key: str, session: str) -> bool:
+    """Does this cell key already carry the session it is being used in?
+
+    `us · mid · bd10-15 · px70-85|accept` does; `bd10-15 · px70-85 · mom5+`
+    does not. The first cannot pool sessions and needs no further check; the
+    second is exactly what answered "pattern supports the existing decision"
+    at n=431 for an `asia` trade whose asia slice was 0W-2L.
+    """
+    if not session:
+        return False
+    head = str(context_key or "").split(" · ", 1)[0].strip()
+    return head == session
+
+
+def _session_support(arm: dict, session: str) -> int | None:
+    """How many of this arm's observations came from `session`.
+
+    None means the arm cannot answer - it was fitted before per-session
+    evidence was recorded - which is different from "none came from it".
+    """
+    by_session = arm.get("by_session")
+    if not isinstance(by_session, dict):
+        return None
+    if not session:
+        # No session on the decision is itself unanswerable, not zero.
+        return None
+    entry = by_session.get(session)
+    if isinstance(entry, dict):
+        return int(entry.get("n") or 0)
+    return int(entry or 0)
+
+
 def shrink(mean: float, n: int, prior: float, weight: float = 60.0) -> float:
     """Pull a sparse group toward the broader one it belongs to.
 
@@ -236,6 +276,8 @@ def decide(
     features_ok: bool = True,
     now_ms: int = 0,
     max_age_ms: int = 0,
+    session: str = "",
+    min_session_n: int = MIN_SESSION_EVIDENCE,
 ) -> Verdict:
     """The single decision. Pure, so replay and live cannot diverge."""
     base = Verdict(
@@ -323,6 +365,74 @@ def decide(
         action, gate = NEUTRAL, None
     if action == VETO and not base_qualified:
         action = NEUTRAL
+
+    # EVIDENCE HAS TO COME FROM THE SESSION IT IS BEING SPENT IN.
+    #
+    # The key is `distance · price · momentum` and deliberately NOT keyed on
+    # session, because keying on it fragments cells below the point where they
+    # can speak. That is still right - but it means a cell POOLS sessions, and
+    # a pooled cell can be carried entirely by sessions other than this one.
+    #
+    # On 2026-09-23 two UP entries lost back to back in `asia` inside
+    # `bd10-15 · px70-85 · mom5+`. The layer answered "pattern supports the
+    # existing decision" at n=431. Split by session that same cell was
+    # us 3W-1L, late-us 3W-0L, asia 0W-2L: the support was real and it was
+    # someone else's.
+    #
+    # So the key stays pooled - `n`, the validation bar and the multiplicity
+    # correction are all untouched - and what is checked here is whether THIS
+    # session is actually represented in the cell that is about to act. It can
+    # only ever withhold an action; it never creates one.
+    # ONLY POOLED KEYS NEED THE CHECK. A key that already names the session
+    # - `us · mid · bd10-15 · px70-85`, the brti-1 shape - is session-pure by
+    # construction and cannot be carried by a different one. The brti-2 setup
+    # key is `distance · price · momentum` with session deliberately left out,
+    # and that is the shape this guards.
+    # A CALLER THAT SUPPLIES NO SESSION GETS THE OLD CONTRACT. The check can
+    # only speak when the session is known, and silently refusing every caller
+    # that predates the argument would disable the layer rather than guard it.
+    # The live path passes it (`session=_session(opened)` in `main`), and a
+    # test pins that so the protection cannot quietly disappear.
+    pooled = bool(session) and not _key_names_session(context_key, session)
+    session_n = _session_support(arm, session)
+    if action in (VETO, ADMIT) and pooled:
+        if session_n is None:
+            # An arm fitted before per-session evidence was recorded cannot
+            # answer the question. An execution action needs it; a confidence
+            # delta does not, and keeps working.
+            action, gate = NEUTRAL, None
+            reason = (
+                "policy predates per-session evidence; "
+                "execution actions withheld"
+            )
+            return Verdict(
+                base_qualified=base_qualified, failed_gates=tuple(failed_gates),
+                final_action=NEUTRAL, reason=reason, confidence_delta=delta,
+                calibrated_probability=arm.get("probability"),
+                expected_net=expected, evidence_n=n, uncertainty=uncertainty,
+                model_version=policy.model_version,
+                policy_version=policy.version,
+                training_cutoff_ms=policy.training_cutoff_ms,
+                context_key=context_key, overrides_gate=None, decision_ask=ask,
+            )
+        if session_n < min_session_n:
+            action, gate = NEUTRAL, None
+            return Verdict(
+                base_qualified=base_qualified, failed_gates=tuple(failed_gates),
+                final_action=NEUTRAL,
+                reason=(
+                    f"cell is pooled across sessions and "
+                    f"{session or 'this session'} has only n={session_n} "
+                    f"of {n}; evidence does not transfer"
+                ),
+                confidence_delta=delta,
+                calibrated_probability=arm.get("probability"),
+                expected_net=expected, evidence_n=n, uncertainty=uncertainty,
+                model_version=policy.model_version,
+                policy_version=policy.version,
+                training_cutoff_ms=policy.training_cutoff_ms,
+                context_key=context_key, overrides_gate=None, decision_ask=ask,
+            )
 
     reason = {
         VETO: "qualified setup matches an adverse pattern",

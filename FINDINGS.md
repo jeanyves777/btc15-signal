@@ -5042,3 +5042,77 @@ defect 2 they are not.
 training path reconciles executions from broker fills instead, so the loop is
 not blind - but the columns are unpopulated and a reader joining on them gets
 nothing. Unmeasured, untouched here.
+
+## 55. Intelligence in the execution loop, and session-aware evidence (2026-09-23)
+
+The operator corrected the standing instruction: the layer is intended to
+operate in the live execution loop, and shadow was the wrong setting.
+
+### The wiring already existed and was correct
+
+`intelligence_verdict` runs BEFORE the auto trading block, and an authorised
+veto closes it:
+
+    if intel_verdict.final_action == intel.VETO:
+        rule_match = False           # main.py, line ~2033
+    ...
+    if rule.enabled and rule_match and auto_on and trader is not None:
+        ...                          # the trading block, line ~2236
+
+`rule_match` is the flag the block is gated on, so a veto means no order is
+submitted. Nothing needed building; what was missing was the authority, and
+one thing the evidence could not see.
+
+Two switches, both required, neither raised by any code path:
+`INTELLIGENCE_MODE=live` and `INTELLIGENCE_AUTHORISED=true`. `may_veto` and
+`may_admit` are separate permissions from `may_confidence`, and
+`may_change_size` returns False for **every** mode - sizing remains the
+operator's alone.
+
+### The evidence could be spent in a session that never earned it
+
+The cell key is `distance · price · momentum`. Session is deliberately NOT in
+it - keying on it fragments cells below the point where they can speak, which
+is why `brti-2` removed it. But a pooled cell can be carried entirely by
+sessions other than the one being traded, and on 2026-09-23 it was:
+
+    bd10-15 · px70-85 · mom5+        n=431, "pattern supports the decision"
+        us        3W-1L
+        late-us   3W-0L
+        asia      0W-2L              <- two UP entries, back to back, -$1.60 each
+
+Both were rated 89 points -> **HIGH**, 10.06x and 10.75x distance, momentum
++7.47 and +8.21 bps. Every gate passed and the layer endorsed them. The
+support was real and it was someone else's.
+
+**The key stays pooled** - `n`, `MIN_VALIDATE_N`, the Holm-Bonferroni
+correction and the promotion bar are all untouched, and no requirement was
+lowered. What changed is that arms now carry `by_session` counts BESIDE the
+evidence, and an execution action on a POOLED key requires that the session
+being traded holds at least `MIN_SESSION_EVIDENCE` (30) of the cell. It can
+only ever withhold an action; it never creates one.
+
+A key that already names its session (`us · mid · bd10-15 · px70-85`, the
+brti-1 shape) is session-pure by construction and needs no such check.
+
+### The documented fallbacks
+
+| situation | behaviour |
+|---|---|
+| arm predates `by_session` on a pooled key | execution withheld; confidence still applies |
+| this session below the floor in that cell | withheld, reason names the session and both counts |
+| caller supplies no session | old contract; the live path always supplies it, pinned by a test |
+| fingerprint mismatch / retired family / inactive policy / thin n | base strategy decides, unchanged |
+
+### Where this leaves it
+
+Authority is ON and connected. The active policy `kalshi-brti-2-1790210737`
+has 29 arms, **0 promoted**, `vetoes_enabled=False`, `admissions_enabled=False`
+and no arm carrying `by_session`. **No policy is currently eligible to affect
+a trade.** Nothing was promoted to make activation claimable, and that is the
+correct state: the bar was not met.
+
+The next refit writes `by_session` into every arm. Until an arm clears
+validation, the multiplicity correction AND the session floor, the layer is
+connected and authorised with nothing actionable to say - which is not trade
+protection and must not be described as such.
