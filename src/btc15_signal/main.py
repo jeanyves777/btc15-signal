@@ -3484,6 +3484,10 @@ async def service() -> None:
                                 f"{last[0]} settled {last[1]:+.2f}"
                                 if last else "",
                                 snapshot=money,
+                                loss_step=(
+                                    settings.loss_step_budget
+                                    if settings.loss_step_enabled else 0.0
+                                ),
                             )
                         elif event == "size_ended":
                             body = messages.recovery_size_ended_message(

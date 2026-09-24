@@ -174,10 +174,27 @@ def _money_block(snapshot) -> str:
     return "\n".join(lines)
 
 
-def recovery_armed(state, trigger: str = "") -> str:
-    """Announced when a realised loss opens a deficit."""
+def recovery_armed(state, trigger: str = "", loss_step: float = 0.0) -> str:
+    """Announced when a realised loss opens a deficit.
+
+    THE SIZING LINE HAS TO MATCH WHAT RUNS. It said "base entries stay at one
+    contract" for as long as that was true. Since 2026-09-24 the loss step
+    sizes the next trade after a losing market to a fixed dollar budget, so a
+    message still promising one contract would describe a system that is
+    about to buy six - and this whole thread began with recovery messages
+    that contradicted each other.
+    """
     head = (
         f"\U0001f527 <b>RECOVERY ARMED</b> · ${state.deficit:,.2f} outstanding"
+    )
+    sizing = (
+        f"After a losing market the next entry is sized to ${loss_step:,.2f}; "
+        "a win resets it. Consecutive losses hold at that budget rather than "
+        "escalating, and the conditional add-on stands down while it applies."
+        if loss_step > 0 else
+        "Base entries stay at one contract. Recovery may add ONE extra "
+        "contract, resting 2¢ below a fill, and only while the BRTI "
+        "evidence still holds."
     )
     body = [
         head,
@@ -185,9 +202,7 @@ def recovery_armed(state, trigger: str = "") -> str:
         "",
         f"Plan: {max(1, state.steps)} step(s), "
         f"${state.required_per_trade():,.2f} a trade.",
-        "Base entries stay at one contract. Recovery may add ONE extra "
-        "contract, resting 2¢ below a fill, and only while the BRTI evidence "
-        "still holds.",
+        sizing,
     ]
     return "\n".join(x for x in body if x != "")
 
@@ -1931,13 +1946,27 @@ def exit_warning_message(*, ticker: str, side: str, price: float,
 
 
 def recovery_armed_message(state, trigger: str = "", *, snapshot=None,
-                           insight: str = "") -> str:
+                           insight: str = "", loss_step: float = 0.0) -> str:
     """A realised loss opened a deficit, and sizing may now rise.
 
-    What it may rise BY is stated here rather than left to the reader: the
-    shipped rule adds ONE extra contract, resting 2c below a fill. It is not
-    a martingale and the message must not read like one.
+    WHAT IT MAY RISE BY IS STATED HERE rather than left to the reader, and it
+    has to be the rule that is actually running. Until 2026-09-24 that was
+    one extra contract rested 2c below a fill. Since the loss step shipped,
+    the next entry after a losing market is sized to a fixed dollar budget -
+    six or seven contracts at band prices - so the old sentence would now
+    understate the position by a factor of six. Neither rule is a martingale
+    and the message must not read like one.
     """
+    sizing = (
+        f"<i>After a losing market the next entry is sized to "
+        f"${loss_step:,.2f} and a win resets it. Consecutive losses hold at "
+        f"that budget rather than escalating, and the conditional add-on "
+        f"stands down while it applies.</i>"
+        if loss_step > 0 else
+        "<i>Base entries stay at one contract. Recovery may add ONE "
+        "extra contract, resting 2\u00a2 below a fill, and only while "
+        "the BRTI evidence still holds.</i>"
+    )
     return surface.compose(
         header=f"{surface.RECOVERY} <b>RECOVERY ARMED</b>",
         ticker="",
@@ -1947,9 +1976,7 @@ def recovery_armed_message(state, trigger: str = "", *, snapshot=None,
             f"{surface.TARGET} Plan: {max(1, state.steps)} step"
             f"{'s' if max(1, state.steps) != 1 else ''} \u00b7 "
             f"${state.required_per_trade():,.2f} a trade",
-            "<i>Base entries stay at one contract. Recovery may add ONE "
-            "extra contract, resting 2\u00a2 below a fill, and only while "
-            "the BRTI evidence still holds.</i>",
+            sizing,
         ],
         checks=[],
         status="",
