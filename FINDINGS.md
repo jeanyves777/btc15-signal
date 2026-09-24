@@ -5681,3 +5681,87 @@ the $3 proposal.
 it, not a verdict on it.** What would change the reading: enough post-loss
 trades to separate 92% from 82.9% - roughly 300-400 of them at this gap, so
 weeks, not days.
+
+## 62. The hourly ladder pair: the guarantee is real and already priced (2026-09-24)
+
+Operator's proposal, from the hourly ladder: buy a low strike YES and a high
+strike NO, both priced 80-90%, and close 10-15 minutes before expiry. At
+least one leg always wins.
+
+**The guarantee is real.** Below the low strike the NO pays; above the high
+strike the YES pays; between them BOTH pay. There is no state in which the
+pair returns nothing.
+
+### Held to expiry it is exactly zero, and that is algebra
+
+For any pair A < B:
+
+```
+cost       = p(X>=A) + (1 - p(X>=B))
+E[payout]  = 1·p(X>=B) + 2·(p(X>=A) - p(X>=B)) + 1·(1 - p(X>=A))
+           = 1 + p(X>=A) - p(X>=B)
+```
+
+Those are the same number. Not approximately - identically, for every pair,
+at every strike spacing. All 66 pairs on the operator's own screenshot return
+an edge of `+0.000000` before fees; after fees they run from **-0.0028 to
+-0.0332**. The circled pair (YES >=83,600 at 0.79 with NO on >=84,200 at
+0.94) costs 1.7300 against an expected payout of 1.7300, and loses the
+1.57c fee.
+
+The "guarantee" is not an edge. It is a repackaging of the same fair bet,
+and what it actually buys is a **capped loss**: -0.75 instead of -1.75.
+
+### Closing early does not escape it
+
+Between the strikes both legs converge on 1.00 and the pair on 2.00; outside
+them the pair converges on 1.00. Selling early collects part of that
+convergence and pays a second spread for it. Whether it pays depends entirely
+on how often the price finishes in the corridor - which is the quantity the
+ladder already prices.
+
+Measured on Kalshi's own hourly chains and settlements, 35 settled chains,
+entry at 30 minutes, exit at 10:
+
+```
+the ladder priced the corridor at : 71.7%
+it actually finished inside       : 22/29 = 75.9%
+break-even needs                  : 73.5%
+
+payoff when inside  : +0.270
+payoff when outside : -0.748   (n=7)
+```
+
+2.4 points above break-even - and then:
+
+```
+2026-09-21  n= 6  inside 6/6    total  +1.712
+2026-09-22  n=21  inside 15/21  total  -0.522
+2026-09-23  n= 2  inside 1/2    total  -0.474
+
+day-clustered bootstrap, 3 clusters: 95% CI [-0.2368, +0.2853]  SPANS ZERO
+```
+
+**One six-window afternoon in which the corridor held every single time
+carries the entire result. The other 23 windows lost money.** The sample is
+35 chains spanning 09-21 16:00 to 09-23 02:00 - about 34 CONSECUTIVE hours
+of one price path, in which BTC moved 1,664 dollars. Those are not 35
+independent draws; neighbouring windows share most of their price history.
+
+### What this actually is
+
+A **short volatility** position. It wins when BTC stays inside the corridor
+and loses when it leaves, at roughly 1:2.8 odds against. The ladder prices
+the corridor correctly, so the trade is a view that BTC will be more
+range-bound than the market thinks - not a free lunch, and not a hedge.
+
+It is the fourth structure tested this session with the same shape: the
+hedge (FINDINGS 59), the out-of-the-money take-profit (60), and now this.
+Each offers a real-sounding guarantee that dissolves into the fee once the
+arithmetic is written out, because both sides of a binary always sum to
+1 + spread.
+
+**Decision: not deployed.** Nothing shipped, and the hourly ladder remains a
+shadow recorder that never trades. What would change it: a corridor hit rate
+persistently above break-even measured across weeks and distinct volatility
+regimes, not 34 hours of one quiet stretch.
