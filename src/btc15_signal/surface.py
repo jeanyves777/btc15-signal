@@ -79,6 +79,7 @@ MONEY = "\U0001f4b0"
 TODAY = "\U0001f4c5"
 PACKAGE = "\U0001f4e6"
 WARN = "⚠️"
+CHOP = "\U0001f30a"                # 🌊 choppiness - a confidence note, never a check
 # THE EXIT EVENT, which is not a direction. `auto_exit` used the DOWN
 # chip as its headline while the body said "Held UP", so one message
 # carried two contradictory direction chips - the exact collapse of the
@@ -543,6 +544,40 @@ def max_net_profit(contracts: float, paid: float, fee: float | None) -> str:
 
 NO_TRADE = f"{PRICE} Not traded \u00b7 realised P&amp;L $0.00"
 ALREADY_COUNTED = "\U0001f9fe <i>Already counted at the sale.</i>"
+
+
+def confidence_note(*, points: int, high_at: int, checks: int, clock: int,
+                    shield: int, intelligence: int = 0,
+                    choppiness: float | None = None,
+                    choppiness_points: int = 0) -> str:
+    """The confidence word as arithmetic, on the line under the word.
+
+    WHY THIS EXISTS. KXBTC15M-26SEP240915-15 alerted "Confidence MEDIUM ·
+    Entry checks 5/5". Every check green and the word still not HIGH, with
+    nothing on screen accounting for it. The operator read the missing
+    choppiness line as the cause; it was not. The real sum was
+
+        checks 100 · shield -6 · clock -11 = 83, and HIGH starts at 85
+
+    with choppiness (-7) taking it to 76 without changing the label. Three
+    separate terms move this word and none of them was visible, so the only
+    way to check the header was to read the source.
+
+    CHOPPINESS IS SHOWN HERE AND NOT AS A CHECK, deliberately. The operator's
+    instruction was that it influences confidence only, so it appears in no
+    `check_facts` list and no rule carries a threshold for it. Printing it
+    beside the other adjustments says what it did without implying a gate.
+    """
+    parts = [f"checks {checks:+d}", f"shield {shield:+d}",
+             f"clock {clock:+d}"]
+    if intelligence:
+        parts.append(f"learned {intelligence:+d}")
+    if choppiness is None:
+        parts.append("chop n/a")
+    else:
+        parts.append(f"chop {choppiness_points:+d} ({choppiness * 100:.0f}%)")
+    return (f"{CHOP} Score {points}/100 · HIGH at {high_at} · "
+            f"<i>{' · '.join(parts)}</i>")
 # A PARTIAL EXIT IS NOT counted at the sale. Two of three
 # contracts were sold here and the third ran to settlement, so
 # part of the money arrived hours after the sale this line says

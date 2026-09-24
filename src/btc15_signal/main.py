@@ -185,6 +185,41 @@ def confidence_label(facts: list[dict], opened: int, blocking_level: float | Non
     )
 
 
+def confidence_breakdown(facts: list[dict], opened: int,
+                         blocking_level: float | None,
+                         intelligence_delta: int = 0,
+                         choppiness: float | None = None,
+                         choppiness_delta: int = 0) -> dict:
+    """Every term behind the confidence word, and the word itself.
+
+    ONE COMPUTATION FOR BOTH MESSAGES. `fill_message` used to call
+    `confidence_label(fill_facts, opened, blocking_level)` with no deltas
+    while the signal that preceded it passed both, so the same trade could
+    alert MEDIUM and fill HIGH - the exact thing `signal_message` promises in
+    its docstring cannot happen. The label here is computed once, from these
+    components, and handed to whoever renders it.
+    """
+    from .regime import HIGH_AT, base_points as regime_base
+    from .regime import confidence_points as regime_clock
+    from .regime import weight_at
+
+    agreeing = sum(1 for fact in facts if fact["passed"])
+    checks = regime_base(agreeing)
+    clock = regime_clock(weight_at(opened))
+    shield = level_points(blocking_level is not None)
+    points = max(0, min(100, checks + clock + shield
+                        + int(intelligence_delta or 0)
+                        + int(choppiness_delta or 0)))
+    return {
+        "points": points, "high_at": HIGH_AT, "checks": checks,
+        "clock": clock, "shield": shield,
+        "intelligence": int(intelligence_delta or 0),
+        "choppiness": choppiness,
+        "choppiness_points": int(choppiness_delta or 0),
+        "label": regime_label(points),
+    }
+
+
 def model_confidence_points(facts: list[dict], opened: int,
                             blocking_level: float | None) -> int:
     """The model's own score, BEFORE any learned adjustment.
@@ -2562,6 +2597,20 @@ async def primary_signal(
                                     levels_ready=levels_ready,
                                 )
                             )
+                            # Computed from the FILL's own facts, but through
+                            # the one function the signal uses, so the two
+                            # messages for a single trade cannot disagree.
+                            _fill_chop = (
+                                getattr(brti, "brti_choppiness", None)
+                                if brti is not None else None
+                            )
+                            fill_confidence = confidence_breakdown(
+                                fill_facts, opened, blocking_level,
+                                intel_verdict.confidence_delta,
+                                _fill_chop,
+                                choppiness_points(
+                                    _fill_chop, settings.choppiness_penalty),
+                            )
                             why = decision_record(
                                 store, settings, claimed, contract,
                                 snapshot, prediction, contract_ask,
@@ -2603,8 +2652,18 @@ async def primary_signal(
                                     paid=paid,
                                     fee=fee,
                                     remaining=remaining,
-                                    confidence=confidence_label(
-                                        fill_facts, opened, blocking_level
+                                    # THE SAME ARITHMETIC AS THE SIGNAL. This
+                                    # called `confidence_label` with no deltas
+                                    # while the signal that preceded it passed
+                                    # both the learned and the choppiness
+                                    # adjustment, so one trade could alert
+                                    # MEDIUM and fill HIGH - exactly what
+                                    # `signal_message` promises cannot happen.
+                                    confidence=fill_confidence["label"],
+                                    confidence_note=surface.confidence_note(
+                                        **{k: v for k, v
+                                           in fill_confidence.items()
+                                           if k != "label"}
                                     ),
                                     facts=fill_facts,
                                     snapshot=notifier.snapshot(now_ms),
@@ -2734,12 +2793,22 @@ async def primary_signal(
     # BRTI window the gates read, and it is passed to the LABEL - not to
     # rule_match, not to check_facts, not to sizing. A window that went
     # nowhere lowers the word and refuses nothing.
-    confidence = confidence_label(
+    window_chop = (
+        getattr(brti, "brti_choppiness", None) if brti is not None else None
+    )
+    breakdown = confidence_breakdown(
         facts, opened, blocking_level, intel_verdict.confidence_delta,
-        choppiness_points(
-            getattr(brti, "brti_choppiness", None) if brti is not None else None,
-            settings.choppiness_penalty,
-        ),
+        window_chop,
+        choppiness_points(window_chop, settings.choppiness_penalty),
+    )
+    confidence = breakdown["label"]
+    # EVERY TERM BEHIND THE WORD, on the line under it. Three adjustments move
+    # this label - the clock, the shield and choppiness - and none of them was
+    # visible, so a 5/5 setup reading MEDIUM could only be checked by reading
+    # the source. Rendered once and shared with the fill message below, which
+    # is how the two are kept from disagreeing.
+    confidence_note = surface.confidence_note(
+        **{k: v for k, v in breakdown.items() if k != "label"}
     )
     policy_note = messages.policy_line(intel_verdict)
     if policy_note:
@@ -2806,6 +2875,7 @@ async def primary_signal(
         ask=contract_ask,
         remaining=remaining,
         confidence=confidence,
+        confidence_note=confidence_note,
         facts=facts,
         executable=qualified,
         status_line=status if offer_button else "⚪ Paper only · no order placed",

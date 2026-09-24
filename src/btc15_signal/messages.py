@@ -1687,7 +1687,8 @@ def signal_message(*, side: str, ticker: str, ask: float, remaining: int,
                    status_line: str, snapshot=None, insight: str = "",
                    band_hold: tuple[int, int] | None = None,
                    distance_text: str = "", priority=None,
-                   verdict: str = "") -> str:
+                   verdict: str = "",
+                   confidence_note: str = "") -> str:
     """A signal, executed or not. The checks are always visible.
 
     `confidence` is the ONE Kalshi-native confidence result, computed once by
@@ -1707,6 +1708,10 @@ def signal_message(*, side: str, ticker: str, ask: float, remaining: int,
         f"{surface.LEARNING} Confidence {escape(confidence)} · "
         f"Entry checks {surface.checks_summary(facts)}"
     )
+    # Directly under the word it explains. Without it a 5/5 setup reading
+    # MEDIUM has nothing on screen to account for the gap.
+    if confidence_note:
+        essentials.append(confidence_note)
     return surface.compose(
         header=f"{surface.side_icon(side)} <b>{escape(side)} SIGNAL · "
                f"{escape(label)}</b>",
@@ -1725,7 +1730,8 @@ def fill_message(*, side: str, ticker: str, contracts: float, paid: float,
                  facts: list[dict], snapshot=None, insight: str = "",
                  band_hold: tuple[int, int] | None = None,
                  decision_ask: float | None = None, priority=None,
-                 size_reason: str = "") -> str:
+                 size_reason: str = "",
+                 confidence_note: str = "") -> str:
     """An executed entry. Cost and maximum profit are both NET.
 
     The old fill report printed `Maximum profit contracts - cost` with no fee
@@ -1755,6 +1761,8 @@ def fill_message(*, side: str, ticker: str, contracts: float, paid: float,
         f"{surface.LEARNING} Confidence {escape(confidence)} · "
         f"Entry checks {surface.checks_summary(facts)}"
     )
+    if confidence_note:
+        essentials.append(confidence_note)
     return surface.compose(
         header=f"{surface.side_icon(side)} <b>{escape(side)} FILLED</b>",
         ticker=ticker,
