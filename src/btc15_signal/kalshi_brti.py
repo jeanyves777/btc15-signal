@@ -115,8 +115,27 @@ class KalshiBRTIRule:
     # THE SAMPLE IS 176 TRADES OVER 5 DAYS and the cell is the best of 36
     # swept combinations, with a trade-level rather than day-clustered
     # interval. That is weaker evidence than the distance floor rests on.
-    # Shipped on the operator's decision with the weakness stated; the
-    # features are archived on every decision so this is re-measurable.
+    #
+    # THE WIDER TEST CONTRADICTED IT, and that is recorded here because the
+    # gates remain live. On 5,546 corpus decision points across 68 days,
+    # day-clustered, inside the deployed price band and scaled distance floor:
+    #
+    #   deployed gates only      n=5546  88.3%  +0.0374  [+0.0225, +0.0512]
+    #   + these three gates      n=1628  87.2%  +0.0390  [+0.0166, +0.0606]
+    #   what they REFUSE         n=3918  88.8%  +0.0368  [+0.0199, +0.0526]
+    #
+    # They refuse 71% of setups and what they refuse scores the same as what
+    # they keep. `accel` points the WRONG WAY on that sample - decaying
+    # setups returned +0.0410 against +0.0296 for building ones, the reverse
+    # of the live result. `held_s < 120` binds 9 times in 5,546.
+    # `rejections` is non-monotonic: 1 -> +0.0366, 2 -> +0.0434,
+    # 3+ -> +0.0245 spanning zero.
+    #
+    # KEPT LIVE BY THE OPERATOR'S DECISION, 2026-09-24, with that evidence in
+    # view. The recommendation on the table was archive-only. The features
+    # are recorded on every decision either way, so this stays re-measurable
+    # on live data under the current rules rather than re-arguable - which is
+    # the only reason shipping against a corpus result is recoverable.
     min_brti_accel: float = -5.0
     min_brti_held_s: float = 120.0
     min_brti_rejections: int = 2

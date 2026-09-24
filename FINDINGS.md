@@ -6037,3 +6037,91 @@ falsification it was.
 **The rule this leaves:** when a measurement contradicts a deployed
 artefact - the live policy's own arms, in this case - reconcile them before
 shipping, not after.
+
+## 66. Three level-holding gates: live said yes, the corpus said no (2026-09-24)
+
+Operator's reframing, after RSI failed: these are mostly in-the-money trades,
+so the bet is not "which way will price go" but **"will price stay on this
+side of the strike"**. Direction at a 15-minute horizon is already in the
+price; whether the strike is being DEFENDED is not.
+
+That reframing is the useful part of this section, whatever the thresholds
+turn out to be worth.
+
+### RSI first, and it failed
+
+Tested on the bot's own 181 live executed trades, RSI reconstructed at each
+decision instant from Kalshi's per-second series:
+
+```
+RSI would KEEP   148 trades   P&L +1.4680
+RSI would AVOID   23 trades   P&L +1.4511   <- 20 winners, 3 losers
+net effect of the filter            -1.4511
+```
+
+Trades RSI disagreed with won **87.0%**; trades it agreed with won 82.4%. The
+threshold sweep was incoherent - net -0.77 at margin 0, -5.54 at 5, +5.86 at
+20. And the correlation between `|RSI-50|` and `|momentum|` was **+0.030**:
+at this horizon it was not measuring what it appeared to.
+
+### Three that did separate on live trades
+
+Same 176 in-the-money executed trades, priced on Kalshi's settlement P&L:
+
+| indicator | what it asks | result |
+|---|---|---|
+| `accel` | is the move that built the cushion still building? | decaying: 40W/15L yet **-6.93** |
+| `held_s` | how long has price held our side? | 5-12 min **91.5%** vs <5 min 79.1% |
+| `rejections` | has the strike been tested and turned back? | 2+ **88.1%** vs 1 78.9% |
+
+Shipped together at `accel >= -5`, `held >= 120s`, `rejections >= 2`: kept 59
+of 176 (34%), 89.8% win, **+9.21 against +1.07 actually realised**.
+
+Four weaknesses were recorded at the time: 176 trades, 5 days, the best of 36
+swept cells, and a trade-level rather than day-clustered interval. `held_s`
+was also noted as non-monotonic - alone at 120s and 180s it HURTS.
+
+### The wider test reversed it
+
+5,546 corpus decision points across 68 days, day-clustered, inside the
+deployed price band and scaled distance floor:
+
+```
+deployed gates only      n=5546  88.3%  +0.0374  [+0.0225, +0.0512]
++ these three gates      n=1628  87.2%  +0.0390  [+0.0166, +0.0606]
+what they REFUSE         n=3918  88.8%  +0.0368  [+0.0199, +0.0526]
+```
+
+**They refuse 71% of setups and what they refuse scores the same as what they
+keep.** And `accel` points the wrong way:
+
+```
+decaying < -5 (REFUSED)   n= 653  +0.0410
+building >= 0             n=2733  +0.0296
+```
+
+`held_s < 120` binds 9 times in 5,546. `rejections` is non-monotonic:
+1 -> +0.0366, 2 -> +0.0434, 3+ -> +0.0245 spanning zero.
+
+### The decision, and the pattern
+
+**Kept live by the operator, with that evidence in view.** The recommendation
+on the table was archive-only; they chose to keep all three gating. Sizing
+and gating are theirs.
+
+This is the third time in one session that a swept winner on a thin sample
+reversed on a larger one - sections 63, 64 and now this. The common shape is
+exact: a best-of-N cell, a few days, an interval that does not cluster the
+thing that is actually correlated, and a result that looks decisive.
+
+What is different here is that the contradiction was found BEFORE it could
+be believed, because the features are archived on every decision, qualified
+or refused. That is the whole value of recording an indicator's input: it
+makes the threshold re-measurable on live data under the current rules
+rather than re-arguable. A gate whose input is not archived can only ever be
+defended.
+
+**The live prediction to check in a week:** these gates refuse ~71% of
+setups. If the corpus is right, live P&L per contract will be unchanged and
+trade volume will be a third of what it was. If the live sample was right, it
+will improve. The archive will answer it either way.
