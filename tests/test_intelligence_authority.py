@@ -273,3 +273,69 @@ def test_main_passes_the_session_to_decide():
 
     src = inspect.getsource(main)
     assert "session=_session(opened)" in src
+
+
+# ------------- an overridden gate is a message, not a DETAILS button
+
+def test_an_admit_reaches_the_message_not_only_the_details_body():
+    """`policy_line` went ONLY to `detail_body`, which is behind a DETAILS
+    button. An ADMIT is the layer overruling a gate and letting an order
+    through - it would have placed a trade with nothing in the message
+    saying why a refused setup was taken."""
+    import inspect
+
+    from btc15_signal import main
+
+    source = inspect.getsource(main.primary_signal)
+    assert "policy_note=admit_note" in source
+    at = source.index("admit_note = (")
+    window = source[at:at + 260]
+    assert "intel.ADMIT" in window
+    assert "intel.VETO" in window
+
+
+def test_the_fill_message_carries_it_too():
+    """An order the layer admitted past a gate must say so on the FILL, not
+    only on the signal that preceded it."""
+    import inspect
+
+    from btc15_signal import main
+
+    source = inspect.getsource(main.primary_signal)
+    at = source.index("policy_note=messages.policy_line(")
+    assert "intel.ADMIT" in source[at:at + 260]
+
+
+def test_both_builders_accept_it():
+    import inspect
+
+    from btc15_signal import messages
+
+    for fn in (messages.signal_message, messages.fill_message):
+        assert "policy_note" in inspect.signature(fn).parameters
+
+
+def test_it_renders_in_essentials_not_in_the_checks_block():
+    """It is not a gate result and must not be read as one."""
+    import inspect
+
+    from btc15_signal import messages
+
+    for fn in (messages.signal_message, messages.fill_message):
+        source = inspect.getsource(fn)
+        at = source.rindex("if policy_note:")
+        assert "essentials.append" in source[at:at + 120]
+
+
+def test_a_neutral_decision_still_says_nothing():
+    """3,700 live decisions are neutral. Narrating every one trains the
+    reader to skip the line, and then the ADMIT goes unread too."""
+    from btc15_signal import messages
+
+    class V:
+        changed = False
+        final_action = "neutral"
+        confidence_delta = 0
+        evidence_n = 0
+
+    assert messages.policy_line(V()) == ""

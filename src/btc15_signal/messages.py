@@ -1688,7 +1688,8 @@ def signal_message(*, side: str, ticker: str, ask: float, remaining: int,
                    band_hold: tuple[int, int] | None = None,
                    distance_text: str = "", priority=None,
                    verdict: str = "",
-                   confidence_note: str = "") -> str:
+                   confidence_note: str = "",
+                   policy_note: str = "") -> str:
     """A signal, executed or not. The checks are always visible.
 
     `confidence` is the ONE Kalshi-native confidence result, computed once by
@@ -1712,6 +1713,11 @@ def signal_message(*, side: str, ticker: str, ask: float, remaining: int,
     # MEDIUM has nothing on screen to account for the gap.
     if confidence_note:
         essentials.append(confidence_note)
+    # A VETO or an ADMIT belongs in the message, not behind the DETAILS
+    # button: one refuses a setup every gate accepted, the other overrules a
+    # gate and lets an order through.
+    if policy_note:
+        essentials.append(policy_note)
     return surface.compose(
         header=f"{surface.side_icon(side)} <b>{escape(side)} SIGNAL · "
                f"{escape(label)}</b>",
@@ -1731,7 +1737,8 @@ def fill_message(*, side: str, ticker: str, contracts: float, paid: float,
                  band_hold: tuple[int, int] | None = None,
                  decision_ask: float | None = None, priority=None,
                  size_reason: str = "",
-                 confidence_note: str = "") -> str:
+                 confidence_note: str = "",
+                 policy_note: str = "") -> str:
     """An executed entry. Cost and maximum profit are both NET.
 
     The old fill report printed `Maximum profit contracts - cost` with no fee
@@ -1763,6 +1770,11 @@ def fill_message(*, side: str, ticker: str, contracts: float, paid: float,
     )
     if confidence_note:
         essentials.append(confidence_note)
+    # A VETO or an ADMIT belongs in the message, not behind the DETAILS
+    # button: one refuses a setup every gate accepted, the other overrules a
+    # gate and lets an order through.
+    if policy_note:
+        essentials.append(policy_note)
     return surface.compose(
         header=f"{surface.side_icon(side)} <b>{escape(side)} FILLED</b>",
         ticker=ticker,

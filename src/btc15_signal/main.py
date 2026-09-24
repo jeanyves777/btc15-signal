@@ -2711,6 +2711,12 @@ async def primary_signal(
                                            in fill_confidence.items()
                                            if k != "label"}
                                     ),
+                                    # An order the layer ADMITTED past a gate
+                                    # must say so on the fill too.
+                                    policy_note=messages.policy_line(
+                                        intel_verdict
+                                    ) if intel_verdict.final_action in (
+                                        intel.ADMIT, intel.VETO) else "",
                                     facts=fill_facts,
                                     snapshot=notifier.snapshot(now_ms),
                                     insight=notifier.insight_for(opened, now_ms),
@@ -2859,6 +2865,21 @@ async def primary_signal(
     policy_note = messages.policy_line(intel_verdict)
     if policy_note:
         detail_body += "\n" + messages.RULE + "\n" + policy_note
+    # AN OVERRIDDEN GATE IS NOT A DETAIL. `policy_line` went only to the
+    # DETAILS body, which is behind a button press, so an ADMIT - the layer
+    # overruling a gate and letting an order through - would have placed a
+    # trade with nothing in the message saying why a refused setup was taken.
+    # A veto already reaches the decline list and a confidence delta already
+    # reaches the score line; this is the one that was silent, and it is the
+    # one that moves money against a gate's judgement.
+    #
+    # Carried in the ESSENTIALS so it survives whether the setup is alerted,
+    # filled or declined.
+    admit_note = (
+        policy_note
+        if intel_verdict.final_action in (intel.ADMIT, intel.VETO)
+        else ""
+    )
     if offer_button:
         proposal = create_proposal(
             store,
@@ -2951,6 +2972,7 @@ async def primary_signal(
         remaining=remaining,
         confidence=confidence,
         confidence_note=confidence_note,
+        policy_note=admit_note,
         facts=facts,
         executable=qualified,
         status_line=status if offer_button else "⚪ Paper only · no order placed",
