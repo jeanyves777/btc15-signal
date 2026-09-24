@@ -8,3 +8,11 @@ __pycache__/
 data/
 reports/*.json
 runtime/
+
+# .env backups. Three of these were committed (195f9d6, 4b5b965) because the
+# ignore rule matched only the exact name `.env` - a timestamped copy made
+# before editing it sailed straight past and carried the live credentials
+# into a public repository.
+.env.bak*
+.env.*.bak
+*.env.backup
