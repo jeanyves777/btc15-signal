@@ -5765,3 +5765,90 @@ arithmetic is written out, because both sides of a binary always sum to
 shadow recorder that never trades. What would change it: a corridor hit rate
 persistently above break-even measured across weeks and distinct volatility
 regimes, not 34 hours of one quiet stretch.
+
+## 63. The deployed rule on ETH and SOL, with BTC as the control (2026-09-24)
+
+Operator's request: backtest the current live strategy, all features, on ETH
+and SOL. No fees, by their standing instruction.
+
+Data already on disk from 2026-09-21: `market_data_kxeth15m.db` and
+`market_data_kxsol15m.db`, ~6,400 settled markets each from Kalshi's own
+`/markets` and `/markets/candlesticks`, alongside the BTC set. Rule as
+deployed today: ask 0.70-0.93, normalized distance >= 10x, retrace <= 0.60,
+momentum aligned, entry 660-360s, one entry per market.
+
+### The control first
+
+```
+        markets  trades   rate   win     ask    edge/trade   total   days
+BTC        6435     259   4.0%  91.1%   0.802     +0.1088   +28.18     43
+ETH        6395     116   1.8%  87.9%   0.807     +0.0727    +8.43     23
+SOL        6397      28   0.4%  89.3%   0.850     +0.0430    +1.20     15
+```
+
+**BTC returns +0.1088 per trade here against +0.0193 per contract that the
+live system has actually made since 2026-09-21.** A harness five times more
+generous than the thing it models is partly measuring itself, and the
+absolute numbers must not be quoted as expectations. The gap is explained:
+minute candles instead of ~10s BRTI, no 60s band-hold timer, the minute-close
+ask assumed executable, no slippage and no missed fills, one entry taken at
+the first qualifying minute, and no fees.
+
+What IS comparable is the ratio, because all three ran through the identical
+harness. ETH lands at 67% of BTC's edge, SOL at 40%.
+
+### Both bars
+
+```
+day-clustered bootstrap (20,000 resamples of DAYS)
+BTC   259 trades  43 days  +0.1088  [+0.0768, +0.1415]  holds
+ETH   116 trades  23 days  +0.0727  [+0.0022, +0.1299]  holds
+SOL    28 trades  15 days  +0.0430  [-0.0668, +0.1221]  SPANS ZERO
+
+walk-forward, first 60% of days train, last 40% test
+BTC   train 170 +0.1126   test 89 +0.1016   HELD
+ETH   train  54 +0.0657   test 62 +0.0788   HELD
+SOL   train  22 +0.0709   test  6 -0.0590   FAILED
+```
+
+**ETH survives both.** Its interval clears zero - barely, lower bound
++0.0022 - and its out-of-sample half scored BETTER than its training half.
+That is the first structure tested this session to pass both bars rather than
+reverse. **SOL fails both**, on 28 trades and a 6-trade test slice.
+
+### The threshold does not transfer, even where the edge does
+
+```
+        markets  qualified   rate   median distance  avg ask
+BTC        6435        259   4.0%              11.8    0.802
+ETH        6395        116   1.8%              11.6    0.807
+SOL        6397         28   0.4%              10.5    0.850
+```
+
+The same 10x floor admits 4.0% of BTC markets and 0.4% of SOL. It is not
+selecting the same KIND of setup on each instrument; it is selecting a
+progressively rarer tail. The floor was measured on BTC volatility
+(FINDINGS 43), and a threshold is a statement about one instrument's
+distribution. Deploying to ETH means re-measuring the floor on ETH, not
+inheriting BTC's - and the 1.8% selection rate means roughly one trade every
+two days, which is a different operational proposition from BTC's 4.0%.
+
+### What this did NOT test
+
+**The reversal gate is effectively inert here.** Median retrace is 0.000 on
+all three, because at minute granularity the 5-minute retrace window holds
+6 points where the live 120-second one holds ~12 at 10s. So this measurement
+validates ask, distance and momentum; it says nothing about
+`max_brti_retrace`, which shipped today on 79 markets of BTC evidence.
+
+The 60s band-hold timer is also absent, and on BTC it is the single largest
+measured improvement in the deployed system.
+
+### Decision
+
+**Nothing deployed.** ETH is the first instrument worth a shadow recorder:
+it passed both bars on 116 trades over 23 days, at 67% of BTC's edge through
+the same harness. The honest next step is not to trade it but to record it -
+book snapshots and a reference series at live resolution - so the distance
+floor can be measured on ETH's own distribution and the reversal gate tested
+at a granularity that can see it. SOL is not a candidate on this evidence.
