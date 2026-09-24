@@ -220,6 +220,24 @@ class Settings(BaseSettings):
     cash_out_enabled: bool = True
     cash_out_capture: float = 0.90  # fraction of the available profit to bank
     cash_out_min_bid: float = 0.90  # and never sell into a thin, low bid
+    # THE ABSOLUTE TRIGGER, operator 2026-09-24: "that's already at max profit
+    # ... no need to wait for expiry". Compared against the DISCOUNTED bid, so
+    # 0.98 here means a quoted 0.99.
+    #
+    # It exists because `cash_out_capture` alone is unreachable on an
+    # expensive entry: banking 90% of the profit above `paid` needs a quoted
+    # bid of 0.10*paid + 0.91, which passes 0.999 once paid exceeds 0.89. The
+    # live record shows the consequence - entries under 0.89 exit 33-58% of
+    # the time, entries above it 4.2% (1 of 24), and a position quoted 99.9%
+    # on a 0.895 entry needed a 0.9995 bid that does not exist.
+    #
+    # Measured over 146 cases that reached a 0.99 quoted bid: selling returns
+    # 0.9938/contract against 0.9932 for holding. That is noise, the same as
+    # the proportional rule's -$0.0006, and it is shipped for the same reason
+    # - it buys certainty rather than money. At a 0.995 bid holding is very
+    # slightly ahead (1.0000 vs 0.9968 over 140 cases, no losses), so this is
+    # deliberately NOT set higher.
+    cash_out_at_bid: float = 0.98
     # How far BELOW the quoted bid a cash-out is priced and judged. Entries
     # have `entry_slippage` because an immediate-or-cancel order at exactly the
     # touch only fills if that quote is real and still there - on 2026-09-21

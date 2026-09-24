@@ -3111,7 +3111,39 @@ async def cash_out_exit(
     if not 0.0 < bid < 1.0 or bid < settings.cash_out_min_bid:
         return
     available = 1.0 - paid  # the most this position can still make
-    if available <= 0 or (bid - paid) < settings.cash_out_capture * available:
+    # THE PROPORTIONAL GATE IS UNREACHABLE ON AN EXPENSIVE ENTRY, and that is
+    # why a position quoted 99.9% sat open. Banking `capture` of the profit
+    # above `paid`, judged after the slippage discount, needs
+    #
+    #     quoted >= 0.10 * paid + 0.91
+    #
+    # which RISES with the entry price while the best bid a binary can offer
+    # is capped near 0.999. Above paid = 0.89 it demands more than any bid can
+    # pay, so it never fires - silently, because a gate that cannot fire looks
+    # exactly like a market that never qualified. In the live record the exit
+    # rate is 35%/58%/33% for entries below 0.89 and 4.2% (1 of 24) above it.
+    #
+    # So there is a second, ABSOLUTE trigger: a contract bid this close to
+    # 1.00 has earned essentially everything it can, whatever it cost. It is
+    # measured at 0.9938 against 0.9932 for holding over 146 cases - the same
+    # "inside the noise" as the proportional rule, bought for the same reason.
+    # One of the 146 is the case this exists for: KXBTC15M-26SEP220200-00 held
+    # a 0.990 bid from 50s to 30s remaining, collapsed to 0.550 at 20s, and
+    # settled the other way.
+    #
+    # Compared against the DISCOUNTED bid like everything else here, so the
+    # default 0.98 means a quoted 0.99 - the level the measurement used.
+    at_max = bid >= settings.cash_out_at_bid
+    if not at_max and (
+        available <= 0 or (bid - paid) < settings.cash_out_capture * available
+    ):
+        return
+    # NEVER SELL AT A LOSS. The proportional gate guarantees this implicitly -
+    # it is a fraction of the profit above `paid` - but the absolute one does
+    # not, so it is stated. An entry above the trigger cannot happen while
+    # `max_entry_price` is below it, and a rule that relies on another
+    # setting's value is a rule that breaks when that setting moves.
+    if bid <= paid:
         return
     if not store.record_alert("primary-cashout", opened, now_ms):
         return
