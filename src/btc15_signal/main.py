@@ -1963,6 +1963,13 @@ def intelligence_verdict(
         store.record_intelligence({
             "window_open": opened,
             "ticker": ticker or getattr(snapshot, "ticker", None),
+            # ONE OPPORTUNITY, derived from the ticker so a restart mid-window
+            # does not split one path into two. Declared on this table and
+            # never written - NULL on every row - which meant the many poll
+            # rows for a single opportunity could only be grouped by window,
+            # and a window that re-opened after a restart looked like one.
+            "signal_id": (ticker or getattr(snapshot, "ticker", None) or
+                          f"w{opened}"),
             "decided_ms": now_ms, "remaining_s": remaining,
             "side": getattr(prediction, "side", None), "ask": ask,
             "base_qualified": int(bool(rule_match)),
@@ -1984,6 +1991,17 @@ def intelligence_verdict(
             "evidence_action": verdict.evidence_action or verdict.final_action,
             "evidence_delta": verdict.evidence_delta,
             "authority": verdict.authority or None,
+            # WHAT WAS GRANTED, beside what was withheld. `authority` above is
+            # NULL whenever nothing was withheld, so on its own the archive
+            # cannot distinguish "the evidence said neutral" from "the
+            # permission was never given" - opposite facts that look identical.
+            "authority_granted": ",".join(
+                name for name, granted in (
+                    ("confidence", settings.intelligence_enabled),
+                    ("veto", intel_mode.may_veto(mode)),
+                    ("admit", intel_mode.may_admit(mode)),
+                ) if granted
+            ) or "none",
             "model_points": model_points,
             # THE RAW FEATURES, so a future re-keying never orphans this row
             # the way `brti-1` orphaned every row written before `brti-2`.

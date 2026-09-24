@@ -333,6 +333,94 @@ class LearningStore:
         ).fetchone()
         return int(row[0] or 0) if row else 0
 
+    def confidence_scoreboard(self, feature_version: str,
+                              policy_version: str = "") -> list[dict]:
+        """How each CONFIDENCE arm is doing on live, settled markets.
+
+        `forward_scoreboard` below tracks EXECUTION candidates - what a veto or
+        an admission would have changed. Confidence arms were tracked by
+        nothing at all: they are the only thing the layer is authorised to do,
+        they moved the label on 12% of live decisions, and there was no record
+        anywhere of whether the direction they moved it was right.
+
+        WHAT A CONFIDENCE ARM CLAIMS, and therefore what is scored here, is a
+        CALIBRATION residual - the observed win rate minus the probability the
+        price implied. An arm that raises confidence is asserting this cell
+        wins MORE than its ask says. So the number that judges it is
+        `won - ask`, not P&L: a cell of 0.90 contracts winning 92% is a good
+        arm and still loses money per contract next to a cell of 0.60
+        contracts winning 55%, and ranking those two on P&L would retire the
+        right arm and keep the wrong one.
+
+        ONE ROW PER MARKET, not per poll. A decision row is written every ten
+        seconds, so a single window contributes dozens of rows and pooling
+        them would count one outcome many times and shrink every interval to
+        nothing. The per-market ask is the one the market was entered at when
+        it was traded, and the mean of the window otherwise.
+
+        TRADED AND UNTRADED ARE SEPARATED, because they answer different
+        questions: the traded leg is what the arm did to real money, the
+        untraded leg is the counterfactual that keeps the sample honest when
+        the gates refuse most of what an arm touches.
+        """
+        where = ["feature_version = ?", "graded_ms IS NOT NULL",
+                 "context_key IS NOT NULL", "confidence_delta <> 0"]
+        args: list = [feature_version]
+        if policy_version:
+            where.append("policy_version = ?")
+            args.append(policy_version)
+        rows = _many(
+            self.db,
+            "SELECT context_key, "
+            "       CASE WHEN confidence_delta > 0 THEN 'raised' "
+            "            ELSE 'lowered' END AS direction, "
+            "       COUNT(*) AS markets, "
+            "       AVG(won) AS win_rate, "
+            "       AVG(ask) AS implied, "
+            "       AVG(COALESCE(fill_price, ask)) AS paid, "
+            "       SUM(filled) AS traded, "
+            "       AVG(confidence_delta) AS delta "
+            "  FROM (SELECT window_open, context_key, confidence_delta, "
+            "               MAX(won) AS won, AVG(ask) AS ask, "
+            "               MAX(filled) AS filled, "
+            "               AVG(fill_price) AS fill_price, "
+            "               MAX(graded_ms) AS graded_ms, "
+            "               feature_version, policy_version "
+            "          FROM intelligence_decisions "
+            "         GROUP BY window_open, context_key, "
+            "                  CASE WHEN confidence_delta > 0 THEN 1 "
+            "                       WHEN confidence_delta < 0 THEN -1 "
+            "                       ELSE 0 END) "
+            f" WHERE {' AND '.join(where)} "
+            " GROUP BY context_key, direction "
+            " ORDER BY markets DESC",
+            tuple(args),
+        )
+        out = []
+        for row in rows:
+            win = float(row["win_rate"] or 0.0)
+            implied = float(row["implied"] or 0.0)
+            residual = win - implied
+            delta = float(row["delta"] or 0.0)
+            # AGREEMENT is the only verdict this function gives. It says the
+            # arm moved the label the way the outcome went; it does not say
+            # the move was large enough, or that it survives multiplicity.
+            # Those bars belong to the trainer and are deliberately not
+            # reimplemented here.
+            agrees = (residual > 0) == (delta > 0)
+            out.append({
+                "context_key": row["context_key"],
+                "direction": row["direction"],
+                "markets": int(row["markets"] or 0),
+                "traded": int(row["traded"] or 0),
+                "win_rate": round(win, 4),
+                "implied": round(implied, 4),
+                "residual": round(residual, 4),
+                "mean_delta": round(delta, 2),
+                "agrees": bool(agrees),
+            })
+        return out
+
     def forward_scoreboard(self, feature_version: str = "") -> dict[str, dict]:
         """Per context key: how many orders an arm CHANGED, and what it cost.
 

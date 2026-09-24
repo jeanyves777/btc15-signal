@@ -723,6 +723,13 @@ class Store:
             # be compared against outcomes on equal footing.
             "brti_retrace": "REAL",
             "brti_choppiness": "REAL",
+            # WHAT THE LAYER WAS PERMITTED TO DO, as distinct from `authority`
+            # - which records only what was WITHHELD and is therefore NULL on
+            # every row where nothing was. Without this the archive cannot say
+            # whether a neutral decision was neutral because the evidence said
+            # so or because the operator had not granted the permission, and
+            # those are opposite facts about the same row.
+            "authority_granted": "TEXT",
         })
         # FORWARD EVALUATION. What each frozen candidate WOULD have changed on
         # a live signal, recorded beside what the unchanged strategy actually
@@ -3509,17 +3516,29 @@ class Store:
         for row in windows:
             window = row["window_open"]
             trade = self.db.execute(
-                "SELECT entry_order_id FROM trade_proposals "
+                "SELECT entry_order_id, id, fill_price, fee_paid "
+                "FROM trade_proposals "
                 "WHERE window_open = ? AND strategy = 'primary' AND status IN "
                 "('filled','protected','unprotected','exited') "
                 "ORDER BY created_at LIMIT 1",
                 (window,),
             ).fetchone()
             order_id = trade[0] if trade else None
+            # THE PRICE ACTUALLY PAID, not the ask the decision saw. Without
+            # it `realised_pnl` on this table is a COUNTERFACTUAL computed from
+            # `ask`, and an arm is then judged on a price nobody was charged.
+            # `fill_price` and `fee_cost` were declared here and never written
+            # - NULL on every row - so the archive could not tell a decision's
+            # estimate from the money.
             cursor = self.db.execute(
-                "UPDATE intelligence_decisions SET order_id = ?, filled = ? "
+                "UPDATE intelligence_decisions SET order_id = ?, filled = ?, "
+                "proposal_id = ?, fill_price = ?, fee_cost = ? "
                 "WHERE window_open = ? AND (filled IS NULL OR filled = 0)",
-                (order_id, 1 if trade else 0, window),
+                (order_id, 1 if trade else 0,
+                 trade[1] if trade else None,
+                 trade[2] if trade else None,
+                 trade[3] if trade else None,
+                 window),
             )
             linked += cursor.rowcount
         if linked:
