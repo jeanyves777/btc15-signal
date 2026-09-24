@@ -68,8 +68,52 @@ class KalshiBRTIRule:
     # it looks deliberate.
     min_brti_momentum_bps: float = 0.0
     require_momentum_alignment: bool = False
+    # MOMENTUM SCALES THE DISTANCE REQUIRED. The operator's reading, 2026-09-24:
+    # "a lot of momentum can mean distance can revert fast", so momentum should
+    # set how far you must be from the strike rather than which way you bet.
+    #
+    # Measured on 2,145 corpus markets sampled 660-360s, priced on the Kalshi
+    # book, day-clustered over 68 days:
+    #
+    #   deployed  >=10x any momentum      n=4350  +0.0268  [+0.012, +0.041]
+    #   proposed  calm >=10x, moving >=15x n=2861 +0.0364  [+0.020, +0.051]
+    #
+    # with the out-of-sample half BETTER than the whole (+0.0380). Non-calm
+    # setups at 10x return +0.0160 with a lower bound of exactly zero; they
+    # need 15x before the interval clears it.
+    #
+    # WHAT WAS MEASURED AND REJECTED: lowering the floor FOR calm setups. Edge
+    # rises with the floor even when calm (+0.0318 at 4x, +0.0560 at 15x), and
+    # the marginal band below 10x spans zero in every cut - 7-10x calm is
+    # +0.0242 [-0.006, +0.052]. So this raises the bar on moving markets and
+    # never lowers it on quiet ones.
+    #
+    # ALIGNMENT IS STILL OFF, and this is not it. Aligned +0.027 against
+    # against +0.026 on BRTI: the Binance-era separation (84.2% vs 71.4%)
+    # does not reproduce. Magnitude is the thing that carries; direction is not.
+    calm_momentum_bps: float = 5.0
+    moving_min_brti_normalized_distance: float = 15.0
     entry_from_seconds: int = 660
     entry_to_seconds: int = 360
+
+    def distance_floor_for(self, momentum_bps: float | None) -> tuple[float, str]:
+        """(floor, why) - the distance this setup must clear, and the reason.
+
+        Returned together so the alert can say WHICH floor applied. A gate
+        whose threshold moves without saying so reads as an inconsistent gate.
+        """
+        magnitude = abs(momentum_bps or 0.0)
+        if magnitude < self.calm_momentum_bps:
+            return self.min_brti_normalized_distance, "calm"
+        # NEVER BELOW THE CALM FLOOR. These are two independent fields, so a
+        # config could set the moving floor lower than the calm one and a
+        # busy market would need LESS cushion than a quiet one - the exact
+        # inverse of what was measured. Worse, raising
+        # `min_brti_normalized_distance` alone would then stop tightening the
+        # gate at all, which is how a test that sets it to 1e9 still saw
+        # setups pass.
+        return max(self.min_brti_normalized_distance,
+                   self.moving_min_brti_normalized_distance), "moving"
 
     @classmethod
     def load(cls, path: str | Path) -> "KalshiBRTIRule":
@@ -97,6 +141,7 @@ class KalshiBRTIRule:
         """
         direction = 1 if features.side == "UP" else -1
         aligned = direction * features.brti_momentum_bps
+        floor, regime = self.distance_floor_for(features.brti_momentum_bps)
         band = f"{self.min_ask * 100:.0f}-{self.max_ask * 100:.0f}c"
         return [
             {
@@ -107,18 +152,21 @@ class KalshiBRTIRule:
                 "value": ask,
             },
             {
+                # THE FLOOR MOVES WITH MOMENTUM, and says which one applied.
+                # A quiet market needs less cushion than a fast one, because
+                # a fast one can erase the cushion before expiry.
                 "name": "BRTI distance",
                 "passed": (
-                    features.brti_normalized_distance
-                    >= self.min_brti_normalized_distance
+                    features.brti_normalized_distance >= floor
                 ),
                 "pass_text": (
                     f"{features.brti_normalized_distance:.1f}x BRTI vol "
-                    f"(needs {self.min_brti_normalized_distance:.0f}x)"
+                    f"(needs {floor:.0f}x, {regime})"
                 ),
                 "fail_text": (
                     f"{features.brti_normalized_distance:.1f}x - needs "
-                    f"{self.min_brti_normalized_distance:.0f}x"
+                    f"{floor:.0f}x ({regime} market, "
+                    f"{abs(features.brti_momentum_bps or 0.0):.1f} bps)"
                 ),
                 "value": features.brti_normalized_distance,
             },

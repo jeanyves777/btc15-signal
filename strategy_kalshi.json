@@ -6,5 +6,7 @@
   "min_brti_momentum_bps": 0.0,
   "require_momentum_alignment": false,
   "entry_from_seconds": 660,
-  "entry_to_seconds": 360
+  "entry_to_seconds": 360,
+  "calm_momentum_bps": 5.0,
+  "moving_min_brti_normalized_distance": 15.0
 }
