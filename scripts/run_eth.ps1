@@ -39,5 +39,26 @@ $env:AUTO_DAILY_LOSS_LIMIT = "10"
 # it its own bot token and turn this back on.
 $env:TELEGRAM_COMMANDS_ENABLED = "false"
 
+# ITS OWN INTELLIGENCE ARTEFACTS. These default to runtime/, which is BTC's.
+# The learning runner WRITES the policy path, so without this the ETH
+# instance would have overwritten BTC's live policy at its first scheduled
+# fit - and in the meantime was reading BTC-fitted arms and applying them to
+# ETH decisions. Neither would have looked wrong: the arms are keyed on
+# distance-price-momentum, strings that exist for both instruments.
+$env:INTELLIGENCE_POLICY_PATH     = "runtime-eth/intelligence_policy.json"
+$env:INTELLIGENCE_CANDIDATES_PATH = "runtime-eth/intelligence_candidates.json"
+
+# LEARNING IS OFF FOR ETH UNTIL IT HAS AN ETH CORPUS.
+#
+# The corpus is data/brti_history.db + data/market_data.db - both BTC, and
+# both function defaults rather than settings. Fitting ETH arms on BTC rows
+# is the instrument-transfer mistake of FINDINGS 43 and 63, done silently.
+# `_corpus_mismatch` in learning_runner.py now REFUSES that fit outright, so
+# this flag is belt and braces rather than the only protection.
+#
+# ETH intelligence still RECORDS every decision. It simply has no arms to
+# apply, which is the honest state: no ETH policy has ever been fitted.
+$env:LEARNING_ENABLED = "false"
+
 New-Item -ItemType Directory -Force runtime-eth | Out-Null
 & .venv\Scripts\pythonw.exe scripts\run_service.py

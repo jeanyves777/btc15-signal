@@ -316,6 +316,35 @@ class LearningRunner:
         finally:
             self._busy = False
 
+    def _corpus_mismatch(self, rows: list[dict]) -> str:
+        """"" if the corpus is this instance's instrument, else why not.
+
+        The corpus carries tickers. `surface.asset` turns KXBTC15M-... into
+        BTC and KXETH15M-... into ETH, so the check is a comparison of the
+        instrument the rows describe against the one this process trades -
+        not a comparison of file paths, which is what a configuration check
+        would be and which is exactly what was missing.
+
+        A corpus with no recognisable tickers is NOT treated as a mismatch:
+        that is a fresh or synthetic set, and refusing it would stop a test
+        or a first run for a reason that has nothing to do with instruments.
+        """
+        from . import surface
+
+        mine = surface.asset(self.settings.kalshi_series)
+        if not mine:
+            return ""
+        seen = {surface.asset(r.get("ticker") or "") for r in rows}
+        seen.discard("")
+        if not seen or seen == {mine}:
+            return ""
+        wrong = ", ".join(sorted(seen - {mine}))
+        return (
+            f"corpus is {wrong} but this instance trades {mine}; refusing to "
+            f"fit {mine} arms on {wrong} rows (set a per-instrument corpus, "
+            f"or disable learning for this instance)"
+        )
+
     # ---------------------------------------------------------- training
     def _train(self, forward: dict, now_ms: int) -> TrainingOutcome:
         """Runs in a worker thread. Its own connection, read-only, no writes.
@@ -326,7 +355,7 @@ class LearningRunner:
         """
         outcome = TrainingOutcome()
         db = None
-        try:
+        try:  # noqa: PLR1702 - guarded below by _corpus_mismatch
             db = sqlite3.connect(
                 f"file:{self.settings.database_path}?mode=ro", uri=True
             )
@@ -336,6 +365,24 @@ class LearningRunner:
             outcome.provenance = provenance.payload()
             if not rows:
                 outcome.error = "no Kalshi-native rows available"
+                return outcome
+            # THE CORPUS MUST BE THE INSTRUMENT THIS PROCESS TRADES.
+            #
+            # `data/brti_history.db` and `data/market_data.db` are BTC, and
+            # they are function defaults rather than settings - so a second
+            # instance would fit an "ETH" policy entirely out of BTC rows and
+            # then write it to the policy path. On 2026-09-24 the ETH
+            # instance was ~6 hours from doing exactly that, and nothing in
+            # the fit would have looked wrong: the arms are keyed on
+            # distance-price-momentum, which are strings that exist for both.
+            #
+            # A threshold is a statement about one instrument's distribution
+            # (FINDINGS 43, 63). So is an arm. Checked here rather than
+            # trusted to configuration, because the failure is silent and the
+            # blast radius is another instance's live policy.
+            mismatch = self._corpus_mismatch(rows)
+            if mismatch:
+                outcome.error = mismatch
                 return outcome
             result = learning.train(
                 rows,
