@@ -1779,6 +1779,35 @@ class Store:
         state = self.recovery_state()
         return state.deficit, state.markets
 
+    def last_market_lost(self) -> bool | None:
+        """Did the most recently realised MARKET end down? None if none has.
+
+        THE FEED IS `realised_events`, the same append-only record recovery
+        folds: exchange-sourced, written once per settlement, and surviving a
+        restart. Reconstructing this from `trade_proposals` would be a second,
+        divergent notion of "a loss" sitting beside the ledger's.
+
+        GROUPED BY MARKET, because a position that was partly cashed out early
+        writes a `cash_out` row AND an `exchange` row for the remainder, and
+        either alone is a fraction of the market's result. 10 of 199 markets
+        are like that; summing them reproduces the broker's P&L exactly.
+
+        `settlements.yes_count/no_count` is NOT usable here for the same
+        reason it was not usable in the backtest: Kalshi books the SALE of a
+        YES as taking the NO side, so a closed position reads as holding both.
+
+        None, not False, when there is no history: a fresh database has not
+        observed a win, and a rule that upsizes on "not a loss" would be the
+        opposite of the one asked for.
+        """
+        row = self.db.execute(
+            "SELECT SUM(amount) FROM realised_events "
+            "GROUP BY ticker ORDER BY MAX(realised_ms) DESC LIMIT 1"
+        ).fetchone()
+        if row is None or row[0] is None:
+            return None
+        return float(row[0]) < 0.0
+
     def recovery_state(
         self, plan_steps: int = DEFAULT_RECOVERY_STEPS, now_ms: int | None = None
     ) -> RecoveryState:

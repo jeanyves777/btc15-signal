@@ -5374,3 +5374,310 @@ left unchanged deliberately for that reason. A setup failing only the reversal
 gate is never traded and is recorded with `rule_match = 0` regardless.
 
 1,213 tests pass.
+
+## 59. The hedge, optimized properly, and the reason it cannot work (2026-09-24)
+
+The operator asked for a hedge: alongside the main entry, buy the cheap
+opposite side and sell it early for whatever profit it offers while the main
+runs. Then, after three rounds of fixed configurations, the instruction that
+mattered — **"Do not just stay on fixed numbers. Always try to find the sweet
+spot."** That was right, and the sweep that followed is the answer.
+
+### What was searched
+
+12,384 cells over the real 10-second book, both sides quoted. The hedge is
+bought at its ask and sold at its bid — the prices a taker gets, not the mid.
+Kalshi only.
+
+| parameter | range |
+|---|---|
+| entry | 780s, 720s, 660s, 600s, 540s |
+| max hedge cost | 0.100 to 0.400, in 0.025 steps |
+| profit target | −0.05 to +0.30, in 0.01 steps |
+| deadline | expire, or sell regardless at 60/120/180/240/300/360/420s left |
+
+The deadline is there because the operator's rule has two parts that the
+earlier tests had collapsed into one. "Sold earlier regardless" does not mean
+*sell when green*; it means a losing hedge is closed for what it is still
+worth instead of being left to die at zero. Those are separate parameters and
+they were swept separately.
+
+**218 of 12,384 cells were positive — 2%.** Median per-hedge across the family
+−0.0445.
+
+### The maximum was an artefact, and finding that out is the point
+
+The best cell was entry 780s, cost ≤ 0.30, sell at +0.30, else expire:
++2.67 over 30 hedges. An earlier, cruder sweep had put "hold to settlement"
+on top of the same subset.
+
+Neither is a hedging result. One YES plus one NO always pays exactly $1.00 and
+always costs 1.010 plus two fees, so a *held* hedge is profitable precisely
+when the main leg loses. At 780s the main wins 52.8% while paying 74.5¢ and
+loses **−0.23 per market**. The optimizer found a bad entry time, not an edge,
+and dressed it as a hedge. Holding both legs there is a guaranteed −1.09.
+
+On its own terms the maximum does not survive either:
+
+```
+day-clustered bootstrap 95% CI on per-hedge : [-0.2579, +0.2628]   includes zero
+walk-forward, chosen on 09-20..09-22, scored on 09-23..09-24:
+  train  n=16  +1.11  (+0.0696/hedge)
+  TEST   n=17  -1.12  (-0.0662/hedge)   FAILED OUT OF SAMPLE
+```
+
+That is the fourth in-sample winner this session to reverse out of sample.
+
+### Why no sweet spot exists
+
+The hedge is priced for exactly the event it pays on.
+
+| entry | hedge ask | +fee | main actually loses | edge if held |
+|---|---|---|---|---|
+| 780s | 0.265 | 0.279 | 47.2% | +0.1934 |
+| 720s | 0.239 | 0.252 | 29.8% | +0.0467 |
+| 660s | 0.220 | 0.232 | 27.4% | +0.0420 |
+| **600s** | 0.215 | 0.227 | **20.0%** | **−0.0269** |
+| **540s** | 0.203 | 0.214 | **19.0%** | **−0.0246** |
+
+At the times the system actually enters, the opposite side costs about what it
+is worth and slightly more. The positive rows are the ones where the main leg
+is losing, which is a statement about entry timing, not about hedging.
+
+So the hedge can only earn from the *option to sell early* — and that option
+is adversely selected. It goes deep green when BRTI has moved against the main
+position, which is the same thing as the main being about to lose. Across
+12,384 exit rules, the best target at every single entry time was +0.30 or
+more: the rule that only fires when the main is already in trouble. Selling on
+a small wiggle, the operator's stated rule, was measured at its own best
+setting and lost:
+
+```
+12 min, 15-25c, sell on any profit  (best of the 36 fixed configurations)
+  sold in profit : 19 trades, avg +0.0548, total +1.04
+  never went green:  7 trades, avg -0.1963, total -1.37
+  NET                                      -0.33
+one dead hedge needs 3.6 sold hedges to pay for it
+```
+
+The operator's observation that both legs often close green is correct —
+13 of 26 at the 12-minute entry. The asymmetry is what defeats it: roughly
+5¢ won against roughly 20¢ lost.
+
+### The one thing worth keeping
+
+The main-leg column is not part of the hedge question but it is the strongest
+signal in the table: price-band-only selection at 780s / 720s / 660s loses
+−8.29 / −4.64 / −6.29, against −0.62 / −0.76 at 600s / 540s. That is a
+band-only filter, **not** the live gates, so it is not evidence that the
+deployed strategy should move its entry — but it is the third measurement this
+session pointing the same way, and it belongs on the list to test properly.
+
+**Nothing shipped.** The hedge is not deployed and no live code changed.
+
+## 60. Buy cheap, sell at 70-90c: the target is the winning outcome, sold for less (2026-09-24)
+
+Operator specification: buy a contract at 20-30c and sell it at 70-90% for
+profit. One leg only, no hedge, no second side. Compare against the deployed
+strategy.
+
+This is section 33's idea at a **much higher target** - 3-4x rather than 1.5x -
+so it was measured on its own terms, on the real 10-second book, 162 markets
+over 5 days, taker prices both ways.
+
+### Every configuration falls short, by about half
+
+At any instant one side of a binary is the cheap one. The test takes whichever
+side's ask is in the buy band, the first time it is, and sells at the bid.
+
+| buy band | sell at | trades | reached the target | needed to break even |
+|---|---|---:|---:|---:|
+| 0.15-0.25 | 0.70 | 162 | **18.5%** | 33.9% |
+| 0.15-0.25 | 0.80 | 162 | **14.8%** | 29.4% |
+| 0.15-0.25 | 0.90 | 162 | **13.0%** | 26.0% |
+| 0.20-0.30 | 0.70 | 159 | **22.6%** | 41.1% |
+| 0.25-0.35 | 0.70 | 158 | **27.8%** | 48.3% |
+
+All 27 configurations short, across every entry window tried (any time,
+5-15 min, last 5 min). Fees and spread do not explain a gap of that size.
+
+### Why: at 70-90c the "exit" is not an exit
+
+| buy band | sell at | won | reached | reached but LOST | won WITHOUT reaching |
+|---|---|---:|---:|---:|---:|
+| 0.15-0.25 | 0.70 | 16.7% | 18.5% | 6 | 3 |
+| 0.15-0.25 | 0.80 | 16.7% | 14.8% | 1 | 4 |
+| 0.15-0.25 | 0.90 | 16.7% | 13.0% | 0 | 6 |
+
+Reaching the sell price and winning are very nearly the same event - a handful
+of markets separate them out of 162. A binary's price converges to 0 or 1 as
+the window runs out, so a cheap side only reaches 70-90c by actually being
+about to win. **The take-profit is not collecting a swing while the outcome is
+still open; it is selling the winner for 70-90c instead of $1.00.**
+
+Which is why holding beats selling at every single target:
+
+```
+buy 0.15-0.25   sell 0.70  -11.62    hold  -10.60    selling costs  -1.02
+                sell 0.80  -12.56    hold  -10.60    selling costs  -1.96
+                sell 0.90  -11.71    hold  -10.60    selling costs  -1.12
+buy 0.25-0.35   sell 0.70  -16.19    hold  -12.27    selling costs  -3.92
+```
+
+Raising the target from 1.5x to 3-4x gives up less per winner than section 33
+measured, and it is still negative, because the entry is what loses.
+
+### The number
+
+```
+BEST OF 27: buy 0.15-0.25, sell 0.70
+  162 trades, 5 days, total -11.62, per trade -0.0717
+  winners 33/162 = 20.4%   avg win +0.553   avg loss -0.231
+  day-clustered bootstrap 95% CI: [-0.0791, -0.0503]   ENTIRELY BELOW ZERO
+  losing on 4 of 5 days
+```
+
+### Against the deployed strategy, read from the broker
+
+`settlements`, mirrored from Kalshi's own /portfolio/settlements:
+
+| | markets | contracts | total | per contract |
+|---|---:|---:|---:|---:|
+| **OTM, best of 27** | 162 | 162 | **−11.62** | **−0.0717** |
+| deployed, since 09-21 | 125 | 285 | **+5.50** | **+0.0193** |
+| deployed, all time | 197 | 938 | +0.17 | +0.0002 |
+
+The deployed strategy is **not** proven profitable - five days of live trading
+and its interval still spans zero, and the all-time figure includes two early
+days that lost 5.33 on a different configuration. What separates them is that
+OTM's interval does **not** span zero. It is the one of the two that is
+measurably losing.
+
+### This is the third independent test of the same idea
+
+| test | n | per trade | 95% CI |
+|---|---:|---:|---:|
+| `reversion_strategy.json` (spike setup, exit 0.50) | 760 | −0.0440 | [−0.0609, −0.0277] |
+| section 33 (no setup, exit 1.5x) | 4,876 | −0.0402 | [−0.0488, −0.0310] |
+| this one (no setup, exit 0.70-0.90) | 162 | −0.0717 | [−0.0791, −0.0503] |
+
+Three differently-built tests, three exit rules from 0.50 to 0.90, all
+negative with intervals clear of zero. The 4,876-trade test is much the
+strongest evidence and this small sample agrees with it.
+
+**The cause is structural, not parametric.** Section 1's favourite-longshot
+bias: favourites win MORE than their price implies, so longshots win LESS.
+Buying the 20-30c side is taking the wrong end of the only durable bias this
+market has, and the deployed strategy is profitable to the extent it takes the
+right end of that same bias. They are not two strategies to choose between -
+they are opposite sides of one bet, and this one is the losing side.
+
+**Decision: not deployed.** Nothing shipped, no live code changed. What would
+change it, unchanged from section 33: an entry filter that predicts WHICH
+cheap contracts come back, validated walk-forward.
+
+## 61. $3 after a loss: the gain is the ordering, and the risk is hidden (2026-09-24)
+
+Operator specification: on the recorded lifecycles, every time a trade loses,
+size the next trade at exactly $3; reset to base after a win. Consecutive
+losses stay at $3, so it is a step, not a martingale.
+
+### Two wrong datasets before the right one
+
+Worth recording, because both looked plausible and both were wrong.
+
+**`settlements` yes_count/no_count.** Kalshi books the SALE of a YES as taking
+the NO side, so a position opened at 0.82 and closed at 0.997 appears as
+"2 yes + 2 no" with `revenue_cents` = 0. 68 of 197 rows are like this. Reading
+an entry price out of that gave a **0.639 average entry and a 48.2% win rate**
+for a strategy that enters at 0.70-0.93 and wins 76% of its markets.
+
+**`fills`.** `fills.count` carries values like 186.97, 23.3 and 0.17 - not
+contract counts. 41 of 188 "buy" fills price below $0.10. A $1 base budget
+came out as 10,928 contracts over 139 markets.
+
+**What worked:** `trade_proposals` (integer counts, real fill prices, explicit
+`exit_price`) joined to Kalshi's settlement records, **keeping only rows whose
+arithmetic lands within 3c of the broker's P&L**. 146 of 154 filled proposals
+reconcile. The 8 that fail all show the broker AHEAD of the proposal row -
+the recovery add-on's extra contract, which sits outside the proposal.
+
+```
+146 reconciled lifecycles, 4 days
+  win rate 82.9%   average entry 0.821
+  as traded: +0.7074 over 233 contracts (+0.0030/contract)
+```
+
+### The result looks good
+
+| rule | contracts | P&L | per contract | max DD | worst day |
+|---|---:|---:|---:|---:|---:|
+| flat $1 | 146 | −0.26 | −0.0018 | −4.58 | −3.56 |
+| $2 after a loss | 171 | +1.92 | +0.0112 | −4.61 | −3.55 |
+| **$3 after a loss** | **202** | **+4.70** | **+0.0233** | **−4.37** | **−3.26** |
+| $4 after a loss | 230 | +6.45 | +0.0281 | −5.27 | −4.04 |
+| $5 after a loss | 260 | +8.85 | +0.0340 | −5.80 | −3.59 |
+
+**+4.96 over flat sizing, and the drawdown got no worse.** Monotone in the
+upsize, which is exactly what a real effect looks like.
+
+### It is the ordering
+
+Every dollar of that comes from one fact: the 25 trades that happened to
+follow a loss won **92.0%**, against 82.9% overall.
+
+```
+after a LOSS   n= 25  win 92.0%   P&L/ct +0.0827
+after a WIN    n=120  win 81.7%   P&L/ct -0.0082
+permutation p = 0.249  -> INDISTINGUISHABLE FROM CHANCE
+```
+
+The decisive test keeps every trade exactly as it was - same entry, same
+outcome, same per-contract result - and shuffles only the ORDER. That breaks
+the link between a loss and the next trade while leaving the edge, the prices
+and the win rate untouched.
+
+```
+actual gain of the $3 rule            : +4.96
+20,000 shuffles of the same trades    : mean +0.89, median +0.99
+5th..95th percentile                  : [-5.24, +6.60]
+shuffles matching or beating +4.96    : 12.9%   (p = 0.129)
+```
+
+One ordering in eight produces a gain this large from trades with no
+loss-to-next-trade link at all. The day-clustered CI on the difference agrees:
+**[−0.37, +10.30]**, spanning zero.
+
+**Upsizing after a loss does not create edge. It buys more contracts, which
+multiplies whatever edge already exists** - here +0.0030/contract as traded,
+which is indistinguishable from zero on 4 days.
+
+### The risk in the table is understated
+
+The observed drawdown of −4.37 is a lucky draw, not the rule's risk profile:
+
+```
+max drawdown of the $3 rule across the shuffles:
+  median -6.84    5% of orderings worse than -12.91    worst -22.42
+  the actual ordering gave -4.37
+```
+
+The sample's longest losing streak was **2**. At a 17.1% loss rate, 3 is
+expected within 146 trades and longer runs are routine over a month. A 5-loss
+run costs about **$12.31** at $3 a trade against **$4.10** flat - 62% of the
+$20 `auto_daily_loss_limit` versus 21%.
+
+### What this is, and whose call it is
+
+This is a **leverage decision, not an edge decision**. The rule multiplies
+exposure about 1.4x and multiplies the outcome - including the sign. With the
+underlying per-contract edge not yet established on 4 days of reconciled
+trades, upsizing amplifies a quantity whose sign is still unknown.
+
+The same is true of the shipped $2 step; this measurement does not single out
+the $3 proposal.
+
+**Nothing shipped. Sizing is the operator's decision and this is evidence for
+it, not a verdict on it.** What would change the reading: enough post-loss
+trades to separate 92% from 82.9% - roughly 300-400 of them at this gap, so
+weeks, not days.

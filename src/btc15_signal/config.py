@@ -426,6 +426,37 @@ class Settings(BaseSettings):
     # deficit is outstanding.
     recovery_upfront_upsize_enabled: bool = False
 
+    # THE LOSS STEP. Operator's rule, 2026-09-24: after a market that lost,
+    # the next trade is sized to a fixed DOLLAR budget; a win resets it to
+    # base. Consecutive losses stay at the same budget, so it is a step and
+    # not a martingale - exposure is bounded by `loss_step_max_contracts`
+    # whatever the streak.
+    #
+    # This is keyed on the LAST MARKET'S RESULT, not on the deficit. It is a
+    # different rule from `recovery_upfront_upsize_enabled` above, which sizes
+    # while money is still outstanding; this one asks only whether the
+    # previous market lost. Both may not run - see `loss_step_size`.
+    #
+    # THE EVIDENCE, recorded beside the decision because it does not support
+    # the rule on its own (FINDINGS 61). On 146 reconciled live lifecycles the
+    # $5 step returned +8.85 against -0.26 flat. But the whole gain comes from
+    # the 25 trades that happened to follow a loss winning 92.0% against 82.9%
+    # overall, which a permutation test could not separate from chance
+    # (p=0.249); shuffling the SAME trades into a different order reproduces a
+    # gain that large 12.9% of the time. The sample contains two 2-loss runs
+    # and NO 3-loss run, so the shallow drawdown it shows has never been
+    # tested by the thing that would move it: across shuffles the median max
+    # drawdown is -6.84 and the worst -22.42, against the -5.80 observed.
+    #
+    # The operator has decided with that measurement in view. It is their
+    # call - sizing always is - and it is implemented in full.
+    loss_step_enabled: bool = True
+    loss_step_budget: float = 5.00
+    # A HARD CEILING, not the rule. At the 0.70 floor of the price band $5
+    # buys 7, so this is headroom against a cheap fill, and the guard that
+    # stops a mispriced ask from turning a $5 budget into a large position.
+    loss_step_max_contracts: int = 8
+
     # THE CONDITIONAL RECOVERY ADD-ON (recovery_add.py).
     #
     # Live-test authorisation: $30 total, and `recovery_test_budget` is a

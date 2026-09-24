@@ -1104,6 +1104,59 @@ def recovery_size(
     )
 
 
+def loss_step_size(
+    store: Store, settings: Settings, base: int, ask: float,
+    lost: bool | None = None,
+) -> tuple[int, str]:
+    """(contracts, why) - after a losing market, size to a fixed dollar budget.
+
+    THE OPERATOR'S RULE, 2026-09-24: every time a trade loses, the next trade
+    is sized at exactly `loss_step_budget`; a win resets it to base.
+    Consecutive losses hold at the same budget rather than escalating, so
+    exposure is bounded by `loss_step_max_contracts` whatever the streak
+    length - this is a step, not a martingale.
+
+    IT KEYS ON THE LAST MARKET, NOT THE DEFICIT. `recovery_size` above sizes
+    while money is outstanding and divides it across a plan; this asks one
+    question - did the previous market lose - and that is the rule that was
+    measured. They must not both run, so the caller applies this LAST and the
+    upfront recovery upsize is off.
+
+    IT NEVER CAUSES A TRADE. Every gate has already passed by the time this is
+    called; it only decides the size of an order that is going out anyway. A
+    loss is never a reason to enter.
+
+    THE CEILING IS REAL WORK, not decoration. At the 0.70 floor of the price
+    band $5 buys 7 contracts; a stale or mispriced ask is what turns a dollar
+    budget into a position nobody chose, so the count is capped before it
+    leaves this function.
+
+    The evidence, which does not support the rule on its own, is recorded
+    against `loss_step_enabled` in config.py and in FINDINGS 61. The operator
+    decided with it in view.
+    """
+    if not settings.loss_step_enabled:
+        return base, ""
+    if lost is None:
+        lost = store.last_market_lost()
+    # None is "no market has settled yet" and must not upsize: a fresh
+    # database has not seen a win either, and "not a win" is the opposite of
+    # the rule asked for.
+    if not lost:
+        return base, ""
+    count = min(
+        contracts_for_budget(settings.loss_step_budget, ask),
+        settings.loss_step_max_contracts,
+    )
+    if count <= base:
+        # Empty reason, so no line claims an upsize that did not happen.
+        return base, ""
+    return count, (
+        f"last market lost - ${settings.loss_step_budget:.2f} buys {count} "
+        f"at {ask:.2f} (cap {settings.loss_step_max_contracts})"
+    )
+
+
 def partial_exit_pnl(
     *, paid: float, bid: float, filled: float, held: float,
     entry_fee: float | None, exit_fee: float | None,
@@ -1289,6 +1342,10 @@ MARKET_GAP: dict[str, int] = {}
 # Which window we have already asked the broker to confirm an entry fill for.
 # One request per window, and only while the sweep has not delivered it.
 ENTRY_CONFIRM: dict[str, int] = {}
+# Which window we have already announced the add-on standing down for, because
+# the loss step owns the size. Once per window: a line on every poll is how a
+# line that matters stops being read.
+STEP_STAND_DOWN: dict[str, int] = {}
 
 
 def mark(name: str) -> None:
@@ -2393,6 +2450,19 @@ async def primary_signal(
                     f"{recovery.deficit:.2f} outstanding",
                     flush=True,
                 )
+            # THE LOSS STEP, applied LAST so it is the single authority when
+            # it fires. The operator's 2026-09-24 rule sizes on the previous
+            # market's result, not on the deficit, and it was measured as the
+            # whole position - so when it applies it REPLACES the count rather
+            # than adding to it, and the conditional add-on stands down for
+            # this position. Two rules that each looked bounded is exactly how
+            # a cap gets exceeded by their sum.
+            last_lost = store.last_market_lost()
+            stepped, step_reason = loss_step_size(
+                store, settings, count, contract_ask, lost=last_lost
+            )
+            if step_reason:
+                count, size_reason = stepped, step_reason
             if count > 1:
                 print(f"auto: sizing {count} contracts - {size_reason}", flush=True)
             proposal = create_proposal(
@@ -3808,6 +3878,7 @@ async def service() -> None:
                     # and places nothing.
                     brti = reference.current_features()
                     position = store.open_position_detail(opened)
+                    stood_down = False
                     if brti is not None and position is not None:
                         # SINCE THE FILL, not since the window opened. The
                         # first live evaluation vetoed an add on a crossing
@@ -3842,6 +3913,33 @@ async def service() -> None:
                                 entry_ms, position[0], now_ms
                             )
                         crossed = crossing.crossed
+                        # NEVER STACK WITH THE LOSS STEP. When the previous
+                        # market lost, the base position was already sized to
+                        # the full `loss_step_budget` - that is the whole
+                        # position the rule was measured as. Resting another
+                        # contract behind it would add exposure to a size
+                        # nobody chose, which is the failure the single-sizing-
+                        # authority rule exists to prevent.
+                        #
+                        # Read here rather than carried from the order path
+                        # because the add-on also runs on a position that
+                        # survived a restart, where nothing was carried. While
+                        # a position is open the previous market's result
+                        # cannot change, so the two reads agree.
+                        stood_down = bool(
+                            settings.loss_step_enabled
+                            and store.last_market_lost()
+                        )
+                        if stood_down and STEP_STAND_DOWN.get("window") != opened:
+                            # Said once per window, not every poll: a line on
+                            # every beat is how a real message gets lost.
+                            STEP_STAND_DOWN["window"] = opened
+                            print(
+                                "recovery add: standing down - position is "
+                                "sized by the loss step",
+                                flush=True,
+                            )
+                    if brti is not None and position is not None and not stood_down:
                         await recovery_add.step(
                             trader=trader,
                             contract=contract,
