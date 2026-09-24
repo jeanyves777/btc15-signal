@@ -5116,3 +5116,29 @@ The next refit writes `by_session` into every arm. Until an arm clears
 validation, the multiplicity correction AND the session floor, the layer is
 connected and authorised with nothing actionable to say - which is not trade
 protection and must not be described as such.
+
+### 55b. The decision-to-order link (2026-09-23)
+
+`intelligence_decisions.order_id` and `.filled` were declared and never
+written - NULL on all 2,635 rows. Nothing broke, because `learning_data`
+reconciles executions from broker fills instead, but the columns were dead: a
+query joining a decision to the order it caused returned nothing, and every
+executed trade looked simulated.
+
+`link_intelligence_orders` joins them per WINDOW, which is the granularity
+that is true. A decision row is written every poll and only one poll produced
+the order, so `filled` means "this market was traded", not "this poll placed
+it" - the second is not a fact any single row can carry. An untraded market
+gets `filled = 0`, not NULL: "we did not trade this" is worth recording.
+
+Run over the archive: 2,640 rows linked, second run 0. Of the 106 windows
+carrying decisions, 60 were traded - and `trade_proposals` holds exactly 60
+filled windows inside that date range, so the link is complete rather than
+merely plausible. A `pending` proposal is an intention and does not count.
+
+Unrelated, resolved while checking: the refit was NOT overdue. The learner's
+own `settled_markets()` reads 97 against a watermark of 87 - **+10**, below
+the +24 trigger - where a naive `COUNT(DISTINCT ticker) FROM daily_ledger`
+suggested +97. The ledger counts every settled market; the learner counts what
+its own corpus can use. Use the learner's number when asking whether a fit is
+due.

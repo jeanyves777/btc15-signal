@@ -3426,6 +3426,49 @@ class Store:
             self.db.commit()
         return closed
 
+    def link_intelligence_orders(self, limit: int = 500) -> int:
+        """Join every decision row to the order its market actually produced.
+
+        `order_id` and `filled` were declared on `intelligence_decisions` and
+        never written - NULL on all 2,635 rows. Nothing broke, because
+        `learning_data` reconciles executions from broker fills instead, but
+        the columns were dead: a query joining a decision to the order it
+        caused got nothing, and every executed trade looked simulated.
+
+        Filled per MARKET, which is the granularity that is true. A decision
+        row is written every poll and only one poll produced the order, so
+        `filled` here means "this market was traded", not "this poll placed
+        it" - the second is not a fact any single row can carry.
+
+        Idempotent and cheap: only rows with a NULL `filled` are considered,
+        so once the archive is linked this costs one indexed scan and stops.
+        """
+        windows = self._dicts(
+            "SELECT DISTINCT window_open FROM intelligence_decisions "
+            "WHERE filled IS NULL ORDER BY window_open DESC LIMIT ?",
+            (limit,),
+        )
+        linked = 0
+        for row in windows:
+            window = row["window_open"]
+            trade = self.db.execute(
+                "SELECT entry_order_id FROM trade_proposals "
+                "WHERE window_open = ? AND strategy = 'primary' AND status IN "
+                "('filled','protected','unprotected','exited') "
+                "ORDER BY created_at LIMIT 1",
+                (window,),
+            ).fetchone()
+            order_id = trade[0] if trade else None
+            cursor = self.db.execute(
+                "UPDATE intelligence_decisions SET order_id = ?, filled = ? "
+                "WHERE window_open = ? AND filled IS NULL",
+                (order_id, 1 if trade else 0, window),
+            )
+            linked += cursor.rowcount
+        if linked:
+            self.db.commit()
+        return linked
+
     def settle_filled_adds(self, now_ms: int) -> int:
         """Close the lifecycle on a filled add, from the BROKER'S settlement.
 

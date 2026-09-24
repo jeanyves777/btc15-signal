@@ -3572,6 +3572,15 @@ async def service() -> None:
                         # `step` is not even called once the base position has
                         # exited, and `open_add` is keyed on the current
                         # window, so without this they stay open forever.
+                        # Join decision rows to the orders their markets
+                        # produced. Idempotent; stops once the archive is
+                        # linked.
+                        linked = store.link_intelligence_orders()
+                        if linked:
+                            print(
+                                f"intelligence rows linked to orders: {linked}",
+                                flush=True,
+                            )
                         stale = store.close_stale_deferred_adds(now_ms)
                         if stale:
                             print(

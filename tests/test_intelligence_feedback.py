@@ -194,3 +194,78 @@ def test_the_runner_asks_for_the_running_contract(tmp_path):
     assert "forward_scoreboard(" in src
     assert "feature_contract.CONTRACT.version" in src
     assert "forward_scoreboard()" not in src, "an unfiltered call would pool"
+
+
+# ------------------------------- joining a decision to the order it caused
+
+def traded(store, window, order_id="ord-1"):
+    store.db.execute(
+        "INSERT INTO trade_proposals (id, strategy, window_open, ticker, side,"
+        " entry_limit, take_profit, count, expires_at, close_ms, status,"
+        " created_at, entry_order_id, fill_price) VALUES "
+        "(?,'primary',?,?,'UP',0.8,0.99,2,0,0,'filled',0,?,0.79)",
+        (f"p{window}", window, f"T{window}", order_id),
+    )
+    store.db.commit()
+
+
+def test_a_traded_market_links_every_decision_row_to_its_order(tmp_path):
+    """`order_id` and `filled` were declared and never written - NULL on all
+    2,635 rows, so a query joining a decision to the order it caused got
+    nothing and every executed trade looked simulated."""
+    store = Store(str(tmp_path / "l1.db"))
+    decision(store, "T", "UP", 0.80, rid="a")
+    decision(store, "T", "UP", 0.81, rid="b")
+    traded(store, W, "ord-xyz")
+    assert store.link_intelligence_orders() == 2
+    rows = store._dicts("SELECT order_id, filled FROM intelligence_decisions")
+    assert all(r["order_id"] == "ord-xyz" for r in rows)
+    assert all(r["filled"] == 1 for r in rows)
+
+
+def test_an_untraded_market_is_marked_not_filled(tmp_path):
+    """Zero, not NULL. "We did not trade this" is a fact worth recording."""
+    store = Store(str(tmp_path / "l2.db"))
+    decision(store, "T", "UP", 0.80)
+    assert store.link_intelligence_orders() == 1
+    row = store._dicts("SELECT order_id, filled FROM intelligence_decisions")[0]
+    assert row["filled"] == 0
+    assert row["order_id"] is None
+
+
+def test_linking_is_idempotent(tmp_path):
+    store = Store(str(tmp_path / "l3.db"))
+    decision(store, "T", "UP", 0.80)
+    traded(store, W)
+    assert store.link_intelligence_orders() == 1
+    assert store.link_intelligence_orders() == 0, "already linked; stop"
+
+
+def test_an_unfilled_proposal_does_not_count_as_traded(tmp_path):
+    """`pending` is an intention, not an execution."""
+    store = Store(str(tmp_path / "l4.db"))
+    decision(store, "T", "UP", 0.80)
+    store.db.execute(
+        "INSERT INTO trade_proposals (id, strategy, window_open, ticker, side,"
+        " entry_limit, take_profit, count, expires_at, close_ms, status,"
+        " created_at, entry_order_id) VALUES "
+        "('p','primary',?,?,'UP',0.8,0.99,2,0,0,'pending',0,'ord-1')",
+        (W, "T"),
+    )
+    store.db.commit()
+    store.link_intelligence_orders()
+    row = store._dicts("SELECT order_id, filled FROM intelligence_decisions")[0]
+    assert row["filled"] == 0
+    assert row["order_id"] is None
+
+
+def test_each_window_links_to_its_own_order(tmp_path):
+    store = Store(str(tmp_path / "l5.db"))
+    decision(store, "T1", "UP", 0.80, window=W, rid="x")
+    decision(store, "T2", "UP", 0.80, window=W + 900_000, rid="y")
+    traded(store, W, "ord-first")
+    traded(store, W + 900_000, "ord-second")
+    store.link_intelligence_orders()
+    got = {r["ticker"]: r["order_id"] for r in store._dicts(
+        "SELECT ticker, order_id FROM intelligence_decisions")}
+    assert got == {"T1": "ord-first", "T2": "ord-second"}
