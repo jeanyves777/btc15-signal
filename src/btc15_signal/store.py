@@ -3764,7 +3764,7 @@ class Store:
             print(f"intelligence record failed: {exc!r}", flush=True)
 
     def grade_intelligence(self, window_open: int, winning_side: str,
-                           pnl: float, now_ms: int) -> None:
+                           pnl: float | None, now_ms: int) -> None:
         """Attach the outcome to every decision taken on this market.
 
         A veto and a rejected signal are graded too, as counterfactuals - they
@@ -3774,14 +3774,53 @@ class Store:
         `won` is per ROW, from that row's own side. One boolean for the market
         cannot be right for both sides of a window the model flipped inside,
         and the one the settlement loop had to hand was true by construction.
+
+        `realised_pnl` IS PER ROW TOO, and it used to be a literal 0.0. The
+        settlement loop passed a constant, so all 557 graded rows under the
+        live policy carried 0.0 and not one of them meant it - a column that
+        is always present, always zero and never true. Anything reading it
+        scored every trade as break-even, and `learning_data` had to route
+        around it and recompute from broker fills.
+
+        It is now the same per-contract counterfactual `grade_candidates`
+        already used one method above: what ONE contract bought at that row's
+        own decision-time ask would have returned, net of the fee. That is the
+        right quantity for a calibration - the money the account actually made
+        depends on size and on an exit this row knew nothing about, and it
+        lives in `daily_ledger`, which remains the only account figure.
+
+        `pnl` is still accepted and still overrides, for a caller that has a
+        better figure for the whole market; passing None asks for the per-row
+        computation.
         """
-        self.db.execute(
-            "UPDATE intelligence_decisions "
-            "SET won = CASE WHEN side=? THEN 1 ELSE 0 END, "
-            "realised_pnl=?, graded_ms=? "
-            "WHERE window_open=? AND graded_ms IS NULL",
-            (winning_side, pnl, now_ms, window_open),
+        from .validation import kalshi_fee_charged
+
+        rows = self._dicts(
+            "SELECT id, side, ask FROM intelligence_decisions "
+            "WHERE window_open = ? AND graded_ms IS NULL",
+            (window_open,),
         )
+        for row in rows:
+            won = row.get("side") == winning_side
+            ask = row.get("ask")
+            if pnl is not None:
+                realised = pnl
+            elif ask is None:
+                # No price was recorded, so there is no counterfactual to
+                # compute. NULL, never zero: "unknown" and "break-even" are
+                # different claims and only one of them is honest here.
+                realised = None
+            else:
+                realised = round(
+                    (1.0 if won else 0.0) - float(ask)
+                    - kalshi_fee_charged(float(ask), 1),
+                    6,
+                )
+            self.db.execute(
+                "UPDATE intelligence_decisions SET won=?, realised_pnl=?, "
+                "graded_ms=? WHERE id=?",
+                (int(won), realised, now_ms, row["id"]),
+            )
         self.db.commit()
 
     def intelligence_summary(self) -> dict:

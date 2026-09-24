@@ -3477,8 +3477,11 @@ async def service() -> None:
                                 lambda ask, won: (1.0 if won else 0.0) - ask
                                 - kalshi_fee_charged(ask, 1),
                             )
+                            # None, not 0.0: each row is scored at its own
+                            # decision-time ask, like the candidates above. The
+                            # constant made every graded row read break-even.
                             store.grade_intelligence(
-                                row[0], winning_side, 0.0, now_ms,
+                                row[0], winning_side, None, now_ms,
                             )
                         except Exception as exc:  # noqa: BLE001
                             print(f"intelligence grading failed: {exc!r}", flush=True)

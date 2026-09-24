@@ -333,7 +333,7 @@ class LearningStore:
         ).fetchone()
         return int(row[0] or 0) if row else 0
 
-    def forward_scoreboard(self) -> dict[str, dict]:
+    def forward_scoreboard(self, feature_version: str = "") -> dict[str, dict]:
         """Per context key: how many orders an arm CHANGED, and what it cost.
 
         Read from `candidate_evaluations`, which is the forward record: one row
@@ -341,7 +341,24 @@ class LearningStore:
         candidate actually disagreed with the rule count as changes - a
         candidate that "changed" a decision that already went its way changed
         nothing, and counting those would flatter every arm.
+
+        FILTERED TO ONE FEATURE VERSION. This pooled every row ever written,
+        so evidence gathered under RETIRED feature definitions was mixed into
+        the number that gates promotion and withdrawal of current arms. The
+        context key is only a label: `bd10-15 · px85-94` computed from brti-1
+        features is not the same population as the identical string computed
+        from brti-2, and 7 of the 16 rows on this database are exactly that -
+        `brti-cand-1790130402`, fitted before the feature reset. Judging a
+        brti-2 arm partly on brti-1 outcomes is the same class of mistake as
+        FINDINGS 49, where a retired artefact went on answering live.
+
+        Passing nothing keeps the old pooled behaviour for callers that
+        genuinely want every row; the runner passes the running contract.
         """
+        where, args = "", ()
+        if feature_version:
+            where = "WHERE feature_version = ? "
+            args = (feature_version,)
         rows = _many(
             self.db,
             "SELECT context_key, "
@@ -352,7 +369,9 @@ class LearningStore:
             "THEN 1 ELSE 0 END),0) AS graded_changes, "
             "COUNT(DISTINCT window_open) AS markets, "
             "proposed_action "
-            "FROM candidate_evaluations GROUP BY context_key, proposed_action",
+            f"FROM candidate_evaluations {where}"
+            "GROUP BY context_key, proposed_action",
+            args,
         )
         out: dict[str, dict] = {}
         for row in rows:

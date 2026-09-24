@@ -299,7 +299,9 @@ class LearningRunner:
             flush=True,
         )
         try:
-            forward = self.learning.forward_scoreboard()
+            forward = self.learning.forward_scoreboard(
+                feature_contract.CONTRACT.version
+            )
             # OFF THE LOOP. The fit reads ~38,000 BRTI points and bootstraps
             # every arm; on the poll thread that is a delayed fill.
             outcome = await asyncio.to_thread(
@@ -588,7 +590,9 @@ class LearningRunner:
             policy = Policy.load(self.policy_path)
             if not policy.active:
                 return
-            forward = self.learning.forward_scoreboard()
+            forward = self.learning.forward_scoreboard(
+                feature_contract.CONTRACT.version
+            )
             withdrawals = learning.deteriorated(
                 policy, forward,
                 min_changes=self.settings.learning_min_withdrawal_n,

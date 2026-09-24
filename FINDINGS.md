@@ -4949,3 +4949,96 @@ unreconciled - 0 non-terminal adds, 0 unsettled filled adds, 0 rows PENDING
 without an order id. The newest BRTI row at that moment carried `ts_ms`
 725ms behind `received_ms`, which is the lag this section is about, visible
 live and well inside what the gate now waits for.
+
+## 54. The live intelligence: what it does, and two numbers it fed itself (2026-09-23)
+
+Asked to verify the intelligence and self-learning are running. They are. Two
+of the numbers they feed on were wrong, both in the same way - always present,
+so every surface looked healthy, and always meaningless.
+
+### What is actually live
+
+| | |
+|---|---|
+| active policy | `kalshi-brti-2-1790189147`, 29 arms, valid on load |
+| decisions | 582 under this policy, ~100/hour, latest within a minute |
+| feature health | `features_ok = 0` on **none** of them |
+| diversity | 30 context keys, 24 evidence levels, 16 distinct reasons |
+| authority | `None` on all 582; vetoes off, admissions off, `overrides_gate` never set |
+| its one effect | the confidence delta → the header word |
+| learning loop | 5 runs, all `ok`, 0 consecutive failures, next fit on schedule |
+
+**The confidence adjustment is real and reaches the operator.** Replaying the
+recorded model score against the recorded delta through `confidence_label`:
+**31 of 581 decisions actually changed the header word** (e.g. 83 points +8 →
+MEDIUM becomes HIGH), with 107 more applying a delta that did not cross a
+label boundary. This is not the FINDINGS 49 state, where 928 of 1,097
+decisions were the identical refusal.
+
+**Whether the adjustment is any GOOD is not yet answerable**, and what little
+there is points the wrong way: over 45 graded markets, raised-confidence won
+5/6 (83%), lowered-confidence won 9/9 (100%), unchanged 27/30 (90%). Markets
+it was least sure about won most often. At n=6 and n=9 that is noise, not a
+refutation - but it is not evidence the calibration works either, and it
+should not be described as working until the counts are an order of magnitude
+larger.
+
+### Defect 1: the graded P&L was a literal zero
+
+`main` called `grade_intelligence(window, winning_side, 0.0, now_ms)` with a
+constant. All 557 graded rows under the live policy carried `realised_pnl =
+0.0` - a column always present, always zero, never true. `learning_data`
+already had to route around it and recompute from broker fills, with a comment
+saying so; anything else reading it scored every trade as break-even.
+
+Each row is now graded at **its own decision-time ask**, the same per-contract
+counterfactual `grade_candidates` uses one method above: `(1 if won else 0) -
+ask - fee`. A row with no recorded ask grades **NULL, not zero** - "unknown"
+and "break-even" are different claims. The account's own money is untouched
+and still comes from `daily_ledger`.
+
+### Defect 2: retired-feature evidence was gating live arms
+
+`forward_scoreboard` pooled **every** candidate evaluation ever written, with
+no filter on feature version, and that number gates both promotion
+(`forward evidence contradicts it`) and withdrawal (`deteriorated`).
+
+A context key is only a label. `asia · mid · bd10-15 · px85-94` computed from
+brti-1 features is not the same population as the identical string computed
+from brti-2. On this database 7 of 16 forward rows are `brti-cand-1790130402`
+- fitted before the feature reset - and they were being mixed into the
+evidence used to judge brti-2 arms. That is the FINDINGS 49 mistake again: a
+retired artefact still answering.
+
+The runner now passes the running contract. The stale context drops out:
+
+    pooled    asia · mid · bd10-15 · px85-94   7 changes  -0.8542
+              bd10-15 · px85-93 · mom5+        7 changes  +1.1645
+              bd15+ · px70-85 · mom5+          2 changes  +0.6607
+    brti-2    bd10-15 · px85-93 · mom5+        7 changes  +1.1645
+              bd15+ · px70-85 · mom5+          2 changes  +0.6607
+
+### Related, measured, and NOT changed
+
+The operator asked whether a candidate that vetoes only winners should be
+invalidated. `c01` did exactly that - 7 forward changes, 7 winners vetoed, 0
+losers, **-0.8542** - and nothing marked it invalid.
+
+It is not reachable: `deteriorated()` only withdraws **promoted execution
+arms**, and the promotion gate only consults forward evidence once
+`changes >= MIN_WITHDRAWAL_N` (20). At 7 changes a bad record gets no vote.
+Nothing has ever been promoted, so nothing has been at risk.
+
+Lowering that threshold is a statistical judgement about how few forward
+markets may overturn a validated arm, and it is the operator's to make, not a
+correctness fix - acting on 7 observations is the same overfitting the
+Holm-Bonferroni correction exists to prevent. **What WAS a correctness fix is
+that c01's rows should never have been in the brti-2 pool at all**, and after
+defect 2 they are not.
+
+### Still true, and worth restating
+
+`filled` and `order_id` are NULL on every `intelligence_decisions` row. The
+training path reconciles executions from broker fills instead, so the loop is
+not blind - but the columns are unpopulated and a reader joining on them gets
+nothing. Unmeasured, untouched here.
