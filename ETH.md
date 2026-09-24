@@ -52,19 +52,34 @@ weaker edge. 8x keeps ETH as selective as BTC.
 peak in a plateau rather than an isolated spike — but a swept maximum is
 always the cell most likely to be flattered.
 
-## Exposure: this is the operator's decision to make
+## Exposure: what is shared and what is not
 
-Two processes do not share the account guards, because they do not share a
-database. The practical effect:
+The two processes have separate databases, so most guards are per-instance.
+But the daily loss floor is NOT, and that is worth being exact about.
 
-* **two open positions** are possible, one per instrument, not one
-* **two daily loss floors** of `AUTO_DAILY_LOSS_LIMIT` each — $40 total at
-  the current $20, not $20
-* trades-per-hour and per-day caps apply per instrument
-* recovery, the deficit and the loss step are tracked per instrument
+**Shared, because it comes from the broker.** `auto_state` takes the daily
+realised figure as the more negative of a local reconstruction and
+`exchange_record`, and `exchange_record` reads `settlements` - the whole
+Kalshi account. Both instances therefore see the SAME number. Verified live
+on 2026-09-24: `btc15.db` and `eth15.db` both reported
+`realised_today = -5.2883` with zero ETH trades ever placed.
 
-`run_eth.ps1` sets `AUTO_DAILY_LOSS_LIMIT=10` so the COMBINED floor stays at
-the $20 already configured, rather than silently becoming $40.
+So the floors do not add up. With BTC at $20 and ETH at $10:
+
+* ETH stands down once the ACCOUNT is down $10
+* BTC keeps trading until the ACCOUNT is down $20
+* the binding limit on total account loss is BTC's $20, unchanged
+
+Halving ETH's floor does not preserve a combined $20 - it makes ETH the first
+to stop. That is a deliberate and conservative arrangement for a strategy on
+its first days live, not a cap on total loss.
+
+**Not shared, genuinely per-instance:**
+
+* **concurrent positions** - each process holds one, so the account can hold
+  TWO. This is the real exposure change.
+* trades-per-hour and per-day caps
+* the loss step, which reads each database's own `trade_proposals`
 
 ## Only one instance listens for commands
 

@@ -105,14 +105,34 @@ def test_eth_artefacts_are_gitignored():
         assert pattern in ignore, pattern
 
 
-def test_the_exposure_change_is_documented():
-    """Two processes do not share the account guards. That doubles the
-    concurrent positions AND the daily loss floor, and it is the operator's
-    decision - so it must be stated where they will read it, not inferred."""
+def test_the_exposure_change_is_documented_accurately():
+    """The real exposure change is CONCURRENT POSITIONS, not the loss floor.
+
+    The first version of this doc said two instances meant two $20 floors and
+    therefore $40. That was wrong: `auto_state` takes the daily realised
+    figure as the more negative of a local reconstruction and
+    `exchange_record`, and `exchange_record` reads `settlements` - the whole
+    Kalshi account. Both instances see the SAME number, verified live with
+    both databases reporting -5.2883 while ETH had never traded. The floors
+    do not add; the lower one simply stands down first."""
     doc = (ROOT / "ETH.md").read_text(encoding="utf-8")
-    assert "two open positions" in doc
-    assert "two daily loss floors" in doc.lower() or "$40" in doc
-    assert "AUTO_DAILY_LOSS_LIMIT" in doc
+    assert "TWO" in doc and "concurrent positions" in doc
+    assert "exchange_record" in doc, "the shared-floor mechanism must be named"
+    assert "do not add up" in doc or "do not add" in doc
+    assert "$40" not in doc, "the additive-floor claim was wrong"
+
+
+def test_the_shared_floor_claim_matches_the_code():
+    """Documentation that drifts from the code is worse than none. If
+    `exchange_record` stopped being account-wide, the doc above would be
+    describing a system that no longer exists."""
+    import inspect
+
+    from btc15_signal.store import Store
+
+    source = inspect.getsource(Store.exchange_record)
+    assert "FROM settlements" in source
+    assert "strategy" not in source, "it must not filter to one instrument"
 
 
 # ------------------------------------- only one instance owns the commands
