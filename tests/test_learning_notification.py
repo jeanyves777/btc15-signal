@@ -18,6 +18,7 @@ sys.path.insert(0, str(ROOT / "src"))
 from btc15_signal import messages  # noqa: E402
 from btc15_signal.config import Settings  # noqa: E402
 from btc15_signal.store import Store  # noqa: E402
+from btc15_signal import feature_contract  # noqa: E402
 
 RUNNER = (ROOT / "src" / "btc15_signal" / "learning_runner.py").read_text(
     encoding="utf-8")
@@ -69,7 +70,7 @@ def test_no_identifier_reaches_the_operator():
     """Policy ids, fingerprints, methods and splits stay in the log."""
     text = messages.learning_update(
         markets=6428, confidence_changes=3, entry_changes=0)
-    for leak in ("kalshi-brti", "arms-nested", "brti-2", "fingerprint",
+    for leak in ("kalshi-brti", "arms-nested", feature_contract.CONTRACT.version, "fingerprint",
                  "holdout", "validate", "policy", "retired", "superseded",
                  "9e41a3df"):
         assert leak not in text.lower(), f"{leak} leaked into the alert"

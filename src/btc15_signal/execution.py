@@ -543,6 +543,46 @@ class KalshiExecutionClient:
         except (httpx.HTTPError, ValueError, KeyError):
             return []
 
+    async def settlement_facts(self, ticker: str) -> dict:
+        """Kalshi's target and settling value for one settled market.
+
+        `/portfolio/settlements` says whether a market resolved yes or no and
+        what it paid, but not BY HOW MUCH - and the margin is the part that
+        distinguishes an 83c favourite settling comfortably from one that
+        settled by a hair. The market object carries both:
+
+            floor_strike       the target price the signal message quotes
+            expiration_value   where the settling BRTI actually finished
+
+        Read from the broker rather than recomputed from our own reference
+        archive, for the same reason the P&L is: this is the number Kalshi
+        settled on, and a local reconstruction that disagrees with it is wrong
+        by definition. `/markets/{ticker}` is public, so no signature is needed
+        and a failure here can never affect an order.
+
+        Returns {} rather than raising: enrichment is bookkeeping, and a market
+        that will not answer must not interrupt a poll that has money in it.
+        """
+        try:
+            response = await self.client.get(
+                f"{self.base_url}/markets/{ticker}")
+            response.raise_for_status()
+            market = response.json().get("market") or {}
+        except Exception:  # noqa: BLE001 - never break a poll for bookkeeping
+            return {}
+
+        def number(value):
+            try:
+                return None if value is None else float(value)
+            except (TypeError, ValueError):
+                return None
+
+        return {
+            "strike": number(market.get("floor_strike")),
+            "expiration_value": number(market.get("expiration_value")),
+            "result": market.get("result"),
+        }
+
     async def _paginate(self, path: str, key: str, limit: int) -> list[dict]:
         """Kalshi caps a page at 200 and hands back a cursor."""
         out: list[dict] = []

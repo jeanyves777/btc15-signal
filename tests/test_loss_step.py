@@ -1,4 +1,4 @@
-"""The loss step: $5 after a losing market, base after a win.
+"""The loss step: $2 after a losing market, base after a win.
 
 THE OPERATOR'S RULE, 2026-09-24, shipped on their decision with the evidence
 against it recorded beside it (config.py, FINDINGS 61). What these tests pin
@@ -180,10 +180,22 @@ def test_the_cap_holds_across_the_whole_price_band(tmp_path):
 
 
 def test_the_shipped_settings_are_the_decided_ones():
+    """$5 on 2026-09-24, reduced to $2 the same day: "5 is too risky just to
+    make 50". The operator's judgement was about a ratio the backtest never
+    addressed - and the drawdown was the least-evidenced number in that result,
+    since the sample held two 2-loss runs and no 3-loss run."""
     s = Settings()
     assert s.loss_step_enabled is True
-    assert s.loss_step_budget == 5.00
+    assert s.loss_step_budget == 2.00
     assert s.loss_step_max_contracts == 8
+
+
+def test_two_dollars_cannot_buy_a_large_position():
+    """The point of the reduction: at every price in the band, a post-loss
+    trade is a small number of contracts rather than a step-change in risk."""
+    from btc15_signal.main import contracts_for_budget
+    for ask in (0.70, 0.80, 0.93):
+        assert contracts_for_budget(2.00, ask) <= 3, ask
 
 
 # ----------------------------------------------- it cannot stack, or create

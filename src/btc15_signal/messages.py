@@ -769,6 +769,36 @@ def _cents(price: float) -> str:
             else f"{value:.1f}¢")
 
 
+
+def _margin_lines(margin: dict | None) -> list[str]:
+    """How far past the target the market finished, in bps and in dollars.
+
+    BPS LEADS because the dollar figure is not comparable between instruments
+    and the bps figure demonstrably is: measured over 143 BTC and 14 ETH
+    executed trades, winners finished a mean 18.3 bps past the target on BOTH,
+    and losers fell 6.4 / 6.5 bps short. A $128 move on BTC and a $4.37 move on
+    ETH are the same event, and only one of those units says so.
+
+    The wording distinguishes three outcomes rather than signing a number:
+    "past" for a favourable finish, "short of" for an adverse one, and a
+    settlement exactly on the strike is named as such - that is the case a
+    reader would otherwise take for a rounding artefact.
+
+    Returns a LIST so an absent margin contributes no line at all. Kalshi
+    publishes the two numbers on the market object and the enrichment pass may
+    not have run yet; "not fetched" and "finished level with the target" are
+    different facts and must not render the same.
+    """
+    if not margin:
+        return []
+    favourable = float(margin.get("favourable") or 0.0)
+    bps = float(margin.get("bps") or 0.0)
+    if abs(favourable) < 0.005:
+        return ["\U0001f4cf Settled exactly ON the target"]
+    word = "past" if favourable > 0 else "short of"
+    return [f"\U0001f4cf Settled ${abs(favourable):,.2f} {word} "
+            f"the target \u00b7 {bps:.1f} bps"]
+
 def settlement(
     *,
     head: str,
@@ -791,6 +821,14 @@ def settlement(
     paper: bool = False,
     exact: bool = True,
     record: str = "",
+    # BY HOW MUCH the market finished past the target, from `Store
+    # .settlement_margin` - Kalshi's own `floor_strike` and
+    # `expiration_value`. The lifecycle recorded whether a trade won and what
+    # it paid but never the MARGIN, which is what says an 83c favourite
+    # settled comfortably rather than by a hair. None when Kalshi has not
+    # published both numbers yet, which is different from a margin of zero:
+    # finishing exactly on the strike is a real and reportable outcome.
+    margin: dict | None = None,
 ) -> str:
     """How a window closed, and what it did to the account.
 
@@ -843,6 +881,7 @@ def settlement(
             "",
             f"{chip_side} Signal: <b>{side}</b>{priced}",
             f"\U0001f3c1 Market settled <b>{winner}</b>",
+            *_margin_lines(margin),
             # WHY it was not traded, not just that it was not. A signal the
             # rule approved and nobody pressed is a different miss from one the
             # rule refused, and only the first is a trade that got away.
@@ -873,6 +912,7 @@ def settlement(
             "",
             f"{chip_side} Bought <b>{side}</b>{priced}",
             f"\U0001f3c1 Market settled <b>{winner}</b>",
+            *_margin_lines(margin),
             "\U0001f9fe <i>The money for this one is not settled yet.</i>",
         ]
         if record:
@@ -921,6 +961,7 @@ def settlement(
             "",
             f"{chip_side} Bought <b>{side}</b>{priced}",
             f"\U0001f3c1 Market settled <b>{winner}</b>",
+            *_margin_lines(margin),
         ]
         # THE CALL, on its own line, every time. It is a different fact from
         # the money and it is the one that was silently inverted: the 12:15
@@ -2109,7 +2150,8 @@ def result_message(*, side: str, ticker: str, winner: str, won: bool,
                    exited_at: float | None = None,
                    called_side: str = "", qualified: bool | None = None,
                    position: dict | None = None,
-                   snapshot=None, insight: str = "", priority=None) -> str:
+                   snapshot=None, insight: str = "", priority=None,
+                   margin: dict | None = None) -> str:
     """How a window closed. Three facts, never collapsed into one verdict.
 
         WIN / LOSS / CLOSED       the broker's realised P&L after fees
@@ -2184,6 +2226,10 @@ def result_message(*, side: str, ticker: str, winner: str, won: bool,
         f"\U0001f3c1 Market{' later' if exited_at is not None else ''} "
         f"settled <b>{escape(winner)}</b>"
     )
+    # BY HOW MUCH, beside the fact that it settled. Whether a trade won was
+    # always here; the MARGIN never was, and it is what distinguishes an 83c
+    # favourite finishing comfortably from one that finished by a hair.
+    essentials.extend(_margin_lines(margin))
     # THE CALL, always, on its own line and in its own words.
     essentials.append(
         f"{surface.PASS if call_right else surface.FAIL} {escape(call)} "

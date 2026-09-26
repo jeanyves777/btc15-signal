@@ -57,6 +57,8 @@ CREATE TABLE IF NOT EXISTS brti_decision_points (
     brti_accel REAL,
     brti_held_s REAL,
     brti_rejections INTEGER,
+    brti_retrace REAL,
+    brti_choppiness REAL,
     PRIMARY KEY (ticker, remaining_s)
 );
 CREATE TABLE IF NOT EXISTS brti_fetched (
@@ -95,7 +97,12 @@ async def run(args) -> None:
     have = {r[1] for r in out.execute("PRAGMA table_info(brti_decision_points)")}
     for column, kind in (("brti_rsi", "REAL"), ("brti_accel", "REAL"),
                          ("brti_held_s", "REAL"),
-                         ("brti_rejections", "INTEGER")):
+                         ("brti_rejections", "INTEGER"),
+                         # Added 2026-09-25. The live rule gates on both and no
+                         # corpus held either, so every fit to date treated two
+                         # live gates as absent.
+                         ("brti_retrace", "REAL"),
+                         ("brti_choppiness", "REAL")):
         if column not in have:
             out.execute(
                 f"ALTER TABLE brti_decision_points ADD COLUMN {column} {kind}")
@@ -147,6 +154,8 @@ async def run(args) -> None:
                     "brti_momentum_bps": f.brti_momentum_bps,
                     "brti_volatility_bps": f.brti_volatility_bps,
                     "brti_normalized_distance": f.brti_normalized_distance,
+                    "brti_retrace": f.brti_retrace,
+                    "brti_choppiness": f.brti_choppiness,
                     "brti_side": f.side,
                     "samples": f.samples,
                     "brti_rsi": f.brti_rsi,
@@ -160,11 +169,11 @@ async def run(args) -> None:
                     "(ticker, remaining_s, open_ms, close_ms, target, "
                     " expiration_value, result, brti_value, signed_distance_bps, "
                     " brti_momentum_bps, brti_volatility_bps, "
-                    " brti_normalized_distance, brti_side, samples, brti_rsi, brti_accel, brti_held_s, brti_rejections) "
+                    " brti_normalized_distance, brti_side, samples, brti_rsi, brti_accel, brti_held_s, brti_rejections, brti_retrace, brti_choppiness) "
                     "VALUES (:ticker, :remaining_s, :open_ms, :close_ms, :target, "
                     " :expiration_value, :result, :brti_value, :signed_distance_bps, "
                     " :brti_momentum_bps, :brti_volatility_bps, "
-                    " :brti_normalized_distance, :brti_side, :samples, :brti_rsi, :brti_accel, :brti_held_s, :brti_rejections)",
+                    " :brti_normalized_distance, :brti_side, :samples, :brti_rsi, :brti_accel, :brti_held_s, :brti_rejections, :brti_retrace, :brti_choppiness)",
                     rows,
                 )
             out.execute(

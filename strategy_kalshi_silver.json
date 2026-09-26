@@ -1,0 +1,38 @@
+{
+  "_comment": "SILVER (KXSILVER15M). PROVISIONAL - deployed for LIVE DATA CAPTURE with automation OFF. Refitted 2026-09-25 under brti-4 as a COMPLETE SET on silver's own corpus, 4,017 priced points over 677 markets and 31 days. None of it inherited from BTC or gold. The honest status is in _status.",
+
+  "_defect_repaired": "WHAT THIS REPLACES, recorded because it ran live for days. The previous config held seven thresholds, each picked from its own best bucket in isolation: price 0.50-0.60, distance <=2bp, held >=60s, rejections >=10, momentum <=10bp, accel +-10, plus a retrace gate inherited from BTC. Each was defensible alone. Intersected, they admitted 2 of 4,017 corpus points - 0.05% - and under the live rule with retrace included, NOTHING: 423 live evaluations, zero qualified, every market blocked. The band was also simply in the wrong place; live silver asks sit around 0.77 and the band ended at 0.60. A configuration that admits nothing cannot be learned from and cannot be shown wrong, which is why the volume floor below is a constraint and not a preference.",
+
+  "_status": "TIER A ON THE FITTED SAMPLE, NOT REPLICATED. The set clears all three requirements on the merged corpus - 15%+ volume, its own interval above zero, and gating demonstrably beating not gating - and both disjoint halves hold (+0.0624 and +0.0506). But re-scored on the older sub-corpus alone it reads +0.0340 [-0.0098, +0.0764], spanning zero, and the gated-minus-ungated test there does not show (+0.0101 [-0.0242, +0.0449]). So more than half the measured edge comes from one of the two samples. Gold's equivalent check held on both. Silver has NOT met that bar and must not be read as established: automation stays off and this exists to generate live evidence at a volume the learned layer can actually use.",
+
+  "enabled": true,
+
+  "_band_comment": "0.65-0.85, moved up from 0.50-0.60. The old band came from the single price bucket that cleared zero marginally; jointly with the other gates the edge sits where silver is actually quoted. Marginally the residual falls monotonically with price (0.40-0.55 +0.0318 down to 0.85+ +0.0054) and no single bucket clears zero, which is exactly why the band had to be chosen inside a complete set rather than from its own table.",
+  "min_ask": 0.65,
+  "max_ask": 0.85,
+
+  "_distance_comment": "An absolute bps BAND, like gold's, because silver's normalised distance median is 0.86 - every silver setup sits under 1x its own volatility, so BTC's normalised floor cannot discriminate at all. The band is WIDER than the old 0.1-2.0: that ceiling was fitted under the 900s lookback and on a marginal table, and the joint fit under brti-4 puts the useful range at 0.5-12bp. The floor at 0.5 still excludes setups sitting on the strike, where the contract is a coin flip.",
+  "min_abs_distance_bps": 0.5,
+  "max_abs_distance_bps": 12.0,
+  "min_brti_normalized_distance": 0.0,
+  "moving_min_brti_normalized_distance": 0.0,
+  "calm_momentum_bps": 5.0,
+
+  "_timing_comment": "THE WINDOW THAT ACTUALLY RUNS. Two independent windows gate entry and only their intersection executes: `settings.entry_from_seconds`/`entry_to_seconds` (660/360 by default, and no launcher overrides them) is checked in main.py BEFORE the rule is consulted, and these two keys are checked again inside the rule. This config previously said 700-400s, a span the service could never use. BEHAVIOUR IS UNCHANGED and the fit is unaffected: the corpus holds decision points at 360, 420, 480, 540, 600 and 660 seconds only, so 700-400s selected exactly the minutes live ran. Narrowed to what it always meant, so the config stops advertising a span that cannot happen - and so that widening the Settings window later cannot silently start trading minutes no corpus point covers. 6.7-11.6 minutes left, widened from 550-400s. The joint fit compared this against 800-250s and kept the wider one - the old 550s start came from a marginal timing table and cost volume for nothing.",
+  "entry_from_seconds": 660,
+  "entry_to_seconds": 420,
+
+  "_gates_comment": "MEASURED ON SILVER, each direction read from the data rather than copied. Momentum is a CEILING at 10bp, not a floor: silver's edge is level-maintenance, so a fast move means the level is being left behind, which is BTC's setup and not silver's. Acceleration is a BAND at +-25: silver's 0..+10 bucket holds (+0.0457 [+0.0214, +0.0717]) while both extremes are negative (< -10 is -0.0048, +10 and up is -0.0147), so a hard-accelerating move is evidence AGAINST the trade - the opposite of BTC, which wants accel high. Level held drops from >=60s to >=10s and rejections from >=10 to >=1: both of those numbers were fitted against the OLD 900s lookback, so they described a quantity that no longer exists, and re-measured under brti-4 they cost volume without adding residual.",
+  "min_brti_held_s": 10.0,
+  "min_brti_rejections": 1,
+  "min_brti_momentum_bps": 0.0,
+  "max_brti_momentum_bps": 10.0,
+  "min_brti_accel": -25.0,
+  "max_brti_accel": 25.0,
+  "require_momentum_alignment": false,
+
+  "_retrace_comment": "MEASURED FOR THE FIRST TIME, and it was the live-only blocker. brti_retrace was never stored in any corpus, so every previous fit scored candidate sets as though this gate were absent while live enforced BTC's inherited (0.60, require-measurable) - which is why the corpus said 7.2% and live said 0%. The backfill now records it. On silver, of the four options only <=0.90 clears zero (+0.0673 [+0.0026, +0.1222]); <=0.40, <=0.60 and <=0.60/require all span it. require_measurable_retrace goes to false: it binds on 3.2% of points and on a level-maintenance instrument a window with no advance to give back is the TARGET state, not a missing measurement.",
+  "max_brti_retrace": 0.90,
+  "require_measurable_retrace": false,
+  "asset": "SILVER"
+}

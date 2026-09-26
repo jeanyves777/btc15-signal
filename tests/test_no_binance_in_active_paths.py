@@ -22,6 +22,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from btc15_signal import feature_contract
 from btc15_signal import intelligence_policy as intel  # noqa: E402
 from btc15_signal.adaptive import brti_context_of  # noqa: E402
+from btc15_signal import feature_contract  # noqa: E402
 
 RUNTIME = Path(__file__).resolve().parents[1] / "runtime"
 

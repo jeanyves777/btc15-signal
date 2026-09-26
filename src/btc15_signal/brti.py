@@ -154,6 +154,21 @@ class BRTIFeatures:
     brti_accel: float | None = None
     brti_held_s: float | None = None
     brti_rejections: int | None = None
+    # THE SAME QUANTITIES OVER 45 MINUTES, recorded as CONTEXT beside the
+    # 300-second ones rather than instead of them.
+    #
+    # The operator's instruction, 2026-09-25: every feature should see 45
+    # minutes "for insight", while the current window "still matters more".
+    # So the gates keep reading `brti_momentum_bps` and `brti_volatility_bps`
+    # exactly as before - nothing about what qualifies changes - and these
+    # answer a different question: is the last five minutes typical of the
+    # last forty-five, or is it the exception?
+    #
+    # A 300-second window cannot tell a market that has been drifting all hour
+    # from one that just turned. Both read the same momentum; only the wider
+    # view separates them.
+    brti_momentum_45m_bps: float | None = None
+    brti_volatility_45m_bps: float | None = None
 
     @property
     def side(self) -> str:
@@ -205,6 +220,29 @@ def features_from_series(
     retrace_window_s: int = 120,
     choppiness_window_s: int = 900,
     rsi_window_s: int = 900,
+    # THE LEVEL LOOKBACK. 2,700s of price action ending at the decision, which
+    # takes in the current running window AND the 30-45 minutes before it.
+    #
+    # It was 900s - the market's OWN window - and the strike IS that window's
+    # opening price, so every window began with price sitting on the strike,
+    # inside the rejection threshold. A clean one-way move therefore scored
+    # exactly 1 rejection: its own departure. Reaching 2 required the move to
+    # have wobbled back toward the strike.
+    #
+    # The deployed gate asks for >= 2, so it refused the cleanest setups. Over
+    # 19,305 corpus points the refused bucket led on every measure - distance
+    # 8.33 against 4.58, held 241s against 212s, momentum 6.3 against 3.2, and
+    # 75.6% wins against 66.9% - with corr(rejections, distance) = -0.319. The
+    # metric measured the opposite of its own name.
+    #
+    # The feed already carried the fix: every market's series is the hour
+    # ending at its close, so 45 minutes of price BEFORE the window opens was
+    # being fetched and discarded. Widening the lookback lets a rejection mean
+    # what it says - price approached this level and was turned back - instead
+    # of counting the move leaving its own starting point. Measured over the
+    # same markets the median goes 1 -> 2, so the gate becomes satisfiable by
+    # an ordinary clean setup rather than refusing it by construction.
+    level_window_s: int = 2700,
     rsi_bucket_s: int = 60,
 ) -> BRTIFeatures | None:
     """Gate inputs from a BRTI series. Returns None rather than guessing.
@@ -289,7 +327,8 @@ def features_from_series(
     # All computed on the winning side's sign, so UP and DOWN read the same
     # way: positive `accel` means the move is still working FOR the position.
     sign = 1.0 if side_up else -1.0
-    level_pts = [(t, v) for t, v in ordered if t >= ts_ms - 900_000]
+    level_pts = [(t, v) for t, v in ordered
+                 if t >= ts_ms - level_window_s * 1000]
 
     def _drift(lo_ms: int, hi_ms: int) -> float | None:
         seg2 = [v for t, v in level_pts if ts_ms - hi_ms <= t <= ts_ms - lo_ms]
@@ -324,6 +363,28 @@ def features_from_series(
                     rejections += 1
                     inside = False
 
+    # The 45-minute context. Same arithmetic as the 300s pair, wider window -
+    # so the two are directly comparable and their RATIO is the insight: a
+    # momentum well above its own 45-minute reading is a turn, not a trend.
+    wide = [v for t, v in ordered if ts_ms - level_window_s * 1000 <= t <= ts_ms]
+    momentum_45m = volatility_45m = None
+    if len(wide) > 2:
+        # EXACTLY the formulae used for the 300s pair, only the window differs.
+        # Anything else and the two are not comparable, which is the single
+        # thing this context is for: the 45-minute reading is only meaningful
+        # against the short one it sits beside.
+        if wide[0]:
+            momentum_45m = (wide[-1] / wide[0] - 1) * 10_000
+        wide_returns = [
+            (wide[i + 1] / wide[i] - 1) * 10_000
+            for i in range(len(wide) - 1)
+            if wide[i]
+        ]
+        volatility_45m = (
+            st.pstdev(wide_returns) * (len(wide_returns) ** 0.5)
+            if wide_returns else 0.0
+        )
+
     return BRTIFeatures(
         event_ticker=event_ticker,
         ts_ms=ts_ms,
@@ -341,6 +402,8 @@ def features_from_series(
         brti_accel=accel,
         brti_held_s=held_s,
         brti_rejections=rejections,
+        brti_momentum_45m_bps=momentum_45m,
+        brti_volatility_45m_bps=volatility_45m,
         stale=(now_ms - ts_ms) > stale_limit_ms,
         settlement_projection=value,
     )

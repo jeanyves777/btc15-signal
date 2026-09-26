@@ -16,6 +16,7 @@ import pytest  # noqa: E402
 
 from btc15_signal import messages, surface  # noqa: E402
 from btc15_signal.store import LifetimeRecord, MoneySnapshot, Store  # noqa: E402
+from btc15_signal import feature_contract  # noqa: E402
 
 NOW = 1_790_000_000_000
 TICKER = "KXBTC15M-26SEP231100-00"
@@ -287,7 +288,7 @@ def test_the_learning_notification_keeps_identifiers_out():
     assert "Entry rules: Unchanged" in text
     assert "Automatic learning continues." in text
     # Policy ids, hashes, methods and splits belong in the log and /learning.
-    for leak in ("kalshi-brti", "fingerprint", "arms-", "holdout", "brti-2"):
+    for leak in ("kalshi-brti", "fingerprint", "arms-", "holdout", feature_contract.CONTRACT.version):
         assert leak not in text
 
 

@@ -34,6 +34,7 @@ sys.path.insert(0, str(ROOT / "src"))
 from btc15_signal.config import Settings  # noqa: E402
 from btc15_signal.execution import KalshiExecutionClient  # noqa: E402
 from btc15_signal.recovery_add_runner import RecoveryAddRunner  # noqa: E402
+from btc15_signal import surface
 from btc15_signal.store import Store  # noqa: E402
 
 
@@ -67,13 +68,35 @@ async def main() -> int:
             print("UNREADABLE: resting orders could not be read")
             return 2
 
-        print(f"broker positions : {held} (marked {mark:+.4f})")
-        for ticker, value in (per_ticker or {}).items():
+        # ONLY WHAT THIS SYSTEM TRADES BLOCKS A RESTART OF THIS SYSTEM.
+        #
+        # `open_mark` reports the whole Kalshi account, and the operator trades
+        # by hand in the same account. On 2026-09-25 three KXMVECROSSCATEGORY
+        # positions - entirely the operator's - held preflight at NOT FLAT
+        # while every 15-minute series this system trades was clear. A restart
+        # cannot disturb a position in a market this process has never touched,
+        # so counting those is a false block, and a false block is how a real
+        # one stops being read.
+        #
+        # This is the same scope error as the money footer, which reported the
+        # account under an instrument's name. Same fix: name the series.
+        mine = {t: v for t, v in (per_ticker or {}).items()
+                if surface.asset(t)}
+        theirs = {t: v for t, v in (per_ticker or {}).items()
+                  if not surface.asset(t)}
+        held_mine = len(mine)
+
+        print(f"broker positions : {held} total, {held_mine} in series this "
+              f"system trades (marked {mark:+.4f})")
+        for ticker, value in mine.items():
             print(f"    {ticker} {value:+.4f}")
+        for ticker, value in theirs.items():
+            print(f"    {ticker} {value:+.4f}   <- not traded by this system")
         print(f"resting orders   : {orders} (${resting:.2f} committed)")
 
-        if held:
-            blockers.append(f"{held} open position(s) at the broker")
+        if held_mine:
+            blockers.append(
+                f"{held_mine} open position(s) in a traded series")
         if orders:
             blockers.append(f"{orders} resting order(s) at the broker")
 

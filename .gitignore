@@ -17,5 +17,13 @@ runtime/
 .env.*.bak
 *.env.backup
 .env.eth
+# PER-INSTANCE CREDENTIAL FILES, by pattern rather than by name. `.env.eth` was
+# listed individually, so `.env.gold`, `.env.silver` and `.env.sol` - three new
+# instances added 2026-09-25 - were not covered. That is the SAME shape of gap
+# that leaked the credentials in the first place: an ignore rule matching only
+# the exact names that existed when it was written. The negation keeps the
+# committed template visible.
+.env.*
+!.env.example
 runtime-*/
 eth15.db*

@@ -361,7 +361,21 @@ BRTI_MOMENTUM_BANDS = ((-9e9, 0.0, "mom<=0"), (0.0, 5.0, "mom0-5"),
 SETUP_PRICE_BANDS = ((0.0, 0.70, "px<70"), (0.70, 0.85, "px70-85"),
                      (0.85, 0.9301, "px85-93"), (0.9301, 1.0, "px93+"))
 
-SETUP_FEATURE_VERSION = "brti-2"
+# THE ONE DEFINITION OF THE FEATURE VERSION. It lives here, and
+# `feature_contract.FeatureContract.version` reads it - rather than each
+# restating the string - because `feature_contract` already imports this
+# module and the reverse would be a cycle.
+#
+# It was a second, independent literal until 2026-09-25, and it drifted twice.
+# `intelligence_policy` records the first: a constant left "at brti-1 when the
+# contract moved to brti-2". The second was this one staying at brti-2 when the
+# contract moved to brti-3, which made `learning_data` - it filters rows on
+# this exact value - discard every row written under the running version.
+# `live_actual_fills` read 0 out of rows that were all present.
+#
+# Twice is a design problem, not an oversight. Change it HERE and the contract
+# follows; there is no longer a second place to forget.
+SETUP_FEATURE_VERSION = "brti-4"
 
 
 def brti_momentum_band(aligned_bps: float) -> str:

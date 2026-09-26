@@ -1208,9 +1208,11 @@ def loss_step_size(
     loss is never a reason to enter.
 
     THE CEILING IS REAL WORK, not decoration. At the 0.70 floor of the price
-    band $5 buys 7 contracts; a stale or mispriced ask is what turns a dollar
-    budget into a position nobody chose, so the count is capped before it
-    leaves this function.
+    band the budget buys more contracts than at the 0.93 ceiling, and a stale
+    or mispriced ask is what turns a dollar budget into a position nobody
+    chose, so the count is capped before it leaves this function. The cap is
+    deliberately left above what this rule can now reach: it bounds the other
+    upsize paths too.
 
     The evidence, which does not support the rule on its own, is recorded
     against `loss_step_enabled` in config.py and in FINDINGS 61. The operator
@@ -1420,6 +1422,71 @@ SETTLEMENT_SYNC: dict[str, int] = {}
 # A gap of seconds is the normal shape of a window boundary; a gap of hours is
 # an outage whose only symptom is silence.
 MARKET_GAP: dict[str, int] = {}
+# The venue's own schedule, cached. Asking Kalshi every poll would replace the
+# requests the closure is meant to save.
+VENUE_SCHEDULE: dict[str, int] = {}
+
+
+async def _venue_closed_until(kalshi, settings, now_ms: int,
+                              gap_s: float) -> int | None:
+    """When the series reopens, if it is CLOSED rather than merely between
+    windows. None means "not closed, or cannot be shown to be".
+
+    GOLD AND SILVER KEEP NEW YORK HOURS - closed at the New York close, open at
+    the New York open, so shut every weekend for about two days. Polling every
+    ten seconds through that is ~19,000 requests recording nothing, because the
+    underlying metal is not trading either.
+
+    FOUR CONDITIONS, because the failure to avoid is calling an OUTAGE a
+    closure. On 2026-09-24 Kalshi listed nothing for two hours while healthy,
+    and the operator's only symptom was Telegram going quiet:
+
+      * the instrument DECLARES that it observes sessions. This is not
+        inferable from the listing: on 2026-09-25 BTC and SOL both reported
+        their next UNOPENED market 5.1 hours out while trading normally,
+        because Kalshi creates markets in daily batches and the near-term ones
+        were already OPEN, which an `unopened` listing excludes. Inferring a
+        closure from that would back off a 24/7 instrument mid-outage and
+        silence the alert built for it;
+      * no open market for `venue_closed_after_s` - a window flip is seconds;
+      * Kalshi lists a next market - unknown is not closed, it is unknown, and
+        an unexplained silence must stay an outage;
+      * that market opens at least `venue_closed_gap_s` away.
+
+    A failed lookup returns None, which keeps the outage alert armed. The
+    conservative direction is to stay noisy.
+    """
+    if not getattr(settings, "venue_has_sessions", False):
+        return None
+    if gap_s < settings.venue_closed_after_s:
+        return None
+    cached = VENUE_SCHEDULE.get("next_open_ms")
+    asked = VENUE_SCHEDULE.get("asked_ms", 0)
+    if cached and cached > now_ms:
+        # A CLOSURE ENDS WHEN THE MARKET OPENS, NOT 30 MINUTES BEFORE.
+        # `venue_closed_gap_s` decides whether a gap IS a closure; applying it
+        # again here made the closure lapse in its final half hour, and the
+        # outage path below would then fire "NO MARKET AT THE EXCHANGE"
+        # reporting the whole 48-hour weekend as a fault - a false alarm every
+        # Sunday, which is precisely the alert-fatigue this was built to avoid.
+        # Once a reopen time is known, the instrument stays closed until it.
+        return cached
+    if now_ms - asked < settings.venue_closed_poll_seconds * 1000:
+        return None
+    VENUE_SCHEDULE["asked_ms"] = now_ms
+    try:
+        nxt = await kalshi.next_open_ms(now_ms)
+    except Exception as exc:  # noqa: BLE001 - unknown is not closed
+        print(f"next-open lookup failed: {exc!r}", flush=True)
+        return None
+    if not nxt:
+        return None
+    VENUE_SCHEDULE["next_open_ms"] = nxt
+    if nxt - now_ms < settings.venue_closed_gap_s * 1000:
+        return None
+    return nxt
+
+
 # Which window we have already asked the broker to confirm an entry fill for.
 # One request per window, and only while the sweep has not delivered it.
 ENTRY_CONFIRM: dict[str, int] = {}
@@ -1763,6 +1830,22 @@ def kalshi_snapshot(features, contract, opened: int, now_ms: int):
     )
 
 
+
+def _scoped_open(per_ticker: dict | None) -> tuple[int, float]:
+    """(count, mark) over the series this instance trades, and nothing else.
+
+    `open_mark` reports the account. Everything that presents a figure under an
+    instrument's name has to narrow it, or it reports the operator's own
+    trading as the strategy's - which the money footer did, preflight did, and
+    the open-position line did.
+
+    `surface.asset` returns "" for a ticker no instrument here recognises, so
+    an unknown series is excluded rather than silently counted.
+    """
+    mine = {t: v for t, v in (per_ticker or {}).items() if surface.asset(t)}
+    return len(mine), round(sum(mine.values()), 6)
+
+
 def active_policy(settings) -> intel.Policy:
     if _POLICY["loaded"] is None:
         _POLICY["loaded"] = intel.Policy.load(settings.intelligence_policy_path)
@@ -1771,6 +1854,18 @@ def active_policy(settings) -> intel.Policy:
             f"intelligence policy: version={pol.version} "
             f"model={pol.model_version} arms={len(pol.arms)} "
             f"vetoes={pol.vetoes_enabled} admissions={pol.admissions_enabled}",
+            flush=True,
+        )
+        # WHETHER IT CAN ACT, not merely whether it loaded. The operator's
+        # instruction is that this layer is never off; the health state is what
+        # makes that checkable, and it is published to the message surface here
+        # so every alert carries the truth as of the policy in force.
+        state = intel.health(pol, settings, int(time.time() * 1000))
+        surface.set_intelligence_state(state)
+        print(
+            f"intelligence health: ok={state['ok']} mode={state['mode']} "
+            f"authorised={state['authorised']} acting_arms="
+            f"{state['acting_arms']}/{state['arms']} · {state['reason']}",
             flush=True,
         )
     return _POLICY["loaded"]
@@ -2072,6 +2167,9 @@ def intelligence_verdict(
             "brti_accel": _feature(brti, "brti_accel"),
             "brti_held_s": _feature(brti, "brti_held_s"),
             "brti_rejections": _feature(brti, "brti_rejections"),
+            "brti_momentum_45m_bps": _feature(brti, "brti_momentum_45m_bps"),
+            "brti_volatility_45m_bps": _feature(
+                brti, "brti_volatility_45m_bps"),
             # CONTEXT, recorded and not keyed on.
             "session": _session(opened),
             "vol_regime": (
@@ -2941,7 +3039,17 @@ async def primary_signal(
             # passed, because that branch is the order path. The conditions
             # are re-read here - on the ALERTING path, where an extra query
             # cannot cost a fill - so a refused signal names all of them.
-            unmet = [str(fact["name"]) for fact in facts if not fact["passed"]]
+            # THE SAME WORDS AS THE TICKS ABOVE. The checks render through
+            # `surface.display_name` - "Price", "Distance" - while this list
+            # printed the rules' internal names, so a single message showed
+            # a failed tick reading "Price" and a decline line naming the same
+            # gate "Decision ask". Four names for two gates, on one screen.
+            #
+            # (The example is paraphrased deliberately: tests locate this
+            # branch by searching the source for the decline heading, and a
+            # comment quoting it verbatim captures that search.)
+            unmet = [surface.display_name(str(fact["name"]))
+                     for fact in facts if not fact["passed"]]
             if settled_s < settings.entry_band_settle_s:
                 unmet.append(
                     f"band held {settled_s:.0f}s of "
@@ -3236,6 +3344,11 @@ async def report_settlement(
         pnl=pnl,
         paid=contract_price,
         exited_at=exited_at,
+        # Kalshi's own target and settling value, so the recap says by how much
+        # the market finished past the strike and not merely which way. None
+        # until the enrichment pass has fetched them, which is a different
+        # state from a market that settled level with its target.
+        margin=store.settlement_margin(ticker, side),
         snapshot=snapshot,
         insight=notifier.insight_for(window_open, now_ms),
         priority=surface.priority_lines(
@@ -3601,6 +3714,7 @@ async def service() -> None:
     market = None
     kalshi = KalshiClient(settings.kalshi_base_url, settings.kalshi_series)
     store = Store(settings.database_path)
+    store.configure_instrument(settings)
     store.configure_recovery_exit(settings)
     telegram = Telegram(settings.telegram_bot_token, settings.telegram_chat_id, settings.dry_run)
     trader = None
@@ -3685,8 +3799,27 @@ async def service() -> None:
     # WHAT SOURCE IS RUNNING, from the process itself. A deployed trading
     # service has to answer "what code is this?" from its own runtime
     # state, not from whatever the working tree looks like when asked.
-    print(f"BTC15 signal started; {revision.line()}; execution requires "
-          "Telegram approval", flush=True)
+    # WHAT THE EXECUTION MODE ACTUALLY IS, read rather than asserted. This line
+    # said "execution requires Telegram approval" unconditionally. That was a
+    # hardcoded claim, and on 2026-09-25 it became false: SOL runs with auto
+    # trading on. A startup banner that states a safety property it never
+    # checked is worse than silence - it is the line an operator would quote.
+    #
+    # AND IT CHECKS EXECUTION IS POSSIBLE, not only that the flag is set. The
+    # flag alone would reproduce the same defect in the other direction: a
+    # banner announcing "AUTO TRADING ON" on an instance that can place no
+    # order, which is the state `/auto on` refuses for exactly this reason -
+    # you would go to sleep believing it was trading.
+    if auto_is_on(store, settings):
+        limits = auto_limits(store, settings)
+        mode = (f"AUTO TRADING ON, ${limits.budget:,.2f} per order, stops for "
+                f"the day at -${abs(limits.daily_loss_limit):,.2f}")
+        if not execution_configured(settings):
+            mode = (f"AUTO TRADING ARMED BUT CANNOT EXECUTE - missing "
+                    f"{missing_for_execution(settings)}")
+    else:
+        mode = "execution requires Telegram approval"
+    print(f"BTC15 signal started; {revision.line()}; {mode}", flush=True)
     store.set_setting_text("running_revision",
                            json.dumps(revision.REVISION), int(time.time() * 1000))
     last_ticker = None
@@ -3862,6 +3995,7 @@ async def service() -> None:
                                 open_n, open_mark, per_ticker = (
                                     await trader.open_mark()
                                 )
+                                open_n, open_mark = _scoped_open(per_ticker)
                                 store.set_setting("open_mark", open_mark, now_ms)
                                 store.set_setting("open_positions", open_n, now_ms)
                                 store.set_setting_text(
@@ -3891,6 +4025,21 @@ async def service() -> None:
                 if trader is not None and now_ms - SETTLEMENT_SYNC.get("at", 0) >= 60_000:
                     try:
                         store.record_settlements(await trader.settlements(), now_ms)
+                        # BY HOW MUCH, not merely whether. The margin between
+                        # Kalshi's target and its settling value is the part of
+                        # the lifecycle that says an 83c favourite finished
+                        # comfortably rather than by a hair - a mean 18.3 bps on
+                        # winners against 6.4 bps on losers, on both
+                        # instruments. Capped per pass so a backlog is worked
+                        # off over several polls instead of stalling one, and
+                        # each market is asked once: `facts_synced_ms` marks it
+                        # done even when Kalshi publishes neither number.
+                        for ticker in store.settlements_missing_facts(8):
+                            facts = await trader.settlement_facts(ticker)
+                            store.record_settlement_facts(
+                                ticker, facts.get("strike"),
+                                facts.get("expiration_value"), now_ms,
+                            )
                         # Executions come from the broker for the same reason
                         # the money does: `trade_proposals` records what the
                         # bot INTENDED, misses anything filled outside it, and
@@ -3900,6 +4049,17 @@ async def service() -> None:
                         # position marked to the bid. Both halves or the number
                         # does not match what the operator is looking at.
                         open_n, open_mark, per_ticker = await trader.open_mark()
+                        # SCOPED TO WHAT THIS INSTANCE TRADES. `open_mark` is
+                        # the whole Kalshi account, and the operator trades by
+                        # hand in it. On 2026-09-25 a BTC alert reported
+                        # "Open position: -$2.89" that was ENTIRELY three
+                        # KXMVECROSSCATEGORY positions of the operator's -
+                        # none of it the bot's, under a BTC heading.
+                        #
+                        # Third instance of the same scope error, after the
+                        # money footer and preflight. Same fix: name the
+                        # series, and count only what this system placed.
+                        open_n, open_mark = _scoped_open(per_ticker)
                         store.set_setting("open_mark", open_mark, now_ms)
                         store.set_setting("open_positions", open_n, now_ms)
                         # Per ticker, so `open_exposure` can drop anything the
@@ -3978,6 +4138,28 @@ async def service() -> None:
                     # was Telegram going quiet. Reported once per gap.
                     MARKET_GAP.setdefault("since", now_ms)
                     gap_s = (now_ms - MARKET_GAP["since"]) / 1000
+                    # IS THE VENUE SHUT, OR IS THIS AN OUTAGE? Gold and silver
+                    # keep New York hours and are closed every weekend for
+                    # about two days. Kalshi answers it: the next market's
+                    # `open_time`. Far away means closed; soon or unknown means
+                    # the outage alert below still has to fire.
+                    closed_until = await _venue_closed_until(
+                        kalshi, settings, now_ms, gap_s)
+                    if closed_until:
+                        if not MARKET_GAP.get("closed_told"):
+                            MARKET_GAP["closed_told"] = 1
+                            hours = (closed_until - now_ms) / 3_600_000
+                            print(f"{settings.kalshi_series} is closed; next "
+                                  f"market opens in {hours:.1f}h - polling "
+                                  f"every {settings.venue_closed_poll_seconds}s "
+                                  f"and not fetching the reference",
+                                  flush=True)
+                        # The reference recorder is deliberately NOT polled. The
+                        # underlying metal is not trading either, so there is no
+                        # price to record - this is the fetch the closure exists
+                        # to avoid, ~19,000 requests across a weekend.
+                        await asyncio.sleep(settings.venue_closed_poll_seconds)
+                        continue
                     if (gap_s >= settings.market_gap_alert_s
                             and not MARKET_GAP.get("told")):
                         MARKET_GAP["told"] = 1
@@ -4014,6 +4196,12 @@ async def service() -> None:
                     gap_s = (now_ms - MARKET_GAP["since"]) / 1000
                     told = MARKET_GAP.pop("told", None)
                     started = MARKET_GAP.pop("since")
+                    # A closure that has ended must leave nothing behind, or
+                    # the next genuine outage is silently treated as a weekend.
+                    if MARKET_GAP.pop("closed_told", None):
+                        print(f"{settings.kalshi_series} reopened after "
+                              f"{gap_s / 3600:.1f}h closed", flush=True)
+                    VENUE_SCHEDULE.clear()
                     if told:
                         try:
                             await Notifier(telegram, store, settings).send_once(

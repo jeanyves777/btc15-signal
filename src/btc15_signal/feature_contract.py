@@ -36,6 +36,7 @@ import json
 from dataclasses import asdict, dataclass, field
 
 from .adaptive import (
+    SETUP_FEATURE_VERSION,
     BRTI_DISTANCE_BANDS,
     BRTI_MOMENTUM_BANDS,
     BRTI_VOL_BANDS,
@@ -47,7 +48,7 @@ from .adaptive import (
 class FeatureContract:
     """Frozen. Changing any field changes the fingerprint, by design."""
 
-    version: str = "brti-2"
+    version: str = SETUP_FEATURE_VERSION
     family: str = "brti"
     # Kalshi only. No Binance endpoint appears here, and none may be added:
     # a fallback that silently re-bases onto another exchange is the failure
@@ -62,6 +63,30 @@ class FeatureContract:
     smoothing: str = "none added; BRTI is a published trailing 60s mean"
     momentum_window_s: int = 300
     volatility_window_s: int = 300
+    # THE LEVEL LOOKBACK, widened from 900s to 2,700s on 2026-09-25 and the
+    # reason this contract was cut anew rather than edited in place. It landed as
+    # brti-3 and the contract is now brti-4; the version is read from
+    # `adaptive.SETUP_FEATURE_VERSION`, which is the ONE definition, so it is
+    # deliberately not restated here - a second literal is exactly the drift
+    # that made `learning_data` discard every row once already.
+    #
+    # At 900s the lookback was the market's OWN window, and the strike IS that
+    # window's opening price - so every window began with price on the strike,
+    # inside the rejection threshold, and a clean one-way move scored exactly
+    # one rejection: its own departure. The `rejections >= 2` gate therefore
+    # refused the cleanest setups, and over 19,305 corpus points the refused
+    # bucket led on distance, hold, momentum and win rate alike.
+    #
+    # The feed always carried the fix - each market's series is the hour ending
+    # at its close, so 45 minutes before the window opened was fetched and
+    # discarded. A rejection now means price approached this level and was
+    # turned back, which is what the name always claimed.
+    #
+    # EVERY THRESHOLD MEASURED UNDER brti-2 IS INVALIDATED BY THIS, which is
+    # precisely what the fingerprint guard is for: the five live policies will
+    # refuse to load and refit rather than apply numbers fitted to a different
+    # quantity.
+    level_window_s: int = 2700
     # STRICT. A sample at exactly the decision instant is in; anything after
     # it is out. This is what makes a replayed decision reproducible.
     cutoff_rule: str = "t <= decision_ms"
@@ -77,8 +102,19 @@ class FeatureContract:
     # against every decision as context and are deliberately NOT here: keying
     # on them fragmented the evidence into cells too small to speak.
     key_dimensions: tuple = ("distance", "price", "momentum")
+    # RECORDED, NOT KEYED. The 45-minute momentum and volatility sit beside
+    # the 300-second pair rather than replacing them: the gates read the short
+    # window, exactly as before, and these answer whether the last five minutes
+    # are typical of the last forty-five. A 300s window cannot tell a market
+    # that has drifted all hour from one that just turned - both read the same
+    # momentum, and only the wider view separates them.
+    #
+    # They are in the contract because the learning can see them, and anything
+    # the learning can see has to be declared - that is what the fingerprint is
+    # for. Adding them moves it, so every policy refits; the fitted quantities
+    # are unchanged, so the arms come back the same.
     context_recorded: tuple = ("session", "vol_regime", "band_hold_s",
-                               "remaining_s")
+                               "remaining_s", "momentum_45m", "volatility_45m")
 
     def payload(self) -> dict:
         data = asdict(self)

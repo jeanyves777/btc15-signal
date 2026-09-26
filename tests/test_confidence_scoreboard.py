@@ -29,9 +29,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from btc15_signal.learning_store import LearningStore  # noqa: E402
 from btc15_signal.store import Store  # noqa: E402
+from btc15_signal import feature_contract  # noqa: E402
 
 W = 1_790_193_600_000
-FV = "brti-2"
+FV = feature_contract.CONTRACT.version
 
 
 def decision(store, *, window, key, delta, ask, won, filled=1,

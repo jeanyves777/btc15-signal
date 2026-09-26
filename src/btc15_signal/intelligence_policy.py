@@ -557,3 +557,78 @@ def wilson_half_width(rate: float, n: int) -> float:
     if n <= 0:
         return 1.0
     return 1.96 * math.sqrt(max(rate * (1 - rate), 1e-9) / n)
+
+def health(policy, settings=None, now_ms: int = 0) -> dict:
+    """Is the layer ACTUALLY able to affect a decision right now?
+
+    WHY THIS IS A FUNCTION AND NOT A FLAG. `intelligence_enabled` being True
+    says the operator wants the layer on. It does not say the layer can act.
+    Five separate conditions silently reduce every decision to NEUTRAL while
+    every switch still reads "on":
+
+      * the artefact is missing or has no arms at all;
+      * its feature fingerprint no longer matches the live contract;
+      * its evidence ENDS more than `intelligence_max_policy_age_ms` ago;
+      * `intelligence_mode` is not "live", or authority was never granted;
+      * every arm was withdrawn, leaving a policy that loads and does nothing.
+
+    Each of those is correct behaviour on its own - a stale fit describing a
+    market that has moved on SHOULD stand down. What is not acceptable is that
+    they are indistinguishable from a working layer that happens to be finding
+    nothing, because then "the intelligence is on" cannot be verified, only
+    believed. The operator's instruction is that it must never be off; that is
+    only enforceable if being off is visible.
+
+    Returns `ok` plus a short reason, so a caller can put it in front of a
+    human instead of discovering it in a table weeks later.
+    """
+    mode = str(getattr(settings, "intelligence_mode", "live") or "live")
+    enabled = bool(getattr(settings, "intelligence_enabled", True))
+    authorised = bool(getattr(settings, "intelligence_authorised", False))
+    arms = getattr(policy, "arms", None) or {}
+    acting = sum(
+        1 for a in arms.values()
+        if int(a.get("delta") or 0) or str(a.get("action") or NEUTRAL) != NEUTRAL
+    )
+    state = {
+        "ok": False, "reason": "", "mode": mode, "enabled": enabled,
+        "authorised": authorised, "arms": len(arms), "acting_arms": acting,
+        "version": getattr(policy, "version", "") or "",
+        "vetoes": bool(getattr(policy, "vetoes_enabled", False)),
+        "admissions": bool(getattr(policy, "admissions_enabled", False)),
+        "age_days": None,
+    }
+    if not enabled:
+        state["reason"] = "intelligence_enabled is False"
+        return state
+    if mode != "live":
+        state["reason"] = f"mode is {mode!r}, not 'live'"
+        return state
+    if not authorised:
+        state["reason"] = "authority not granted"
+        return state
+    if not arms:
+        state["reason"] = "policy has no arms (artefact missing or empty)"
+        return state
+    if not feature_contract.compatible(getattr(policy, "feature_fingerprint", "")):
+        state["reason"] = "feature contract mismatch"
+        return state
+    freshness = getattr(policy, "data_end_ms", 0) or getattr(
+        policy, "training_cutoff_ms", 0)
+    max_age = int(getattr(settings, "intelligence_max_policy_age_ms", 0) or 0)
+    if now_ms and freshness:
+        age = now_ms - freshness
+        state["age_days"] = round(age / 86_400_000, 1)
+        if max_age and age > max_age:
+            state["reason"] = f"evidence is {state['age_days']} days old"
+            return state
+    if not acting:
+        state["reason"] = "every arm is neutral (all withdrawn or none promoted)"
+        return state
+    state["ok"] = True
+    state["reason"] = (
+        f"{acting} of {len(arms)} arms can move a decision"
+        f"{'; vetoes live' if state['vetoes'] else ''}"
+        f"{'; admissions live' if state['admissions'] else ''}"
+    )
+    return state

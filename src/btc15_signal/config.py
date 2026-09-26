@@ -127,6 +127,46 @@ class Settings(BaseSettings):
     # for TWO HOURS and the only symptom was Telegram going quiet, which is
     # the silent stop this system is most exposed to.
     market_gap_alert_s: int = 600
+    # SESSION HOURS, TAKEN FROM THE VENUE. Gold and silver keep New York hours:
+    # they close at the New York close and reopen at the New York open, so they
+    # are shut every weekend for about two days. On 2026-09-25 both went quiet
+    # at 21:00 UTC and the next market Kalshi listed opened 53 hours later.
+    #
+    # A closure is NOT the outage `market_gap_alert_s` exists to catch, and
+    # must not be reported as one - a false alarm on a Friday night teaches the
+    # operator to ignore the alert that matters. It is told apart by asking
+    # Kalshi when the series next lists a market: far away means closed, soon
+    # or unknown means keep worrying.
+    #
+    # WHICH INSTRUMENTS OBSERVE SESSIONS AT ALL, declared rather than guessed.
+    # Off by default, and set only on the metals. "The next unopened market is
+    # far away" looked like sufficient evidence of a closure and is NOT: Kalshi
+    # creates markets in daily batches, so on 2026-09-25 BTC and SOL both
+    # reported their next UNOPENED market 5.1 hours out while trading normally,
+    # because the near-term ones were already OPEN and an `unopened` listing
+    # excludes those. Inferring a closure from that would have backed off a
+    # 24/7 instrument during an outage and silenced the alert built for it -
+    # the exact failure the two-hour gap of 2026-09-24 exists to catch.
+    #
+    # So the instrument declares that it has sessions and the EXCHANGE supplies
+    # the reopen time. No hardcoded New York calendar, and nothing to misfire
+    # on BTC, ETH or SOL.
+    venue_has_sessions: bool = False
+    # `venue_closed_after_s` is how long no open market may last before that
+    # question is asked at all. A window boundary is seconds, so ten minutes
+    # never triggers on a 24/7 instrument.
+    venue_closed_after_s: int = 600
+    # How far ahead the next market must be to count as a closure rather than
+    # a boundary. Kalshi creates markets in daily batches, so on a 24/7 series
+    # the next UNOPENED market can legitimately be a day out while trading is
+    # continuous - which is why this is only consulted once there has already
+    # been no open market for `venue_closed_after_s`.
+    venue_closed_gap_s: int = 1800
+    # The poll interval while closed. Not the whole closure: sleeping 53 hours
+    # would miss an early reopen, a config change and the settlement sweep.
+    # Ten minutes cuts a weekend from ~19,000 requests to ~320 and still
+    # notices a reopen within ten minutes.
+    venue_closed_poll_seconds: int = 600
     # THE REVERSAL GATE. Refuse an entry standing on a move that has already
     # turned over. Shipped as a BLOCKING gate on the operator's explicit
     # instruction, with the evidence recorded beside it in FINDINGS 58:
@@ -488,11 +528,28 @@ class Settings(BaseSettings):
     #
     # The operator has decided with that measurement in view. It is their
     # call - sizing always is - and it is implemented in full.
+    #
+    # REDUCED $5 -> $2 BY THE OPERATOR, 2026-09-24 the same day: "5 is too
+    # risky just to make 50". That judgement is about the ratio the measurement
+    # never addressed. The $5 step risks $5 per post-loss trade to chase a
+    # total upside the backtest put at +8.85, and the permutation test could
+    # not distinguish that gain from ordering luck (p=0.249) on a sample with
+    # two 2-loss runs and NO 3-loss run. The drawdown it reported had never
+    # been tested by the thing that would move it - across shuffles the median
+    # worst drawdown was -6.84 against the -5.80 observed - so the downside was
+    # the least-evidenced number in the whole result. Sizing down when the
+    # evidence is weakest is the conservative reading of exactly that.
+    #
+    # $2 is also the size the two other upsize triggers use, so the three no
+    # longer disagree about what "one step up" means.
     loss_step_enabled: bool = True
-    loss_step_budget: float = 5.00
-    # A HARD CEILING, not the rule. At the 0.70 floor of the price band $5
-    # buys 7, so this is headroom against a cheap fill, and the guard that
-    # stops a mispriced ask from turning a $5 budget into a large position.
+    loss_step_budget: float = 2.00
+    # A HARD CEILING, not the rule. At the 0.70 floor of the price band $2
+    # buys 2, so this is headroom against a cheap fill, and the guard that
+    # stops a mispriced ask from turning a $2 budget into a large position.
+    # Left at 8 deliberately: it bounds the OTHER upsize paths too, and
+    # lowering a ceiling that is no longer reachable by this rule would only
+    # look like it had been tightened.
     loss_step_max_contracts: int = 8
 
     # THE CONDITIONAL RECOVERY ADD-ON (recovery_add.py).

@@ -1,0 +1,42 @@
+{
+  "_comment": "GOLD (KXGOLD15M). Every number is measured on gold's own corpus and none is inherited from BTC. Refitted 2026-09-25 under brti-4 (45-minute level lookback) as a COMPLETE SET rather than gate by gate - see _method. Combined: n=921 decision points over 445 markets and 35 days, win 78.4% at a 0.691 mean ask, residual +0.0925 [+0.0613, +0.1219], both disjoint halves holding independently (+0.1099 and +0.0768).",
+
+  "_method": "WHY THE WHOLE SET WAS REFITTED. The previous numbers were each chosen from their own best bucket in isolation. That is how silver and SOL came to hold seven individually defensible thresholds that, intersected, admitted NOTHING - 423 and 422 live evaluations, zero qualified. scripts/fit_instrument_config.py now scores complete candidate sets against three requirements, in order: (1) the set admits at least 15% of decision points, because below that the confidence arms never reach min_evidence and the configuration can never be corrected by evidence; (2) the set's own residual interval clears zero; (3) gating DEMONSTRABLY BEATS NOT GATING - the gated-minus-ungated difference, bootstrapped on the same resampled days, has a lower bound above zero. Requirement 3 is what rejects the opposite failure: an early ranking preferred a set admitting 74% of points at +0.0495 against a +0.0346 baseline, which is the baseline with extra steps and selects for nothing. Gold clears all three and both halves, which is TIER A - the bar gold was originally shipped on.",
+
+  "_replication": "CHECKED ON A NEAR-DISJOINT SAMPLE. Re-fetching the reference series to capture retrace landed on different markets of the same period - the two corpora share 59 markets out of 485 and 365 - so the second one is close to a holdout. This set scores +0.1003 [+0.0634, +0.1381] there on 673 points, and gating still beats not gating (+0.0656 [+0.0392, +0.0959]). The two samples disagree by 0.042 on the UNGATED baseline, which is a warning about how much sampling noise a 36-day window carries: it is as large as most edges being fitted. The fit therefore uses both corpora merged (758 markets) rather than either alone.",
+
+  "enabled": true,
+
+  "_band_comment": "0.60-0.80, widened from 0.65-0.75. NOT BTC's 0.70-0.93. Gold's edge is a price bucket rather than a floor, and jointly with the distance band the bucket is wider than the marginal fit suggested: the wider band adds volume (20.4% of points against 15.6%) without costing residual, and volume is what lets the learned layer accumulate evidence. Above 0.85 the residual goes negative on every sample.",
+  "min_ask": 0.60,
+  "max_ask": 0.80,
+
+  "_distance_comment": "AN ABSOLUTE BAND IN BPS, unchanged at 1.5-6.0, because the normalised distance does not mean on gold what it means on BTC. Gold's per-second feed jitters ~7x more but that jitter mean-reverts: only 4.0% survives to settlement against BTC's 30.5%. Dividing by it puts gold's median normalised distance at 0.83 where BTC reads 6.92, while the two are equivalent risk-adjusted. BTC's 10-15x floor rejects 99.4% of gold setups - a measurement error, not a verdict on gold. A BAND and not a floor: 2-5bp scores +0.0453 while <2bp is -0.0108 and 5-10bp is -0.0380, so both ends carry weight. The joint fit re-derived this band independently and returned the same one, which is the strongest thing that can be said for a threshold.",
+  "min_abs_distance_bps": 1.5,
+  "max_abs_distance_bps": 6.0,
+  "min_brti_normalized_distance": 0.0,
+  "moving_min_brti_normalized_distance": 0.0,
+  "calm_momentum_bps": 5.0,
+
+  "_timing_comment": "THE WINDOW THAT ACTUALLY RUNS. Two independent windows gate entry and only their intersection executes: `settings.entry_from_seconds`/`entry_to_seconds` (660/360 by default, and no launcher overrides them) is checked in main.py BEFORE the rule is consulted, and these two keys are checked again inside the rule. This config previously said 700-400s, a span the service could never use. BEHAVIOUR IS UNCHANGED and the fit is unaffected: the corpus holds decision points at 360, 420, 480, 540, 600 and 660 seconds only, so 700-400s selected exactly the minutes live ran. Narrowed to what it always meant, so the config stops advertising a span that cannot happen - and so that widening the Settings window later cannot silently start trading minutes no corpus point covers. 6.7-11.6 minutes left. The joint fit compared this against 800-250s and 900-120s and kept the narrower window: gold's edge needs the window to still have room to hold its level.",
+  "entry_from_seconds": 660,
+  "entry_to_seconds": 420,
+
+  "_level_gates_comment": "NOW MEASURED, WHERE THEY USED TO BE SENTINELS. accel >= -1e9, held >= 0s and rejections >= 0 were thresholds no value could fail, and they were still counted as passed checks - a gold alert read 'Entry checks 8/8' with five of the eight unable to fail. Under brti-4 all three carry real numbers measured on gold: held 90-240s scores +0.0710 [+0.0364, +0.1055] against -0.0028 below 30s, so 30s is a floor with evidence behind it; rejections 8+ scores +0.0389 [+0.0132, +0.0649] and the >= 2 floor costs almost nothing because under the 45-minute lookback only 19 of 2,910 points score below it; acceleration is a BAND, not a floor - gold's -10..0 bucket (+0.0403) beats 0..+10 (+0.0286), so a hard-accelerating move is not gold's edge the way it is BTC's, and +-25 excludes the extremes without cutting the middle.",
+  "min_brti_accel": -25.0,
+  "max_brti_accel": 25.0,
+  "min_brti_held_s": 30.0,
+  "min_brti_rejections": 2,
+
+  "_momentum_comment": "A CEILING, the opposite of BTC, which has none. Gold's edge is level-maintenance, so a fast move means the level is being left behind - which is BTC's setup and not gold's. 10bp is the measured ceiling. The floor stays at 0 and alignment stays off: neither is measured on gold, and this codebase's rule is that an unmeasured gate is worse than no gate because it looks deliberate.",
+  "min_brti_momentum_bps": 0.0,
+  "max_brti_momentum_bps": 10.0,
+  "require_momentum_alignment": false,
+
+  "_retrace_comment": "MEASURED FOR THE FIRST TIME. brti_retrace was never stored in any corpus, so every previous fit scored candidate sets as though this gate were absent while live enforced it. The backfill now records it. On gold it is unmeasurable on only 3.8% of points - so require_measurable_retrace was never the blocker here - and the cap is set at 0.90 because that is the widest option clearing the 15% volume floor: <=0.40 scores better (+0.1070 against +0.0728) but admits 9.7%, under the floor, and a threshold that starves the learned layer cannot be corrected later. require_measurable_retrace stays false: on an instrument whose edge is holding a level, a window with no advance to give back is the TARGET state, not a missing measurement.",
+  "max_brti_retrace": 0.90,
+  "require_measurable_retrace": false,
+
+  "_asset_comment": "Wording only. The gate reads the GOLD feed - verified gold-scale values and zero cross-contamination in either direction - but the label said 'BRTI stability', naming Bitcoin's reference index on a market that has never touched it.",
+  "asset": "GOLD"
+}

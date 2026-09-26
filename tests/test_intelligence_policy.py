@@ -16,6 +16,7 @@ from btc15_signal import intelligence_policy as intel  # noqa: E402
 from btc15_signal import messages  # noqa: E402
 from btc15_signal.adaptive import context_of  # noqa: E402
 from btc15_signal.store import Store  # noqa: E402
+from btc15_signal import feature_contract  # noqa: E402
 
 NOW = int(time.time() * 1000)
 # BRTI bands, because the policy under test declares `brti-1`. These were

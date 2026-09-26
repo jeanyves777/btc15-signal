@@ -21,6 +21,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from btc15_signal import feature_contract, learning_data  # noqa: E402
 from btc15_signal.config import Settings  # noqa: E402
 from btc15_signal.learning_runner import LearningRunner  # noqa: E402
+from btc15_signal import feature_contract  # noqa: E402
 
 ROOT = Path(__file__).resolve().parents[1]
 

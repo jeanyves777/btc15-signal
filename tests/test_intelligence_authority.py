@@ -30,13 +30,13 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from btc15_signal import intel_mode  # noqa: E402
 from btc15_signal import intelligence_policy as intel  # noqa: E402
+from btc15_signal import feature_contract  # noqa: E402
 
 KEY = "bd10-15 · px70-85 · mom5+|accept"
 
 
 def policy(*, action="veto", vetoes=True, admissions=False, n=400,
-           by_session=None, version="brti-2", fingerprint=None):
-    from btc15_signal import feature_contract
+           by_session=None, version=feature_contract.CONTRACT.version, fingerprint=None):
 
     arm = {
         "action": action, "n": n, "markets": n, "days": 30,
@@ -201,14 +201,13 @@ def test_a_caller_that_supplies_no_session_gets_the_old_contract():
 def test_a_session_keyed_cell_needs_no_pooling_check():
     """`us · mid · ...` already names its session and cannot be carried by a
     different one, so it acts without per-session counts."""
-    from btc15_signal import feature_contract
 
     arm = {"action": "veto", "n": 400, "markets": 400, "days": 30,
            "mean": -0.05, "low": -0.09, "high": -0.01, "delta": 0,
            "probability": 0.62, "gate": None, "promoted": True}
     key = "us · mid · bd10-15 · px70-85|accept"
     pol = intel.Policy(
-        version="t", model_version="m", feature_version="brti-2",
+        version="t", model_version="m", feature_version=feature_contract.CONTRACT.version,
         feature_fingerprint=feature_contract.FINGERPRINT,
         arms={key: arm}, vetoes_enabled=True, admissions_enabled=False,
         min_evidence=40, training_cutoff_ms=0, data_end_ms=0)

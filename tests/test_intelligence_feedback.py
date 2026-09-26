@@ -25,6 +25,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from btc15_signal.learning_store import LearningStore  # noqa: E402
 from btc15_signal.store import Store  # noqa: E402
 from btc15_signal.validation import kalshi_fee_charged  # noqa: E402
+from btc15_signal import feature_contract  # noqa: E402
 
 W = 1_790_193_600_000
 NOW = 1_790_200_000_000
@@ -35,8 +36,9 @@ def decision(store, ticker, side, ask, window=W, rid=None):
         "INSERT INTO intelligence_decisions (window_open, ticker, signal_id, "
         "decided_ms, side, ask, base_qualified, final_action, reason, "
         "confidence_delta, evidence_n, policy_version, feature_version) "
-        "VALUES (?,?,?,?,?,?,1,'neutral','t',0,10,'p1','brti-2')",
-        (window, ticker, rid or ticker, NOW - 1000, side, ask),
+        "VALUES (?,?,?,?,?,?,1,'neutral','t',0,10,'p1',?)",
+        (window, ticker, rid or ticker, NOW - 1000, side, ask,
+         feature_contract.CONTRACT.version),
     )
     store.db.commit()
 
@@ -142,12 +144,12 @@ def board(store, version=""):
 def test_evidence_from_a_retired_feature_set_is_excluded(tmp_path):
     store = Store(str(tmp_path / "h.db"))
     evaluation(store, "ctx-old", "brti-1", True, 0.5, 0.0, W)
-    evaluation(store, "ctx-new", "brti-2", True, -0.5, 0.0, W + 1000)
+    evaluation(store, "ctx-new", feature_contract.CONTRACT.version, True, -0.5, 0.0, W + 1000)
 
     pooled = board(store)
     assert "ctx-old|accept" in pooled and "ctx-new|accept" in pooled
 
-    current = board(store, "brti-2")
+    current = board(store, feature_contract.CONTRACT.version)
     assert "ctx-old|accept" not in current, "brti-1 evidence must not judge brti-2"
     assert "ctx-new|accept" in current
 
@@ -156,12 +158,12 @@ def test_the_same_context_label_is_not_pooled_across_versions(tmp_path):
     """The label is identical; the population is not."""
     store = Store(str(tmp_path / "i.db"))
     evaluation(store, "same", "brti-1", True, 1.0, 0.0, W)
-    evaluation(store, "same", "brti-2", True, -1.0, 0.0, W + 1000)
+    evaluation(store, "same", feature_contract.CONTRACT.version, True, -1.0, 0.0, W + 1000)
 
     pooled = board(store)["same|accept"]
     assert pooled["changes"] == 2
 
-    current = board(store, "brti-2")["same|accept"]
+    current = board(store, feature_contract.CONTRACT.version)["same|accept"]
     assert current["changes"] == 1
     assert current["incremental"] == 1.0, "only the brti-2 row"
 
@@ -170,16 +172,16 @@ def test_an_unfiltered_call_still_returns_everything(tmp_path):
     """Callers that genuinely want every row keep the old behaviour."""
     store = Store(str(tmp_path / "j.db"))
     evaluation(store, "a", "brti-1", True, 0.5, 0.0, W)
-    evaluation(store, "b", "brti-2", True, 0.5, 0.0, W + 1000)
+    evaluation(store, "b", feature_contract.CONTRACT.version, True, 0.5, 0.0, W + 1000)
     assert len(board(store)) == 2
 
 
 def test_only_real_changes_count(tmp_path):
     """A candidate that agreed with the rule changed nothing."""
     store = Store(str(tmp_path / "k.db"))
-    evaluation(store, "ctx", "brti-2", False, 0.5, 0.5, W)
-    evaluation(store, "ctx", "brti-2", True, -0.5, 0.0, W + 1000)
-    entry = board(store, "brti-2")["ctx|accept"]
+    evaluation(store, "ctx", feature_contract.CONTRACT.version, False, 0.5, 0.5, W)
+    evaluation(store, "ctx", feature_contract.CONTRACT.version, True, -0.5, 0.0, W + 1000)
+    entry = board(store, feature_contract.CONTRACT.version)["ctx|accept"]
     assert entry["changes"] == 1
     assert entry["incremental"] == 0.5
 
@@ -192,6 +194,10 @@ def test_the_runner_asks_for_the_running_contract(tmp_path):
 
     src = inspect.getsource(learning_runner)
     assert "forward_scoreboard(" in src
+    # It must READ the running contract, not carry a version literal. The
+    # original assertion looked for "brti-2" in the source, which passed only
+    # while that string happened to be there - and would have gone on passing
+    # if the filter were dropped and the literal left behind in a comment.
     assert "feature_contract.CONTRACT.version" in src
     assert "forward_scoreboard()" not in src, "an unfiltered call would pool"
 

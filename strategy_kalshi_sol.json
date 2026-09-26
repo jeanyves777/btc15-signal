@@ -1,0 +1,38 @@
+{
+  "_comment": "SOL (KXSOL15M). TRADING LIVE, AUTOMATION ON, by the operator's decision of 2026-09-25 and AGAINST the measurement in _no_edge_found below - which is not withdrawn. This label says what is deployed: it was DATA CAPTURE ONLY until that decision, and leaving that wording in place while real orders went out is exactly the stale-name failure this project keeps paying for. Refitted 2026-09-25 under brti-4 as a COMPLETE SET on SOL's own corpus: 10,878 priced points over 1,844 markets and 68 days, the largest corpus of the three and the most conclusive.",
+
+  "_no_edge_found": "THE HONEST FINDING, stated first so nothing below reads as a claim, and it is the reason this instrument is not expected to make money on the evidence available. SOL's UNGATED residual is +0.0013 [-0.0124, +0.0159] over 1,844 markets - the market prices these contracts essentially correctly. Of 4,860 complete candidate gate sets, 1,073 cleared the 15% volume floor and the baseline, and NOT ONE demonstrably beat taking everything: the best reads +0.0222 [-0.0057, +0.0486], spanning zero, holding in its first disjoint half (+0.0438) and going negative in its second (-0.0055). Re-scored on the older sub-corpus it spans zero again. Two near-disjoint samples, 57 and 68 days, agree that there is nothing to gate for. A 500-market replay of the most recent days, through the real rule, put the admitted group at -0.0375 against a blocked group at -0.0157. The gate set admits a share the learned layer can accumulate evidence from and makes no claim beyond that. It now trades live anyway, on the operator's decision, with AUTO_DAILY_LOSS_LIMIT and the per-day and per-hour trade caps as the guard. Fees are excluded from every figure here per standing instruction; with no measured edge, fees are the expected cost. The Telegram kill switch does not reach this instance - only BTC consumes getUpdates - so stop it with: python scripts/auto_switch.py --db sol15.db --off",
+
+  "_defect_repaired": "WHAT THIS REPLACES, and it was worse than narrow. The previous seven thresholds - price 0.50-0.60, distance <=2bp, momentum <=10bp, plus BTC's inherited retrace gate and three sentinels - admitted 235 of 10,878 corpus points (2.16%) at a 50.6% win rate against a 73.9% baseline, for a residual of -0.0502. Under the live rule with retrace included it admitted 20 of 6,396, and live it qualified nothing across 422 evaluations. So the old set did not merely block: what little it let through, it chose badly. Each of those seven numbers came from its own best bucket in isolation, and the check that would have caught it - does the COMBINATION admit a usable share - was never run.",
+
+  "enabled": true,
+
+  "_band_comment": "0.55-0.90, replacing 0.50-0.60. Not an edge, a coverage choice: it spans where SOL is actually quoted so the recorder sees representative setups. SOL's normalised distance median is 6.76, essentially BTC's 6.9, so unlike gold there is NO measurement error to correct here - BTC's own band was tested directly on SOL and shows nothing (0.70-0.80 spans zero, 0.80-0.88 -0.0028, 0.88-0.96 -0.0113), reproducing the earlier compare_series result of -0.0029 [-0.0135, +0.0078].",
+  "min_ask": 0.55,
+  "max_ask": 0.90,
+
+  "_distance_comment": "0.5-12bp. The old 0.1-2.0 ceiling came from a marginal table fitted under the 900s lookback; re-measured under brti-4 inside a complete set it costs volume without adding residual. The floor at 0.5 excludes setups sitting exactly on the strike, where the contract is a coin flip and the reference feed's own jitter decides it.",
+  "min_abs_distance_bps": 0.5,
+  "max_abs_distance_bps": 12.0,
+  "min_brti_normalized_distance": 0.0,
+  "moving_min_brti_normalized_distance": 0.0,
+  "calm_momentum_bps": 5.0,
+
+  "_timing_comment": "THE WINDOW THAT ACTUALLY RUNS. Two independent windows gate entry and only their intersection executes: `settings.entry_from_seconds`/`entry_to_seconds` (660/360 by default, and no launcher overrides them) is checked in main.py BEFORE the rule is consulted, and these two keys are checked again inside the rule. This config previously said 800-250s, a span the service could never use. BEHAVIOUR IS UNCHANGED and the fit is unaffected: the corpus holds decision points at 360, 420, 480, 540, 600 and 660 seconds only, so 800-250s selected exactly the minutes live ran. Narrowed to what it always meant, so the config stops advertising a span that cannot happen - and so that widening the Settings window later cannot silently start trading minutes no corpus point covers. 13.3-4.2 minutes left. Wider than the old 700-250s split window, which was carved around a gap in a marginal table - carving a gap out of one sample is fitting the sample, and on 68 days the gap did not survive.",
+  "entry_from_seconds": 660,
+  "entry_to_seconds": 360,
+
+  "_gates_comment": "Real thresholds rather than sentinels, taken from the best complete set even though that set does not clear zero - a config for recording still has to be a config, and a threshold no value can fail must never be shown as a passed check. min_brti_accel and max_brti_accel replace the old sentinel (accel >= -1e9): SOL's extremes beyond +-60 are the only part of the acceleration range that separates. min_brti_held_s replaces >= 0 and min_brti_rejections replaces >= 0. Momentum is a ceiling at 10bp on the same reasoning as silver and gold. None of these is claimed as an edge; each is the value the joint fit preferred, recorded so the live gate matches what was measured.",
+  "min_brti_momentum_bps": 0.0,
+  "max_brti_momentum_bps": 10.0,
+  "min_brti_accel": -60.0,
+  "max_brti_accel": 60.0,
+  "min_brti_held_s": 90.0,
+  "min_brti_rejections": 2,
+  "require_momentum_alignment": false,
+
+  "_retrace_comment": "MEASURED FOR THE FIRST TIME, and it was the live-only blocker. brti_retrace was never stored in any corpus, so every previous fit scored candidate sets as though this gate were absent while live enforced BTC's inherited (0.60, require-measurable). On SOL it is unmeasurable on 11.7% of points - three times gold's and silver's rate - so requiring measurability alone discarded an eighth of all setups for a reason never measured on SOL. All four options span zero; <=0.90 is the widest and the least bad (+0.0173 against +0.0082 for the inherited one), and require_measurable_retrace goes to false because an unmeasurable retrace is a state, not a fault.",
+  "max_brti_retrace": 0.90,
+  "require_measurable_retrace": false,
+  "asset": "SOL"
+}

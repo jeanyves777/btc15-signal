@@ -17,6 +17,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from btc15_signal.store import Store  # noqa: E402
+from btc15_signal import feature_contract  # noqa: E402
 
 W = 1_790_193_600_000
 NOW = 1_790_200_000_000
@@ -58,7 +59,7 @@ def test_a_decision_stores_both(tmp_path):
         "decided_ms": NOW, "side": "UP", "ask": 0.80,
         "base_qualified": 1, "final_action": "neutral", "reason": "t",
         "confidence_delta": 0, "evidence_n": 10,
-        "policy_version": "p", "feature_version": "brti-2",
+        "policy_version": "p", "feature_version": feature_contract.CONTRACT.version,
         "brti_retrace": 0.42, "brti_choppiness": 0.91,
     })
     row = store._dicts(
@@ -75,7 +76,7 @@ def test_an_unmeasurable_window_stores_null_not_zero(tmp_path):
         "decided_ms": NOW, "side": "UP", "ask": 0.80,
         "base_qualified": 1, "final_action": "neutral", "reason": "t",
         "confidence_delta": 0, "evidence_n": 10,
-        "policy_version": "p", "feature_version": "brti-2",
+        "policy_version": "p", "feature_version": feature_contract.CONTRACT.version,
         "brti_retrace": None, "brti_choppiness": None,
     })
     row = store._dicts(

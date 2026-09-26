@@ -119,6 +119,17 @@ class LifetimeRecord:
     dollars: float
     since_ms: int | None
     complete: bool
+    # The series this figure covers, and what the ACCOUNT holds outside it.
+    # Both instances reconcile the whole Kalshi account into their own ledger,
+    # so an unscoped total reports the other instrument's trades and anything
+    # traded by hand as though this strategy had done it. On 2026-09-24 the
+    # BTC message read -$8.20 while KXBTC15M itself was +$0.11: -$1.44 was
+    # ETH and -$6.76 sat in five KXBTCD and two natural-gas markets that no
+    # bot proposal or manual_trades row accounts for. `foreign_*` carries that
+    # remainder so it can be shown rather than silently absorbed.
+    series: str | None = None
+    foreign_markets: int = 0
+    foreign_dollars: float = 0.0
 
     @property
     def losers(self) -> int:
@@ -164,6 +175,12 @@ class MoneySnapshot:
     # include it. Set by the caller, which is the only thing that knows which
     # market the message is about.
     pending: bool = False
+    # THIS INSTRUMENT'S CALL RECORD - every signal, traded or not. It was only
+    # ever visible when the insight rotation happened to pick it, so whether a
+    # reader could see if the strategy is right about DIRECTION depended on
+    # chance. With five instruments running it is the number that says whether
+    # a new one works at all, so it is carried on every snapshot.
+    signal_record: dict | None = None
 
     @property
     def losers(self) -> int:
@@ -286,6 +303,21 @@ class Store:
         "updated_ms": "INTEGER",
     }
 
+    # The settlement outcome as Kalshi states it, beyond yes/no. `strike` is
+    # `floor_strike` - the same target the signal message quotes - and
+    # `expiration_value` is the settling BRTI. Their difference is the margin a
+    # trade won or lost by, which nothing in the lifecycle recorded before.
+    #
+    # Measured over 143 BTC and 14 ETH executed trades: winners finish a mean
+    # 18.3 bps past the target on BOTH instruments, losers fall 6.4/6.5 bps
+    # short. That the figure is identical in bps across assets 20x apart in
+    # price is why it is stored raw and reported in bps, never in dollars.
+    SETTLEMENT_FACT_COLUMNS = {
+        "strike": "REAL",
+        "expiration_value": "REAL",
+        "facts_synced_ms": "INTEGER",
+    }
+
     def _migrate_delivery(self) -> None:
         """Bring `notifications` up to what delivery tracking needs.
 
@@ -304,6 +336,28 @@ class Store:
         no learning runner and no poll can reach the table before it.
         """
         self._add_columns("notifications", self.DELIVERY_COLUMNS)
+        # `decision_records` is created lazily by `record_decision`, which is
+        # the WRITE path. Everything that READS it therefore fails on a brand
+        # new instance until the first decision happens to be written - and on
+        # 2026-09-24 the gold instance logged "decision records for window ...
+        # were NOT graded: no such table" on every settlement from launch.
+        #
+        # This is the `_migrate_delivery` failure seen from the other end: that
+        # one put a column inside a CREATE TABLE IF NOT EXISTS so it reached
+        # only fresh installs; this one puts the whole table behind a write so
+        # it reaches only instances that have already written. Both are cases
+        # of schema arriving from somewhere other than startup.
+        self._create_decision_records()
+        # HOW FAR THE MARKET FINISHED FROM THE TARGET. The lifecycle recorded
+        # whether a trade won and what it paid, but not by how much it won -
+        # and that margin is the thing that says whether an 83c favourite
+        # settled comfortably or by a hair. Both come from Kalshi itself on
+        # `/markets/{ticker}`: `floor_strike` is the target the message quotes
+        # and `expiration_value` is where BRTI actually finished, so this is the
+        # broker's own account of the outcome rather than a local
+        # reconstruction. `facts_synced_ms` marks a row as enriched, so the
+        # backfill is resumable and a re-sync of the P&L never re-fetches it.
+        self._add_columns("settlements", self.SETTLEMENT_FACT_COLUMNS)
         # The insight rotation persists in `settings_text`; a message that
         # cannot read its variant is a message that silently stops rotating.
         self.db.execute("""
@@ -312,6 +366,40 @@ class Store:
             )
         """)
         self.db.commit()
+
+    def _create_decision_records(self) -> None:
+        """The decision archive, created at STARTUP rather than on first write.
+
+        Every PASS, WAIT, refused setup and unfilled order lands here - the
+        counterfactuals, which is most of the value. It used to be created
+        inside `record_decision`, so a reader on a new instance found no table
+        at all; gold logged an ungraded settlement on every window from launch
+        until this moved.
+
+        Idempotent, so calling it from both places costs one pragma.
+        """
+        self.db.execute("""
+            CREATE TABLE IF NOT EXISTS decision_records (
+                observation_id TEXT PRIMARY KEY,
+                signal_id TEXT, market_id TEXT, proposal_id TEXT,
+                strategy_version TEXT,
+                window_open INTEGER, created_at INTEGER,
+                ticker TEXT, side TEXT, remaining_s INTEGER,
+                action TEXT, blocked_reason TEXT,
+                ask REAL, limit_submitted REAL, count REAL,
+                gates TEXT, settled_s REAL,
+                measured_edge REAL, fee REAL, net_edge REAL,
+                distance_dollars REAL, normalized_distance REAL,
+                volatility_bps REAL, momentum_bps REAL, spread_bps REAL,
+                session TEXT, hour_utc INTEGER, vol_regime TEXT,
+                regime_weight REAL, confidence_adjustment INTEGER,
+                protective_level REAL, level_adjustment INTEGER,
+                cohort_n INTEGER, cohort_win_probability REAL,
+                cohort_win_low REAL, cohort_win_high REAL,
+                cohort_action TEXT, cohort_reason TEXT,
+                fill_price REAL, filled INTEGER, won INTEGER
+            )
+        """)
 
     def _add_columns(self, table: str, columns: dict[str, str]) -> None:
         """Add any missing columns to an existing table, idempotently.
@@ -334,6 +422,13 @@ class Store:
         # overrides them from Settings at startup via `configure_recovery_exit`
         # - a setting that silently does nothing is worse than no setting.
         self.recovery_exit_policy: dict = {}
+        # WHICH INSTRUMENT'S MONEY THIS STORE SPEAKS FOR. None means "the whole
+        # ledger", which is right for a test and wrong for a live instance: both
+        # BTC and ETH reconcile the same Kalshi account into their own database,
+        # so an unscoped total presents the other instrument's trades - and
+        # anything traded by hand - as this strategy's result. Set at startup by
+        # `configure_instrument` from `settings.kalshi_series`.
+        self.instrument_series: str | None = None
         self.db.execute("""
             CREATE TABLE IF NOT EXISTS predictions (
                 window_open INTEGER PRIMARY KEY, created_at INTEGER NOT NULL,
@@ -739,6 +834,10 @@ class Store:
             "brti_accel": "REAL",
             "brti_held_s": "REAL",
             "brti_rejections": "INTEGER",
+            # The 45-minute context, archived beside the 300s pair so a
+            # replayed decision can ask whether its short window was typical.
+            "brti_momentum_45m_bps": "REAL",
+            "brti_volatility_45m_bps": "REAL",
         })
         # FORWARD EVALUATION. What each frozen candidate WOULD have changed on
         # a live signal, recorded beside what the unchanged strategy actually
@@ -1091,6 +1190,24 @@ class Store:
             "avg_decision_to_submit_ms": row[2],
             "avg_round_trip_ms": row[3],
         }
+
+    def configure_instrument(self, settings) -> None:
+        """Bind this store's money reporting to the series it actually trades.
+
+        Called once at startup, beside `configure_recovery_exit`. Both live
+        instances reconcile the ENTIRE Kalshi account into their own ledger -
+        that is deliberate, because the account is one pot and the capital
+        controller has to see all of it - but the *performance* figures must
+        name one instrument or they are not about the strategy at all.
+
+        Without this the BTC message on 2026-09-24 read "Live since 19 Sep:
+        -$8.20 · 231 closed" when KXBTC15M was +$0.11 over 211 markets. The
+        difference was ETH (-$1.44) plus seven markets nothing in this system
+        placed: five KXBTCD and two KXAAAGASD, -$6.76 between them. A strategy
+        cannot be judged against a number that mostly is not its own.
+        """
+        series = str(getattr(settings, "kalshi_series", "") or "").strip()
+        self.instrument_series = series or None
 
     def configure_recovery_exit(self, settings) -> None:
         """Take the stand-down thresholds from the deployed configuration.
@@ -1767,8 +1884,28 @@ class Store:
                 )
             except (ValueError, AttributeError):
                 settled_ms = now_ms
+            # NAMED COLUMNS, not positions. This was `VALUES (?,?,...)` with
+            # thirteen placeholders, so widening the table - which
+            # `_add_columns` now does for the settlement facts - would have
+            # silently written the wrong value into every column past the
+            # insertion point, or raised on count. Naming them also means an
+            # upsert never clears a column it does not mention: the settlement
+            # facts are fetched separately and must survive a re-sync.
             self.db.execute(
-                "INSERT OR REPLACE INTO settlements VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                "INSERT INTO settlements (ticker, event_ticker, market_result,"
+                " yes_count, yes_cost, no_count, no_cost, revenue_cents,"
+                " fee_cost, pnl, settled_ms, synced_at, window_ms)"
+                " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)"
+                " ON CONFLICT(ticker) DO UPDATE SET"
+                "   event_ticker=excluded.event_ticker,"
+                "   market_result=excluded.market_result,"
+                "   yes_count=excluded.yes_count, yes_cost=excluded.yes_cost,"
+                "   no_count=excluded.no_count, no_cost=excluded.no_cost,"
+                "   revenue_cents=excluded.revenue_cents,"
+                "   fee_cost=excluded.fee_cost, pnl=excluded.pnl,"
+                "   settled_ms=excluded.settled_ms,"
+                "   synced_at=excluded.synced_at,"
+                "   window_ms=excluded.window_ms",
                 (
                     ticker, row.get("event_ticker"), row.get("market_result"),
                     float(row.get("yes_count_fp") or 0),
@@ -1785,6 +1922,67 @@ class Store:
             written += 1
         self.db.commit()
         return written
+
+    def settlements_missing_facts(self, limit: int = 40) -> list[str]:
+        """Settled markets whose target and settling value we have not fetched.
+
+        Newest first: a live settlement is worth enriching before a month-old
+        one, and the backfill of history can take as many passes as it needs.
+        """
+        return [r[0] for r in self.db.execute(
+            "SELECT ticker FROM settlements "
+            " WHERE facts_synced_ms IS NULL AND market_result IS NOT NULL "
+            " ORDER BY settled_ms DESC LIMIT ?", (int(limit),),
+        )]
+
+    def record_settlement_facts(self, ticker: str, strike: float | None,
+                                expiration_value: float | None,
+                                now_ms: int) -> None:
+        """Store Kalshi's target and settling value for one market.
+
+        `facts_synced_ms` is set even when Kalshi returns neither number, so a
+        market that simply does not publish them is not retried forever. The
+        absent case stays absent - NULL, never 0.0, because a strike of zero
+        would read as a real target and put a 100% move in every average.
+        """
+        self.db.execute(
+            "UPDATE settlements SET strike=?, expiration_value=?, "
+            "facts_synced_ms=? WHERE ticker=?",
+            (None if strike is None else float(strike),
+             None if expiration_value is None else float(expiration_value),
+             int(now_ms), ticker),
+        )
+        self.db.commit()
+
+    def settlement_margin(self, ticker: str, side: str) -> dict | None:
+        """How far past the target the market finished, from OUR side's view.
+
+        Positive is favourable: an UP trade wants the settling value above the
+        target, a DOWN trade below it. Returned in bps of the target as well as
+        in dollars, because the dollar figure is not comparable between
+        instruments and the bps figure demonstrably is.
+
+        None when either number is missing - which is different from a margin
+        of zero, and a settlement that finished exactly on the strike is a real
+        and reportable event.
+        """
+        row = self.db.execute(
+            "SELECT strike, expiration_value FROM settlements WHERE ticker=?",
+            (ticker,),
+        ).fetchone()
+        if not row or row[0] is None or row[1] is None:
+            return None
+        strike, value = float(row[0]), float(row[1])
+        if strike <= 0:
+            return None
+        move = value - strike
+        favourable = move if str(side).upper() == "UP" else -move
+        return {
+            "strike": strike, "value": value, "move": move,
+            "favourable": favourable,
+            "bps": round(abs(favourable) / strike * 10_000, 1),
+            "signed_bps": round(favourable / strike * 10_000, 1),
+        }
 
     def outstanding_loss(self) -> tuple[float, int]:
         """(dollars still to recover, markets applied since it was opened).
@@ -3730,7 +3928,31 @@ class Store:
             sessions=tuple(session_breakdown(self.session_rows(now_ms))),
             recovery=self.stored_deficit(),
             last_add=self.last_add_decision(),
+            signal_record=self.signal_record(),
         )
+
+    def signal_record(self) -> dict:
+        """(settled, wins) over every graded signal for THIS instrument.
+
+        Counts CALLS, not trades: a signal the rule refused is still a
+        prediction that was right or wrong, and excluding them would score the
+        strategy only on the subset it acted on. Scoped by series for the same
+        reason the money is - an unscoped count reports the other instruments.
+        """
+        series = self.instrument_series
+        where = "won IS NOT NULL"
+        params: tuple = ()
+        if series:
+            where += " AND contract_ticker LIKE ?"
+            params = (f"{series}-%",)
+        try:
+            row = self.db.execute(
+                f"SELECT COUNT(*), COALESCE(SUM(won), 0) FROM predictions "
+                f" WHERE {where}", params,
+            ).fetchone()
+        except sqlite3.Error:
+            return {}
+        return {"settled": int(row[0] or 0), "wins": int(row[1] or 0)}
 
     def session_rows(self, now_ms: int | None = None) -> list[tuple[int, float]]:
         """(window_ms, pnl) for every market settled in the current NY day.
@@ -4083,16 +4305,40 @@ class Store:
         total disagree with the broker, which is the number this system is not
         allowed to invent.
         """
+        series = self.instrument_series
+        if not series:
+            row = self.db.execute(
+                "SELECT COUNT(*), COALESCE(SUM(pnl > 0), 0), "
+                "COALESCE(SUM(pnl), 0), MIN(COALESCE(window_ms, first_ms)) "
+                "FROM daily_ledger"
+            ).fetchone()
+            return LifetimeRecord(
+                markets=int(row[0] or 0), winners=int(row[1] or 0),
+                dollars=round(float(row[2] or 0.0), 6),
+                since_ms=int(row[3]) if row[3] else None,
+                complete=self.history_is_complete(),
+            )
+        # SCOPED TO THIS INSTRUMENT. Both instances reconcile the whole account,
+        # so the series prefix is what separates "what this strategy did" from
+        # "what the account holds". Anything outside it is real money and is
+        # reported, but never as this strategy's result.
         row = self.db.execute(
             "SELECT COUNT(*), COALESCE(SUM(pnl > 0), 0), COALESCE(SUM(pnl), 0), "
-            "MIN(COALESCE(window_ms, first_ms)) FROM daily_ledger"
+            "MIN(COALESCE(window_ms, first_ms)) FROM daily_ledger "
+            "WHERE ticker LIKE ?", (f"{series}-%",),
         ).fetchone()
-        markets = int(row[0] or 0)
-        since = int(row[3]) if row[3] else None
+        other = self.db.execute(
+            "SELECT COUNT(*), COALESCE(SUM(pnl), 0) FROM daily_ledger "
+            "WHERE ticker NOT LIKE ?", (f"{series}-%",),
+        ).fetchone()
         return LifetimeRecord(
-            markets=markets, winners=int(row[1] or 0),
-            dollars=round(float(row[2] or 0.0), 6), since_ms=since,
+            markets=int(row[0] or 0), winners=int(row[1] or 0),
+            dollars=round(float(row[2] or 0.0), 6),
+            since_ms=int(row[3]) if row[3] else None,
             complete=self.history_is_complete(),
+            series=series,
+            foreign_markets=int(other[0] or 0),
+            foreign_dollars=round(float(other[1] or 0.0), 6),
         )
 
     def history_is_complete(self) -> bool:
@@ -4406,28 +4652,7 @@ class Store:
         NEVER raises: bookkeeping may not propagate into the path that trades.
         """
         try:
-            self.db.execute("""
-                CREATE TABLE IF NOT EXISTS decision_records (
-                    observation_id TEXT PRIMARY KEY,
-                    signal_id TEXT, market_id TEXT, proposal_id TEXT,
-                    strategy_version TEXT,
-                    window_open INTEGER, created_at INTEGER,
-                    ticker TEXT, side TEXT, remaining_s INTEGER,
-                    action TEXT, blocked_reason TEXT,
-                    ask REAL, limit_submitted REAL, count REAL,
-                    gates TEXT, settled_s REAL,
-                    measured_edge REAL, fee REAL, net_edge REAL,
-                    distance_dollars REAL, normalized_distance REAL,
-                    volatility_bps REAL, momentum_bps REAL, spread_bps REAL,
-                    session TEXT, hour_utc INTEGER, vol_regime TEXT,
-                    regime_weight REAL, confidence_adjustment INTEGER,
-                    protective_level REAL, level_adjustment INTEGER,
-                    cohort_n INTEGER, cohort_win_probability REAL,
-                    cohort_win_low REAL, cohort_win_high REAL,
-                    cohort_action TEXT, cohort_reason TEXT,
-                    fill_price REAL, filled INTEGER, won INTEGER
-                )
-            """)
+            self._create_decision_records()
             columns = [
                 "observation_id", "signal_id", "market_id", "proposal_id",
                 "strategy_version", "window_open", "created_at", "ticker",

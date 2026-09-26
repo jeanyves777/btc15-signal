@@ -26,6 +26,7 @@ from btc15_signal import feature_contract as fc  # noqa: E402
 from btc15_signal import intelligence_policy as intel  # noqa: E402
 from btc15_signal.adaptive import brti_context_of, setup_context_of  # noqa: E402
 from btc15_signal.brti import features_from_series  # noqa: E402
+from btc15_signal import feature_contract  # noqa: E402
 
 
 def series(n: int, end_ms: int = 1_000_000, start: float = 100_000.0):
@@ -218,3 +219,35 @@ def test_incompatible_candidates_evaluate_nothing():
     )
     assert not cs.compatible
     assert cs.evaluate(context_key=setup_key(None, ask=0.50), qualified=True) == []
+
+
+def test_the_feature_version_has_exactly_one_definition():
+    """It drifted twice. `intelligence_policy` records the first - a constant
+    left "at brti-1 when the contract moved to brti-2" - and on 2026-09-25
+    `adaptive.SETUP_FEATURE_VERSION` stayed at brti-2 when the contract went to
+    brti-3. `learning_data` filters rows on that exact value, so it silently
+    discarded every row written under the running version: `live_actual_fills`
+    read 0 out of rows that were all present.
+
+    One definition, and the contract reads it.
+    """
+    from btc15_signal import feature_contract
+    from btc15_signal.adaptive import SETUP_FEATURE_VERSION
+    assert feature_contract.CONTRACT.version == SETUP_FEATURE_VERSION
+
+
+def test_no_module_restates_the_version_as_a_literal():
+    """A second literal is how it drifted both times. Comments may mention an
+    old version; assignments may not."""
+    import re
+    from pathlib import Path
+    src = Path(__file__).resolve().parents[1] / "src" / "btc15_signal"
+    offenders = []
+    for path in src.glob("*.py"):
+        if path.name == "adaptive.py":
+            continue
+        for line in path.read_text(encoding="utf-8").splitlines():
+            code = line.split("#", 1)[0]
+            if re.search(r'=\s*["\']brti-\d["\']', code):
+                offenders.append(f"{path.name}: {line.strip()}")
+    assert not offenders, offenders

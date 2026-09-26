@@ -70,6 +70,41 @@ class KalshiClient:
             raise RuntimeError(f"Expected one active {self.series} market, found {len(matches)}")
         return matches[0]
 
+    async def next_open_ms(self, now_ms: int) -> int | None:
+        """When does this series next list a market, per Kalshi itself?
+
+        GOLD AND SILVER KEEP NEW YORK HOURS. They close at the New York close
+        and reopen at the New York open, so they are shut every weekend for
+        about two days - on 2026-09-25 at 21:00 UTC both went quiet and the
+        next market Kalshi listed opened 2026-09-28T02:45:00Z, 53 hours later.
+        Polling every ten seconds through that costs roughly 19,000 requests
+        and records nothing, because the underlying metal is not trading either.
+
+        ASKED, NOT ASSUMED. A hardcoded New York calendar would be wrong on
+        every market holiday and on any schedule change, and this codebase's
+        rule is to measure rather than reason. Kalshi publishes the next
+        market's `open_time`, so the venue is the authority on its own hours.
+
+        Returns None when nothing is scheduled, which is NOT the same as
+        "closed": it means unknown, and the caller must keep treating an
+        unexplained silence as a possible outage.
+        """
+        response = await self.client.get(
+            self.base_url + "/markets",
+            params={"series_ticker": self.series, "status": "unopened",
+                    "limit": 100},
+        )
+        response.raise_for_status()
+        times = []
+        for item in response.json().get("markets", []):
+            raw = item.get("open_time")
+            if not raw:
+                continue
+            opened = iso_ms(raw)
+            if opened > now_ms:
+                times.append(opened)
+        return min(times) if times else None
+
     async def result(self, ticker: str) -> str | None:
         response = await self.client.get(self.base_url + f"/markets/{ticker}")
         response.raise_for_status()

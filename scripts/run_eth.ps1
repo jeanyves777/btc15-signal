@@ -1,3 +1,5 @@
+param([switch]$Supervise)
+
 # Launch the ETH instance.
 #
 # CREDENTIALS ARE NOT DUPLICATED. pydantic-settings gives real environment
@@ -64,4 +66,18 @@ $env:CORPUS_MARKET_PATH = "data/market_data_kxeth15m.db"
 $env:LEARNING_ENABLED = "true"
 
 New-Item -ItemType Directory -Force runtime-eth | Out-Null
-& .venv\Scripts\pythonw.exe scripts\run_service.py
+# SUPERVISED OR ONE-SHOT. With -Supervise this hands off to watchdog.py
+# instead of the service directly, and watchdog.py relaunches it whenever
+# it exits. The environment above is already set and watchdog.py runs
+# run_service.py as a CHILD, so the instance variables are inherited -
+# which is why the switch lives here rather than in a second script. A
+# copied env block is how one instance ends up writing another's database
+# (FINDINGS 43, 63).
+#
+# The boot+logon scheduled task passes -Supervise. Run it bare to start
+# the instance by hand.
+if ($Supervise) {
+    & .venv\Scripts\pythonw.exe scripts\watchdog.py
+} else {
+    & .venv\Scripts\pythonw.exe scripts\run_service.py
+}
