@@ -2050,6 +2050,62 @@ class Store:
             proceeds = count * (1.0 if won else 0.0)
         return (proceeds - spend) < 0.0
 
+    def settled_bot_markets(self, limit: int = 24) -> list[tuple[int, bool]]:
+        """[(window_open, won)] newest first, as the BOT experienced them.
+
+        The same join, fees and early-exit arithmetic as `last_market_lost` -
+        which is exactly why it is here rather than rebuilt at the call site.
+        That function answers "did the last one lose"; the waiting loss step
+        also needs "how many markets have settled since it", and the two must
+        not be able to disagree about which markets those are or who traded
+        them. The operator's rule is about the BOT's trade, so the market is
+        found through `trade_proposals` and priced from the bot's own fill.
+        """
+        rows = self.db.execute(
+            "SELECT p.window_open, p.side, p.count, p.fill_price, p.fee_paid, "
+            "       p.status, p.exit_price, p.exit_count, s.market_result "
+            "  FROM trade_proposals p "
+            "  JOIN settlements s ON s.ticker = p.ticker "
+            " WHERE p.strategy = 'primary' AND p.fill_price IS NOT NULL "
+            "   AND s.market_result IN ('yes','no') "
+            " ORDER BY p.window_open DESC, p.created_at DESC LIMIT ?",
+            (limit,),
+        ).fetchall()
+        out: list[tuple[int, bool]] = []
+        seen: set[int] = set()
+        for (window, side, count, fill_price, fee_paid, status,
+             exit_price, exit_count, result) in rows:
+            if not count or window in seen:
+                continue
+            seen.add(window)
+            won = (result == "yes") == (side == "UP")
+            spend = count * fill_price + (fee_paid or 0.0)
+            if status == "exited" and exit_price is not None and exit_count:
+                proceeds = (exit_count * exit_price
+                            + (count - exit_count) * (1.0 if won else 0.0))
+            else:
+                proceeds = count * (1.0 if won else 0.0)
+            out.append((int(window), (proceeds - spend) >= 0.0))
+        return out
+
+    def upsized_since(self, window_open: int) -> bool:
+        """Has a primary entry already gone out above base size since then?
+
+        THE "ALREADY SPENT" TEST, derived rather than flagged. The waiting loss
+        step must fire ONCE per losing episode: without this, every later
+        in-band trade inside the waiting window would upsize again, on one
+        loss. A stored flag would have to be written by the sizing path and
+        would then be wrong whenever an order failed after it; this reads what
+        actually happened.
+        """
+        row = self.db.execute(
+            "SELECT 1 FROM trade_proposals "
+            " WHERE strategy = 'primary' AND window_open > ? AND count > 1 "
+            " LIMIT 1",
+            (int(window_open),),
+        ).fetchone()
+        return row is not None
+
     def recovery_state(
         self, plan_steps: int = DEFAULT_RECOVERY_STEPS, now_ms: int | None = None
     ) -> RecoveryState:

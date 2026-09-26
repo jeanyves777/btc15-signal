@@ -174,7 +174,9 @@ def _money_block(snapshot) -> str:
     return "\n".join(lines)
 
 
-def recovery_armed(state, trigger: str = "", loss_step: float = 0.0) -> str:
+def recovery_armed(state, trigger: str = "", loss_step: float = 0.0,
+                   band: tuple[float, float] = (0.70, 0.79),
+                   wait: int = 5) -> str:
     """Announced when a realised loss opens a deficit.
 
     THE SIZING LINE HAS TO MATCH WHAT RUNS. It said "base entries stay at one
@@ -188,9 +190,12 @@ def recovery_armed(state, trigger: str = "", loss_step: float = 0.0) -> str:
         f"\U0001f527 <b>RECOVERY ARMED</b> · ${state.deficit:,.2f} outstanding"
     )
     sizing = (
-        f"After a losing market the next entry is sized to ${loss_step:,.2f}; "
-        "a win resets it. Consecutive losses hold at that budget rather than "
-        "escalating, and the conditional add-on stands down while it applies."
+        f"After a losing market ONE later entry is sized to "
+        f"${loss_step:,.2f} - but it waits for an ask between "
+        f"{band[0]:.2f} and {band[1]:.2f}, where the extra contract is worth "
+        f"having, so it may be several markets later. It expires unspent after "
+        f"{wait} settled markets, fires once, and never escalates; the "
+        f"conditional add-on stands down only on the entry it actually sizes."
         if loss_step > 0 else
         "Base entries stay at one contract. Recovery may add ONE extra "
         "contract, resting 2¢ below a fill, and only while the BRTI "
@@ -2007,7 +2012,9 @@ def exit_warning_message(*, ticker: str, side: str, price: float,
 
 
 def recovery_armed_message(state, trigger: str = "", *, snapshot=None,
-                           insight: str = "", loss_step: float = 0.0) -> str:
+                           insight: str = "", loss_step: float = 0.0,
+                           band: tuple[float, float] = (0.70, 0.79),
+                           wait: int = 5) -> str:
     """A realised loss opened a deficit, and sizing may now rise.
 
     WHAT IT MAY RISE BY IS STATED HERE rather than left to the reader, and it
@@ -2019,10 +2026,12 @@ def recovery_armed_message(state, trigger: str = "", *, snapshot=None,
     and the message must not read like one.
     """
     sizing = (
-        f"<i>After a losing market the next entry is sized to "
-        f"${loss_step:,.2f} and a win resets it. Consecutive losses hold at "
-        f"that budget rather than escalating, and the conditional add-on "
-        f"stands down while it applies.</i>"
+        f"<i>After a losing market ONE later entry is sized to "
+        f"${loss_step:,.2f}, and it WAITS for an ask between {band[0]:.2f} and "
+        f"{band[1]:.2f} - at 0.90 an extra contract makes about 10¢, which "
+        f"base size earns anyway at a better price. So it may fire several "
+        f"markets later; it expires unspent after {wait} settled markets, fires "
+        f"once, and never escalates.</i>"
         if loss_step > 0 else
         "<i>Base entries stay at one contract. Recovery may add ONE "
         "extra contract, resting 2\u00a2 below a fill, and only while "

@@ -20,6 +20,7 @@ from .capital import CapitalController, ny_day
 from .config import Settings
 from .decision import decision_facts
 from .execution import KalshiExecutionClient
+from .mirror import MirroringExecutionClient, targets_from_settings
 from .features import _session
 from .hourly_shadow import HourlyShadow
 from .kalshi import KalshiClient, KalshiMarket
@@ -1189,13 +1190,41 @@ def loss_step_size(
     store: Store, settings: Settings, base: int, ask: float,
     lost: bool | None = None,
 ) -> tuple[int, str]:
-    """(contracts, why) - after a losing market, size to a fixed dollar budget.
+    """(contracts, why) - after a losing market, size up AT A PRICE THAT PAYS.
 
-    THE OPERATOR'S RULE, 2026-09-24: every time a trade loses, the next trade
-    is sized at exactly `loss_step_budget`; a win resets it to base.
-    Consecutive losses hold at the same budget rather than escalating, so
-    exposure is bounded by `loss_step_max_contracts` whatever the streak
-    length - this is a step, not a martingale.
+    THE OPERATOR'S RULE, 2026-09-24, as AMENDED BY THEM ON 2026-09-25: the
+    upsize no longer fires on whatever trade comes next. It waits for an ask
+    inside `loss_step_band_lo`-`loss_step_band_hi` (0.70-0.79), which may be
+    three to five trades later, because that is where a fixed dollar budget can
+    actually dent a deficit: the extra contract wins `1 - ask`, so at 0.90 it
+    risks 90c to make 10c and at 0.75 it risks 75c to make 25c. Spending the
+    step at the top of the band earns about 20c, which base size would have
+    earned anyway at a better price - the operator's exact objection.
+
+    WHAT WAITING CHANGES, stated because it is a real change and not a tweak.
+    Before, the step fired once per loss, immediately, and a win reset it. Now
+    it stays ARMED across intervening markets whatever they do, and it fires on
+    the first in-band trade. So it can land after a win, which the old rule
+    could not do. Three bounds keep that from becoming a standing upsize:
+
+      * it expires after `loss_step_wait_markets` settled markets, unspent;
+      * it fires ONCE per losing episode - `Store.upsized_since` reads whether
+        an upsized entry already went out, rather than trusting a flag;
+      * the budget never escalates, so a second loss re-arms at the same size.
+
+    Consecutive losses therefore hold at one step, as before: this is a step,
+    not a martingale.
+
+    THE EVIDENCE DOES NOT SUPPORT THE BAND, and that is recorded rather than
+    hidden. Expected value per extra contract is `p - ask`, which is the
+    calibration residual itself, so the payoff ratio cancels: 25c at 0.75 beats
+    10c at 0.90 only if the win rate fails to make up the difference. On BTC's
+    7,139 ungated brti-4 points the 0.70-0.79 band measured +0.0026 per
+    contract against +0.0159 outside it, and 0.90-0.93 was the strongest cell
+    at +0.0240 [+0.0009]. The population that actually matters - setups the
+    gates admit - could not be scored, because BTC's brti-2-era floors admit
+    too few brti-4 points. The operator decided with that in view and
+    instructed it be shipped; sizing is theirs. See config.py for the table.
 
     IT KEYS ON THE LAST MARKET, NOT THE DEFICIT. `recovery_size` above sizes
     while money is outstanding and divides it across a plan; this asks one
@@ -1220,13 +1249,52 @@ def loss_step_size(
     """
     if not settings.loss_step_enabled:
         return base, ""
-    if lost is None:
-        lost = store.last_market_lost()
-    # None is "no market has settled yet" and must not upsize: a fresh
-    # database has not seen a win either, and "not a win" is the opposite of
-    # the rule asked for.
-    if not lost:
+
+    lo, hi = settings.loss_step_band_lo, settings.loss_step_band_hi
+    wait = max(1, settings.loss_step_wait_markets)
+
+    # THE ARMING LOSS, and how many markets have settled since it. Both come
+    # off `settled_bot_markets`, which is the same join, fees and early-exit
+    # arithmetic as `last_market_lost` - so "did it lose" and "how long ago"
+    # cannot disagree about which markets those were or who traded them.
+    history = store.settled_bot_markets(limit=max(4 * wait, 24))
+    if not history:
+        # No settled bot market at all. None is not a loss: a fresh database
+        # has not seen a win either, and upsizing on "not a win" is the
+        # opposite of the rule asked for.
         return base, ""
+    armed_window = None
+    markets_since = 0
+    for index, (window, won) in enumerate(history):
+        if not won:
+            armed_window, markets_since = window, index
+            break
+    if armed_window is None:
+        return base, ""
+
+    # `lost` IS NOT CONSULTED for arming any more, and that is the point of the
+    # amendment rather than an oversight. It answers "did the LAST market lose",
+    # and the waiting step has to survive exactly the case where it did not: a
+    # loss, then a win at 0.88, then an in-band setup two markets later is the
+    # behaviour the operator asked for, and an early return on `lost is False`
+    # would have refused it. The parameter is kept because callers and tests
+    # pass it and it still reflects the ledger; `history` is the authority.
+
+    if markets_since >= wait:
+        return base, (
+            f"recovery expired unspent - {markets_since} markets since the "
+            f"loss, limit {wait}"
+        )
+    if store.upsized_since(armed_window):
+        return base, "recovery already taken for this loss"
+    if not lo <= ask <= hi:
+        # NOT an upsize, and it must not read as one. The step stays armed and
+        # this trade goes out at base size, which still wins its own money.
+        return base, (
+            f"recovery waiting for {lo:.2f}-{hi:.2f} - this ask is {ask:.2f} "
+            f"({markets_since + 1} of {wait} markets used)"
+        )
+
     count = min(
         contracts_for_budget(settings.loss_step_budget, ask),
         settings.loss_step_max_contracts,
@@ -1235,8 +1303,10 @@ def loss_step_size(
         # Empty reason, so no line claims an upsize that did not happen.
         return base, ""
     return count, (
-        f"last market lost - ${settings.loss_step_budget:.2f} buys {count} "
-        f"at {ask:.2f} (cap {settings.loss_step_max_contracts})"
+        f"recovery taken at {ask:.2f}, inside {lo:.2f}-{hi:.2f} - "
+        f"${settings.loss_step_budget:.2f} buys {count}, "
+        f"{markets_since} market(s) after the loss "
+        f"(cap {settings.loss_step_max_contracts})"
     )
 
 
@@ -3725,6 +3795,27 @@ async def service() -> None:
                 settings.kalshi_api_key_id,
                 settings.kalshi_private_key_path,
             )
+            # COPY TRADING. Wrapping the client here is the whole integration:
+            # every order path in this codebase goes through this one object,
+            # and recovery_add_runner receives it as a parameter, so the mirrors
+            # cover entry, upsize and exit without a single call site changing.
+            # Reads still answer for the primary account alone.
+            #
+            # Three conditions, all required. Dry run must never reach another
+            # account, and a mirror block with no key pair is ignored rather
+            # than fatal.
+            if settings.mirror_enabled and not settings.dry_run:
+                mirror_targets = targets_from_settings(settings)
+                if mirror_targets:
+                    trader = MirroringExecutionClient(
+                        trader, mirror_targets, settings.kalshi_base_url
+                    )
+                    print(f"copy trading ON -> {trader.describe()}", flush=True)
+                else:
+                    print(
+                        "copy trading enabled but no mirror credentials set",
+                        flush=True,
+                    )
         except (OSError, ValueError) as exc:
             print(f"Kalshi execution disabled: {exc}", flush=True)
     # The hourly ladder takes its OWN Binance reading (see HourlyShadow.poll),
@@ -3856,6 +3947,12 @@ async def service() -> None:
                                     settings.loss_step_budget
                                     if settings.loss_step_enabled else 0.0
                                 ),
+                                # The band and the wait come from the SETTINGS
+                                # that decide them, so the sentence cannot
+                                # describe a rule the service is not running.
+                                band=(settings.loss_step_band_lo,
+                                      settings.loss_step_band_hi),
+                                wait=settings.loss_step_wait_markets,
                             )
                         elif event == "size_ended":
                             body = messages.recovery_size_ended_message(
@@ -4363,9 +4460,20 @@ async def service() -> None:
                         # survived a restart, where nothing was carried. While
                         # a position is open the previous market's result
                         # cannot change, so the two reads agree.
+                        # STAND DOWN ONLY IF THE STEP ACTUALLY TOOK THIS
+                        # POSITION. This used to key on "did the last market
+                        # lose", which was the same thing while the step fired
+                        # on the very next trade. Since 2026-09-25 it WAITS for
+                        # a 0.70-0.79 ask, so a loss no longer implies an
+                        # upsize - and standing the add-on down for an upsize
+                        # that never happened would remove one mechanism
+                        # without engaging the other.
+                        stepped_now, _step_why = loss_step_size(
+                            store, settings, 1,
+                            contract.ask(position.side), lost=None,
+                        )
                         stood_down = bool(
-                            settings.loss_step_enabled
-                            and store.last_market_lost()
+                            settings.loss_step_enabled and stepped_now > 1
                         )
                         if stood_down and STEP_STAND_DOWN.get("window") != opened:
                             # Said once per window, not every poll: a line on

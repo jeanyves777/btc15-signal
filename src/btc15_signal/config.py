@@ -415,6 +415,35 @@ class Settings(BaseSettings):
     kalshi_api_key_id: str = ""
     kalshi_private_key_path: str = ""
     execution_enabled: bool = False
+    # --- copy trading to other accounts ---------------------------------
+    # Every order this system places on the primary account is forwarded to up
+    # to two other Kalshi accounts, each with its own API key and ITS OWN
+    # SIZING. The mirrors are write-only: no balance, fill, settlement or P&L is
+    # ever read from them, so nothing here can reach the ledger.
+    #
+    # OFF BY DEFAULT, and off unless `mirror_enabled` is true AND a key pair is
+    # configured AND execution itself is live. Dry run never mirrors.
+    #
+    # Sizing per account is base-through-upsize, in the same units as the
+    # primary: `base_budget` is dollars PER CONTRACT (like `auto_budget`) and 0
+    # means "ignore the budget, buy `base_contracts`"; `add_contracts` is the
+    # upsize and 0 means "use whatever count the primary's add used";
+    # `max_contracts` is a hard ceiling on every order and 0 means none.
+    # A mirror does NOT inherit the primary's tier, so the growth controller
+    # raising the primary's size leaves a small mirror account alone.
+    mirror_enabled: bool = False
+    mirror_1_api_key_id: str = ""
+    mirror_1_private_key_path: str = ""
+    mirror_1_base_budget: float = 0.0
+    mirror_1_base_contracts: int = 1
+    mirror_1_add_contracts: int = 0
+    mirror_1_max_contracts: int = 0
+    mirror_2_api_key_id: str = ""
+    mirror_2_private_key_path: str = ""
+    mirror_2_base_budget: float = 0.0
+    mirror_2_base_contracts: int = 1
+    mirror_2_add_contracts: int = 0
+    mirror_2_max_contracts: int = 0
     # Dollar budget per order, not a contract count. These are only the
     # defaults: /size and /autosize change them from Telegram at runtime and
     # the stored value wins, so sizing never needs a restart.
@@ -544,6 +573,51 @@ class Settings(BaseSettings):
     # longer disagree about what "one step up" means.
     loss_step_enabled: bool = True
     loss_step_budget: float = 2.00
+    # IT WAITS FOR THE PRICE WHERE IT MATTERS. Operator instruction,
+    # 2026-09-25: "the recovery after a loss does not need to be triggered
+    # automatically, as we will make it wait for the best opportunity ...
+    # around the 70 to 79 range ... so that we are not making 20 cent profit
+    # on a recovery trade where normal sizing can offer the same on a better
+    # opportunity."
+    #
+    # The arithmetic behind it: the extra contract wins `1 - ask` and loses
+    # `ask`, so at 0.90 it risks 90c to make 10c and at 0.75 it risks 75c to
+    # make 25c. Firing the step at the top of the band spends the whole upsize
+    # for about 10c, which is the complaint.
+    #
+    # THE EVIDENCE, recorded beside the decision because it does NOT support the
+    # band on its own. Expected value per extra contract is `p - ask`, which is
+    # the calibration residual - so the payoff ratio cancels and the question
+    # becomes where the market is most mispriced, not where the win pays most.
+    # On BTC's 7,139 priced brti-4 points over 64 days, ungated:
+    #
+    #     0.70-0.75   73.1%   +0.0104 per contract   +0.0138 per dollar
+    #     0.75-0.80   76.5%   -0.0053               -0.0067
+    #     0.85-0.90   89.4%   +0.0242               +0.0284
+    #     0.90-0.93   94.1%   +0.0240 [+0.0009]     +0.0261
+    #
+    #     in 0.70-0.79  +0.0026 per contract, 21.7% of setups
+    #     outside       +0.0159 [+0.0004]
+    #
+    # So on that population the band the operator chose is where the extra
+    # contract earns LEAST, and the top of the price band is where it earns
+    # most. The measurement could not be repeated on the population that
+    # actually matters - the setups the gates admit, which is all the step ever
+    # sizes - because BTC's brti-2-era floors admit too few brti-4 points to
+    # score. So the ungated table is suggestive, not decisive.
+    #
+    # The operator has decided with that in view and instructed it be shipped.
+    # Sizing is theirs; it is implemented in full, and the interval above is
+    # here so the decision can be revisited against live results rather than
+    # re-argued.
+    loss_step_band_lo: float = 0.70
+    loss_step_band_hi: float = 0.79
+    # HOW LONG IT MAY WAIT. The operator's "3 to 5 trades later" as a bound:
+    # after this many settled bot markets the armed step expires unspent. A
+    # wait with no bound is not a wait, it is a permanent upsize waiting for a
+    # cheap ask - and the further from the loss it fires, the less it is a
+    # recovery of anything.
+    loss_step_wait_markets: int = 5
     # A HARD CEILING, not the rule. At the 0.70 floor of the price band $2
     # buys 2, so this is headroom against a cheap fill, and the guard that
     # stops a mispriced ask from turning a $2 budget into a large position.

@@ -52,6 +52,32 @@ def store_with(tmp_path, events, name="s.db"):
     return store
 
 
+def _settle(store, store_id, window, pnl):
+    """One further settled BOT market at BASE size.
+
+    count=1 deliberately. `store_with` writes count=2, and the amended rule
+    reads `trade_proposals` for "has the step already been spent" - so an
+    intervening market written at 2 contracts would look like the upsize had
+    already fired and every waiting test would pass for the wrong reason.
+    """
+    won = pnl > 0
+    store.db.execute(
+        "INSERT INTO trade_proposals (id, strategy, window_open, ticker,"
+        " side, entry_limit, take_profit, count, expires_at, close_ms,"
+        " status, created_at, fill_price, fee_paid) "
+        "VALUES (?,'primary',?,?,'UP',0.80,0,1,?,?,'filled',?,0.80,0.01)",
+        (store_id, window, store_id, window + 60_000, window + 900_000,
+         window))
+    store.db.execute(
+        "INSERT INTO settlements (ticker, event_ticker, market_result,"
+        " yes_count, yes_cost, no_count, no_cost, revenue_cents, fee_cost,"
+        " pnl, settled_ms, synced_at, window_ms) "
+        "VALUES (?,?,?,0,0,0,0,0,0,?,?,?,?)",
+        (store_id, store_id, "yes" if won else "no", pnl,
+         window + 900_000, window, window))
+    store.db.commit()
+
+
 # ------------------------------------------------------- reading the ledger
 
 def test_no_history_is_not_a_loss(tmp_path):
@@ -99,11 +125,79 @@ def test_a_market_the_bot_never_filled_is_skipped(tmp_path):
 # --------------------------------------------------------------- the sizing
 
 def test_it_sizes_to_the_budget_after_a_loss(tmp_path):
+    """At an IN-BAND ask. Since 2026-09-25 the upsize waits for 0.70-0.79, so
+    the budget arithmetic is still the rule but 0.82 is no longer where it
+    applies - see `test_it_waits_when_the_ask_is_too_high`."""
     store = store_with(tmp_path, [("A", 1_000_000, -0.80)])
     s = Settings(loss_step_enabled=True, loss_step_budget=5.0)
-    count, why = main.loss_step_size(store, s, 1, 0.82)
-    assert count == 6, why           # int(5.00 / 0.82)
-    assert "last market lost" in why
+    count, why = main.loss_step_size(store, s, 1, 0.75)
+    assert count == 6, why           # int(5.00 / 0.75)
+    assert "recovery taken at 0.75" in why
+
+
+def test_it_waits_when_the_ask_is_too_high(tmp_path):
+    """THE AMENDMENT. The operator's objection: an extra contract at 0.90 risks
+    90c to make 10c, which base size would have earned anyway at a better
+    price. So the step stays armed and this trade goes out at base - and the
+    reason must not read as an upsize."""
+    store = store_with(tmp_path, [("A", 1_000_000, -0.80)])
+    s = Settings(loss_step_enabled=True, loss_step_budget=5.0)
+    count, why = main.loss_step_size(store, s, 1, 0.88)
+    assert count == 1
+    assert "waiting" in why and "0.70-0.79" in why
+    assert "taken" not in why
+
+
+def test_it_survives_a_win_and_fires_later(tmp_path):
+    """THE TEST THAT CATCHES THE OBVIOUS WRONG IMPLEMENTATION. "Recovery can
+    happen 3 to 5 trades later" only means anything if the armed step outlives
+    the markets in between - and since the win rate is about 3 in 4, the very
+    next market usually WINS. A first cut of this change returned base whenever
+    the last market had won, which killed the feature while every other test
+    here still passed."""
+    store = store_with(tmp_path, [("A", 1_000_000, -0.80)])
+    s = Settings(loss_step_enabled=True, loss_step_budget=5.0)
+    # a WIN lands after the loss, at a price the step would not have taken
+    _settle(store, store_id="win1", window=1_100_000, pnl=+0.19)
+    assert main.loss_step_size(store, s, 1, 0.88)[0] == 1, "still waiting"
+    count, why = main.loss_step_size(store, s, 1, 0.74)
+    assert count > 1, why
+    assert "1 market(s) after the loss" in why
+
+
+def test_it_expires_unspent_after_the_wait(tmp_path):
+    """A wait with no bound is not a wait, it is a standing upsize looking for
+    a cheap ask - and the further from the loss it fires, the less it recovers
+    anything."""
+    store = store_with(tmp_path, [("A", 1_000_000, -0.80)])
+    s = Settings(loss_step_enabled=True, loss_step_budget=5.0,
+                 loss_step_wait_markets=3)
+    for i in range(3):
+        _settle(store, store_id=f"w{i}", window=1_100_000 + i * 100_000,
+                pnl=+0.19)
+    count, why = main.loss_step_size(store, s, 1, 0.74)
+    assert count == 1
+    assert "expired unspent" in why
+
+
+def test_it_fires_once_per_losing_episode(tmp_path):
+    """Without this, every later in-band trade inside the waiting window would
+    upsize again on ONE loss. Derived from `trade_proposals` rather than a
+    flag, so an order that failed after a flag was written cannot hide it."""
+    store = store_with(tmp_path, [("A", 1_000_000, -0.80)])
+    s = Settings(loss_step_enabled=True, loss_step_budget=5.0)
+    assert main.loss_step_size(store, s, 1, 0.74)[0] > 1
+    # the upsized entry actually went out
+    store.db.execute(
+        "INSERT INTO trade_proposals (id, strategy, window_open, ticker, side,"
+        " entry_limit, take_profit, count, expires_at, close_ms, status,"
+        " created_at) VALUES ('taken','primary',?, 'T','UP',0.74,0,2,?,?,"
+        "'filled',?)",
+        (1_100_000, 1_160_000, 1_900_000, 1_100_000))
+    store.db.commit()
+    count, why = main.loss_step_size(store, s, 1, 0.74)
+    assert count == 1
+    assert "already taken" in why
 
 
 def test_it_does_nothing_after_a_win(tmp_path):
@@ -124,7 +218,7 @@ def test_consecutive_losses_do_not_escalate(tmp_path):
     exposure is bounded whatever the streak length."""
     st = Settings(loss_step_enabled=True, loss_step_budget=5.0)
     store = store_with(tmp_path, [("A", 1_000_000, -0.80)])
-    first = main.loss_step_size(store, st, 1, 0.80)[0]
+    first = main.loss_step_size(store, st, 1, 0.75)[0]
     # a SECOND losing bot trade, after the first
     store.db.execute(
         "INSERT INTO trade_proposals (id, strategy, window_open, ticker, side,"
@@ -140,7 +234,7 @@ def test_consecutive_losses_do_not_escalate(tmp_path):
         (2_900_000, 2_000_000, 2_000_000))
     store.db.commit()
     assert store.last_market_lost() is True
-    second = main.loss_step_size(store, st, 1, 0.80)[0]
+    second = main.loss_step_size(store, st, 1, 0.75)[0]
     assert first == second == 6
 
 
@@ -155,25 +249,40 @@ def test_it_never_sizes_DOWN(tmp_path):
     reach is left alone, with an empty reason so no line claims an upsize."""
     store = store_with(tmp_path, [("A", 1_000_000, -0.80)])
     s = Settings(loss_step_enabled=True, loss_step_budget=1.0)
-    assert main.loss_step_size(store, s, 4, 0.82) == (4, "")
+    assert main.loss_step_size(store, s, 4, 0.75) == (4, "")
 
 
 # ------------------------------------------------------------------ the cap
 
-def test_the_cap_binds_at_a_cheap_ask(tmp_path):
+def test_a_mispriced_ask_cannot_produce_a_position(tmp_path):
     """A stale or mispriced ask is what turns a dollar budget into a position
-    nobody chose. $5 at 1c would be 500 contracts."""
+    nobody chose - $5 at 1c would be 500 contracts. Since 2026-09-25 the band
+    refuses it outright, which is STRONGER than the cap: 1c is not 0.70-0.79,
+    so the answer is base size and the cap is never reached."""
     store = store_with(tmp_path, [("A", 1_000_000, -0.80)])
     s = Settings(loss_step_enabled=True, loss_step_budget=5.0,
                  loss_step_max_contracts=8)
-    assert main.loss_step_size(store, s, 1, 0.01)[0] == 8
+    assert main.loss_step_size(store, s, 1, 0.01)[0] == 1
+
+
+def test_the_cap_still_binds_inside_the_band(tmp_path):
+    """The cap is not decoration just because the band narrowed. Within
+    0.70-0.79 a large budget must still be bounded, because the budget is a
+    dollar figure and the count it buys is not something anyone typed."""
+    store = store_with(tmp_path, [("A", 1_000_000, -0.80)])
+    s = Settings(loss_step_enabled=True, loss_step_budget=20.0,
+                 loss_step_max_contracts=8)
+    count, why = main.loss_step_size(store, s, 1, 0.70)
+    assert count == 8, why           # int(20 / 0.70) = 28, capped
 
 
 def test_the_cap_holds_across_the_whole_price_band(tmp_path):
     store = store_with(tmp_path, [("A", 1_000_000, -0.80)])
     s = Settings(loss_step_enabled=True, loss_step_budget=5.0,
                  loss_step_max_contracts=8)
-    for ask in (0.70, 0.75, 0.80, 0.85, 0.90, 0.93, 0.95):
+    # Out-of-band asks return BASE now, which still satisfies the cap - the
+    # point of the sweep is that no price produces a position nobody chose.
+    for ask in (0.70, 0.75, 0.79, 0.80, 0.85, 0.90, 0.93, 0.95):
         count = main.loss_step_size(store, s, 1, ask)[0]
         assert 1 <= count <= 8, (ask, count)
         assert count * ask <= 5.0 + ask, (ask, count)
@@ -188,6 +297,11 @@ def test_the_shipped_settings_are_the_decided_ones():
     assert s.loss_step_enabled is True
     assert s.loss_step_budget == 2.00
     assert s.loss_step_max_contracts == 8
+    # The 2026-09-25 amendment, as instructed: wait for 0.70-0.79, up to five
+    # settled markets. The evidence against the band is recorded beside it in
+    # config.py - the decision is the operator's and sizing always is.
+    assert (s.loss_step_band_lo, s.loss_step_band_hi) == (0.70, 0.79)
+    assert s.loss_step_wait_markets == 5
 
 
 def test_two_dollars_cannot_buy_a_large_position():
@@ -208,9 +322,14 @@ def test_the_add_on_stands_down_when_the_step_fires():
 
     source = inspect.getsource(main.service)
     at = source.index("stood_down = bool(")
-    window = source[at:at + 300]
+    window = source[at - 900:at + 300]
     assert "loss_step_enabled" in window
-    assert "last_market_lost" in window
+    # Keyed on the step ACTUALLY firing, not on "did the last market lose".
+    # Since the step waits for 0.70-0.79, a loss no longer implies an upsize,
+    # and standing the add-on down for one that never happens would remove one
+    # mechanism without engaging the other.
+    assert "loss_step_size(" in window
+    assert "stepped_now > 1" in window
     # and the add-on call is actually guarded by it
     call = source.index("await recovery_add.step(")
     assert "not stood_down" in source[:call][-400:]

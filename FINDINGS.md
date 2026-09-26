@@ -7613,3 +7613,98 @@ but are now marked.
 threshold nothing can fail always passes, so excluding it from the count cannot
 change a qualification, verified independently against every caller. All five
 configs load with no unknown key. No secret is in the commit.
+
+## 78. The loss step waits for a 0.70-0.79 ask (2026-09-25)
+
+Operator instruction, shipped as instructed: "the recovery after a loss does not
+need to be triggered automatically, as we will make it wait for the best
+opportunity ... around the 70 to 79 range ... meaning recovery can happen 3 to 5
+trades later when the best opportunity presents itself, so that we are not making
+20 cent profit on a recovery trade where normal sizing can offer the same on a
+better opportunity."
+
+### What changed
+
+The upsize no longer fires on whatever trade comes next after a loss. It arms,
+waits for an ask inside 0.70-0.79, and fires there — which may be several markets
+later. Three bounds stop a wait becoming a standing upsize:
+
+* it expires unspent after `loss_step_wait_markets` (5) settled markets;
+* it fires ONCE per losing episode, and "already spent" is READ off
+  `trade_proposals` rather than trusted to a flag, so an order that failed after
+  a flag was written cannot hide it;
+* the budget never escalates — a second loss re-arms at the same $2.
+
+The arming loss and the count of markets since it both come from
+`Store.settled_bot_markets`, which is the same join, fee handling and early-exit
+arithmetic as `last_market_lost`. That is deliberate: a second, slightly
+different notion of "the bot lost" beside the reconciled one is how the
+2026-09-24 defect happened, where the operator's own 10-contract manual fills in
+the same market moved a figure meant to describe the bot.
+
+### The payoff reasoning is right, and it is not the whole calculation
+
+The operator's arithmetic is exact: the extra contract wins `1 - ask` and loses
+`ask`, so at 0.90 it risks 90c to make 10c and at 0.75 it risks 75c to make 25c.
+Spending the step at the top of the band earns about 20c, which base size would
+have earned anyway at a better price.
+
+What that reasoning leaves out is that expected value per extra contract is
+
+    p * (1 - ask) - (1 - p) * ask  =  p - ask
+
+which is the calibration residual itself. **The payoff ratio cancels.** So "where
+does an extra contract pay most" and "where is the market most mispriced" are the
+same question, and 25c at 0.75 beats 10c at 0.90 only if the win rate fails to
+make up the difference. On BTC it does not. Measured on 7,139 priced brti-4
+decision points over 64 days, ungated:
+
+| band | win% | per contract | 95% CI | per dollar |
+|---|---|---|---|---|
+| 0.70-0.75 | 73.1% | +0.0104 | [-0.0253, +0.0446] | +0.0138 |
+| 0.75-0.80 | 76.5% | -0.0053 | [-0.0518, +0.0407] | -0.0067 |
+| 0.80-0.85 | 81.4% | -0.0051 | [-0.0413, +0.0312] | -0.0063 |
+| 0.85-0.90 | 89.4% | +0.0242 | [-0.0076, +0.0533] | +0.0284 |
+| 0.90-0.93 | 94.1% | **+0.0240** | **[+0.0009, +0.0437]** | +0.0261 |
+
+    in 0.70-0.79   +0.0026 per contract, 21.7% of setups
+    outside        +0.0159 [+0.0004, +0.0315]
+
+On that population the chosen band is where the extra contract earns **least**,
+and the only cell whose interval clears zero is 0.90-0.93 — the one the
+instruction singles out as not worth taking.
+
+### Why that table is suggestive and not decisive
+
+It is UNGATED. The step only ever sizes a trade that has already passed every
+gate; it never causes one. The population that decides the question is therefore
+the qualifying subset, and the gates select on distance, momentum and level
+behaviour, all of which correlate with price. That measurement could not be made:
+BTC's deployed floors are brti-2-era and admit too few brti-4 points to score
+(FINDINGS 77 records that those thresholds are themselves now measuring a
+different quantity). So the honest position is that the band is unmeasured where
+it matters and contradicted where it could be measured.
+
+The operator decided with that in view and instructed it be shipped. Sizing is
+theirs, and it is implemented in full, with the interval above recorded so the
+decision can be revisited against live results rather than re-argued.
+
+### What it also fixed
+
+Two defects found while implementing, both introduced by the change itself and
+caught before shipping.
+
+**An early cut returned base size whenever the last market had won**, which
+killed the feature outright: the win rate is about 3 in 4, so the market after a
+loss usually wins, and the armed step has to survive exactly that. Every other
+test still passed. `test_it_survives_a_win_and_fires_later` now pins it.
+
+**The add-on stood down on the wrong condition.** It keyed on "did the last
+market lose", which was the same thing while the step fired immediately. Now the
+step usually waits, so that would have stood the add-on down for an upsize that
+never happened — removing one mechanism without engaging the other. It keys on
+the step actually firing.
+
+Both RECOVERY ARMED messages said "the next entry is sized to $X; a win resets
+it". Neither half is true any more, and they now state the band, the wait and
+that a win no longer resets it.
