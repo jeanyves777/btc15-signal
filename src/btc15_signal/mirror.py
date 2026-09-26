@@ -62,7 +62,9 @@ not tracking them.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
+import os
 import time
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -245,7 +247,7 @@ class _Mirror:
             await self.queue.put(None)
             try:
                 await asyncio.wait_for(self.worker, timeout=drain_timeout)
-            except (asyncio.TimeoutError, asyncio.CancelledError):
+            except (TimeoutError, asyncio.CancelledError):
                 self.worker.cancel()
         await self.client.close()
 
@@ -373,12 +375,57 @@ class MirroringExecutionClient:
         return ok, note
 
     async def close(self) -> None:
+        # A mirror that will not shut down cleanly must not stop the primary
+        # from closing its own connection.
         for m in self._mirrors:
-            try:
+            with contextlib.suppress(Exception):
                 await m.close(self._drain_timeout)
-            except Exception:  # noqa: BLE001
-                pass
         await self._primary.close()
+
+
+BTC_INSTANCE_ALIASES = ("btc", "primary", "default")
+
+
+def current_instance() -> str:
+    """The running instance's name, with the original BTC service called `btc`.
+
+    `run_service.py` reads BTC15_INSTANCE to choose its runtime directory and
+    leaves it unset for BTC, so an empty value is not "no instance" - it is the
+    BTC one.
+    """
+    return (os.environ.get("BTC15_INSTANCE") or "").strip().lower() or "btc"
+
+
+def mirror_allowed(settings) -> tuple[bool, str]:
+    """May THIS instance forward orders? Returns (allowed, why not).
+
+    Fails closed. All instances share one .env, so an unlisted instance -
+    including an instrument added long after this was written - mirrors nothing.
+    """
+    if not settings.mirror_enabled:
+        return False, "MIRROR_ENABLED is false"
+    if settings.dry_run:
+        return False, "DRY_RUN is true"
+    instance = current_instance()
+    listed = [
+        name.strip().lower()
+        for name in (settings.mirror_instances or "").split(",")
+        if name.strip()
+    ]
+    if not listed:
+        return False, (
+            "MIRROR_INSTANCES is empty - name the instances that may mirror, "
+            f"e.g. MIRROR_INSTANCES={instance}"
+        )
+    allowed = instance in listed or (
+        instance == "btc" and any(a in listed for a in BTC_INSTANCE_ALIASES)
+    )
+    if not allowed:
+        return False, (
+            f"instance '{instance}' is not in MIRROR_INSTANCES "
+            f"({', '.join(listed)})"
+        )
+    return True, ""
 
 
 def targets_from_settings(settings) -> list[MirrorTarget]:

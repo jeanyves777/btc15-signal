@@ -6,8 +6,6 @@ sizes itself, and an exit closes what THAT account bought.
 """
 import asyncio
 
-import pytest
-
 from btc15_signal import mirror as mirror_mod
 from btc15_signal.execution import ExecutionResult
 from btc15_signal.mirror import (
@@ -261,3 +259,63 @@ def test_no_targets_means_no_mirrors(monkeypatch):
         await wrapper.execute_with_take_profit(proposal())
         assert primary.calls == [("entry", "KXBTC15M-T", "yes", 1)]
     asyncio.run(run())
+
+
+# --- per-instance scoping -------------------------------------------------
+# All instances read one .env, so `mirror_enabled` alone would turn copy trading
+# on for every instrument at once. These lock the fail-closed behaviour.
+
+class ScopeCfg:
+    mirror_enabled = True
+    dry_run = False
+    mirror_instances = "btc,eth"
+
+
+def test_listed_instance_may_mirror(monkeypatch):
+    monkeypatch.setenv("BTC15_INSTANCE", "eth")
+    assert mirror_mod.mirror_allowed(ScopeCfg())[0] is True
+
+
+def test_empty_instance_is_btc(monkeypatch):
+    monkeypatch.delenv("BTC15_INSTANCE", raising=False)
+    assert mirror_mod.current_instance() == "btc"
+    assert mirror_mod.mirror_allowed(ScopeCfg())[0] is True
+
+
+def test_unlisted_instance_is_refused(monkeypatch):
+    """A new instrument inherits MIRROR_ENABLED and must still not mirror."""
+    monkeypatch.setenv("BTC15_INSTANCE", "gold")
+    ok, why = mirror_mod.mirror_allowed(ScopeCfg())
+    assert ok is False
+    assert "gold" in why
+
+
+def test_empty_list_fails_closed(monkeypatch):
+    monkeypatch.setenv("BTC15_INSTANCE", "sol")
+
+    class Cfg2(ScopeCfg):
+        mirror_instances = ""
+
+    ok, why = mirror_mod.mirror_allowed(Cfg2())
+    assert ok is False
+    assert "MIRROR_INSTANCES" in why
+
+
+def test_dry_run_never_mirrors(monkeypatch):
+    monkeypatch.delenv("BTC15_INSTANCE", raising=False)
+
+    class Cfg3(ScopeCfg):
+        dry_run = True
+
+    ok, why = mirror_mod.mirror_allowed(Cfg3())
+    assert ok is False
+    assert "DRY_RUN" in why
+
+
+def test_disabled_flag_beats_everything(monkeypatch):
+    monkeypatch.delenv("BTC15_INSTANCE", raising=False)
+
+    class Cfg4(ScopeCfg):
+        mirror_enabled = False
+
+    assert mirror_mod.mirror_allowed(Cfg4())[0] is False

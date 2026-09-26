@@ -321,15 +321,14 @@ def test_the_add_on_stands_down_when_the_step_fires():
     import inspect
 
     source = inspect.getsource(main.service)
-    at = source.index("stood_down = bool(")
-    window = source[at - 900:at + 300]
-    assert "loss_step_enabled" in window
-    # Keyed on the step ACTUALLY firing, not on "did the last market lose".
-    # Since the step waits for 0.70-0.79, a loss no longer implies an upsize,
-    # and standing the add-on down for one that never happens would remove one
-    # mechanism without engaging the other.
-    assert "loss_step_size(" in window
-    assert "stepped_now > 1" in window
+    # The decision now lives in `add_on_stands_down`, which a test can CALL -
+    # see test_the_stand_down_runs_on_the_real_position_tuple. What this still
+    # pins is that `service` uses it and that the add-on is gated on it.
+    assert "add_on_stands_down(" in source
+    helper = inspect.getsource(main.add_on_stands_down)
+    assert "loss_step_enabled" in helper
+    assert "loss_step_size(" in helper
+    assert "position[0]" in helper
     # and the add-on call is actually guarded by it
     call = source.index("await recovery_add.step(")
     assert "not stood_down" in source[:call][-400:]
@@ -437,3 +436,64 @@ def test_an_early_exit_is_priced_at_the_exit(tmp_path):
              fill=0.80, result="no", status="exited",
              exit_price=0.997, exit_count=2)
     assert store.last_market_lost() is False
+
+
+# ------------------------------- the stand-down, EXECUTED rather than grepped
+
+def test_the_stand_down_runs_on_the_real_position_tuple(tmp_path):
+    """THE BUG THIS EXISTS TO CATCH, which cost twenty minutes of ETH downtime.
+
+    `open_position_detail` returns the TUPLE (side, paid, count, ticker, id).
+    An earlier cut of the stand-down read `position.side`, which raises
+    AttributeError on a tuple - on every poll, once an instrument held a
+    position. The watchdog restarted ETH every 11 seconds until it hit its
+    6-per-hour budget and gave up, leaving nothing running and no alert.
+
+    `test_the_add_on_stands_down_when_the_step_fires` passed the whole time,
+    because it SCANS THE SOURCE for strings. A source scan cannot catch an
+    AttributeError. So this one calls the code with the real tuple shape.
+    """
+    from btc15_signal.kalshi import KalshiMarket
+
+    store = store_with(tmp_path, [("A", 1_000_000, -0.80)])
+    s = Settings(loss_step_enabled=True, loss_step_budget=5.0)
+    market = KalshiMarket(ticker="T", target=64.0, open_ms=0, close_ms=900_000,
+                          yes_ask=0.74, no_ask=0.26, yes_bid=0.73, no_bid=0.25)
+    # EXACTLY what the store returns: (side, paid, count, ticker, id)
+    position = ("UP", 0.74, 1, "T", "p9")
+
+    # In band after a loss -> the step would size this position, so the add-on
+    # must stand down. This is the call that used to raise.
+    assert main.add_on_stands_down(store, s, market, position) is True
+
+    # Out of band -> the step is waiting, so the add-on must NOT stand down:
+    # standing it down for an upsize that never happens removes one mechanism
+    # without engaging the other.
+    high = KalshiMarket(ticker="T", target=64.0, open_ms=0, close_ms=900_000,
+                        yes_ask=0.91, no_ask=0.09, yes_bid=0.90, no_bid=0.08)
+    assert main.add_on_stands_down(store, s, high, position) is False
+
+    # No position at all must be answerable without raising.
+    assert main.add_on_stands_down(store, s, market, None) is False
+
+
+def test_nothing_in_main_uses_attribute_access_on_a_position_tuple():
+    """`position` is a tuple everywhere it is used. An attribute read on it is
+    an AttributeError that only fires once a position exists - so it survives
+    every test that runs without one, which is how it reached production.
+
+    PARSED, NOT GREPPED. A regex over the source matched the COMMENTS that
+    describe the bug and failed on a clean file - its own small lesson about
+    source-scanning tests. The AST sees code and nothing else.
+    """
+    import ast
+
+    source = (Path(__file__).resolve().parents[1] / "src" / "btc15_signal"
+              / "main.py").read_text(encoding="utf-8")
+    bad = [
+        f"position.{node.attr}"
+        for node in ast.walk(ast.parse(source))
+        if isinstance(node, ast.Attribute)
+        and isinstance(node.value, ast.Name) and node.value.id == "position"
+    ]
+    assert not bad, f"attribute access on the position tuple: {sorted(set(bad))}"

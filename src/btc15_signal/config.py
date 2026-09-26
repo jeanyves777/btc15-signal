@@ -431,6 +431,19 @@ class Settings(BaseSettings):
     # `max_contracts` is a hard ceiling on every order and 0 means none.
     # A mirror does NOT inherit the primary's tier, so the growth controller
     # raising the primary's size leaves a small mirror account alone.
+    # WHICH INSTANCES MAY MIRROR. Every instance reads this ONE .env file - the
+    # per-instance launchers override only instrument values and deliberately
+    # keep shared secrets here (see scripts/run_gold.ps1) - so `mirror_enabled`
+    # alone would turn copy trading on for BTC, ETH, GOLD, SILVER and SOL at
+    # once, and for every instrument added afterwards. Five instances forwarding
+    # a base contract each is five times the exposure the operator configured on
+    # the destination account.
+    #
+    # So mirroring is scoped by name and FAILS CLOSED: an instance not listed
+    # here does not mirror, and a new instrument inherits nothing. Comma
+    # separated, matched against BTC15_INSTANCE, where an empty instance - the
+    # original BTC service - is named `btc`.
+    mirror_instances: str = ""
     mirror_enabled: bool = False
     mirror_1_api_key_id: str = ""
     mirror_1_private_key_path: str = ""

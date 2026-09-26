@@ -20,7 +20,12 @@ from .capital import CapitalController, ny_day
 from .config import Settings
 from .decision import decision_facts
 from .execution import KalshiExecutionClient
-from .mirror import MirroringExecutionClient, targets_from_settings
+from .mirror import (
+    MirroringExecutionClient,
+    current_instance,
+    mirror_allowed,
+    targets_from_settings,
+)
 from .features import _session
 from .hourly_shadow import HourlyShadow
 from .kalshi import KalshiClient, KalshiMarket
@@ -1308,6 +1313,33 @@ def loss_step_size(
         f"{markets_since} market(s) after the loss "
         f"(cap {settings.loss_step_max_contracts})"
     )
+
+
+def add_on_stands_down(store, settings, contract, position) -> bool:
+    """Should the conditional add-on stand down for this position?
+
+    It stands down only when the LOSS STEP ACTUALLY SIZED THIS POSITION. The two
+    must never stack: the step was measured as the whole position, so resting
+    another contract behind it adds exposure nobody chose.
+
+    EXTRACTED SO IT CAN BE EXECUTED BY A TEST. This lived inline inside
+    `service`, and on 2026-09-25 it read `position.side` - but `position` is the
+    TUPLE `open_position_detail` returns, `(side, paid, count, ticker, id)`. It
+    raised AttributeError on every poll once an instrument held a position, the
+    watchdog restarted ETH every 11 seconds until it hit its 6-per-hour budget,
+    and ETH was then DOWN for twenty minutes with no alert.
+
+    The test that covered this block passed throughout, because it SCANNED THE
+    SOURCE for strings rather than running it. A source scan cannot catch an
+    AttributeError, so the logic now lives somewhere a test can call.
+    """
+    if not position:
+        # No position, nothing to stand down - and `position[0]` would raise.
+        return False
+    stepped, _why = loss_step_size(
+        store, settings, 1, contract.ask(position[0]), lost=None
+    )
+    return bool(settings.loss_step_enabled and stepped > 1)
 
 
 def partial_exit_pnl(
@@ -3804,18 +3836,30 @@ async def service() -> None:
             # Three conditions, all required. Dry run must never reach another
             # account, and a mirror block with no key pair is ignored rather
             # than fatal.
-            if settings.mirror_enabled and not settings.dry_run:
+            mirror_ok, mirror_why = mirror_allowed(settings)
+            if mirror_ok:
                 mirror_targets = targets_from_settings(settings)
                 if mirror_targets:
                     trader = MirroringExecutionClient(
                         trader, mirror_targets, settings.kalshi_base_url
                     )
-                    print(f"copy trading ON -> {trader.describe()}", flush=True)
+                    print(
+                        f"copy trading ON [{current_instance()}] -> "
+                        f"{trader.describe()}",
+                        flush=True,
+                    )
                 else:
                     print(
                         "copy trading enabled but no mirror credentials set",
                         flush=True,
                     )
+            elif settings.mirror_enabled:
+                # Say why on every instance that read the flag and declined it,
+                # so a mirror that is off is never silently off.
+                print(
+                    f"copy trading OFF [{current_instance()}]: {mirror_why}",
+                    flush=True,
+                )
         except (OSError, ValueError) as exc:
             print(f"Kalshi execution disabled: {exc}", flush=True)
     # The hourly ladder takes its OWN Binance reading (see HourlyShadow.poll),
@@ -4468,12 +4512,16 @@ async def service() -> None:
                         # upsize - and standing the add-on down for an upsize
                         # that never happened would remove one mechanism
                         # without engaging the other.
-                        stepped_now, _step_why = loss_step_size(
-                            store, settings, 1,
-                            contract.ask(position.side), lost=None,
-                        )
-                        stood_down = bool(
-                            settings.loss_step_enabled and stepped_now > 1
+                        #
+                        # `position` IS A TUPLE - (side, paid, count, ticker,
+                        # id) from `open_position_detail` - and an earlier cut
+                        # of this read `position.side`, which is an
+                        # AttributeError on every poll. It crash-looped ETH
+                        # every 11 seconds on 2026-09-25 until the log was
+                        # read. Side is element 0, and the ask is only ever
+                        # used to ask "would the step fire at this price".
+                        stood_down = add_on_stands_down(
+                            store, settings, contract, position
                         )
                         if stood_down and STEP_STAND_DOWN.get("window") != opened:
                             # Said once per window, not every poll: a line on
