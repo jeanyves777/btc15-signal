@@ -1,0 +1,40 @@
+{
+  "_comment": "XRP (KXXRP15M). SHADOW ONLY - it records and never trades. Automation OFF, and unlike gold there is no measured edge here at all. Backtested 2026-09-26 on XRP's own corpus: 6,335 priced decision points over 1,065 markets and 46 days, built from 4,262 settled markets.",
+
+  "_no_edge_found": "THE BACKTEST RESULT, stated first so nothing below reads as a claim. XRP's UNGATED calibration residual is +0.0130 [-0.0064, +0.0324] - it spans zero, so the market prices these contracts about right. Of 19,440 complete candidate gate sets, 673 cleared the 15% volume floor AND the baseline, and NOT ONE reached tier A or tier B: none demonstrably beat taking everything. The best set reads +0.0257 [-0.0029, +0.0537], spanning zero, and BOTH disjoint halves span zero too (+0.0102 and +0.0390). Against the ungated baseline it adds +0.0127 [-0.0083, +0.0350], which does not show. This is SOL's shape (+0.0013 ungated), not gold's (+0.0346).",
+
+  "_why_it_is_still_deployed": "To RECORD, not to select. The gate set below admits 23.0% of decision points, which is enough for the confidence arms to accumulate evidence, and the instance captures live per-second reference data that no backtest can reconstruct - there is no historical order-book depth, so fill probability and queue position are only ever answerable from data this system archives itself. If an edge exists it will show in that record; nothing here claims one now.",
+
+  "_first_corpus_with_every_gate_visible": "XRP is the first instrument fitted with all fourteen live gates in view. `brti_retrace` and `brti_choppiness` were computed and then discarded by the backfill until 2026-09-25, so every earlier fit - BTC, ETH, gold, silver, SOL - scored candidate sets as though those two gates were absent while live enforced them (FINDINGS 75). 5,713 of XRP's 6,390 points carry retrace, and the fit CHOSE to require it, which no other instrument's fit did.",
+
+  "enabled": true,
+
+  "_band_comment": "0.55-0.90. Not an edge, a coverage choice: it spans where XRP is actually quoted so the recorder sees representative setups. Marginally no price bucket clears zero - 0.55-0.65 reads -0.0004 and 0.65-0.75 reads +0.0191 spanning zero - which is exactly why the band was chosen inside a complete set rather than off its own table.",
+  "min_ask": 0.55,
+  "max_ask": 0.90,
+
+  "_distance_comment": "0-25bp, effectively open. The joint search was offered six narrower bands including gold's 1.5-6.0 and silver's 0.5-12.0 and preferred none of them, which is itself the finding: distance does not separate on XRP. An absolute bps band rather than the normalised floor, because XRP's normalised distance does not mean what BTC's does and BTC's 10-15x floor is not transferable (FINDINGS 43).",
+  "min_abs_distance_bps": 0.0,
+  "max_abs_distance_bps": 25.0,
+  "min_brti_normalized_distance": 0.0,
+  "moving_min_brti_normalized_distance": 0.0,
+  "calm_momentum_bps": 5.0,
+
+  "_timing_comment": "THE WINDOW THAT ACTUALLY RUNS. The fit chose 700-400s, but entry is gated twice and only the intersection executes: `settings.entry_from_seconds`/`entry_to_seconds` (660/360, which no launcher overrides) is checked in main.py BEFORE the rule is consulted. The corpus holds decision points at 360..660 seconds only, so 700-400 selected exactly the minutes 660-420 selects - behaviour identical, and the config now states what it can act on rather than a span the service can never reach (FINDINGS 77).",
+  "entry_from_seconds": 660,
+  "entry_to_seconds": 420,
+
+  "_gates_comment": "Real thresholds from the best complete set, recorded even though that set does not clear zero: a config for recording still has to be a config, and a threshold no value can fail must never be shown as a passed check. Momentum is capped at 40bp, acceleration is a BAND at +-25 rather than BTC's floor, level held >=30s and level tested >=2 under the 45-minute lookback. None is claimed as an edge.",
+  "min_brti_momentum_bps": 0.0,
+  "max_brti_momentum_bps": 40.0,
+  "min_brti_accel": -25.0,
+  "max_brti_accel": 25.0,
+  "min_brti_held_s": 30.0,
+  "min_brti_rejections": 2,
+  "require_momentum_alignment": false,
+
+  "_retrace_comment": "MEASURED, AND REQUIRED - the only instrument whose fit asked for that. Gold, silver and SOL all preferred `require_measurable_retrace: false`, because on a level-maintenance instrument a window with no advance to give back is the target state. XRP's search preferred the opposite: cap 0.60 AND refuse an unmeasurable retrace. Retrace is present on 5,713 of 6,390 points, so requiring it costs about 11% of setups. Recorded as measured, not as understood.",
+  "max_brti_retrace": 0.60,
+  "require_measurable_retrace": true,
+  "asset": "XRP"
+}

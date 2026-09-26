@@ -53,6 +53,8 @@ INSTRUMENTS = {
     "GOLD": ("strategy_kalshi_gold.json", "brti_history_gold_v5.db"),
     "SILVER": ("strategy_kalshi_silver.json", "brti_history_silver_v5.db"),
     "SOL": ("strategy_kalshi_sol.json", "brti_history_sol_v5.db"),
+    # XRP's corpus was built after the retrace fix, so there is only one of it.
+    "XRP": ("strategy_kalshi_xrp.json", "brti_history_xrp.db"),
 }
 
 
@@ -139,7 +141,8 @@ def admit(rule, rows):
 
 MARKETS = {"GOLD": "market_data_kxgold15m.db",
            "SILVER": "market_data_kxsilver15m.db",
-           "SOL": "market_data_kxsol15m.db"}
+           "SOL": "market_data_kxsol15m.db",
+           "XRP": "market_data_kxxrp15m.db"}
 
 
 def loaded(name):

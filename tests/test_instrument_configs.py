@@ -45,6 +45,7 @@ CONFIGS = {
     "GOLD": "strategy_kalshi_gold.json",
     "SILVER": "strategy_kalshi_silver.json",
     "SOL": "strategy_kalshi_sol.json",
+    "XRP": "strategy_kalshi_xrp.json",
 }
 
 
@@ -66,6 +67,7 @@ def test_every_instrument_declares_its_asset():
     assert surface.asset("KXSILVER15M") == "SILVER"
     assert surface.asset("KXSOL15M") == "SOL"
     assert surface.asset("KXGOLD15M") == "GOLD"
+    assert surface.asset("KXXRP15M") == "XRP"
 
 
 def test_no_instrument_inherits_btcs_price_band():
@@ -217,7 +219,8 @@ def test_eth_config_did_not_acquire_any_new_key():
 # ----------------------------------------------------- instance isolation
 
 def test_each_launcher_isolates_every_shared_path():
-    for name, script in (("silver", "run_silver.ps1"), ("sol", "run_sol.ps1")):
+    for name, script in (("silver", "run_silver.ps1"), ("sol", "run_sol.ps1"),
+                         ("xrp", "run_xrp.ps1")):
         text = (ROOT / "scripts" / script).read_text(encoding="utf-8")
         for needed in (f'BTC15_INSTANCE       = "{name}"',
                        f"runtime-{name}/intelligence_policy.json",
@@ -236,7 +239,7 @@ def test_no_launcher_points_at_another_instruments_corpus():
     """`_corpus_mismatch` catches this at fit time, but a launcher that names
     the wrong corpus is a defect whether or not something else stops it."""
     import re
-    for name in ("gold", "silver", "sol", "eth"):
+    for name in ("gold", "silver", "sol", "eth", "xrp"):
         script = ROOT / "scripts" / f"run_{name}.ps1"
         if not script.exists():
             continue

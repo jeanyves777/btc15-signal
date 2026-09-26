@@ -1,0 +1,125 @@
+param([switch]$Supervise)
+
+# Launch the SOL instance (KXXRP15M).
+#
+# The third instance. BTC keeps runtime/, ETH keeps runtime-eth/, and nothing
+# here touches either: BTC15_INSTANCE is unset for BTC, so its paths are
+# exactly what they were.
+#
+# CREDENTIALS ARE NOT DUPLICATED. pydantic-settings gives real environment
+# variables precedence over the .env file, so shared secrets stay in the one
+# .env and only per-instance values are set here. On 2026-09-24 three .env
+# backups carrying live keys reached a public repo; a second credential file is
+# the same mistake waiting to happen.
+#
+# WHY SOL AT ALL, given BTC's rule rejects 99.4% of its setups: because the
+# rejection was a measurement error, not a verdict. Gold's per-second reference
+# jitters ~7x more than BRTI but that jitter mean-reverts - 4.0% of it survives
+# to settlement against BTC's 30.5% - so `brti_normalized_distance` divides by
+# noise and reads 0.83 where BTC reads 6.92, while the two are equivalent in
+# risk-adjusted terms. Measured on sol's own scale the edge is larger than
+# BTC's: +0.0987 residual against +0.0375. FINDINGS 73 has the full derivation
+# and the tests that it survived, including a disjoint sub-period split.
+
+Set-Location $PSScriptRoot\..
+
+$env:BTC15_INSTANCE       = "xrp"
+$env:KALSHI_SERIES        = "KXXRP15M"
+$env:DATABASE_PATH        = "xrp15.db"
+$env:KALSHI_STRATEGY_PATH = "strategy_kalshi_sol.json"
+
+# Own reference and ladder stores. Sharing either would mix sol observations
+# into the BTC archive, which is the cross-contamination this design exists to
+# avoid.
+$env:REFERENCE_DATABASE_PATH = "runtime-xrp/settlement_reference.db"
+$env:HOURLY_DATABASE_PATH    = "runtime-xrp/hourly.db"
+$env:HOURLY_ENABLED          = "false"   # the ladder is a BTC product
+
+# EXPOSURE. The three processes do not share account guards, so each carries
+# its own daily loss floor. The combined floor was $20 across two instances at
+# EXPOSURE. Each instance carries its own daily loss floor because the
+# processes share no account guard. XRP's is set but unreachable while
+# automation is off; it exists so arming it later cannot leave it without
+# one. The five-instance aggregate is the operator's to set, not this file's
+# to assume - the arithmetic that used to be repeated here was copied from
+# gold's launcher and was wrong for every instrument that inherited it.
+# SHADOW ONLY - IT RECORDS AND NEVER TRADES. Automation is OFF, deliberately
+# and by default, and the reason is the backtest rather than caution:
+#
+#   XRP's UNGATED calibration residual is +0.0130 [-0.0064, +0.0324] over 1,065
+#   markets and 46 days - it spans zero. Of 19,440 complete candidate gate sets,
+#   673 cleared the 15% volume floor AND the baseline, and NOT ONE reached tier
+#   A or B: none demonstrably beat taking everything. The deployed set reads
+#   +0.0257 [-0.0029, +0.0537] and BOTH disjoint halves span zero.
+#
+# So there is nothing here to trade on yet. What the instance is FOR is the
+# record: live per-second reference data and a gate set admitting 23% of
+# decision points, which no backtest can reconstruct because Kalshi serves no
+# historical order-book depth.
+#
+# TO TURN IT ON LATER, both of these, deliberately:
+#     $env:AUTO_TRADE_ENABLED = "true"
+#     python scripts/auto_switch.py --db xrp15.db --on
+# The STORED row wins over this default, so a restart cannot arm it by itself.
+# And note the Telegram kill switch does NOT reach this instance - only BTC
+# consumes getUpdates - so the off switch is:
+#     python scripts/auto_switch.py --db xrp15.db --off
+#
+# The daily loss floor is set even though nothing can trade, so arming it later
+# cannot leave the account without one.
+$env:AUTO_DAILY_LOSS_LIMIT = "5"
+
+# EXACTLY ONE INSTANCE LISTENS FOR COMMANDS. Telegram getUpdates is
+# destructive - it acknowledges with an offset - so three processes on one bot
+# token would race for every message, including the kill switch. BTC keeps the
+# command stream; xrp still SENDS all of its alerts.
+$env:TELEGRAM_COMMANDS_ENABLED = "false"
+
+# ITS OWN INTELLIGENCE ARTEFACTS. These default to runtime/, which is BTC's,
+# and the learning runner WRITES the policy path - so without this the sol
+# instance would overwrite BTC's live policy at its first scheduled fit, and in
+# the meantime would apply BTC-fitted arms to sol decisions. The arms are
+# keyed on distance-price-momentum, strings that exist for every instrument, so
+# neither failure would look wrong from outside.
+$env:INTELLIGENCE_POLICY_PATH     = "runtime-xrp/intelligence_policy.json"
+$env:INTELLIGENCE_CANDIDATES_PATH = "runtime-xrp/intelligence_candidates.json"
+
+# ITS OWN CORPUS. `_corpus_mismatch` in learning_runner.py independently
+# refuses any fit whose rows disagree with KALSHI_SERIES, so a wrong path here
+# is caught rather than silently trained on.
+# THE MERGED CORPUS, 2026-09-25. Re-fetching the reference series to
+# capture brti_retrace landed on a near-disjoint set of markets, so the
+# samples were unioned rather than one discarded. It is the same
+# instrument throughout, and it is the only corpus carrying retrace -
+# which the live rule gates on and no earlier fit could see.
+$env:CORPUS_BRTI_PATH   = "data/brti_history_xrp.db"
+$env:CORPUS_MARKET_PATH = "data/market_data_kxxrp15m.db"
+
+# LEARNING ON, and XRP is the first instrument whose corpus carries EVERY gate
+# the live rule reads. `brti_retrace` and `brti_choppiness` were computed and
+# then discarded by the backfill until 2026-09-25, so every earlier fit scored
+# candidates as though those two gates were absent while live enforced them
+# (FINDINGS 75). 5,713 of XRP's 6,390 points carry retrace.
+#
+# The promotion bar is unchanged - Holm-Bonferroni at FWER 0.05 on a
+# chronological validation slice, plus no contradicting forward evidence - and
+# it has never promoted anything on any instrument. With no measured edge to
+# start from, that bar matters more here, not less.
+$env:LEARNING_ENABLED = "true"
+
+New-Item -ItemType Directory -Force runtime-xrp | Out-Null
+# SUPERVISED OR ONE-SHOT. With -Supervise this hands off to watchdog.py
+# instead of the service directly, and watchdog.py relaunches it whenever
+# it exits. The environment above is already set and watchdog.py runs
+# run_service.py as a CHILD, so the instance variables are inherited -
+# which is why the switch lives here rather than in a second script. A
+# copied env block is how one instance ends up writing another's database
+# (FINDINGS 43, 63).
+#
+# The boot+logon scheduled task passes -Supervise. Run it bare to start
+# the instance by hand.
+if ($Supervise) {
+    & .venv\Scripts\pythonw.exe scripts\watchdog.py
+} else {
+    & .venv\Scripts\pythonw.exe scripts\run_service.py
+}
