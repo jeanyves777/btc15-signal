@@ -50,6 +50,39 @@ def has_table(db: sqlite3.Connection, name: str) -> bool:
     ).fetchone() is not None
 
 
+def trades_from_allsignal(db, since_ms: int, prefix: str) -> tuple[list[dict], list[str]]:
+    """BTC arm A from the full lifecycle log: entry fill -> exit -> settlement.
+
+    `allsignal_trades` is the live system's own trade record, one row per
+    window, carrying the sized fill, the cash-out (`exit_*`, `exited_ms`) and
+    the graded net `pnl`. Preferred over reconstructing from `fills` because it
+    already reconciles the entry, the early exit and the settlement into one
+    final figure, and it records when the position actually closed.
+    """
+    if not has_table(db, "allsignal_trades"):
+        return [], ["no allsignal_trades table"]
+    cols = {r[1] for r in db.execute("PRAGMA table_info(allsignal_trades)")}
+    rows, problems = [], []
+    for r in db.execute(
+        "SELECT * FROM allsignal_trades WHERE ticker LIKE ? AND created_ms >= ? "
+        "AND filled > 0 AND pnl IS NOT NULL ORDER BY created_ms", (prefix + "%", since_ms),
+    ):
+        close_ms = r["window_open"] + WINDOW_MS
+        fill_price = r["fill_price"] if r["fill_price"] is not None else r["ask"]
+        cost = (r["filled"] or 0) * (fill_price or 0) + (r["fee"] or 0)
+        exited = r["exited_ms"] if "exited_ms" in cols else None
+        # Known/paid when the position closed, else at expiry.
+        outcome_ms = min(close_ms, exited) if exited else close_ms
+        paid_ms = exited if exited else close_ms + 90_000
+        rows.append({
+            "ticker": r["ticker"], "close_ms": close_ms, "side": (r["side"] or "").lower(),
+            "entry_ms": r["created_ms"], "contracts": r["filled"],
+            "cost": round(cost, 6), "net_pnl": r["pnl"],
+            "outcome_ms": outcome_ms, "paid_ms": paid_ms, "source": "allsignal_trades",
+        })
+    return rows, problems
+
+
 def export_trades(db, since_ms: int, prefix: str) -> tuple[list[dict], list[str]]:
     """BTC arm A: every recorded BTC market, aggregated over its buys."""
     buys = db.execute(
@@ -149,6 +182,33 @@ def outcomes_from_trading(db, market: str, since_ms: int) -> dict[str, dict]:
     return found
 
 
+def outcomes_from_predictions(db, market: str, since_ms: int) -> dict[str, dict]:
+    """Market result per window from the per-window prediction archive.
+
+    `predictions` is keyed one row per window and settles `won`/`final_price`
+    for every window the system priced - far more complete than `settlements`
+    (only markets actually settled on the book). `won` is relative to the
+    predicted `side`, so the winning side is `side` when won else the opposite;
+    `final_price` vs `target` agrees and is kept for audit.
+    """
+    if not has_table(db, "predictions"):
+        return {}
+    found: dict[str, dict] = {}
+    for r in db.execute(
+        "SELECT window_open, contract_ticker, side, won, final_price, target "
+        "FROM predictions WHERE won IS NOT NULL AND side IS NOT NULL "
+        "AND window_open + ? >= ?", (WINDOW_MS, since_ms),
+    ):
+        ticker = r["contract_ticker"]
+        if not ticker:
+            continue
+        win_yes = (r["side"] == "yes") == bool(r["won"])
+        found[ticker] = {
+            "market": market, "ticker": ticker, "close_ms": r["window_open"] + WINDOW_MS,
+            "result": "yes" if win_yes else "no", "settled_ms": ""}
+    return found
+
+
 def outcomes_from_observations(db, market: str, since_ms: int) -> dict[str, dict]:
     """Market result per window, derived from the settled observation archive.
 
@@ -218,7 +278,11 @@ def main() -> None:
     btc = ro(a.btc_db)
     gold = ro(a.gold_db)
 
-    trades, problems = export_trades(btc, since, a.btc_prefix)
+    # Prefer the full lifecycle log; fall back to reconstructing from fills.
+    trades, problems = trades_from_allsignal(btc, since, a.btc_prefix)
+    if not trades:
+        trades, problems = export_trades(btc, since, a.btc_prefix)
+        problems.insert(0, "allsignal_trades empty/absent - reconstructed arm A from fills")
 
     quotes = quotes_from_observations(btc, "BTC", since)
     quotes += quotes_from_observations(gold, "GOLD", since)
@@ -227,7 +291,7 @@ def main() -> None:
         quotes += quotes_from_book(path, "GOLD", a.gold_prefix, since)
 
     # Authoritative settlements first, then the market cache, then the
-    # observation-derived result fills every remaining window.
+    # per-window prediction archive, and finally observations fill any gap.
     outcomes = outcomes_from_trading(btc, "BTC", since)
     outcomes.update(outcomes_from_trading(gold, "GOLD", since))
     for market, path, prefix in (("BTC", a.btc_cache, a.btc_prefix),
@@ -235,6 +299,9 @@ def main() -> None:
         if Path(path).exists():
             for tk, row in outcomes_from_cache(path, market, prefix, since).items():
                 outcomes.setdefault(tk, row)
+    for db, market in ((btc, "BTC"), (gold, "GOLD")):
+        for tk, row in outcomes_from_predictions(db, market, since).items():
+            outcomes.setdefault(tk, row)
     for db, market in ((btc, "BTC"), (gold, "GOLD")):
         for tk, row in outcomes_from_observations(db, market, since).items():
             outcomes.setdefault(tk, row)
