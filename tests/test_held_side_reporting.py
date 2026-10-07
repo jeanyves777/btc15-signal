@@ -20,6 +20,7 @@ It had happened once before, on 2026-09-21, and gone unnoticed: 2 of 131 traded
 markets, both reported as losses, both actually wins.
 """
 
+import re
 import sys
 from pathlib import Path
 
@@ -31,6 +32,18 @@ from btc15_signal import messages, surface  # noqa: E402
 
 TICKER = "KXBTC15M-26SEP231215-15"
 
+
+
+def header_after_label(text: str) -> str:
+    """The header with any instrument label stripped.
+
+    Since two instances write to one Telegram chat, every message begins
+    with `<b>BTC</b> · ` or `<b>ETH</b> · `. These tests are about what
+    follows it - the direction and the outcome - so the label is removed
+    here rather than each assertion being rewritten around it.
+    """
+    first = text.splitlines()[0]
+    return re.sub(r"^<b>[A-Z]{3,4}</b> · ", "", first)
 
 def test_the_recap_reports_the_side_that_owned_the_money():
     """The real market, with the broker's own numbers."""
@@ -44,7 +57,7 @@ def test_the_recap_reports_the_side_that_owned_the_money():
         paid=0.932,
         snapshot=None,
     )
-    assert text.startswith(surface.WON_MONEY), "a paid-out market is not a loss"
+    assert header_after_label(text).startswith(surface.WON_MONEY), "a paid-out market is not a loss"
     assert "Bought <b>UP</b>" in text
     assert "DOWN" not in text.split(surface.DIVIDER)[0]
     assert "Realised <b>+$0.13</b>" in text
@@ -94,7 +107,7 @@ def test_report_settlement_prefers_the_trades_side_over_the_predictions(
     ))
     text = captured["text"]
     assert "Bought <b>UP</b>" in text, "the recap must name the side we held"
-    assert text.startswith(surface.WON_MONEY), "settled YES holding UP is a win"
+    assert header_after_label(text).startswith(surface.WON_MONEY), "settled YES holding UP is a win"
     # And the call is still reported, because it was genuinely wrong.
     assert "called DOWN" in text and "held UP" in text
 
@@ -105,7 +118,7 @@ def test_an_untraded_signal_is_still_scored_on_the_call():
         side="DOWN", ticker=TICKER, winner="UP", won=False, traded=False,
         pnl=None, snapshot=None,
     )
-    assert text.startswith(surface.LOST_PAPER)
+    assert header_after_label(text).startswith(surface.LOST_PAPER)
     assert "Not traded · realised P&amp;L $0.00" in text
     assert "Cost" not in text
 

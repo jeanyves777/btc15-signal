@@ -30,7 +30,18 @@ class LogStream:
 def main() -> None:
     project = Path(__file__).resolve().parents[1]
     os.chdir(project)
-    runtime = project / "runtime"
+    # ONE RUNTIME DIRECTORY PER INSTANCE. A second series runs as a separate
+    # PROCESS against its own database rather than as a second loop inside
+    # this one, because every window-keyed query here assumes one series:
+    # BTC and ETH windows close at the same instants and therefore share
+    # `window_open`, and `predictions` and `strategy_alerts` carry no ticker
+    # at all. Two series in one database would cross-attribute positions and
+    # share the alert throttle; two processes share nothing.
+    #
+    # Empty INSTANCE keeps the original paths exactly, so the BTC service is
+    # untouched by this and an existing deployment does not move.
+    instance = (os.environ.get("BTC15_INSTANCE") or "").strip()
+    runtime = project / ("runtime" if not instance else f"runtime-{instance}")
     runtime.mkdir(exist_ok=True)
     with (runtime / "service.lock").open("a+b") as lock:
         try:

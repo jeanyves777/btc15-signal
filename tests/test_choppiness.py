@@ -123,9 +123,13 @@ def test_the_choppiest_possible_window_refuses_nothing():
     the confidence word says so."""
     from btc15_signal import kalshi_signal
 
+    # The three level-holding gates are neutralised HERE because this test
+    # is about choppiness and nothing else: it must fail if CHOPPINESS
+    # refuses, not because a synthetic window never tested its strike.
     rule = KalshiBRTIRule(min_brti_normalized_distance=0.0,
                           require_momentum_alignment=False,
-                          max_brti_retrace=1.0)
+                          max_brti_retrace=1.0,
+                          min_brti_accel=-1e9, min_brti_held_s=0, min_brti_rejections=0)
     f = feats(CHOP)
     assert f.brti_choppiness > 0.9
     ok, _facts, failed = kalshi_signal.evaluate(rule, f, 0.80, 600)
@@ -154,3 +158,42 @@ def test_the_shipped_settings_are_the_documented_ones():
     s = Settings()
     assert s.choppiness_window_s == 900
     assert s.choppiness_penalty == 15
+
+
+# ------------- the penalty must not be absorbed by the clamp
+
+def test_the_penalty_is_not_eaten_by_the_clamp_on_the_bonuses():
+    """2026-09-24, 16:00. Both instruments took the same window at 5/5 and
+    "Score 100/100 · HIGH": BTC at choppiness 0.94 with a -14 penalty, ETH
+    at 0.87 with -13. Their raw sums were 114 and 104, so BOTH PENALTIES
+    COST NOTHING - a 94%-choppy market scored exactly what a perfectly clean
+    one would. Both lost.
+
+    That is the opposite of what choppiness is for: the strongest-looking
+    setups are precisely where a false HIGH is most expensive."""
+    facts = [{"name": str(i), "passed": True} for i in range(5)]
+    clean = main.confidence_breakdown(facts, OPENED, None, 7, 0.0, 0)
+    choppy = main.confidence_breakdown(facts, OPENED, None, 7, 0.94, -14)
+    assert clean["points"] > choppy["points"], (
+        "a choppy window must score below a clean one")
+    assert clean["points"] - choppy["points"] == 14
+
+
+def test_every_penalty_size_moves_the_score():
+    """Whatever the bonuses are, a penalty of N costs N."""
+    facts = [{"name": str(i), "passed": True} for i in range(5)]
+    for intel in (0, 7, 25):
+        base = main.confidence_breakdown(facts, OPENED, None, intel, 0.0, 0)
+        for pen in (-2, -8, -15):
+            got = main.confidence_breakdown(facts, OPENED, None, intel,
+                                            0.5, pen)
+            assert got["points"] == max(0, base["points"] + pen), (intel, pen)
+
+
+def test_it_still_cannot_raise_confidence():
+    """The clamp fix must not have turned it into a bonus."""
+    facts = [{"name": str(i), "passed": True} for i in range(5)]
+    base = main.confidence_breakdown(facts, OPENED, None, 0, None, 0)
+    for chop, pen in ((0.2, -3), (0.9, -14), (1.0, -15)):
+        assert main.confidence_breakdown(
+            facts, OPENED, None, 0, chop, pen)["points"] <= base["points"]

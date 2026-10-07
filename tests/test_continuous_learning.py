@@ -38,6 +38,7 @@ from btc15_signal.learning_store import (  # noqa: E402
     LearningStore,
 )
 from btc15_signal.store import Store  # noqa: E402
+from btc15_signal import feature_contract  # noqa: E402
 
 NOW = 1_790_000_000_000
 DAY = 86_400_000

@@ -1,0 +1,40 @@
+{
+  "_comment": "NEAR (KXNEAR15M). SHADOW ONLY - it records and never trades. Automation OFF. Backtested 2026-09-26 on NEAR's own corpus: 6,278 priced decision points over 1,066 markets and 46 days, built from 4,262 settled markets.",
+
+  "_no_edge_found": "THE BACKTEST RESULT, and it is the weakest of the six instruments measured. NEAR's UNGATED calibration residual is NEGATIVE: -0.0022 [-0.0253, +0.0206] at a 0.758 mean ask. Taking every setup loses money before fees on this instrument - no other has done that (gold +0.0346, XRP +0.0130, SOL +0.0013). Of 19,440 complete candidate gate sets only 50 cleared the 15% volume floor and the baseline - XRP managed 673 - and NOT ONE reached tier A or tier B. The best reads +0.0192 [-0.0182, +0.0558], spanning zero, and against the ungated baseline it adds +0.0213 [-0.0109, +0.0523], which does not show.",
+
+  "_the_halves_disagree_and_that_matters": "The chosen set's first disjoint half is NEGATIVE (-0.0145, spanning zero) and its second HOLDS (+0.0697 [+0.0181, +0.1160]). That is the opposite shape from silver and SOL, which held in the first half and decayed in the second - and it is no more trustworthy. A result carried entirely by the later half is either a regime that has just begun or noise that will revert, and 23 days cannot tell those apart. Recorded as the reason this is a recorder rather than a strategy.",
+
+  "_why_it_is_still_deployed": "To RECORD. The gate set admits 15.2% of decision points, which is enough for the confidence arms to accumulate evidence, and the instance captures live per-second reference data that no backtest can reconstruct - Kalshi serves no historical order-book depth, so fill probability and queue position are only ever answerable from data this system archives itself. If the second-half result is real it will continue; if it was noise, the record will say so.",
+
+  "enabled": true,
+
+  "_band_comment": "0.55-0.75, the lowest band of any instrument here - gold sits at 0.60-0.80, BTC at 0.70-0.93. The admitted group's mean ask is 0.668 and it wins 68.8%, so NEAR is a cheaper-contract instrument than the rest: less cushion, more upside per win. Chosen inside a complete set, not off its own table.",
+  "min_ask": 0.55,
+  "max_ask": 0.75,
+
+  "_distance_comment": "0-25bp, effectively open. The search was offered six narrower bands including gold's 1.5-6.0 and silver's 0.5-12.0 and preferred none - distance does not separate on NEAR, the same result as XRP. An absolute bps band rather than the normalised floor, because BTC's 10-15x floor is not transferable across instruments (FINDINGS 43).",
+  "min_abs_distance_bps": 0.0,
+  "max_abs_distance_bps": 25.0,
+  "min_brti_normalized_distance": 0.0,
+  "moving_min_brti_normalized_distance": 0.0,
+  "calm_momentum_bps": 5.0,
+
+  "_timing_comment": "THE WINDOW THAT ACTUALLY RUNS. The fit chose 800-250s, but entry is gated twice and only the intersection executes: settings.entry_from_seconds/entry_to_seconds (660/360, which no launcher overrides) is checked in main.py BEFORE the rule is consulted. The corpus holds decision points at 360..660 seconds only, so 800-250 selected exactly the minutes 660-360 selects - behaviour identical, and the config states what it can act on rather than a span the service can never reach (FINDINGS 77).",
+  "entry_from_seconds": 660,
+  "entry_to_seconds": 360,
+
+  "_gates_comment": "Real thresholds from the best complete set, recorded even though that set does not clear zero - a config for recording still has to be a config, and a threshold no value can fail must never be shown as a passed check. Momentum capped at 40bp, acceleration a BAND at +-25 rather than BTC's floor, level held >=10s and level tested >=1 under the 45-minute lookback. None is claimed as an edge.",
+  "min_brti_momentum_bps": 0.0,
+  "max_brti_momentum_bps": 40.0,
+  "min_brti_accel": -25.0,
+  "max_brti_accel": 25.0,
+  "min_brti_held_s": 10.0,
+  "min_brti_rejections": 1,
+  "require_momentum_alignment": false,
+
+  "_retrace_comment": "MEASURED, AND REQUIRED - the second instrument to ask for it, after XRP. Gold, silver and SOL all preferred require_measurable_retrace: false, on the reasoning that a window with no advance to give back is the target state on a level-maintenance instrument. NEAR's search preferred the opposite: cap 0.60 AND refuse an unmeasurable retrace. Retrace is present on 5,715 of 6,396 points, so requiring it costs about 11% of setups. Recorded as measured, not as understood.",
+  "max_brti_retrace": 0.60,
+  "require_measurable_retrace": true,
+  "asset": "NEAR"
+}

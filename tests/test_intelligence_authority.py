@@ -30,13 +30,13 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from btc15_signal import intel_mode  # noqa: E402
 from btc15_signal import intelligence_policy as intel  # noqa: E402
+from btc15_signal import feature_contract  # noqa: E402
 
 KEY = "bd10-15 · px70-85 · mom5+|accept"
 
 
 def policy(*, action="veto", vetoes=True, admissions=False, n=400,
-           by_session=None, version="brti-2", fingerprint=None):
-    from btc15_signal import feature_contract
+           by_session=None, version=feature_contract.CONTRACT.version, fingerprint=None):
 
     arm = {
         "action": action, "n": n, "markets": n, "days": 30,
@@ -201,14 +201,13 @@ def test_a_caller_that_supplies_no_session_gets_the_old_contract():
 def test_a_session_keyed_cell_needs_no_pooling_check():
     """`us · mid · ...` already names its session and cannot be carried by a
     different one, so it acts without per-session counts."""
-    from btc15_signal import feature_contract
 
     arm = {"action": "veto", "n": 400, "markets": 400, "days": 30,
            "mean": -0.05, "low": -0.09, "high": -0.01, "delta": 0,
            "probability": 0.62, "gate": None, "promoted": True}
     key = "us · mid · bd10-15 · px70-85|accept"
     pol = intel.Policy(
-        version="t", model_version="m", feature_version="brti-2",
+        version="t", model_version="m", feature_version=feature_contract.CONTRACT.version,
         feature_fingerprint=feature_contract.FINGERPRINT,
         arms={key: arm}, vetoes_enabled=True, admissions_enabled=False,
         min_evidence=40, training_cutoff_ms=0, data_end_ms=0)
@@ -273,3 +272,69 @@ def test_main_passes_the_session_to_decide():
 
     src = inspect.getsource(main)
     assert "session=_session(opened)" in src
+
+
+# ------------- an overridden gate is a message, not a DETAILS button
+
+def test_an_admit_reaches_the_message_not_only_the_details_body():
+    """`policy_line` went ONLY to `detail_body`, which is behind a DETAILS
+    button. An ADMIT is the layer overruling a gate and letting an order
+    through - it would have placed a trade with nothing in the message
+    saying why a refused setup was taken."""
+    import inspect
+
+    from btc15_signal import main
+
+    source = inspect.getsource(main.primary_signal)
+    assert "policy_note=admit_note" in source
+    at = source.index("admit_note = (")
+    window = source[at:at + 260]
+    assert "intel.ADMIT" in window
+    assert "intel.VETO" in window
+
+
+def test_the_fill_message_carries_it_too():
+    """An order the layer admitted past a gate must say so on the FILL, not
+    only on the signal that preceded it."""
+    import inspect
+
+    from btc15_signal import main
+
+    source = inspect.getsource(main.primary_signal)
+    at = source.index("policy_note=messages.policy_line(")
+    assert "intel.ADMIT" in source[at:at + 260]
+
+
+def test_both_builders_accept_it():
+    import inspect
+
+    from btc15_signal import messages
+
+    for fn in (messages.signal_message, messages.fill_message):
+        assert "policy_note" in inspect.signature(fn).parameters
+
+
+def test_it_renders_in_essentials_not_in_the_checks_block():
+    """It is not a gate result and must not be read as one."""
+    import inspect
+
+    from btc15_signal import messages
+
+    for fn in (messages.signal_message, messages.fill_message):
+        source = inspect.getsource(fn)
+        at = source.rindex("if policy_note:")
+        assert "essentials.append" in source[at:at + 120]
+
+
+def test_a_neutral_decision_still_says_nothing():
+    """3,700 live decisions are neutral. Narrating every one trains the
+    reader to skip the line, and then the ADMIT goes unread too."""
+    from btc15_signal import messages
+
+    class V:
+        changed = False
+        final_action = "neutral"
+        confidence_delta = 0
+        evidence_n = 0
+
+    assert messages.policy_line(V()) == ""

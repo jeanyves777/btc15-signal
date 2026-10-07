@@ -1,9 +1,24 @@
+import asyncio
 import base64
 import time
 from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import urlparse
 from uuid import uuid4
+
+# THE $ ORDER'S "SENT" SIGNAL (review 2026-09-30): one Event per order id, set
+# the moment its entry POST has been answered (or the order refused before it).
+# The alert waits on it - about one round trip - so the order goes out FIRST,
+# instead of the order task waiting behind the alert's synchronous work.
+ORDER_SENT: dict = {}
+
+
+def fresh_order_event(key: str) -> asyncio.Event:
+    """A new Event for the next send of order `key` (replaces an old one)."""
+    ORDER_SENT[key] = event = asyncio.Event()
+    for old in list(ORDER_SENT)[:-16]:
+        ORDER_SENT.pop(old, None)
+    return event
 
 import httpx
 from cryptography.hazmat.primitives import hashes, serialization
@@ -103,13 +118,62 @@ def parse_fill(order: dict | None, side: str) -> dict | None:
     }
 
 
+# THE ACCOUNT'S CASH IS SPLIT BY EXCHANGE SHARD, and an API order can spend only
+# the shard its market lives on. `/portfolio/balance` reports one entry per
+# `exchange_index`; every 15-minute crypto market is shard 2. The Kalshi APP
+# hides this: placing an order there moves exactly the cost from shard 0 into
+# the market's shard in the same second - the operator's wife's DOGE order on
+# 2026-09-27 04:13:39 carried an automatic $1.0092 transfer 0 -> 2. The API does
+# no such thing, so her mirror spent shard 2 down to $0.09 and then had every
+# entry refused `insufficient_balance` for ~15 hours while $30 sat in shard 0.
+#
+# `auto_fund` makes an API account behave like the app: move the shortfall into
+# the market's shard before the order goes out. It is OFF by default and an
+# account opts in, because what the bot may reach is a sizing decision.
+FUND_TRANSFER_PATH = "/portfolio/intra_exchange_instance_transfer"
+FUND_STATUS_PATH = "/portfolio/intra_exchange_instance_transfers"
+# Per contract, on top of the price: Kalshi's fee is at most ~2c a contract.
+# The app moved $1.0092 for a $0.9849 fill; this covers that with room.
+FUND_FEE_ALLOWANCE = 0.02
+
+
+async def _sleep(seconds: float) -> None:
+    """Module-level so a test can make transfer polling instant."""
+    await asyncio.sleep(seconds)
+
+
 class KalshiExecutionClient:
+    daily_profit_guard = None
+    allowed_entry_series = None
+
+    async def entry_block_reason(self, ticker, strategy="", count=None, price=None):
+        if self.allowed_entry_series and ticker.split("-")[0] not in self.allowed_entry_series:
+            return "New entries disabled: BTC only"
+        if self.daily_profit_guard is not None:
+            # The strategy decides whether a guard that lowers its stake past
+            # the target lets this entry through: only the $ strategy's does.
+            return await self.daily_profit_guard.block_reason(
+                ticker, strategy=strategy, count=count, price=price)
+        return ""
+    # Class-level too, so a client built without __init__ (a test double)
+    # still reads funding as off rather than raising.
+    auto_fund = False
+    fund_source_shard = 0
+    last_funding_note = ""
+
     def __init__(self, base_url: str, api_key_id: str, private_key_path: str) -> None:
         self.base_url = base_url.rstrip("/")
         self.api_key_id = api_key_id
         key_bytes = Path(private_key_path).expanduser().read_bytes()
         self.private_key = serialization.load_pem_private_key(key_bytes, password=None)
         self.client = httpx.AsyncClient(timeout=10)
+        # See FUND_TRANSFER_PATH above. Off unless the account opts in.
+        self.auto_fund = False
+        self.fund_source_shard = 0
+        self._shard_of: dict[str, int] = {}
+        # The last funding action, for the caller's log line: "" when nothing
+        # was needed, otherwise what moved or why it could not.
+        self.last_funding_note = ""
 
     async def close(self) -> None:
         await self.client.aclose()
@@ -135,8 +199,177 @@ class KalshiExecutionClient:
             json=payload,
             headers=self._headers("POST", path),
         )
-        response.raise_for_status()
+        if response.status_code >= 400:
+            # KEEP KALSHI'S REASON. `raise_for_status()` alone produced
+            # "Client error '400 Bad Request'" and nothing else, so a mirror
+            # refused `insufficient_balance` for fifteen hours logged the same
+            # line as a malformed order and nobody could tell which it was.
+            raise httpx.HTTPStatusError(
+                f"{response.status_code} from {path}: {response.text[:300]}",
+                request=getattr(response, "request", None),
+                response=response,
+            )
         return response.json()
+
+    # ------------------------------------------------------------ funding
+    async def market_shard(self, ticker: str) -> int | None:
+        """The exchange shard a market lives on, or None if it cannot be read."""
+        if ticker in self._shard_of:
+            return self._shard_of[ticker]
+        try:
+            response = await self.client.get(self.base_url + f"/markets/{ticker}")
+            if response.status_code >= 400:
+                return None
+            shard = (response.json().get("market") or {}).get("exchange_index")
+        except (httpx.HTTPError, OSError, ValueError):
+            return None
+        if shard is None:
+            return None
+        self._shard_of[ticker] = int(shard)
+        return int(shard)
+
+    async def shard_balances(self) -> dict[int, float]:
+        """{exchange_index: dollars} for this account."""
+        path = "/portfolio/balance"
+        started = time.time()
+        response = await self.client.get(
+            self.base_url + path, headers=self._headers("GET", path))
+        response.raise_for_status()
+        out = {int(x["exchange_index"]): float(x["balance"])
+               for x in response.json().get("balance_breakdown", [])}
+        # Remembered for the ORDER PATH (`ensure_funds`): a fresh read lets an
+        # order go out without a Kalshi call in front of it (2026-09-30). An
+        # order reserved while this read was in flight is not in Kalshi's
+        # answer yet, so it is taken off again.
+        cached = dict(out)
+        for at, shard, amount in self._live_reservations():
+            if at >= started:
+                cached[shard] = cached.get(shard, 0.0) - amount
+        self._balance_cache = (time.time(), cached)
+        return out
+
+    def _live_reservations(self) -> list:
+        now = time.time()
+        live = [r for r in getattr(self, "_reservations", []) if now - r[0] < 60]
+        self._reservations = live
+        return live
+
+    def _reserve(self, shard: int, amount: float) -> None:
+        """This order's cost, spent from the cached balance and remembered."""
+        self._reservations = self._live_reservations() + [(time.time(), shard, amount)]
+        cache = getattr(self, "_balance_cache", None)
+        if cache:
+            cache[1][shard] = cache[1].get(shard, 0.0) - amount
+
+    def cached_balances(self, max_age_s: float = 30.0) -> dict[int, float] | None:
+        """The last balance read if it is younger than `max_age_s`, else None."""
+        cache = getattr(self, "_balance_cache", None)
+        if not cache or time.time() - cache[0] > max_age_s:
+            return None
+        return cache[1]
+
+    async def transfer_between_shards(
+        self, dollars: float, source: int, destination: int,
+        wait_s: float = 8.0,
+    ) -> tuple[bool, str]:
+        """Move cash between this account's shards; wait until it is complete.
+
+        Kalshi documents cross-shard transfers as non-atomic, so "the request
+        was accepted" is not "the money arrived": the status is polled until
+        `complete`, and anything short of that is reported as not done.
+        """
+        body = {
+            "source": "event_contract", "destination": "event_contract",
+            "amount": int(round(dollars * 10000)),   # centi-cents
+            "source_exchange_shard": source,
+            "destination_exchange_shard": destination,
+            "source_subaccount": 0, "destination_subaccount": 0,
+        }
+        try:
+            created = await self._post(FUND_TRANSFER_PATH, body)
+        except (httpx.HTTPError, OSError) as exc:
+            return False, f"transfer refused: {exc}"[:200]
+        transfer_id = created.get("transfer_id")
+        if not transfer_id:
+            return False, f"transfer returned no id: {created}"[:200]
+        deadline = time.time() + wait_s
+        status = "unknown"
+        while time.time() < deadline:
+            path = f"{FUND_STATUS_PATH}/{transfer_id}"
+            try:
+                response = await self.client.get(
+                    self.base_url + path, headers=self._headers("GET", path))
+                if response.status_code < 400:
+                    status = (response.json().get("transfer") or {}).get(
+                        "status", "unknown")
+                    if status == "complete":
+                        return True, (f"moved ${dollars:.2f} shard {source} -> "
+                                      f"{destination} ({transfer_id})")
+            except (httpx.HTTPError, OSError, ValueError):
+                pass
+            await _sleep(0.5)
+        return False, (f"transfer {transfer_id} still {status} after "
+                       f"{wait_s:g}s - not relying on it")
+
+    async def ensure_funds(self, ticker: str, count: float,
+                           price: float, force: bool = False,
+                           reserve: bool = True) -> tuple[bool, str]:
+        """Make sure the market's shard can pay for `count` at `price`.
+
+        Does nothing unless `auto_fund` is on, or `force` - the recovery combo
+        on the operator's own account (operator, 2026-09-27: "auto-fund
+        combos"), whose market lives in a shard nothing else funds. Moves only the SHORTFALL plus a
+        fee allowance - exactly what the app does - never a standing float, so
+        the shard holds no more of the account's cash than the next order
+        needs. Never raises: a failure is reported and the order is still sent,
+        so Kalshi's own answer is what gets logged.
+        """
+        if not (self.auto_fund or force) or count <= 0 or price <= 0:
+            return True, ""
+        shard = await self.market_shard(ticker)
+        if shard is None:
+            return False, f"could not read {ticker}'s shard; not funding"
+        source = self.fund_source_shard
+        if shard == source:
+            return True, ""
+        need_now = count * (price + FUND_FEE_ALLOWANCE)
+        cached = self.cached_balances()
+        if cached is not None and cached.get(shard, 0.0) >= need_now:
+            # NO KALSHI CALL IN FRONT OF THE ORDER: the background read (every
+            # 15 s) already shows enough on the shard. Reserve it locally so
+            # two quick orders cannot both count the same dollars.
+            if reserve:
+                self._reserve(shard, need_now)
+            return True, ""
+        try:
+            balances = await self.shard_balances()
+        except (httpx.HTTPError, OSError, ValueError, KeyError) as exc:
+            return False, f"could not read balances: {type(exc).__name__}"
+        have = balances.get(shard, 0.0)
+        need = count * (price + FUND_FEE_ALLOWANCE)
+        shortfall = need - have
+        if shortfall <= 0:
+            if reserve:
+                self._reserve(shard, need)
+            return True, ""
+        # Whole cents, rounded UP, so a rounding error cannot leave the order a
+        # fraction of a cent short.
+        amount = int(shortfall * 100 + 0.999999) / 100.0
+        available = balances.get(source, 0.0)
+        if available < amount:
+            return False, (f"shard {shard} holds ${have:.2f} of ${need:.2f} "
+                           f"needed and shard {source} has only "
+                           f"${available:.2f} to move")
+        ok, note = await self.transfer_between_shards(amount, source, shard)
+        # SAID on every account - the primary's transfers left no trace
+        # (review, 2026-09-29); the mirrors also carry it in their own log.
+        print(f"funding [{ticker}]: {note}", flush=True)
+        if ok:
+            self._balance_cache = (time.time(), {**balances, shard: have + amount,
+                                                 source: available - amount})
+            if reserve:
+                self._reserve(shard, need)
+        return ok, note
 
     async def execute_with_take_profit(
         self, proposal: TradeProposal, slippage: float = 0.0,
@@ -152,6 +385,20 @@ class KalshiExecutionClient:
         is paid only when the book actually moved - in the cases that would
         otherwise have been no trade at all.
         """
+        sent = ORDER_SENT.get(getattr(proposal, "id", "") or "")
+        try:
+            reason = await self.entry_block_reason(
+                proposal.ticker, getattr(proposal, "strategy", "") or "",
+                count=getattr(proposal, "count", None),
+                price=getattr(proposal, "entry_limit", None))
+        except BaseException:
+            if sent is not None:
+                sent.set()
+            raise
+        if reason:
+            if sent is not None:
+                sent.set()
+            return ExecutionResult("paused", 0, "", None, reason)
         path = "/portfolio/events/orders"
         # THE LIMIT IS THE CEILING, NOT THE PRICE.
         #
@@ -182,20 +429,38 @@ class KalshiExecutionClient:
             limit = ceiling
         limit = min(limit, 0.99)
         book_side, yes_price = event_order(proposal.side, limit)
-        entry = await self._post(
-            path,
-            {
-                "ticker": proposal.ticker,
-                "client_order_id": str(uuid4()),
-                "side": book_side,
-                "count": f"{proposal.count:.2f}",
-                "price": f"{yes_price:.4f}",
-                "time_in_force": "immediate_or_cancel",
-                "self_trade_prevention_type": "taker_at_cross",
-                "cancel_order_on_pause": True,
-                "reduce_only": False,
-            },
-        )
+        # Worst case this order can cost is count x limit - the limit is the
+        # ceiling we will pay on OUR side, UP or DOWN alike.
+        body = {
+            "ticker": proposal.ticker,
+            "client_order_id": str(uuid4()),
+            "side": book_side,
+            "count": f"{proposal.count:.2f}",
+            "price": f"{yes_price:.4f}",
+            "time_in_force": "immediate_or_cancel",
+            "self_trade_prevention_type": "taker_at_cross",
+            "cancel_order_on_pause": True,
+            "reduce_only": False,
+        }
+        try:
+            _funded, self.last_funding_note = await self.ensure_funds(
+                proposal.ticker, proposal.count, limit)
+            try:
+                entry = await self._post(path, body)
+            except httpx.HTTPStatusError as exc:
+                if not self.auto_fund or "insufficient_balance" not in str(exc):
+                    raise
+                # THE CACHED BALANCE WAS WRONG (another spend, a stale read):
+                # re-read, top up, send once more. A refused order was never
+                # created, so this cannot double it (review 2026-09-30).
+                self._balance_cache = None
+                _funded, self.last_funding_note = await self.ensure_funds(
+                    proposal.ticker, proposal.count, limit)
+                body["client_order_id"] = str(uuid4())
+                entry = await self._post(path, body)
+        finally:
+            if sent is not None:
+                sent.set()
         filled = float(entry["fill_count"])
         entry_id = entry["order_id"]
         if filled <= 0:
@@ -274,7 +539,12 @@ class KalshiExecutionClient:
         # deadline. The V2 shape carries direction in `side` (bid buys, ask
         # sells) with fixed-point dollar prices - there is no `action` or
         # `type` field, and sending them is how the wrong shape went unnoticed.
+        reason = await self.entry_block_reason(ticker)
+        if reason:
+            return {"status": "paused", "note": reason}
         order_side, yes_price = event_order(side, price)
+        _funded, self.last_funding_note = await self.ensure_funds(
+            ticker, count, price)
         return await self._post(
             "/portfolio/events/orders",
             {
@@ -428,6 +698,19 @@ class KalshiExecutionClient:
             total += remaining * price
         return len(orders), round(total, 4)
 
+    async def held_contracts(self, ticker: str, side: str) -> float:
+        """Broker inventory for a reduce-only exit after a process restart."""
+        path = "/portfolio/positions"
+        response = await self.client.get(
+            self.base_url + path, params={"limit": 200, "ticker": ticker},
+            headers=self._headers("GET", path))
+        response.raise_for_status()
+        for row in response.json().get("market_positions") or []:
+            if row.get("ticker") == ticker:
+                size = float(row.get("position_fp") or 0)
+                return max(0.0, size if side == "UP" else -size)
+        return 0.0
+
     async def close_position(
         self, ticker: str, side: str, count: float, limit_price: float,
         floor: float | None = None,
@@ -543,6 +826,46 @@ class KalshiExecutionClient:
         except (httpx.HTTPError, ValueError, KeyError):
             return []
 
+    async def settlement_facts(self, ticker: str) -> dict:
+        """Kalshi's target and settling value for one settled market.
+
+        `/portfolio/settlements` says whether a market resolved yes or no and
+        what it paid, but not BY HOW MUCH - and the margin is the part that
+        distinguishes an 83c favourite settling comfortably from one that
+        settled by a hair. The market object carries both:
+
+            floor_strike       the target price the signal message quotes
+            expiration_value   where the settling BRTI actually finished
+
+        Read from the broker rather than recomputed from our own reference
+        archive, for the same reason the P&L is: this is the number Kalshi
+        settled on, and a local reconstruction that disagrees with it is wrong
+        by definition. `/markets/{ticker}` is public, so no signature is needed
+        and a failure here can never affect an order.
+
+        Returns {} rather than raising: enrichment is bookkeeping, and a market
+        that will not answer must not interrupt a poll that has money in it.
+        """
+        try:
+            response = await self.client.get(
+                f"{self.base_url}/markets/{ticker}")
+            response.raise_for_status()
+            market = response.json().get("market") or {}
+        except Exception:  # noqa: BLE001 - never break a poll for bookkeeping
+            return {}
+
+        def number(value):
+            try:
+                return None if value is None else float(value)
+            except (TypeError, ValueError):
+                return None
+
+        return {
+            "strike": number(market.get("floor_strike")),
+            "expiration_value": number(market.get("expiration_value")),
+            "result": market.get("result"),
+        }
+
     async def _paginate(self, path: str, key: str, limit: int) -> list[dict]:
         """Kalshi caps a page at 200 and hands back a cursor."""
         out: list[dict] = []
@@ -559,6 +882,27 @@ class KalshiExecutionClient:
             cursor = page.get("cursor") or ""
             if not cursor or not rows:
                 return out
+
+    async def account_value(self) -> float | None:
+        """Cash plus open positions at COST - what the account is worth before
+        the open markets settle. None if either half could not be read."""
+        cash = await self.balance_dollars()
+        if cash < 0:
+            return None
+        try:
+            response = await self.client.get(
+                self.base_url + "/portfolio/positions?limit=200",
+                headers=self._headers("GET", "/portfolio/positions"),
+            )
+            response.raise_for_status()
+            exposure = sum(
+                float(p.get("market_exposure_dollars") or 0)
+                for p in (response.json().get("market_positions") or [])
+                if float(p.get("position_fp") or 0) != 0
+            )
+        except (httpx.HTTPError, ValueError, TypeError):
+            return None
+        return round(cash + exposure, 2)
 
     async def open_mark(self) -> tuple[int, float, dict[str, float]]:
         """(open positions, unrealised dollars, per-ticker marks) at the bid.
@@ -611,36 +955,51 @@ class KalshiExecutionClient:
 
     @staticmethod
     def market_open_ms(ticker: str) -> int | None:
-        """The market's own time, parsed from its ticker. None if unrecognised.
+        """The market's window OPEN in epoch ms, parsed from its ticker.
 
-        SETTLEMENT TIME IS NOT MARKET TIME. Kalshi settles these in batches
-        hours after close - KXBTC15M-26SEP220445-45 settled at 08:45 UTC, four
-        hours after its window - so bucketing realised P&L by `settled_time`
-        files a trade under the wrong day and hands the daily loss floor the
-        wrong window. The ticker carries the real one:
+        THE TICKER'S TIME IS THE CLOSE, ON THE NEW YORK WALL CLOCK. Reading it
+        as UTC (as this did until 2026-09-28) put every window 3h45m early in
+        EDT and 4h45m early in EST, so markets closing 00:15-03:45 ET fell out
+        of their own New York day - 17 markets and -$20.15 on 2026-09-28. The
+        ticker agrees with Kalshi's own open/close times on every one of 2,296
+        stored proposals once it is read in America/New_York; settlement lands
+        5-8 seconds after that close, not hours.
 
-            KXBTC15M-26SEP220445-45   ->  2026-09-22 04:45 UTC
-            KXBTCD-26SEP2207-T80099   ->  2026-09-22 07:00 UTC (hourly)
+            KXBTC15M-26SEP220445-45  close 04:45 ET  -> open 2026-09-22 08:30 UTC
+            KXBTCD-26SEP2207-T80099  close 07:00 ET  -> open 2026-09-22 10:00 UTC
+
+        None when the ticker names no time (combos, daily gas) or a length we
+        do not know; the caller then falls back to its own anchor.
         """
         import re
-        from datetime import UTC, datetime
+        from datetime import datetime
 
-        match = re.match(r"^[A-Z0-9]+-(\d{2})([A-Z]{3})(\d{2})(\d{2})(\d{2})?", ticker or "")
+        from .capital import NY
+
+        match = re.match(
+            r"^([A-Z0-9]+)-(\d{2})([A-Z]{3})(\d{2})(\d{2})(\d{2})?", ticker or ""
+        )
         if not match:
             return None
-        year, mon, day, hour, minute = match.groups()
+        series, year, mon, day, hour, minute = match.groups()
         months = ("JAN", "FEB", "MAR", "APR", "MAY", "JUN",
                   "JUL", "AUG", "SEP", "OCT", "NOV", "DEC")
         if mon not in months:
             return None
+        if minute is None:
+            length_ms = 3_600_000          # hourly ladder: KXBTCD-26SEP2207
+        elif series.endswith("15M"):
+            length_ms = 900_000            # KXBTC15M ... KXSILVER15M
+        else:
+            return None
         try:
-            stamp = datetime(
+            close = datetime(
                 2000 + int(year), months.index(mon) + 1, int(day),
-                int(hour), int(minute or 0), tzinfo=UTC,
+                int(hour), int(minute or 0), tzinfo=NY,
             )
         except ValueError:
             return None
-        return int(stamp.timestamp() * 1000)
+        return int(close.timestamp() * 1000) - length_ms
 
     @staticmethod
     def settlement_pnl(row: dict) -> float:

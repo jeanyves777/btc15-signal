@@ -6,6 +6,7 @@ promising a gross figure the settlement then paid net, two money snapshots in
 one message, a rotation that moved on a message nobody received.
 """
 
+import re
 import sys
 from pathlib import Path
 
@@ -15,6 +16,7 @@ import pytest  # noqa: E402
 
 from btc15_signal import messages, surface  # noqa: E402
 from btc15_signal.store import LifetimeRecord, MoneySnapshot, Store  # noqa: E402
+from btc15_signal import feature_contract  # noqa: E402
 
 NOW = 1_790_000_000_000
 TICKER = "KXBTC15M-26SEP231100-00"
@@ -47,11 +49,23 @@ def signal(**kw):
 # ------------------------------------------------------------- 1. order
 
 
+
+def header_after_label(text: str) -> str:
+    """The header with any instrument label stripped.
+
+    Since two instances write to one Telegram chat, every message begins
+    with `<b>BTC</b> · ` or `<b>ETH</b> · `. These tests are about what
+    follows it - the direction and the outcome - so the label is removed
+    here rather than each assertion being rewritten around it.
+    """
+    first = text.splitlines()[0]
+    return re.sub(r"^<b>[A-Z]{3,4}</b> · ", "", first)
+
 def test_the_fixed_order_holds():
     text = signal(insight=surface.insight_line("signals",
                                                {"settled": 245, "wins": 200}))
     lines = text.splitlines()
-    assert lines[0].startswith(surface.DOWN)          # 1 direction and event
+    assert header_after_label(text).startswith(surface.DOWN)          # 1 direction and event
     assert TICKER in lines[1]                          # 2 ticker
     assert "Ask" in lines[2]                           # 3 essential price
     checks_at = next(i for i, x in enumerate(lines) if "Price:" in x)
@@ -85,7 +99,7 @@ def test_direction_and_outcome_are_separate_axes():
         side="DOWN", ticker=TICKER, winner="DOWN", won=True, traded=True,
         pnl=0.42, paid=0.78, snapshot=SNAP,
     )
-    assert text.startswith(surface.WON_MONEY)
+    assert header_after_label(text).startswith(surface.WON_MONEY)
     assert surface.DOWN in text
 
 
@@ -242,7 +256,7 @@ def test_recovery_is_one_line_with_deficit_and_permission():
 
     line = surface.recovery_line(State())
     assert "$1.24 outstanding" in line
-    assert "extra sizing allowed" in line
+    assert "recovery by combo at base size" in line   # nothing upsizes since 09-27
     State.base_only = True
     assert "base size only" in surface.recovery_line(State())
     State.owes = False
@@ -274,7 +288,7 @@ def test_the_learning_notification_keeps_identifiers_out():
     assert "Entry rules: Unchanged" in text
     assert "Automatic learning continues." in text
     # Policy ids, hashes, methods and splits belong in the log and /learning.
-    for leak in ("kalshi-brti", "fingerprint", "arms-", "holdout", "brti-2"):
+    for leak in ("kalshi-brti", "fingerprint", "arms-", "holdout", feature_contract.CONTRACT.version):
         assert leak not in text
 
 
@@ -390,7 +404,7 @@ def test_an_early_exit_says_already_counted_and_separates_money_from_call():
     assert "Already counted at the sale." in text
     assert "DOWN prediction was wrong" in text      # the call
     assert "Realised <b>+$0.26</b>" in text         # the money
-    assert text.startswith(surface.WON_MONEY)       # profitable despite a miss
+    assert header_after_label(text).startswith(surface.WON_MONEY)       # profitable despite a miss
 
 
 def test_a_price_is_not_rounded_into_a_price_that_never_traded():

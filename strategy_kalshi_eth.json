@@ -1,0 +1,16 @@
+{
+  "enabled": true,
+  "min_ask": 0.7,
+  "max_ask": 0.93,
+  "min_brti_normalized_distance": 8.0,
+  "max_brti_retrace": 0.6,
+  "min_brti_momentum_bps": 0.0,
+  "require_momentum_alignment": false,
+  "entry_from_seconds": 660,
+  "entry_to_seconds": 360,
+  "calm_momentum_bps": 5.0,
+  "moving_min_brti_normalized_distance": 12.0,
+  "min_brti_accel": -5.0,
+  "min_brti_held_s": 120.0,
+  "min_brti_rejections": 2
+}

@@ -5374,3 +5374,5838 @@ left unchanged deliberately for that reason. A setup failing only the reversal
 gate is never traded and is recorded with `rule_match = 0` regardless.
 
 1,213 tests pass.
+
+## 59. The hedge, optimized properly, and the reason it cannot work (2026-09-24)
+
+The operator asked for a hedge: alongside the main entry, buy the cheap
+opposite side and sell it early for whatever profit it offers while the main
+runs. Then, after three rounds of fixed configurations, the instruction that
+mattered — **"Do not just stay on fixed numbers. Always try to find the sweet
+spot."** That was right, and the sweep that followed is the answer.
+
+### What was searched
+
+12,384 cells over the real 10-second book, both sides quoted. The hedge is
+bought at its ask and sold at its bid — the prices a taker gets, not the mid.
+Kalshi only.
+
+| parameter | range |
+|---|---|
+| entry | 780s, 720s, 660s, 600s, 540s |
+| max hedge cost | 0.100 to 0.400, in 0.025 steps |
+| profit target | −0.05 to +0.30, in 0.01 steps |
+| deadline | expire, or sell regardless at 60/120/180/240/300/360/420s left |
+
+The deadline is there because the operator's rule has two parts that the
+earlier tests had collapsed into one. "Sold earlier regardless" does not mean
+*sell when green*; it means a losing hedge is closed for what it is still
+worth instead of being left to die at zero. Those are separate parameters and
+they were swept separately.
+
+**218 of 12,384 cells were positive — 2%.** Median per-hedge across the family
+−0.0445.
+
+### The maximum was an artefact, and finding that out is the point
+
+The best cell was entry 780s, cost ≤ 0.30, sell at +0.30, else expire:
++2.67 over 30 hedges. An earlier, cruder sweep had put "hold to settlement"
+on top of the same subset.
+
+Neither is a hedging result. One YES plus one NO always pays exactly $1.00 and
+always costs 1.010 plus two fees, so a *held* hedge is profitable precisely
+when the main leg loses. At 780s the main wins 52.8% while paying 74.5¢ and
+loses **−0.23 per market**. The optimizer found a bad entry time, not an edge,
+and dressed it as a hedge. Holding both legs there is a guaranteed −1.09.
+
+On its own terms the maximum does not survive either:
+
+```
+day-clustered bootstrap 95% CI on per-hedge : [-0.2579, +0.2628]   includes zero
+walk-forward, chosen on 09-20..09-22, scored on 09-23..09-24:
+  train  n=16  +1.11  (+0.0696/hedge)
+  TEST   n=17  -1.12  (-0.0662/hedge)   FAILED OUT OF SAMPLE
+```
+
+That is the fourth in-sample winner this session to reverse out of sample.
+
+### Why no sweet spot exists
+
+The hedge is priced for exactly the event it pays on.
+
+| entry | hedge ask | +fee | main actually loses | edge if held |
+|---|---|---|---|---|
+| 780s | 0.265 | 0.279 | 47.2% | +0.1934 |
+| 720s | 0.239 | 0.252 | 29.8% | +0.0467 |
+| 660s | 0.220 | 0.232 | 27.4% | +0.0420 |
+| **600s** | 0.215 | 0.227 | **20.0%** | **−0.0269** |
+| **540s** | 0.203 | 0.214 | **19.0%** | **−0.0246** |
+
+At the times the system actually enters, the opposite side costs about what it
+is worth and slightly more. The positive rows are the ones where the main leg
+is losing, which is a statement about entry timing, not about hedging.
+
+So the hedge can only earn from the *option to sell early* — and that option
+is adversely selected. It goes deep green when BRTI has moved against the main
+position, which is the same thing as the main being about to lose. Across
+12,384 exit rules, the best target at every single entry time was +0.30 or
+more: the rule that only fires when the main is already in trouble. Selling on
+a small wiggle, the operator's stated rule, was measured at its own best
+setting and lost:
+
+```
+12 min, 15-25c, sell on any profit  (best of the 36 fixed configurations)
+  sold in profit : 19 trades, avg +0.0548, total +1.04
+  never went green:  7 trades, avg -0.1963, total -1.37
+  NET                                      -0.33
+one dead hedge needs 3.6 sold hedges to pay for it
+```
+
+The operator's observation that both legs often close green is correct —
+13 of 26 at the 12-minute entry. The asymmetry is what defeats it: roughly
+5¢ won against roughly 20¢ lost.
+
+### The one thing worth keeping
+
+The main-leg column is not part of the hedge question but it is the strongest
+signal in the table: price-band-only selection at 780s / 720s / 660s loses
+−8.29 / −4.64 / −6.29, against −0.62 / −0.76 at 600s / 540s. That is a
+band-only filter, **not** the live gates, so it is not evidence that the
+deployed strategy should move its entry — but it is the third measurement this
+session pointing the same way, and it belongs on the list to test properly.
+
+**Nothing shipped.** The hedge is not deployed and no live code changed.
+
+## 60. Buy cheap, sell at 70-90c: the target is the winning outcome, sold for less (2026-09-24)
+
+Operator specification: buy a contract at 20-30c and sell it at 70-90% for
+profit. One leg only, no hedge, no second side. Compare against the deployed
+strategy.
+
+This is section 33's idea at a **much higher target** - 3-4x rather than 1.5x -
+so it was measured on its own terms, on the real 10-second book, 162 markets
+over 5 days, taker prices both ways.
+
+### Every configuration falls short, by about half
+
+At any instant one side of a binary is the cheap one. The test takes whichever
+side's ask is in the buy band, the first time it is, and sells at the bid.
+
+| buy band | sell at | trades | reached the target | needed to break even |
+|---|---|---:|---:|---:|
+| 0.15-0.25 | 0.70 | 162 | **18.5%** | 33.9% |
+| 0.15-0.25 | 0.80 | 162 | **14.8%** | 29.4% |
+| 0.15-0.25 | 0.90 | 162 | **13.0%** | 26.0% |
+| 0.20-0.30 | 0.70 | 159 | **22.6%** | 41.1% |
+| 0.25-0.35 | 0.70 | 158 | **27.8%** | 48.3% |
+
+All 27 configurations short, across every entry window tried (any time,
+5-15 min, last 5 min). Fees and spread do not explain a gap of that size.
+
+### Why: at 70-90c the "exit" is not an exit
+
+| buy band | sell at | won | reached | reached but LOST | won WITHOUT reaching |
+|---|---|---:|---:|---:|---:|
+| 0.15-0.25 | 0.70 | 16.7% | 18.5% | 6 | 3 |
+| 0.15-0.25 | 0.80 | 16.7% | 14.8% | 1 | 4 |
+| 0.15-0.25 | 0.90 | 16.7% | 13.0% | 0 | 6 |
+
+Reaching the sell price and winning are very nearly the same event - a handful
+of markets separate them out of 162. A binary's price converges to 0 or 1 as
+the window runs out, so a cheap side only reaches 70-90c by actually being
+about to win. **The take-profit is not collecting a swing while the outcome is
+still open; it is selling the winner for 70-90c instead of $1.00.**
+
+Which is why holding beats selling at every single target:
+
+```
+buy 0.15-0.25   sell 0.70  -11.62    hold  -10.60    selling costs  -1.02
+                sell 0.80  -12.56    hold  -10.60    selling costs  -1.96
+                sell 0.90  -11.71    hold  -10.60    selling costs  -1.12
+buy 0.25-0.35   sell 0.70  -16.19    hold  -12.27    selling costs  -3.92
+```
+
+Raising the target from 1.5x to 3-4x gives up less per winner than section 33
+measured, and it is still negative, because the entry is what loses.
+
+### The number
+
+```
+BEST OF 27: buy 0.15-0.25, sell 0.70
+  162 trades, 5 days, total -11.62, per trade -0.0717
+  winners 33/162 = 20.4%   avg win +0.553   avg loss -0.231
+  day-clustered bootstrap 95% CI: [-0.0791, -0.0503]   ENTIRELY BELOW ZERO
+  losing on 4 of 5 days
+```
+
+### Against the deployed strategy, read from the broker
+
+`settlements`, mirrored from Kalshi's own /portfolio/settlements:
+
+| | markets | contracts | total | per contract |
+|---|---:|---:|---:|---:|
+| **OTM, best of 27** | 162 | 162 | **−11.62** | **−0.0717** |
+| deployed, since 09-21 | 125 | 285 | **+5.50** | **+0.0193** |
+| deployed, all time | 197 | 938 | +0.17 | +0.0002 |
+
+The deployed strategy is **not** proven profitable - five days of live trading
+and its interval still spans zero, and the all-time figure includes two early
+days that lost 5.33 on a different configuration. What separates them is that
+OTM's interval does **not** span zero. It is the one of the two that is
+measurably losing.
+
+### This is the third independent test of the same idea
+
+| test | n | per trade | 95% CI |
+|---|---:|---:|---:|
+| `reversion_strategy.json` (spike setup, exit 0.50) | 760 | −0.0440 | [−0.0609, −0.0277] |
+| section 33 (no setup, exit 1.5x) | 4,876 | −0.0402 | [−0.0488, −0.0310] |
+| this one (no setup, exit 0.70-0.90) | 162 | −0.0717 | [−0.0791, −0.0503] |
+
+Three differently-built tests, three exit rules from 0.50 to 0.90, all
+negative with intervals clear of zero. The 4,876-trade test is much the
+strongest evidence and this small sample agrees with it.
+
+**The cause is structural, not parametric.** Section 1's favourite-longshot
+bias: favourites win MORE than their price implies, so longshots win LESS.
+Buying the 20-30c side is taking the wrong end of the only durable bias this
+market has, and the deployed strategy is profitable to the extent it takes the
+right end of that same bias. They are not two strategies to choose between -
+they are opposite sides of one bet, and this one is the losing side.
+
+**Decision: not deployed.** Nothing shipped, no live code changed. What would
+change it, unchanged from section 33: an entry filter that predicts WHICH
+cheap contracts come back, validated walk-forward.
+
+## 61. $3 after a loss: the gain is the ordering, and the risk is hidden (2026-09-24)
+
+Operator specification: on the recorded lifecycles, every time a trade loses,
+size the next trade at exactly $3; reset to base after a win. Consecutive
+losses stay at $3, so it is a step, not a martingale.
+
+### Two wrong datasets before the right one
+
+Worth recording, because both looked plausible and both were wrong.
+
+**`settlements` yes_count/no_count.** Kalshi books the SALE of a YES as taking
+the NO side, so a position opened at 0.82 and closed at 0.997 appears as
+"2 yes + 2 no" with `revenue_cents` = 0. 68 of 197 rows are like this. Reading
+an entry price out of that gave a **0.639 average entry and a 48.2% win rate**
+for a strategy that enters at 0.70-0.93 and wins 76% of its markets.
+
+**`fills`.** `fills.count` carries values like 186.97, 23.3 and 0.17 - not
+contract counts. 41 of 188 "buy" fills price below $0.10. A $1 base budget
+came out as 10,928 contracts over 139 markets.
+
+**What worked:** `trade_proposals` (integer counts, real fill prices, explicit
+`exit_price`) joined to Kalshi's settlement records, **keeping only rows whose
+arithmetic lands within 3c of the broker's P&L**. 146 of 154 filled proposals
+reconcile. The 8 that fail all show the broker AHEAD of the proposal row -
+the recovery add-on's extra contract, which sits outside the proposal.
+
+```
+146 reconciled lifecycles, 4 days
+  win rate 82.9%   average entry 0.821
+  as traded: +0.7074 over 233 contracts (+0.0030/contract)
+```
+
+### The result looks good
+
+| rule | contracts | P&L | per contract | max DD | worst day |
+|---|---:|---:|---:|---:|---:|
+| flat $1 | 146 | −0.26 | −0.0018 | −4.58 | −3.56 |
+| $2 after a loss | 171 | +1.92 | +0.0112 | −4.61 | −3.55 |
+| **$3 after a loss** | **202** | **+4.70** | **+0.0233** | **−4.37** | **−3.26** |
+| $4 after a loss | 230 | +6.45 | +0.0281 | −5.27 | −4.04 |
+| $5 after a loss | 260 | +8.85 | +0.0340 | −5.80 | −3.59 |
+
+**+4.96 over flat sizing, and the drawdown got no worse.** Monotone in the
+upsize, which is exactly what a real effect looks like.
+
+### It is the ordering
+
+Every dollar of that comes from one fact: the 25 trades that happened to
+follow a loss won **92.0%**, against 82.9% overall.
+
+```
+after a LOSS   n= 25  win 92.0%   P&L/ct +0.0827
+after a WIN    n=120  win 81.7%   P&L/ct -0.0082
+permutation p = 0.249  -> INDISTINGUISHABLE FROM CHANCE
+```
+
+The decisive test keeps every trade exactly as it was - same entry, same
+outcome, same per-contract result - and shuffles only the ORDER. That breaks
+the link between a loss and the next trade while leaving the edge, the prices
+and the win rate untouched.
+
+```
+actual gain of the $3 rule            : +4.96
+20,000 shuffles of the same trades    : mean +0.89, median +0.99
+5th..95th percentile                  : [-5.24, +6.60]
+shuffles matching or beating +4.96    : 12.9%   (p = 0.129)
+```
+
+One ordering in eight produces a gain this large from trades with no
+loss-to-next-trade link at all. The day-clustered CI on the difference agrees:
+**[−0.37, +10.30]**, spanning zero.
+
+**Upsizing after a loss does not create edge. It buys more contracts, which
+multiplies whatever edge already exists** - here +0.0030/contract as traded,
+which is indistinguishable from zero on 4 days.
+
+### The risk in the table is understated
+
+The observed drawdown of −4.37 is a lucky draw, not the rule's risk profile:
+
+```
+max drawdown of the $3 rule across the shuffles:
+  median -6.84    5% of orderings worse than -12.91    worst -22.42
+  the actual ordering gave -4.37
+```
+
+The sample's longest losing streak was **2**. At a 17.1% loss rate, 3 is
+expected within 146 trades and longer runs are routine over a month. A 5-loss
+run costs about **$12.31** at $3 a trade against **$4.10** flat - 62% of the
+$20 `auto_daily_loss_limit` versus 21%.
+
+### What this is, and whose call it is
+
+This is a **leverage decision, not an edge decision**. The rule multiplies
+exposure about 1.4x and multiplies the outcome - including the sign. With the
+underlying per-contract edge not yet established on 4 days of reconciled
+trades, upsizing amplifies a quantity whose sign is still unknown.
+
+The same is true of the shipped $2 step; this measurement does not single out
+the $3 proposal.
+
+**Nothing shipped. Sizing is the operator's decision and this is evidence for
+it, not a verdict on it.** What would change the reading: enough post-loss
+trades to separate 92% from 82.9% - roughly 300-400 of them at this gap, so
+weeks, not days.
+
+## 62. The hourly ladder pair: the guarantee is real and already priced (2026-09-24)
+
+Operator's proposal, from the hourly ladder: buy a low strike YES and a high
+strike NO, both priced 80-90%, and close 10-15 minutes before expiry. At
+least one leg always wins.
+
+**The guarantee is real.** Below the low strike the NO pays; above the high
+strike the YES pays; between them BOTH pay. There is no state in which the
+pair returns nothing.
+
+### Held to expiry it is exactly zero, and that is algebra
+
+For any pair A < B:
+
+```
+cost       = p(X>=A) + (1 - p(X>=B))
+E[payout]  = 1·p(X>=B) + 2·(p(X>=A) - p(X>=B)) + 1·(1 - p(X>=A))
+           = 1 + p(X>=A) - p(X>=B)
+```
+
+Those are the same number. Not approximately - identically, for every pair,
+at every strike spacing. All 66 pairs on the operator's own screenshot return
+an edge of `+0.000000` before fees; after fees they run from **-0.0028 to
+-0.0332**. The circled pair (YES >=83,600 at 0.79 with NO on >=84,200 at
+0.94) costs 1.7300 against an expected payout of 1.7300, and loses the
+1.57c fee.
+
+The "guarantee" is not an edge. It is a repackaging of the same fair bet,
+and what it actually buys is a **capped loss**: -0.75 instead of -1.75.
+
+### Closing early does not escape it
+
+Between the strikes both legs converge on 1.00 and the pair on 2.00; outside
+them the pair converges on 1.00. Selling early collects part of that
+convergence and pays a second spread for it. Whether it pays depends entirely
+on how often the price finishes in the corridor - which is the quantity the
+ladder already prices.
+
+Measured on Kalshi's own hourly chains and settlements, 35 settled chains,
+entry at 30 minutes, exit at 10:
+
+```
+the ladder priced the corridor at : 71.7%
+it actually finished inside       : 22/29 = 75.9%
+break-even needs                  : 73.5%
+
+payoff when inside  : +0.270
+payoff when outside : -0.748   (n=7)
+```
+
+2.4 points above break-even - and then:
+
+```
+2026-09-21  n= 6  inside 6/6    total  +1.712
+2026-09-22  n=21  inside 15/21  total  -0.522
+2026-09-23  n= 2  inside 1/2    total  -0.474
+
+day-clustered bootstrap, 3 clusters: 95% CI [-0.2368, +0.2853]  SPANS ZERO
+```
+
+**One six-window afternoon in which the corridor held every single time
+carries the entire result. The other 23 windows lost money.** The sample is
+35 chains spanning 09-21 16:00 to 09-23 02:00 - about 34 CONSECUTIVE hours
+of one price path, in which BTC moved 1,664 dollars. Those are not 35
+independent draws; neighbouring windows share most of their price history.
+
+### What this actually is
+
+A **short volatility** position. It wins when BTC stays inside the corridor
+and loses when it leaves, at roughly 1:2.8 odds against. The ladder prices
+the corridor correctly, so the trade is a view that BTC will be more
+range-bound than the market thinks - not a free lunch, and not a hedge.
+
+It is the fourth structure tested this session with the same shape: the
+hedge (FINDINGS 59), the out-of-the-money take-profit (60), and now this.
+Each offers a real-sounding guarantee that dissolves into the fee once the
+arithmetic is written out, because both sides of a binary always sum to
+1 + spread.
+
+**Decision: not deployed.** Nothing shipped, and the hourly ladder remains a
+shadow recorder that never trades. What would change it: a corridor hit rate
+persistently above break-even measured across weeks and distinct volatility
+regimes, not 34 hours of one quiet stretch.
+
+## 63. The deployed rule on ETH and SOL, with BTC as the control (2026-09-24)
+
+> **WITHDRAWN - see section 65.** The distance here is computed from
+> minute-kline volatility, not `brti_normalized_distance`, which is what the
+> deployed gate compares. Different quantity, different scale: "10x" selects
+> 4% of markets on this scale and 23% on the gate's. Every number below that
+> depends on the floor is unusable.
+
+Operator's request: backtest the current live strategy, all features, on ETH
+and SOL. No fees, by their standing instruction.
+
+Data already on disk from 2026-09-21: `market_data_kxeth15m.db` and
+`market_data_kxsol15m.db`, ~6,400 settled markets each from Kalshi's own
+`/markets` and `/markets/candlesticks`, alongside the BTC set. Rule as
+deployed today: ask 0.70-0.93, normalized distance >= 10x, retrace <= 0.60,
+momentum aligned, entry 660-360s, one entry per market.
+
+### The control first
+
+```
+        markets  trades   rate   win     ask    edge/trade   total   days
+BTC        6435     259   4.0%  91.1%   0.802     +0.1088   +28.18     43
+ETH        6395     116   1.8%  87.9%   0.807     +0.0727    +8.43     23
+SOL        6397      28   0.4%  89.3%   0.850     +0.0430    +1.20     15
+```
+
+**BTC returns +0.1088 per trade here against +0.0193 per contract that the
+live system has actually made since 2026-09-21.** A harness five times more
+generous than the thing it models is partly measuring itself, and the
+absolute numbers must not be quoted as expectations. The gap is explained:
+minute candles instead of ~10s BRTI, no 60s band-hold timer, the minute-close
+ask assumed executable, no slippage and no missed fills, one entry taken at
+the first qualifying minute, and no fees.
+
+What IS comparable is the ratio, because all three ran through the identical
+harness. ETH lands at 67% of BTC's edge, SOL at 40%.
+
+### Both bars
+
+```
+day-clustered bootstrap (20,000 resamples of DAYS)
+BTC   259 trades  43 days  +0.1088  [+0.0768, +0.1415]  holds
+ETH   116 trades  23 days  +0.0727  [+0.0022, +0.1299]  holds
+SOL    28 trades  15 days  +0.0430  [-0.0668, +0.1221]  SPANS ZERO
+
+walk-forward, first 60% of days train, last 40% test
+BTC   train 170 +0.1126   test 89 +0.1016   HELD
+ETH   train  54 +0.0657   test 62 +0.0788   HELD
+SOL   train  22 +0.0709   test  6 -0.0590   FAILED
+```
+
+**ETH survives both.** Its interval clears zero - barely, lower bound
++0.0022 - and its out-of-sample half scored BETTER than its training half.
+That is the first structure tested this session to pass both bars rather than
+reverse. **SOL fails both**, on 28 trades and a 6-trade test slice.
+
+### The threshold does not transfer, even where the edge does
+
+```
+        markets  qualified   rate   median distance  avg ask
+BTC        6435        259   4.0%              11.8    0.802
+ETH        6395        116   1.8%              11.6    0.807
+SOL        6397         28   0.4%              10.5    0.850
+```
+
+The same 10x floor admits 4.0% of BTC markets and 0.4% of SOL. It is not
+selecting the same KIND of setup on each instrument; it is selecting a
+progressively rarer tail. The floor was measured on BTC volatility
+(FINDINGS 43), and a threshold is a statement about one instrument's
+distribution. Deploying to ETH means re-measuring the floor on ETH, not
+inheriting BTC's - and the 1.8% selection rate means roughly one trade every
+two days, which is a different operational proposition from BTC's 4.0%.
+
+### What this did NOT test
+
+**The reversal gate is effectively inert here.** Median retrace is 0.000 on
+all three, because at minute granularity the 5-minute retrace window holds
+6 points where the live 120-second one holds ~12 at 10s. So this measurement
+validates ask, distance and momentum; it says nothing about
+`max_brti_retrace`, which shipped today on 79 markets of BTC evidence.
+
+The 60s band-hold timer is also absent, and on BTC it is the single largest
+measured improvement in the deployed system.
+
+### Decision
+
+**Nothing deployed.** ETH is the first instrument worth a shadow recorder:
+it passed both bars on 116 trades over 23 days, at 67% of BTC's edge through
+the same harness. The honest next step is not to trade it but to record it -
+book snapshots and a reference series at live resolution - so the distance
+floor can be measured on ETH's own distribution and the reversal gate tested
+at a granularity that can see it. SOL is not a candidate on this evidence.
+
+## 64. The distance floor refuses setups that were worth taking (2026-09-24)
+
+> **WITHDRAWN - see section 65.** The distance here is computed from
+> minute-kline volatility, not `brti_normalized_distance`, which is what the
+> deployed gate compares. Different quantity, different scale: "10x" selects
+> 4% of markets on this scale and 23% on the gate's. Every number below that
+> depends on the floor is unusable.
+
+Operator's observation: KXBTC15M-26SEP241445-45 was refused at 5.5x against a
+10x floor, priced 73c, and settled DOWN. The signal was right and no order
+went out. They report seeing this often and asked whether it is studied.
+
+**It is archived** - 16,962 refused live setups carry a known outcome, plus
+the whole 6,435-market corpus scored against the deployed gates. So the
+question is answerable rather than anecdotal.
+
+### A refused winner is not evidence of anything on its own
+
+A 73c contract that wins is the EXPECTED case: 73c is the market's claim that
+it wins 73% of the time. What matters is whether refused setups win MORE than
+their price implies - a calibration residual, not a win count.
+
+### They do
+
+The setups the 10x floor turns away, everything else at deployed values:
+
+```
+setups refused by the 10x floor : 2,696
+they won                        : 86.3%
+their price implied             : 80.0%
+calibration residual            : +6.3%
+edge per trade                  : +0.0628
+day-clustered 95% CI            : [+0.0485, +0.0768]   excludes zero
+```
+
+### And the whole floor is a plateau, not a cliff
+
+```
+ floor  trades   rate     win     ask  edge/trade            95% CI   walk-fwd
+     3    2955  45.9%   86.7%   0.798     +0.0690  [+0.0560, +0.0820]    +0.0811
+     5    1652  25.7%   88.7%   0.813     +0.0739  [+0.0586, +0.0889]    +0.0970
+     7     788  12.2%   89.3%   0.814     +0.0797  [+0.0568, +0.1005]    +0.1061
+    10     259   4.0%   91.1%   0.802     +0.1088  [+0.0767, +0.1415]    +0.1016
+    15      92   1.4%   87.0%   0.783     +0.0864  [+0.0372, +0.1317]    +0.0835
+```
+
+**Every floor from 3x to 20x clears both bars** - a day-clustered interval
+excluding zero AND a chronological split whose out-of-sample half stays
+positive. This is not an in-sample artefact.
+
+### What the floor is actually buying
+
+Per-trade edge RISES with the floor: +0.069 at 3x against +0.109 at 10x. The
+gate is doing its job - it selects better setups. What it costs is volume:
+
+```
+ 10x   259 trades x +0.1088  =  +28.2 total
+  3x  2955 trades x +0.0690  = +203.9 total
+```
+
+So the floor is a quality-versus-quantity trade, and on this corpus the
+quantity side wins by 7x on total dollars while every individual trade is
+worth less.
+
+### Three reasons not to simply lower it
+
+**One position at a time.** The account holds a single position, so a 5x
+setup taken at 10:00 can block a 12x setup at 10:10. A lower floor does not
+only ADD trades, it can spend the slot on the weaker one. Nothing in this
+measurement models that, because the corpus scores every market
+independently.
+
+**The harness is generous.** It returned +0.1088/trade for BTC at 10x against
++0.0193/contract the live system has actually made - about 5.6x. Minute
+candles, no 60s band-hold timer, the minute-close ask assumed fillable, no
+slippage and no missed fills. Scaled, 3x's +0.069 is nearer +0.012 live.
+
+**Marginal setups are the ones that miss.** The lower the distance, the
+thinner the case, and FINDINGS 22 measured that decision-to-submit latency
+already costs fills on setups that DID qualify. A 3x setup is more likely to
+move before the order lands, which the corpus cannot see.
+
+### Decision
+
+**Nothing changed.** The 10x floor was set on FINDINGS 43 and this does not
+overturn it - it quantifies its cost, which had not been measured before. The
+operator now has the number: the refused band is worth +0.0628/trade with an
+interval clear of zero, against +0.1088 for what is taken.
+
+The honest next step is not to move the floor but to test a MIDDLE one live -
+7x or 8x roughly triples the trade count while keeping per-trade edge within
+a cent of 10x - and to measure it against the position slot it actually has
+to compete for. ETH already runs 8x for exactly this reason (FINDINGS 63).
+
+## 65. CORRECTION: findings 63 and 64 measured the wrong quantity (2026-09-24)
+
+**Sections 63 and 64 are withdrawn. The floor they recommended was briefly
+shipped to BTC and is reverted. No trade was taken under it.**
+
+### The error
+
+`cross_asset.py` computed `normalized_distance` as distance in bps over a
+volatility estimated from **minute klines**. The deployed gate compares
+`brti_normalized_distance`, computed from the per-second BRTI series by
+`features_from_series`. These are different quantities:
+
+```
+                                    median   >=10x    >=7x
+corpus, real BRTI (what gates read)    5.7   22.9%   39.8%
+my harness, minute-kline volatility    3.1    4.1%   11.9%
+```
+
+FINDINGS 43 had already recorded exactly this trap in its own words -
+"reads 15-22 on BRTI where Binance reads 2-4" - and the same mistake was
+made again with klines in place of Binance. A floor of "10x" selects 4% of
+markets on one scale and 23% on the other. Setting the live gate to 7x on
+the harness's evidence was therefore a far larger loosening than anything
+measured, and it reached production for about forty minutes.
+
+### What the right measurement says
+
+Swept with `load_policy_rows(distance_floor=...)` - the loader the TRAINER
+uses, on the quantity the gate reads:
+
+```
+ floor   taken   rate     win     ask  residual  per trade            95% CI
+     6    4963  77.2%   80.9%   0.794     +1.5%    +0.0041  [-0.0063, +0.0143]
+     8    4264  66.3%   82.8%   0.810     +1.7%    +0.0066  [-0.0045, +0.0177]
+    10    3495  54.4%   84.5%   0.825     +2.0%    +0.0101  [-0.0007, +0.0210]
+    12    2738  42.6%   85.9%   0.837     +2.3%    +0.0132  [+0.0010, +0.0255]
+    15    1764  27.4%   88.0%   0.852     +2.8%    +0.0197  [+0.0033, +0.0353]
+```
+
+**The floor is too LOW, not too high.** Edge rises monotonically with it, and
+the interval only clears zero at 12x and above. And the setups 10x refuses
+for distance alone are a losing class, not a missed one:
+
+```
+refused for DISTANCE ALONE : 547
+they won                   : 65.4%
+their price implied        : 76.0%
+residual                   : -10.6%
+per trade if taken         : -0.1184
+```
+
+That reconciles with the thing that should have caught this immediately:
+**all 21 reject-leg arms in the live policy carry a negative mean.** The
+intelligence layer had already measured the refused band on the correct
+features and correctly refused to propose a single ADMIT. Section 64
+contradicted the running policy and that contradiction was not checked.
+
+### ETH is affected too
+
+FINDINGS 63 chose ETH's 8x floor from the same harness. On ETH's own corpus
+with real BRTI features, every floor from 4x to 15x returns a per-trade edge
+within 0.003 of zero with an interval spanning zero at all of them. **ETH has
+no measurable edge on this evidence at any floor**, which is a different
+statement from 63's +0.1034 and supersedes it.
+
+ETH is live and auto-trading. Its record so far is +0.1419, -0.878, +1.2222
+across three auto trades - real money, and too few trades to mean anything
+either way.
+
+### What was actually wrong with the method
+
+The harness was validated against a control - BTC ran through it beside ETH
+and SOL - and the control PASSED, which is what made it feel safe. But a
+control only tests the things that differ between arms. Every arm shared the
+same wrong volatility, so the comparison between instruments was internally
+consistent and the comparison against the deployed gate was meaningless. A
+harness must be reconciled against the SYSTEM it models, not only against
+itself: BTC returned +0.1088/trade through it against +0.0193/contract live,
+a 5.6x gap that was noticed, written down in 63, and then not treated as the
+falsification it was.
+
+**The rule this leaves:** when a measurement contradicts a deployed
+artefact - the live policy's own arms, in this case - reconcile them before
+shipping, not after.
+
+## 66. Three level-holding gates: live said yes, the corpus said no (2026-09-24)
+
+Operator's reframing, after RSI failed: these are mostly in-the-money trades,
+so the bet is not "which way will price go" but **"will price stay on this
+side of the strike"**. Direction at a 15-minute horizon is already in the
+price; whether the strike is being DEFENDED is not.
+
+That reframing is the useful part of this section, whatever the thresholds
+turn out to be worth.
+
+### RSI first, and it failed
+
+Tested on the bot's own 181 live executed trades, RSI reconstructed at each
+decision instant from Kalshi's per-second series:
+
+```
+RSI would KEEP   148 trades   P&L +1.4680
+RSI would AVOID   23 trades   P&L +1.4511   <- 20 winners, 3 losers
+net effect of the filter            -1.4511
+```
+
+Trades RSI disagreed with won **87.0%**; trades it agreed with won 82.4%. The
+threshold sweep was incoherent - net -0.77 at margin 0, -5.54 at 5, +5.86 at
+20. And the correlation between `|RSI-50|` and `|momentum|` was **+0.030**:
+at this horizon it was not measuring what it appeared to.
+
+### Three that did separate on live trades
+
+Same 176 in-the-money executed trades, priced on Kalshi's settlement P&L:
+
+| indicator | what it asks | result |
+|---|---|---|
+| `accel` | is the move that built the cushion still building? | decaying: 40W/15L yet **-6.93** |
+| `held_s` | how long has price held our side? | 5-12 min **91.5%** vs <5 min 79.1% |
+| `rejections` | has the strike been tested and turned back? | 2+ **88.1%** vs 1 78.9% |
+
+Shipped together at `accel >= -5`, `held >= 120s`, `rejections >= 2`: kept 59
+of 176 (34%), 89.8% win, **+9.21 against +1.07 actually realised**.
+
+Four weaknesses were recorded at the time: 176 trades, 5 days, the best of 36
+swept cells, and a trade-level rather than day-clustered interval. `held_s`
+was also noted as non-monotonic - alone at 120s and 180s it HURTS.
+
+### The wider test reversed it
+
+5,546 corpus decision points across 68 days, day-clustered, inside the
+deployed price band and scaled distance floor:
+
+```
+deployed gates only      n=5546  88.3%  +0.0374  [+0.0225, +0.0512]
++ these three gates      n=1628  87.2%  +0.0390  [+0.0166, +0.0606]
+what they REFUSE         n=3918  88.8%  +0.0368  [+0.0199, +0.0526]
+```
+
+**They refuse 71% of setups and what they refuse scores the same as what they
+keep.** And `accel` points the wrong way:
+
+```
+decaying < -5 (REFUSED)   n= 653  +0.0410
+building >= 0             n=2733  +0.0296
+```
+
+`held_s < 120` binds 9 times in 5,546. `rejections` is non-monotonic:
+1 -> +0.0366, 2 -> +0.0434, 3+ -> +0.0245 spanning zero.
+
+### The decision, and the pattern
+
+**Kept live by the operator, with that evidence in view.** The recommendation
+on the table was archive-only; they chose to keep all three gating. Sizing
+and gating are theirs.
+
+This is the third time in one session that a swept winner on a thin sample
+reversed on a larger one - sections 63, 64 and now this. The common shape is
+exact: a best-of-N cell, a few days, an interval that does not cluster the
+thing that is actually correlated, and a result that looks decisive.
+
+What is different here is that the contradiction was found BEFORE it could
+be believed, because the features are archived on every decision, qualified
+or refused. That is the whole value of recording an indicator's input: it
+makes the threshold re-measurable on live data under the current rules
+rather than re-arguable. A gate whose input is not archived can only ever be
+defended.
+
+**The live prediction to check in a week:** these gates refuse ~71% of
+setups. If the corpus is right, live P&L per contract will be unchanged and
+trade volume will be a third of what it was. If the live sample was right, it
+will improve. The archive will answer it either way.
+
+## 67. RETRACTED BEFORE SHIPPING: "illiquid markets lose" was my own pagination cap (2026-09-24)
+
+The operator listed what Kalshi can supply for expired 15-minute contracts:
+ticker and expiry, the UP/DOWN settlement, one-minute bid/ask/price candles,
+volume and open interest, and **individual public trades**. Four of the five
+were already stored. The trades were not, and they are the only item that is
+not another cut of price - `taker_side`, `taker_book_side`, `count_fp` and
+`created_time` say who was transacting and which way they leaned. After three
+swept winners reversed in one session (63, 64, 66), new information looked
+like a better bet than new thresholds on old information.
+
+### What was measured
+
+`scripts/fetch_trades.py` pulled 4,164,733 trades across the 172 markets the
+bot has actually traded. Taker imbalance in the minutes before each decision
+was a dead end - correlation with the ask -0.021. But the PRESENCE of flow
+split the bot's own executed trades hard:
+
+```
+flow in the 2 min before entry   n=123  win 94.3%  ask 0.832  residual +11.1%  P&L +24.11
+no flow at all                   n= 49  win 55.1%  ask 0.807  residual -25.6%  P&L -20.51
+```
+
+Binary, not a gradient: either thousands of trades or exactly zero, nothing
+between. It held on all five live days, worse every day:
+
+```
+day           flow  noflow   flow win   noflow win
+2026-09-21      19      11        89%          73%
+2026-09-22      39      19        97%          63%
+2026-09-23      43      12        95%          50%
+2026-09-24      22       6        91%          17%
+
+no-flow, day-clustered over 5 days: residual -0.256  95% CI [-0.522, -0.143]
+```
+
+The interval excludes zero. The effect is enormous. The mechanism was easy to
+tell: a quote nobody is trading against is stale, so an 82c setup at 12x
+distance is priced off a book no one is honouring. It is independent of every
+deployed gate. Everything about it was right except that it was false.
+
+### Why it was false
+
+The fetcher paginated from the newest trade with a 25-page, 25,000-trade cap.
+A 15-minute BTC market trades roughly 48 times a SECOND - the windows later
+re-fetched properly averaged 13,400 trades per ten minutes - so 25,000 trades
+reached back only a few minutes from close, and the cap silently discarded
+everything earlier. 137 of the 172 markets hit it.
+
+For those markets the pre-decision window had never been fetched, so the
+volume query returned 0, and **zero volume was spelled exactly like an
+illiquid market**. Checking the earliest fetched trade against the window:
+
+```
+has flow  n=123   window fetched:  92   window truncated away:  31
+NO flow   n= 49   window fetched:   0   window truncated away:  49
+```
+
+49 of 49. Not one genuine case. The "finding" was my own truncation plotted
+against time of day, and the per-day consistency was the cap being consistent.
+Nothing was shipped from it.
+
+### What this class of error defeats
+
+Day-clustering, a bootstrap interval, a confound check on session and
+time-of-day, a plausible mechanism, consistency across every day in the
+sample - it passed all of them. It had to, because the data was not noisy. It
+was MISSING, and no statistical test distinguishes a missing measurement from
+a measured zero when both arrive as the number 0.
+
+This is a different failure from 63/64 (wrong quantity) and 66 (thin sample
+overfitted). Those were errors of inference on real data. This was an error in
+the data itself, wearing the costume of a result.
+
+The fix is structural, not a larger cap:
+
+* the fetch is now BOUNDED - `min_ts`/`max_ts` around the decision instant
+  taken from `MIN(trade_proposals.created_at)`, reaching backwards, because
+  flow after an entry cannot inform that entry;
+* `trades_coverage` records the bounds actually covered and a `complete` flag
+  set when the page budget outlasted the cursor;
+* the analysis DROPS any window not fully covered instead of scoring it, and
+  reports genuinely-quiet-but-covered windows as a separate count, so "quiet
+  market" stays falsifiable rather than being defined into existence by
+  missing data;
+* `tests/test_trades_coverage.py` pins the invariant: an unfetched window and
+  a real zero must not be representable as the same value.
+
+The 25,000-trade artifact also means the imbalance numbers above were computed
+on partly-truncated windows for 31 more markets, so the -0.021 correlation is
+not evidence either way. Order flow is UNTESTED as of this section, not
+refuted - the re-measurement on bounded windows follows.
+
+### The rule this earns
+
+Before believing any split, ask what the absent case looks like in the data.
+If "not measured" and "measured as nothing" are the same value, the split is
+not evidence yet, however many days it holds across and whatever the interval
+says. Record coverage first; measure second.
+
+## 68. Order flow, tested properly: nothing, and the diagnostic I trusted was wrong (2026-09-24)
+
+Section 67 retracted a liquidity finding that was an artifact of the fetch.
+With bounded windows and recorded coverage, 2,067,943 trades across the bot's
+173 executed trades and 2,116,757 across 612 corpus markets, order flow can
+now be measured honestly. It carries nothing.
+
+### The two claims, and what killed each
+
+**"Illiquid markets lose."** The live version said 49 markets, 55.1% win,
+residual -0.256. All 49 were truncation. Properly bounded, NO market the bot
+traded was quiet - the quietest quarter still trades ~200,000 contracts in the
+two minutes before entry, and the volume quartiles separate nothing (81.4%,
+83.7%, 81.4%, 86.4%, every interval spanning zero). Quiet windows do exist in
+the corpus, 36 of 612, and they say nothing either:
+
+```
+genuinely QUIET (0 trades)  n= 36 days= 4  win 80.6%  -0.0244  [-0.1964, +0.1069]
+has flow                    n=576 days=64  win 87.5%  +0.0395  [+0.0120, +0.0643] HOLDS
+```
+
+An order of magnitude smaller than claimed, spanning zero, and the 36 fall in
+only 4 of 64 days - a day effect wearing a liquidity costume.
+
+**"Balanced flow wins."** This one deserved the wider test on its merits. On
+the live trades it had everything section 66 lacked: n=51, residual +0.082,
+day-clustered interval [+0.028, +0.114], and a MONOTONIC boundary sweep -
++0.115 at 0.05 easing to +0.013 at 0.20. Refusing the rest would have turned
++3.80 realised into +6.90 on 29% of the volume.
+
+576 corpus markets over 64 days, nearly disjoint from the live days, inverted
+it:
+
+```
+                      live (5 days, n=51)      corpus (64 days, n=576)
+balanced |imb|<0.10   +0.082  HOLDS            +0.0173  [-0.0277, +0.0613]
+the rest              -0.015                   +0.0521  [+0.0167, +0.0863] HOLDS
+```
+
+Balanced is the WORST bucket out of sample. Both leaning directions beat it
+(-0.5..-0.1 -> +0.0531 HOLDS; +0.1..+0.5 -> +0.0678 HOLDS). And the boundary
+sweep runs the other way - live tightened into strength, the corpus loosens
+into it:
+
+```
+|imb| < 0.05   +0.0309  [-0.0296, +0.0877]
+|imb| < 0.10   +0.0173  [-0.0277, +0.0613]
+|imb| < 0.20   +0.0461  [+0.0136, +0.0770] HOLDS
+```
+
+Not shipped. The deployed gates already score +0.0395 [+0.0133, +0.0643] on
+these 576; the balanced gate would cut that to +0.0173 while refusing 64% of
+the volume.
+
+### The part worth keeping
+
+**Monotonicity is not evidence.** I called the live boundary sweep "what a
+real effect looks like, and the opposite of the 66 signature". It was not. A
+monotonic sweep on five days is a smooth interpolation through the same small
+set of trades; smoothness says the metric is continuous, not that the ordering
+will survive. The corpus sweep is equally monotonic and points the other way.
+That was the last diagnostic I had that did not require a wider sample, and it
+does not work.
+
+What does work is the only thing that has worked all session: a sample large
+enough to be split, over enough days, clustered on the day. Sections 63, 64,
+66 and now 68 are four five-day winners that reversed, plus 67 which was never
+real. The score for five-day findings this session is 0 for 5.
+
+**Why flow could not have helped anyway.** Mean imbalance is -0.117 with a
+mean ask of 0.835: we take the favourite, and aggressors buy the cheap side.
+The SIGN of taker imbalance is mostly set by which side is cheap - the
+favourite-longshot bias of FINDINGS 1 - not by anything about our setup. And
+`corr(|imb|, ask)` is +0.015, so the magnitude carries no price information
+either. There was no mechanism for it to be informative.
+
+### What the flow data DID establish
+
+Two things, both durable:
+
+* The bot never trades an illiquid market. 0 of 173 executed trades had a
+  quiet window, against 36 of 612 corpus markets. Whatever the deployed gates
+  are doing, they already exclude the dead end of the book.
+* Kalshi sells no historical order-book DEPTH, so outcomes and approximate
+  entry prices are testable from candles but queue position and fill
+  probability are not. That kills addition counterfactuals - any claim that a
+  signal we DIDN'T take should have been taken - which is a second and
+  independent reason section 64 could not have been trusted. Refusal
+  counterfactuals are unaffected: declining a fill we actually got is priced
+  on the broker's own P&L.
+
+The live archive is the only route to the missing half, and it already holds
+more than expected: `observations` carries real Kalshi depth from
+`orderbook_fp` (`book_yes_depth`, `book_no_depth`, `book_bid_size`,
+`book_ask_size`, `book_levels`) on 22,048 rows. Note that `buy_volume`,
+`sell_volume`, `trade_count` and `depth_*_qty` in the same table are Binance
+BTCUSDT spot in BTC units, NOT Kalshi contract flow, and cannot stand in for
+it. `taker_imbalance` there has been 0.0 since the Kalshi-only cutover on
+2026-09-23 03:00 UTC, which is deliberate and documented, not a fault.
+
+First cut of the empirical fill model, from our own posted orders - the only
+place this can come from:
+
+```
+fill rate 91.3%   168 filled / 16 unfilled, 184 matched to archived depth
+```
+
+n=16 unfilled is far too few to build a curve, and it cannot answer fill
+probability at a price we never posted, which is what an addition
+counterfactual needs. It is the right seed and it grows on its own.
+
+## 69. Why every five-day finding failed: the noise floor is twice the edge (2026-09-24)
+
+The session produced five candidate gates from the bot's own live trades and
+all five died - 63, 64, 66, 68 reversed on the corpus, 67 was never real. That
+looked like a run of bad luck or bad discipline. It was neither. It was
+arithmetic, fixed before any of the analysis started.
+
+Residuals of the deployed gates across the corpus, 5,547 decision points over
+68 days:
+
+```
+mean residual  +0.0375
+per-TRADE sd    0.318
+per-DAY sd      0.061      <- the relevant one: trades in a day share a path
+```
+
+Minimum detectable effect, 80% power, two-sided 5%, clustered on the day:
+
+```
+   5 days    MDE +-0.0759     <- twice the entire deployed edge
+  20 days    MDE +-0.0379
+  64 days    MDE +-0.0212
+ 120 days    MDE +-0.0155
+```
+
+**Five days cannot resolve an effect twice the size of the whole strategy's
+edge.** And every finding that reversed measured between +0.08 and +0.11:
+balanced flow +0.082, `held_s` +0.111, `rejections` +0.088. Those are not weak
+effects that happened to fail. They ARE the five-day noise floor, read off as
+signal. A sweep over 36 cells on five days will reliably return a cell near
++0.08 whether or not anything is there, and it will look decisive, because
+the bootstrap correctly reports the precision of a quantity that is noise.
+
+This is the unifying explanation for the whole session and it supersedes the
+per-section post-mortems: no diagnostic applied to a five-day sample could
+have separated these, because the information required was not present. Day
+clustering, Holm-Bonferroni, monotonic boundary sweeps and confound checks all
+describe a measurement; none of them create resolution.
+
+### The design rule
+
+* **Live data cannot originate a gate.** Its jobs are catching bugs and
+  settling predictions the corpus has already made.
+* **The corpus proposes; live verifies.** 20 days is the minimum to see the
+  deployed edge at all; ~72 days to resolve a change of half its size.
+* **State the MDE before the result.** If a candidate's claimed effect is
+  below the sample's MDE, the number is not evidence regardless of its
+  interval - and if it is far ABOVE, that is itself a warning, since real
+  improvements to a +0.038 edge are unlikely to be +0.11.
+
+### What the session actually yielded
+
+Not edge - correctness. The capital inflation that counted 102 settled rows as
+$141.25 committed and ratcheted the tier to 2 (fixed: tier went 2 -> 1 live);
+ETH reading and, within about six hours, nearly overwriting BTC's policy while
+fitting on BTC's corpus; auto cash-out at max profit; the confidence clamp that
+absorbed the choppiness penalty so it cost nothing; the `window_open` /
+`window_ms` join that produced a confident claim about a fill that never
+happened; the fetch-coverage invariant of 67. Every one of those was worth more
+than any gate proposed this session, and none of them needed new data.
+
+The deployed rule's edge - +0.0375 over 68 days, interval excluding zero - was
+never improved on. It is also the finding most easily lost from view, because
+nothing about it changed while a great deal of effort went into things that
+did not work.
+
+## 70. Two fixes: money attributed per instrument, and the learned layer made verifiable (2026-09-24)
+
+### The money was the other instrument's, and the account's
+
+Both live instances reconcile the WHOLE Kalshi account into their own ledger.
+That is deliberate - the account is one pot and the capital controller has to
+see all of it - but `lifetime_record()` read the same unscoped table, so the
+performance footer named an instrument and reported the account. The BTC
+message read:
+
+```
+Live since 19 Sep: -$8.20 · 231 closed · 173W-58L
+```
+
+while KXBTC15M itself was **+$0.11 over 211 markets**. The difference:
+
+```
+KXBTC15M (bot)   +0.1106   211 markets
+KXETH15M (bot)   -1.4360    14 markets
+not the bot      -6.7617     7 markets   5x KXBTCD + 2x KXAAAGASD (natural gas)
+```
+
+The seven have no `trade_proposals` row and no `manual_trades` row. KXBTCD
+matters on its own: the hourly ladder is shadow-only and must never trade.
+
+The error ran in the dangerous direction - it made a flat strategy look like a
+losing one, which invites changing something that is working. `store.py` now
+scopes the figure to `settings.kalshi_series` via `configure_instrument`, and
+reports the remainder as what it is rather than absorbing it:
+
+```
+KXBTC15M:  Live since 19 Sep  +0.3900  over 213 markets  166W-47L
+           account also holds -8.1977 in 21 market(s) this strategy did not place
+KXETH15M:  Live since 24 Sep  -1.4360  over  14 markets    9W- 5L
+```
+
+ETH's label self-corrected from "Live since 21 Sep" to 24 Sep - it had been
+inheriting BTC's first market. An unconfigured Store still reports the whole
+ledger, so tests and any single-instance deployment are unchanged. The series
+match is by `"{series}-%"` prefix, which `test_instrument_money.py` pins
+specifically because KXBTC15M and KXBTCD share a prefix up to the D.
+
+### The learned layer: on, acting, and now checkable
+
+Operator's instruction: the intelligence is on and affects trades, never off.
+
+It already was, and the earlier report in this session that it "has never
+touched a trade" was wrong. Vetoes and admissions are off, but the layer acts
+through the CONFIDENCE channel, and confidence decides execution at the HIGH
+threshold. The ETH fill at 18:49 existed only because of it: 80 + `learned +7`
+= 87, HIGH at 85. Graded on outcomes, BTC's deltas order correctly:
+
+```
+delta  -6:  241 seen,  53 filled,  161W/80L  = 66.8%
+delta  +4:   39 seen,  35 filled,   31W/ 8L  = 79.5%
+delta  +5:   60 seen,  60 filled,   47W/13L  = 78.3%
+delta  +8:  155 seen, 154 filled,  129W/26L  = 83.2%
+```
+
+A 16-point spread, and it is acting on it - 154 of 155 filled at +8 against 53
+of 241 at -6.
+
+**ETH's is inverted and this is recorded beside the decision, not against it:**
+
+```
+delta  +4:   7 seen,  7W/ 0L
+delta  +7:  10 seen,  7W/ 3L
+delta +10:  30 seen, 15W/15L   <- largest bonus, coin flip
+```
+
+ETH has one bootstrap fit on its own 6,389-market corpus and no graded live
+evidence. The recommendation on the table was to suppress ETH's delta until it
+has some; the operator's instruction is that the layer stays on everywhere. It
+stays on. This is the number to re-read once ETH has a week of gradings.
+
+Vetoes being off is the promotion bar working, not a switch being down: no arm
+clears Holm-Bonferroni at FWER 0.05 on the validation slice, and graded live,
+all three current veto arms would refuse more winners than losers (7W/0L,
+23W/6L, 7W/5L). Enabling them is a decision about evidence.
+
+### Why "never off" needed code, not a flag
+
+`intelligence_enabled=True` says the operator wants the layer on. It does not
+say the layer CAN act. Five conditions reduce every decision to NEUTRAL while
+every switch still reads on: a missing or empty artefact, a feature-fingerprint
+mismatch, evidence older than `intelligence_max_policy_age_ms`, a mode other
+than `live`, and every arm withdrawn. Each is correct behaviour alone - a stale
+fit describing a market that has moved on SHOULD stand down - but a layer
+contributing +0 is indistinguishable from a layer that is gone, so "it is on"
+could only ever be believed.
+
+`intelligence_policy.health()` answers it as a state, `main.active_policy`
+publishes it on every load and reload, and `surface.compose` - the single
+assembler - renders a warning when the layer cannot act, so no message builder
+can omit it. It is silent while healthy on purpose: a reassurance printed on
+every message stops being read.
+
+Verified live on both instances, which are correctly separate:
+
+```
+BTC  version=kalshi-brti-2-1790275749  arms=29  acting=2  age=0.2d  ok=True
+ETH  version=kalshi-brti-2-1790275536  arms=30  acting=2  age=0.2d  ok=True
+```
+
+1,394 tests pass (20 new). Both instances restarted on the change: BTC 14728
+via the watchdog, ETH 14476 manually, preflight FLAT at the time.
+
+### Resolved: the 7 unattributed markets were manual (2026-09-24)
+
+The operator confirms the five KXBTCD and two KXAAAGASD markets, -$6.76
+between them, were placed by hand. **No defect**, and specifically not the
+hourly ladder breaking its shadow-only guarantee - which held.
+
+The general fact this establishes, worth more than the resolution: an
+operator-placed position in ANY series lands in both instances' ledgers with no
+`trade_proposals` and no `manual_trades` row. So absence from those tables means
+"this system did not place it", never "something placed it that should not
+have". That is now the fix's whole purpose - the footer separates the account
+from the strategy, so hand trading and bot trading can coexist in one account
+without either being mistaken for the other.
+
+Final attribution:
+
+```
+KXBTC15M (bot)   +0.3900   213 markets  166W-47L
+KXETH15M (bot)   -1.4360    14 markets    9W- 5L
+operator, by hand -6.7617     7 markets
+```
+
+## 71. The winning margin: 18.4 bps on both instruments, and now in the lifecycle (2026-09-24)
+
+Operator's question: when a trade wins, how far does the market travel from the
+target to where it settles - for BTC and for ETH?
+
+### The answer
+
+```
+              n     mean $      median $    mean bps   median bps
+BTC winners  146   +$157.44    +$128.58       18.4        15.1
+BTC losers    29    -$67.13     -$35.66        7.9         4.2
+ETH winners    9     +$4.91      +$4.37       18.3        16.3
+ETH losers     5     -$1.74      -$0.96        6.5         3.6
+```
+
+**18.4 bps on BTC and 18.3 on ETH** - assets 20x apart in price, the same
+figure to a decimal. The margin is scale-free, so bps is the only honest unit:
+$128 on BTC and $4.37 on ETH are the same event and dollars cannot say so.
+
+The asymmetry is the finding. Winners finish about **2.4x further past** the
+target than losers finish short of it, and the medians widen that to 3.6x
+(15.1 vs 4.2 bps on BTC). When this strategy is wrong it is barely wrong -
+median miss $35.66 on BTC, $0.96 on ETH.
+
+That is the exact signature of buying 83c favourites: the losses are
+NEAR-MISSES, not reversals. It also explains why every filter tried this
+session refused more winners than losers. A filter can only separate what is
+separable, and at settlement the losers sit 4 bps on the wrong side of a line
+the winners clear by 15 - which is inside the noise of any pre-entry feature.
+The 18.3-vs-6.4 asymmetry and the 0-for-5 record of section 69 are the same
+fact seen from two ends.
+
+### It is recorded per trade now, from Kalshi
+
+Both numbers come off Kalshi's market object - `floor_strike` is the target the
+signal message already quotes, `expiration_value` is where the settling BRTI
+finished. Taken from the BROKER rather than recomputed from
+`settlement_reference.db`, which holds equivalents and would have been quicker
+to read: the archive is ours and the settlement is Kalshi's, and where they
+disagree the broker is right by definition. Same rule as the P&L.
+
+* `settlements` gained `strike`, `expiration_value`, `facts_synced_ms` by
+  `_add_columns` migration - `CREATE TABLE IF NOT EXISTS` would have reached
+  only fresh installs;
+* `execution.settlement_facts()` reads the public market object, returning {}
+  rather than raising, because enrichment is bookkeeping and must never
+  interrupt a poll with money in it;
+* the service enriches 8 per pass, so a backlog is worked off over several
+  polls, and marks a market asked even when Kalshi publishes neither number -
+  otherwise the queue never drains;
+* `store.settlement_margin(ticker, side)` returns it from OUR side's view, so
+  positive is favourable for UP and DOWN alike, in dollars and bps;
+* `scripts/backfill_settlement_facts.py` filled history: 235 markets per
+  instance, zero failures;
+* the recap carries `Settled $127.50 past the target · 18.3 bps`, with landing
+  exactly on the strike named rather than rounded away.
+
+**A latent bug had to be fixed to do this safely.** `record_settlements` was a
+positional `INSERT OR REPLACE ... VALUES (?,?,...)` with thirteen placeholders.
+Widening the table would have written values into the wrong columns, and every
+routine P&L re-sync would have blanked the new facts - a field that is always
+present and always empty, which is the failure mode FINDINGS 54 already
+recorded twice. It is now a named-column upsert that touches only the columns
+it lists, pinned by `test_a_pnl_resync_does_not_wipe_the_facts`.
+
+Deployed with the account FLAT (it was not on the first attempt; the restart
+waited). 1,408 tests pass, 14 new. All 237 settlements in both databases carry
+the margin, and the two that settled AFTER the restart were enriched by the
+live service rather than the backfill - the live path is confirmed working, not
+assumed:
+
+```
+KXBTC15M-26SEP242030-30  strike 84630.33  value 84639.58  move   +9.25
+KXETH15M-26SEP242030-30  strike  2694.23  value  2691.05  move   -3.18
+```
+
+### Loss step reduced $5 -> $2 by the operator (2026-09-24, same day)
+
+"5 is too risky just to make 50." The reduction is well founded on the
+measurement that shipped the $5 version in the first place (section 61): the
+whole +8.85 gain came from 25 post-loss trades winning 92.0% against 82.9%
+overall, which a permutation test could not separate from ordering luck
+(p=0.249). And the DOWNSIDE was the least-evidenced number in that result - the
+sample held two 2-loss runs and no 3-loss run, so the -5.80 drawdown it showed
+had never been tested by the thing that would move it; across shuffles the
+median worst drawdown was -6.84 and the worst -22.42.
+
+Sizing down where the evidence is thinnest is the conservative reading of
+exactly that result, and the ratio the operator objected to - risk per
+post-loss trade against a speculative total upside - is a question the backtest
+never asked.
+
+Effect across the deployed price band:
+
+```
+ask 0.70 -> 2 contracts, $1.40 at risk   (was $4.90 at $5)
+ask 0.80 -> 2 contracts, $1.60 at risk   (was $4.80 at $5)
+ask 0.93 -> 2 contracts, $1.86 at risk   (was $4.65 at $5)
+```
+
+`loss_step_max_contracts` stays at 8 deliberately: it bounds the other upsize
+paths too, and lowering a ceiling this rule can no longer reach would only look
+like a tightening. $2 now matches the other upsize triggers, so the three no
+longer disagree about what one step up means. Both instances restarted FLAT;
+1,409 tests pass.
+
+## 72. Gold 15-minute: the rule does not transfer, and gold cannot answer whether it should (2026-09-24)
+
+`KXGOLD15M` exists, settles the same way BTC15M does - strike is the previous
+window's settlement, "above or below in 15 minutes" - and carries the SAME
+per-second reference feed at `/live_data/events/{event_ticker}`: 3,600 points
+at 1s in the identical `{t, v}` shape. Band liquidity matches too: 34.2% of
+candles inside 70-93c against BTC's 32.2%, median spread 1.0c on both. Every
+structural precondition for running the deployed rule is present.
+
+It still does not transfer, for a reason visible before any backtest.
+
+### The distance floor is unreachable on gold
+
+```
+        vol_bps   |mom|   norm_distance   clears 10x   clears 15x
+GOLD       5.67    3.78            0.83         0.6%         0.5%
+BTC        0.77    4.28            6.92        33.4%        15.7%
+```
+
+The rule requires the reference to sit 10-15 VOLATILITY UNITS from the strike.
+Gold's per-second feed is about seven times noisier in bps than BRTI, so the
+same dollar gap buys a fraction of the volatility units. Median normalised
+distance is 0.83 against BTC's 6.92, and the deployed floor would fire on
+roughly three of 584 markets. That is not a weak result; it is no result.
+
+This is the third instrument to confirm the same thing: a threshold expressed
+in volatility units is still an instrument-specific constant, because it
+inherits the noise characteristics of that instrument's reference feed.
+
+### Gold's own scale, measured on its own percentiles
+
+1,630 priced decision points in the band over 35 days:
+
+```
+bucket                           n  days    win%     ask residual         95% CI
+everything in the band        1630    35   83.7%   0.813  +0.0240  [-0.0142, +0.0605]
+distance p0-25                 407    33   74.9%   0.741  +0.0089  [-0.0467, +0.0642]
+distance p25-50                408    32   83.8%   0.790  +0.0479  [-0.0136, +0.1021]
+distance p50-75                407    34   86.7%   0.842  +0.0254  [-0.0256, +0.0691]
+distance p75-90                245    33   87.3%   0.880  -0.0061  [-0.0691, +0.0482]
+distance p90+ (farthest)       163    31   92.6%   0.883  +0.0436  [-0.0175, +0.0968]
+```
+
+The favourite-longshot bias IS present - 83.7% at an 81.3c ask, +2.4% residual,
+the same direction and a similar magnitude to BTC's. What is absent is the
+DISCRIMINATOR: distance buckets run +0.048, +0.025, -0.006, +0.044. Not
+monotonic, no ordering, nothing clears zero. The mechanism the deployed rule
+depends on has no signal in gold.
+
+### Why this cannot be resolved with more effort
+
+```
+        n     days   residual   per-day sd   MDE at n days
+GOLD   1630     34    +0.0240      0.1170        +-0.0562
+BTC   19087     68    +0.0181      0.0423        +-0.0144
+```
+
+**Gold's per-day residual sd is 2.8x BTC's.** Its observed +0.0240 sits well
+INSIDE its own noise floor, and resolving an effect that size would take **187
+days** against BTC's 43. We have 34, and cannot get more: the reference
+endpoint serves only recent events, so the backfill returned 584 of 3,907
+markets with 197 fetch failures and no path to the rest.
+
+So the verdict is not "gold has no edge". It is that gold cannot be measured to
+a conclusion with the data that exists, and the one thing that could have been
+measured - whether distance discriminates - came back flat.
+
+### The operator's live test
+
+A manual gold trade was taken at 97c with the reference $5.81 above a $4,287.96
+target and 7 minutes left. Worth recording that the deployed rule would have
+DECLINED it on price alone: the band ends at 93c. At 97c a win pays 3c against
+97c at risk, which needs a 97% strike rate merely to break even - and gold's
+measured win rate in its FARTHEST distance decile, the most favourable bucket
+in the table above, is 92.6%.
+
+## 73. Gold: the operator was right, and the edge is where BTC's rule would never look (2026-09-24)
+
+Section 72 concluded gold could not be measured to a conclusion. That was
+wrong, and it was wrong because it asked gold BTC's question.
+
+### The operator's correction
+
+Told that gold's reference was "seven times noisier", the operator pushed back:
+*"gold is more stable at maintaining its price level than any other asset"*.
+Both statements are the same measurement, and the operator's framing is the
+useful one. Share of short-horizon volatility that survives to settlement:
+
+```
+GOLD  0.040      BTC  0.305
+```
+
+Gold's per-second feed genuinely jitters - 80% distinct values, 1.5% flat
+ticks, so it is not quantisation - but that jitter MEAN-REVERTS. Gold holds its
+level eight times better than BTC. Measured directly, with no model at all:
+
+```
+        |15-min move|   median distance   distance/move
+GOLD       5.21 bp          3.85 bp          0.74x
+BTC        5.57 bp          4.34 bp          0.78x
+```
+
+The two are equivalent in risk-adjusted terms, while
+`brti_normalized_distance` reports 0.83 against 6.92. **The denominator was
+measuring feed noise, not tradeable volatility**, and the 8x correction is
+confirmed by two independent routes (persistence ratio 7.6x, direct
+distance/move 7.9x).
+
+### Where gold's edge actually is
+
+Level-maintenance shows up exactly where it should - P(side holds to
+settlement) by distance already travelled:
+
+```
+distance      GOLD     BTC    gold edge
+0-2bp        57.7%   59.1%       -1.4
+2-5bp        75.4%   66.0%       +9.4
+5-10bp       78.4%   76.3%       +2.1
+10-20bp      86.8%   84.0%       +2.8
+20bp+        86.0%   89.1%       -3.1
+```
+
+BTC needs 10-20bp to reach 84%. **Gold reaches 75% at 2-5bp** - and the market
+does not price the difference:
+
+```
+asset  distance     n    win%     ask  residual                95% CI
+GOLD   2-5bp      865   75.7%   0.686  +0.0715  [+0.0344, +0.1078]  HOLDS
+BTC    2-5bp     8921   71.5%   0.708  +0.0069  [-0.0098, +0.0227]
+```
+
+Gold at 2-5bp is priced like BTC at 2-5bp and outperforms it by four points of
+win rate. **+7.15% residual, against the deployed BTC strategy's +3.75%.**
+
+### It survives every test that killed the others today
+
+```
+p = 0.0001; Holm-Bonferroni over the 8 cells needs p < 0.00625   SURVIVES
+boundary: all 7 overlapping bands hold, +0.0606 to +0.0787
+sub-period: first half  +0.0576 [+0.0120, +0.0981]  HOLDS
+            second half +0.0865 [+0.0285, +0.1415]  HOLDS
+sessions:   all four positive, +0.0567 to +0.0860
+fillable:   tight spread (<=1.0c) +0.0771 [+0.0376, +0.1141]  HOLDS
+            wide spread  (2.5c)   +0.0310 [-0.0628, +0.1145]
+```
+
+The DISJOINT sub-period split is the one that matters - it is what reversed
+sections 63, 64, 66, 68 and the perpetual plateau. Both halves hold
+independently. And the edge concentrates in TIGHT books, the opposite of a
+stale-quote artifact; that check is what condemned the perpetual basket.
+
+### Why BTC's rule could never have found this
+
+The deployed rule requires 10-15 normalised distance units and an ask of
+70-93c. Gold's edge sits at 2-5bp of distance and a **0.686 ask** - below the
+price band and, on the uncorrected scale, far below the distance floor. The
+rule would have rejected every one of these 865 setups twice over.
+
+An instrument's gates are not portable, and this is the sharpest instance yet:
+the transfer failed not because gold lacks an edge but because BTC's thresholds
+point away from it.
+
+### What is still unknown
+
+Thirty-four days. Fill probability at 0.686 is unmeasured - Kalshi serves no
+historical depth, so this is an ADDITION counterfactual and section 68's
+limitation applies in full: it claims setups we have never traded. The corpus
+is 584 of 3,907 markets because `live_data` serves only recent events, so the
+sample may not be representative of the rest.
+
+Nothing is shipped. The next step is not code: it is more days, and then a
+paper-traded confirmation that the 0.686 ask is actually fillable.
+
+### Gold shipped live as a third instance (2026-09-24)
+
+`runtime-gold/`, `gold15.db`, `strategy_kalshi_gold.json`,
+`scripts/run_gold.ps1`. BTC and ETH untouched; all three now on the same
+revision.
+
+**Every number in gold's config was measured on gold and none inherited.**
+
+```
+ask 0.65-0.75        entirely BELOW where BTC's 0.70-0.93 starts
+distance 1.5-6.0bp   a BAND in bps, not a floor in volatility units
+entry 400-700s       below 6.7 minutes the edge dies (-0.0068)
+```
+
+Two structural departures from BTC, each load-bearing:
+
+*The distance test is a band.* On BTC more distance is always better - it means
+the move already happened and the strike is far behind. On gold the edge is
+level-MAINTENANCE, so distance beyond 6bp is evidence against the trade:
+2-5bp scores +0.0715 while 5-10bp scores +0.0074 spanning zero. Implemented as
+`min_abs_distance_bps` / `max_abs_distance_bps`, both None by default so BTC
+and ETH are bit-identical.
+
+*An unmeasurable retrace is not a refusal on gold.* `brti_retrace` is None
+whenever the recent window holds no advance to give back - which on BTC means
+the move cannot be shown alive, and on gold IS the target state. The shipped
+gate would have refused precisely the setups the edge was measured on. Added
+`require_measurable_retrace`, default True.
+
+**BTC's three level-holding gates are OFF on gold, measured not forgotten.**
+`accel` refuses the better group (+0.1334 refused against +0.0908 kept); all
+three together cut volume 51% to buy +0.009 of residual, dropping total edge
+from 52.0 to 27.7. Momentum and retrace are ungated because they are not yet
+measured on gold - this codebase's own rule being that an unmeasured gate is
+worse than none, since it looks deliberate.
+
+**A latent defect found while wiring it.** `surface.asset()` knew only crypto
+names, so `KXGOLD15M` returned "". That is not cosmetic:
+`learning_runner._corpus_mismatch` treats an unrecognised series as "no
+opinion" so a synthetic corpus is not refused - which means gold's corpus guard
+was SILENTLY DISABLED and a fit on BTC rows would have been allowed. Exactly
+the failure that guard exists to prevent. GOLD, SILVER, PLATINUM and PALLADIUM
+added; pinned by a test that feeds a gold instance BTC rows and asserts refusal.
+
+**Verified live.** Gold bootstrapped its learning on **560 markets** - its own
+corpus, not BTC's 6,428 - producing 13 arms, 0 promoted. Each database writes
+only its own instrument's tickers (BTC 343, ETH 43, GOLD 1). Three distinct
+policies: 29 / 30 / 13 arms. 1,427 tests pass.
+
+**What is not yet known, and will not be known for weeks.** Gold's corpus is
+584 of 3,907 settled markets because `live_data` serves only recent events, so
+the sample may not represent the rest. Fill probability at a 0.694 ask is
+unmeasured - Kalshi sells no historical depth, so this is an ADDITION
+counterfactual and section 68's limitation applies in full: it claims setups
+never traded. 33 days is short, though the effect is large relative to gold's
+noise floor and survived a disjoint sub-period split, which is the test that
+reversed sections 63, 64, 66, 68 and the perpetual plateau.
+
+The prediction to check: ~16 trades a day at a 0.694 ask and 79.3% win. If the
+corpus is right the residual stays near +0.09; if the sample was unrepresentative
+it will fall toward zero. The archive answers it either way.
+
+## 74. WITHDRAWN: "the gates refuse profitable setups" was a reporting defect (2026-09-25)
+
+### What was claimed, and is now withdrawn
+
+Three claims made on 2026-09-24/25, all from the same source and all wrong:
+
+* that BTC's gate was ANTI-SELECTING - qualified -2.1% against declined +3.5%;
+* that since the three level-holding gates shipped, BTC had qualified only 4
+  signals in 14 hours while what it DECLINED scored +7.7%;
+* the section 66 formulation that its gates "refuse setups that were worth
+  taking", insofar as it rested on live declined-vs-qualified counts.
+
+The operator identified the defect before it changed anything: *"A declined
+contract eventually winning does not prove it offered a qualifying, profitable
+entry beforehand."* Exactly so.
+
+### The defect
+
+`predictions.qualified` is a snapshot written when the ALERT was produced.
+Every report read it as the market's verdict, which classifies a 15-minute
+contract by its FIRST evaluation. It is a real fact about the alert; it was
+being used as a fact about the market.
+
+Traced against `intelligence_decisions`, which records every poll:
+
+```
+markets that failed the distance check -> did evaluation CONTINUE?
+  BTC 55/55      ETH 49/49      GOLD 37/37        (stopped: 0, 0, 0)
+median evaluations per market: 27
+
+of those, LATER became eligible:  BTC 11   ETH 14   GOLD 32
+markets that became eligible -> order placed -> FILLED:
+  BTC 13/13      ETH 14/16 (1 unfilled, 1 awaiting authorisation)
+```
+
+**There was no lifecycle bug.** A failed gate rejects that moment and nothing
+more, evaluation runs to the entry deadline, and when a market becomes eligible
+an order goes out and fills. The trading path was never at fault - only the
+reporting of it.
+
+The scale of the misclassification:
+
+```
+BTC: 53 predictions marked "not qualified" -> 9 had actually TRADED, 9W/0L at 0.829
+ETH: 55 marked "not qualified" -> 10 had actually TRADED, 10W/0L at 0.852
+```
+
+Because every misclassified market was a WINNER, moving them from "declined" to
+"traded" moves a block of wins out of one bucket and into the other. That single
+error produced both halves of the false conclusion.
+
+### The corrected evaluation, since the last gate shipped
+
+Classified by whether a market was EVER eligible:
+
+```
+              ever eligible                    never eligible
+BTC    n=13   92.3%  price 0.838  +8.5%    n=45  77.8%  price 0.734  +4.4%
+ETH    n=16   93.8%  price 0.834 +10.3%    n=43  76.7%  price 0.763  +0.5%
+GOLD   n=32   71.9%  price 0.711  +0.8%    n= 5 100.0%  price 0.776 +22.4%
+```
+
+Gold's corrected figure is +0.8%, not the +9.3% reported from the snapshot -
+that number compared different populations. Gold's 32 eligible markets are all
+`awaiting_authorization`: auto-execution is off there, which is a deliberate
+SETTING and not a failure of anything.
+
+### What this does and does not establish
+
+It supports the gates' SELECTION so far. It does not show they are effective.
+The samples are 13, 16 and 32 markets; a residual here is win rate minus quoted
+price, which is calibration and not net executable profit; it excludes fees and
+assumes a fill at the quoted price, which is the addition counterfactual
+section 68 established cannot be verified. Whether the gates are worth their
+cost in refused volume is a separate question these samples cannot answer.
+
+### What was built
+
+`src/btc15_signal/market_lifecycle.py` derives, per market: eligibility
+(never / at first / became, with the first eligibility instant and every
+transition), execution (no proposal / awaiting authorisation / blocked /
+submitted-unfilled / partially filled / filled, with reasons and order ids),
+and outcome (won / lost / PENDING / no record, never merged).
+`scripts/lifecycle_report.py` reports on it.
+`tests/test_lifecycle_classification.py` (13 tests) pins the contract, the
+first of them being the exact mistake in the exact shape it occurred.
+
+**Training labels were never affected.** `learning_data` already labels on
+`intelligence_decisions.base_qualified` per evaluation and upgrades a market
+when a later poll qualifies - the became-eligible semantics, correct all along.
+Only the reporting was broken, so no label regeneration is required.
+
+`since_ms` filters on DECISION time, not window open. Mixing the two anchors is
+what made 16 eligible ETH markets report as 15; reconciled, all 16 are graded,
+0 pending, 0 missing.
+
+### A second error, recorded because it was mine
+
+While adding the module I wrote it to `src/btc15_signal/lifecycle.py`, which
+already existed and holds the trade-path reconstruction (`exit_quotes`,
+`build_lifecycle`, MFE/MAE, exit simulation) that `gridsearch` and `validation`
+import. The Write result said "updated", not "created", and I did not read it.
+It was restored byte-exact from git - `git status` shows the file unmodified -
+and the new module renamed to `market_lifecycle.py`. Check whether a module
+exists before writing it; the tool result says which happened.
+
+### 74a. Four facts, kept apart, and none of them inferred (2026-09-25)
+
+Three further corrections from the operator, each removing an inference that
+was being presented as a record.
+
+**`pending` is a lapsed state, not an open one.** Every resting proposal on all
+three instances is past its expiry - BTC 328, ETH 72, gold 38, zero live, none
+ever carrying an order id, expiry set about two minutes after creation. Reported
+as `expired`.
+
+**Automation being on does not prove an approval was requested.** It means
+approval was not REQUIRED. There is no approval-request record anywhere in the
+schema - notification kinds are settlement, signal, fill, cash_out,
+session_close, learning and recovery - so `awaiting_authorization` cannot be
+evidenced today and must not be claimed. The module had been inferring it from
+the automation setting, which is exactly the error the whole section is about.
+
+So four facts are now separate fields, and merging any two reintroduces the
+ambiguity:
+
+```
+execution          expired | filled | submitted_unfilled | blocked | ...
+automation_on      the setting as it stood
+authorization      requested | approved | declined | never_requested
+execution_reason   evidence-backed only
+```
+
+A reason is stated only where a record supports it. With automation off, the
+absence of any submission IS the evidence and the report says so. With
+automation on and nothing explaining the lapse, it says **"expired without
+submission - reason unknown"** rather than naming a cause.
+
+**Proposal expiry does not terminate market evaluation**, verified rather than
+assumed. Of markets whose entry window stayed open past a proposal expiry:
+
+```
+        window still open past expiry   evaluation continued   became eligible AFTER it
+BTC                   160                       160                      52
+ETH                    74                        74                      17
+GOLD                   31                        31                      15
+```
+
+Every one continued, and a substantial share became eligible afterwards. A
+lapsed proposal ends that ATTEMPT, not the market.
+
+**Counts are timestamped.** They move as markets settle and fills land - gold's
+eligible set went 32 -> 33 and ETH's fills 14 -> 15 between two runs an hour
+apart - and an untimestamped count invites reading that as a reconciliation
+error rather than a later snapshot. Every report now prints the instant it was
+taken, plus the automation setting and the authorization tally.
+
+1,450 tests pass. Nine of them pin this section, the sharpest being that
+automation being on never implies an approval was requested.
+
+## 75. Seven marginal best-buckets intersect to nothing: all three configs refitted as SETS (2026-09-25)
+
+### The error, and it was mine
+
+Silver and SOL each received seven thresholds, and every one was chosen from its
+own best bucket in isolation — price 0.50-0.60, distance ≤2bp, held ≥60s,
+rejections ≥10, momentum ≤10bp, accel ±10, plus a retrace gate inherited from
+BTC. Each was defensible alone. Intersected, they admitted almost nothing, and
+the check that would have caught it — *does the COMBINATION let a usable share
+through* — was never run.
+
+Measured against each instrument's own corpus, the deployed sets admitted:
+
+| deployed config | admits | win rate | residual |
+|---|---|---|---|
+| SILVER | 2 / 4,017 = **0.05%** | unscoreable | — |
+| SOL | 235 / 10,878 = **2.16%** | **50.6%** vs 73.9% baseline | **-0.0502** |
+| GOLD | 705 / 4,524 = 15.6% | 78.6% | +0.0906 |
+
+Live it was worse: 423 and 422 evaluations, zero qualified, every market
+blocked. Gold, carrying two active gates, qualified 18.7%.
+
+SOL is the sharper lesson. It was not merely narrow — what little it let
+through it chose **badly**, at a 50.6% win rate against a 73.9% baseline. A
+config can be wrong in both directions at once.
+
+### Two things the corpus could not see
+
+**`brti_retrace` and `brti_choppiness` were never stored.** `features_from_series`
+computes both and the backfill discarded them, so every fit ever run scored
+candidate sets as though those two gates were absent, while live enforced BTC's
+inherited `(0.60, require-measurable)`. That is most of the gap between "the
+corpus says 7.2%" and "live says 0%" — under the real rule SOL's old config
+admits 20 of 6,396, not 235. Both columns are now recorded.
+
+**`enabled` was rendered but never computed.** `surface.check_line` renders a
+gate as DISABLED when `fact["enabled"] is False` and `checks_summary` excludes
+it from the count. Nothing ever set it: `check_facts` called
+`fact.setdefault("enabled", True)`, so every gate came back enabled and the
+rendering was unreachable. The defect the gold audit was raised about — "Entry
+checks 8/8" with five thresholds that no input can fail — was therefore never
+actually fixed. `KalshiBRTIRule.gate_binds` now derives it from the config, and
+gold's alert reads `3/3 (5 off)` on the old config, which is what the operator
+said it should have said all along.
+
+### What replaced the method
+
+`scripts/fit_instrument_config.py` scores complete candidate sets, never single
+gates, against three requirements in order:
+
+1. **Volume is a constraint, not a preference.** A set admitting under 15% can
+   never reach `min_evidence`, so the learned layer stays inert and the
+   configuration can never be corrected by evidence.
+2. The set's own residual interval clears zero.
+3. **Gating demonstrably beats not gating** — the gated-minus-ungated
+   difference, bootstrapped on the same resampled days.
+
+Requirement 3 exists because of the *opposite* failure, which I walked into on
+the way here: ranking by total edge chose a set admitting 74% of gold's points
+at +0.0495 against a +0.0346 baseline. That is the baseline with extra steps. It
+selects for nothing, and without a paired test it looks like an improvement.
+
+Sets are then tiered — A holds in both disjoint halves, B in one, C spans zero —
+and a lower tier is reported only when the one above is empty. That is the bar
+gold was originally shipped on and the one silver and SOL skipped.
+
+### An accident that turned into a holdout
+
+Re-fetching the reference series to capture retrace landed on a **near-disjoint
+sample of the same period**: gold's two corpora share 59 markets out of 485 and
+365, because the stride walked a market table that had grown. The two disagree
+by **0.042 on the ungated baseline** — as large as most edges being fitted here.
+That is the most useful number in this section. It sets the scale of sampling
+noise in a 36-day window, and it is why the fits use both corpora merged (gold
+758 markets, silver 677, SOL 1,844) and why each set is then re-scored on the
+sub-samples separately.
+
+### The three results
+
+| | tier | share | win | residual | vs ungated | halves | replicates |
+|---|---|---|---|---|---|---|---|
+| **GOLD** | A | 20.4% | 78.4% | +0.0925 [+0.0613, +0.1219] | +0.0743 [+0.0522, +0.1001] | both hold | **yes**, +0.1003 [+0.0634, +0.1381] |
+| **SILVER** | A | 17.8% | 78.2% | +0.0562 [+0.0222, +0.0891] | +0.0373 [+0.0058, +0.0666] | both hold | **no**, +0.0340 [-0.0098, +0.0764] |
+| **SOL** | C | 22.1% | 73.6% | +0.0222 [-0.0057, +0.0486] | +0.0209 [+0.0001, +0.0411] | one decays | no |
+
+**Gold is established.** It holds on both sub-samples, both halves, and gating
+beats not gating on each. Three gates that were sentinels — `accel >= -1e9`,
+`held >= 0s`, `rejections >= 0` — now carry measured values, and the distance
+band came back as the same 1.5-6.0bp it already had, which is the strongest
+thing that can be said for a threshold.
+
+**Silver is provisional.** It clears every requirement on the fitted sample and
+both halves, but on the older sub-corpus alone it spans zero: more than half the
+measured edge lives in one of the two samples. Gold's equivalent check held on
+both. Automation stays off.
+
+**SOL has no edge, and 1,844 markets say so.** Its ungated residual is +0.0013
+[-0.0124, +0.0159] — the market prices these contracts correctly. Of 4,860
+candidate sets, 1,073 cleared volume and the baseline and **not one**
+demonstrably beat taking everything. Two near-disjoint samples, 57 and 68 days,
+agree. Its config now exists to RECORD, not to select, and says so.
+
+### What this does not establish
+
+The residual is win rate minus the price quoted — calibration, not realised
+profit. It excludes fees, per the operator's standing instruction, and it
+assumes a fill at the quoted price, which for a market no order ever touched is
+a counterfactual this system cannot verify: there is no historical book depth.
+Gold's live automation state is unchanged, and none of these numbers is an
+argument for turning it on.
+
+The configs hot-reload — `KalshiBRTIRule.load` runs every evaluation cycle — so
+all three took effect without restarting anything.
+
+### The test that was missing
+
+`tests/test_gate_sets_admit_volume.py` runs the real rule over each
+instrument's own corpus and asserts three things per instrument: the set admits
+at least 10% of decision points, it does not admit at a worse win rate than it
+blocks, and no gate counted as a passed check is one that nothing in the corpus
+can fail. It fails loudly on the old silver and SOL configs, which is the point.
+
+One correction inside that test, recorded because it made the guard useless:
+`sum(1 for _, won in through)` counts every row rather than the wins, so the
+"does not select for losers" assertion read 100% for both instruments and could
+not fail.
+
+Admitted against blocked, under the real rule including retrace:
+
+| | admits | admitted W-L | admitted win | blocked win |
+|---|---|---|---|---|
+| GOLD | 17.4% | 279W-86L | 76.4% | 71.5% |
+| SILVER | 15.5% | 213W-63L | 77.2% | 73.9% |
+| SOL | 20.5% | 962W-346L | 73.5% | 73.9% |
+
+SOL's two columns being equal is not a failure of the gating — it is the same
+finding as the table above, seen from the other side.
+
+### 75a. The corpus holds only markets whose fetch succeeded (2026-09-25)
+
+An open caveat on every number in section 75, found while checking the fits
+against fresh reference data and not resolved.
+
+The corpus and an independent replay disagree about the same 8 days. On markets
+present in both, gold's deployed set scores **+0.1019 [+0.0423, +0.1883]** from
+the corpus and **+0.0069 [-0.0213, +0.0558]** from the replay. Three
+explanations were tested and two are eliminated:
+
+**Not staleness.** Stored features were compared against features recomputed
+today for 270 decision points across 45 markets: `signed_distance_bps`,
+`brti_momentum_bps`, `brti_volatility_bps`, `brti_normalized_distance`,
+`brti_accel`, `brti_held_s` and `brti_rejections` all matched **exactly, 100%**.
+The corpus describes what the live code produces.
+
+**Not time-of-day sampling.** The stride-8 backfill was suspected of landing on
+12 fixed times a day. It does not: all three corpora cover all 96 distinct close
+times.
+
+**Not the period.** Splitting the corpus at the same date shows the set scoring
++0.0900 [+0.0406, +0.1449] in exactly the last 8 days the replay calls weak.
+
+What remains is the market POPULATION. The backfill only stores markets whose
+reference series was served — 123 of 488 gold fetches failed, 183 of 490 on
+silver — while the replay lost 40 of 500. If a failed fetch correlates with
+anything about a market, the corpus is a survivorship-filtered sample and every
+threshold fitted on it inherits that filter. This is not demonstrated, and it is
+not dismissed.
+
+**The consequence for the shipped configs.** Gold's edge is positive in every
+view and its admitted group beats its blocked group in both. The MAGNITUDE is
+uncertain: +0.09 from the corpus, +0.007 from the denser replay. Nothing here
+should be quoted as gold earning +0.09 per contract live.
+
+### 75b. Gold and silver keep New York hours (2026-09-25)
+
+The operator's correction: gold and silver close at the New York close and
+reopen at the New York open, so they are shut every weekend for about two days,
+and the service must not poll through it.
+
+Measured the same evening: both went quiet at 21:00 UTC, and Kalshi's next
+listed market for either series opened **2026-09-27T22:00Z, 48 hours later**. At
+a ten-second poll that is roughly 19,000 requests and an equal number of
+reference fetches, recording nothing — the underlying metal is not trading
+either.
+
+**A closure is not the outage `market_gap_alert_s` exists to catch.** On
+2026-09-24 Kalshi listed nothing for two hours while the service was healthy and
+the operator's only symptom was Telegram going quiet. A false outage alert every
+Friday night teaches the operator to ignore the one that matters, so the two are
+told apart rather than merged.
+
+**The first attempt was wrong, and it is worth recording why.** Inferring the
+closure from the listing alone — "the next unopened market is far away" — looked
+sufficient and is not. Checked against the live exchange, BTC and SOL *also*
+reported their next unopened market 5.1 hours out, while both were trading
+normally, because Kalshi creates markets in daily batches and an `unopened`
+listing excludes the ones already open. That rule would have backed BTC off
+during an outage and silenced its alert.
+
+So the instrument **declares** that it observes sessions (`VENUE_HAS_SESSIONS`,
+set on gold and silver only, off by default) and the **exchange supplies the
+reopen time**. No hardcoded New York calendar, which would be wrong on every
+market holiday, and nothing that can misfire on a 24/7 series. Four conditions
+must all hold: the instrument declares sessions, no open market for 10 minutes,
+Kalshi lists a next market, and it is at least 30 minutes away. An unknown
+answer or a failed lookup is not a closure — the conservative direction is to
+stay noisy.
+
+While closed the service skips the reference fetch entirely and polls every ten
+minutes rather than every ten seconds: a weekend falls from ~19,000 requests to
+~320, and a reopen is still noticed within ten minutes. Sleeping the whole 48
+hours was rejected — it would miss an early reopen, a config change and the
+settlement sweep.
+
+Twelve tests pin it, the load-bearing one being that a 24/7 instrument never
+even asks.
+
+### 75c. SOL trades live, against the measurement, by the operator's decision (2026-09-25)
+
+Recorded with the evidence beside the decision, because that is the standing
+rule when the operator decides against a measurement rather than with it.
+
+**The measurement, which is not withdrawn.** SOL's UNGATED calibration residual
+is **+0.0013 [-0.0124, +0.0159]** over 1,844 markets and 68 days: the market
+prices these contracts correctly. Of 4,860 complete candidate gate sets, 1,073
+cleared the 15% volume floor and the baseline and **not one** demonstrably beat
+taking everything. The deployed set spans zero (+0.0222 [-0.0057, +0.0486]) and
+its second disjoint half is negative. A 500-market replay of the most recent
+days, through the real rule with the entry window applied, put the admitted
+group at **-0.0375** against a blocked group at **-0.0157**. Two near-disjoint
+samples, 57 and 68 days, agree there is nothing to gate for.
+
+So this is not expected to make money on the evidence available, and every
+figure above excludes fees per standing instruction — with no measured edge,
+fees are the expected cost.
+
+**What was enabled.** `AUTO_TRADE_ENABLED=true` in `run_sol.ps1`, plus the
+stored `auto_trade_enabled` row written deliberately rather than left to the
+.env default. Effective limits, read back from the service's own resolver:
+$1.00 per order, one contract, **stops for the day at -$5.00**, at most 40
+trades a day, 6 an hour, 120 seconds apart. Account cash at the time: $36.14.
+
+**Why auto rather than approval.** There is no third option. Live orders need
+either auto trading or a Telegram approval, and only ONE process may consume the
+command stream: `getUpdates` is destructive, so a second poller silently steals
+messages from the first, including the kill switch. BTC is that listener. Giving
+SOL the command stream would have put BTC's `/auto off` in a race.
+
+**The gap that had to be closed first.** That same design means `/auto off` can
+never reach SOL, so enabling unattended trading would have left the daily loss
+limit and `Stop-Process` as the only stops. `scripts/auto_switch.py` now writes
+the same `settings` row `main.auto_is_on` reads on every decision — the stored
+value already wins over the .env default, so it takes effect within one poll and
+survives a restart:
+
+    python scripts/auto_switch.py --db sol15.db --off
+
+**A banner that asserted a safety property it never checked.** Startup printed
+"execution requires Telegram approval" as a hardcoded string on every instance.
+It became false the moment SOL was armed, and it is exactly the line an operator
+would quote back. It now reads the real mode: the four approval instances say so,
+and SOL says `AUTO TRADING ON, $1.00 per order, stops for the day at -$5.00`.
+
+**The relabelled config.** `strategy_kalshi_sol.json` said "DATA CAPTURE ONLY -
+automation OFF". Leaving that in place while real orders went out is the
+stale-name failure this project keeps paying for, so the config now states that
+it trades live by the operator's decision, against the finding, with the finding
+still in it.
+
+### 75d. A reboot took four of five instances down, and the banner had been lying (2026-09-25)
+
+The machine rebooted at 19:06 local. **Only BTC came back.** `BTC15Signal` and
+`BTC15Recorder` are the only boot-triggered scheduled tasks on the box, so ETH,
+gold, silver and SOL stayed down with nothing to say so.
+
+SOL had been armed for live trading about ninety minutes earlier. So *armed* and
+*running* had come apart: the configuration said one thing and no process was
+executing it. Nothing alerted, because the process that would alert is the one
+that was down. That is the silent stop this system is most exposed to, arriving
+by a route none of the existing guards cover — the watchdog restarts a service
+that DIES, and a service that was never started does not die.
+
+**The durable fix needs a privilege this session does not have.**
+`scripts/install_instance_tasks.ps1` registers boot+logon tasks per instance,
+mirroring `BTC15Signal` exactly (restart 999 at one-minute intervals, no
+execution time limit, S4U, Highest) and running each instance's own launcher with
+a new `-Supervise` switch so `watchdog.py` supervises it. The switch lives in the
+existing launcher rather than a second script on purpose: a copied environment
+block is how one instance ends up writing another's database. Registering it
+fails with "Access is denied" from a non-elevated shell — even a plain logon-only
+task — so it is the operator's one elevated command.
+`scripts/install_startup_fallback.ps1` is the non-elevated alternative and fires
+at logon rather than boot, which an unattended reboot at the lock screen would
+miss.
+
+### The banner had been asserting a safety property it never checked
+
+Startup printed `execution requires Telegram approval` as a **hardcoded string**
+on every instance. Section 75c replaced it with a read of
+`auto_is_on(store, settings)`. When the four restarted instances came up on the
+new code, they reported what was actually true:
+
+| instance | reported before | actual, from the stored flag |
+|---|---|---|
+| BTC | "requires Telegram approval" | **AUTO ON** since 2026-09-20 22:58, day stop -$20 |
+| ETH | "requires Telegram approval" | **AUTO ON** since 2026-09-24 13:36, day stop -$10 |
+| GOLD | "requires Telegram approval" | no stored flag — approval, correct |
+| SILVER | "requires Telegram approval" | no stored flag — approval, correct |
+| SOL | — | **AUTO ON** since 2026-09-25 18:40, day stop -$5 |
+
+BTC and ETH had been trading unattended for five days and one day respectively.
+That is the operator's own `/auto on`, not a change made here — but every report
+of the execution modes up to this point, including ones given to the operator,
+was wrong, and the source was a string that looked like a fact.
+
+**The lesson is the one this file keeps relearning in new costumes.** A banner,
+a label or a config comment that states a property without reading it is worse
+than silence, because it is the line someone quotes back. `auto_trade_enabled`
+is a STORED row that outlives the .env and outlives a restart, by design, so
+that `/auto off` from a phone cannot be undone by rebooting — which means the
+.env default says nothing about what is armed. Read the row:
+
+```sql
+SELECT value, updated_at FROM settings WHERE key='auto_trade_enabled';
+```
+
+**And the kill switch does not reach four of the five.** `getUpdates` is
+destructive, so only BTC consumes the command stream. `/auto off` cannot stop
+ETH, gold, silver or SOL. `scripts/auto_switch.py` writes that same row for any
+instance, which is why it had to exist before SOL was armed rather than after.
+
+---
+
+## 76. At-the-money, price action picks the side: no edge on any asset (2026-09-25)
+
+Operator specification: on the 15-minute markets, use price action on the
+underlying to choose UP or DOWN, and enter only when Kalshi offers that side at
+45-50c. Measured by `scripts/measure_atm.py`: ~6,400 settled markets per asset,
+69 days, first qualifying minute per market (elapsed 1-13), held to
+settlement, net of `kalshi_fee_charged` at one contract, CI clustered by day.
+24 price-action rules (1/3/5/15/60/240-minute returns, move since window open,
+distance from strike, same-colour candle streaks, 15/60-minute range position,
+EMA 5/20, Kalshi's own mid change), each scored as continuation AND reversal:
+48 rules, Holm across the family.
+
+| BTC, no information (controls) | n | win | ask | net/contract | 95% CI |
+|---|---:|---:|---:|---:|---:|
+| always UP | 3412 | 47.2% | 0.475 | -0.0212 | [-0.0373, -0.0052] |
+| always DOWN | 3423 | 47.4% | 0.477 | -0.0198 | [-0.0353, -0.0029] |
+| coin flip | 3481 | 46.5% | 0.476 | -0.0287 | [-0.0446, -0.0124] |
+
+**The price is right at 50c, and the fee is at its maximum there.** A 47.5c
+ask wins ~47%; the loss is the ~1.75c fee. To break even a rule must add ~2
+points of win rate the price does not already carry.
+
+**No rule does, on any asset.** Best of 48 on BTC: `r5>0 cont` +0.0003
+[-0.0183, +0.0189], `window_move>0 cont` +0.0001, `streak>3 cont` +0.0383
+[-0.0399, +0.1187] (n=273). Holm p = 1.000 for every rule.
+
+**Replication kills the only candidate.** `streak>3 cont` (3+ same-colour 1m
+candles, follow them): first half of days +0.0699 (56.7%, n=157), second half
+**-0.0044** (49.1%, n=116); ETH **-0.0490**, SOL **-0.0462**. Best on ETH
+(`window_move>3 cont` +0.0069) and SOL (`r60>20 rev` -0.0045) are different
+rules, each spanning zero - the best-of-48 noise ceiling, not a signal.
+
+**One consistent shape, too small to trade:** on BTC continuation beats
+reversal for short horizons (r5: 49.5% vs 46.3%), i.e. at 50c the side the
+underlying is moving toward is very slightly underpriced. It brings a rule to
+breakeven, not past the fee, and it does not replicate on ETH or SOL.
+
+Caveats: underlying is Binance spot 1m klines, not BRTI; fills assume the
+candle-close ask was takeable for one contract (no historical depth).
+
+**Decision: not built.** Consistent with sections 1, 14, 33 and 36: the only
+durable bias here is favourite-longshot, and at 45-50c there is neither a
+favourite nor a longshot - only the peak fee. What would change it: a signal
+worth >2 points of win rate at 50c that replicates on disjoint days AND
+another asset, on BRTI.
+
+## 77. brti-4: the level lookback is 45 minutes, and what that invalidated (2026-09-25)
+
+Written on the way to a commit, because a six-lens audit of the uncommitted diff
+found that **the largest behavioural change in it was recorded nowhere here.**
+`grep -c "brti-4" FINDINGS.md` returned 0, as did `brti-3`, `level_window` and
+`19,305`. Every supporting measurement lived only in source comments, and the
+three new strategy configs referred to "under brti-4" without anything in the
+durable record saying what brti-4 is. That is the failure this file exists to
+prevent, so it is fixed here.
+
+### What changed
+
+`features_from_series` gained `level_window_s`, and it went from the market's own
+15-minute window to **2,700 seconds** - the running window plus the 30-45 minutes
+before it. Three features are computed from `level_pts` and therefore all three
+changed meaning: `brti_rejections`, `brti_held_s` and `brti_accel`.
+
+The feature contract moved `brti-2` (`9e41a3dfea0f7059`) → `brti-3`
+(`60c45b5c38c8ff5d`) → `brti-4` (`a641ab8e2a05aa44`), and
+`SETUP_FEATURE_VERSION` in `adaptive.py` is now the single definition that
+`feature_contract.py` reads - reversing the import to remove the second version
+literal that had already caused one silent failure (a stale `brti-2` there made
+`learning_data` discard every row, so `live_actual_fills` read 0).
+
+### Why the rejection count had been measuring the opposite of its name
+
+At 900s the lookback WAS the market's own window, and the strike IS that window's
+opening price - so every window began with price sitting on the strike, inside
+the rejection threshold. A clean one-way move therefore scored exactly **1**
+rejection: its own departure. Reaching 2 required the move to have wobbled back
+toward the strike.
+
+The deployed gate asked for `>= 2`, so it refused the cleanest setups. Over
+19,305 brti-2 corpus points the refused bucket led on every measure:
+
+    distance   8.33  against  4.58
+    held        241s against   212s
+    momentum     6.3 against    3.2
+    win rate   75.6% against  66.9%
+
+with `corr(rejections, distance) = -0.319`. Widening to 2,700s moves the median
+rejection count from 1 to 2, so the same threshold now asks the question its name
+implies: did price approach this level and get turned back.
+
+This is also the operator's correction that started it - a clear winning setup
+was refused, and "how far back do we look" turned out to be the whole defect.
+
+### What it invalidated, and what is still deployed on the old meaning
+
+Every threshold fitted under brti-2 describes a quantity that no longer exists.
+`feature_contract.py` states this and the five live policies refuse to load and
+refit, which is the intended behaviour.
+
+**BTC and ETH still carry brti-2-era level thresholds.** Both configs were
+untouched by the 2026-09-25 work and still deploy:
+
+    "min_brti_accel": -5.0
+    "min_brti_held_s": 120.0
+    "min_brti_rejections": 2
+
+Those gates now read the 45-minute quantity. Their live admission behaviour
+therefore changed the moment `brti.py` shipped, without either config or this
+file recording it. On 5,547 brti-2 points the same three gates measured: the
+rejection gate costs 69% of volume for nothing, `accel >= -5` refuses its own
+better bucket, and `held >= 120s` binds on 9 of 5,547. Re-measuring them on a
+brti-4 BTC corpus and deciding whether to keep, widen or retire them is an OPEN
+ITEM and the operator's call; nothing here changes BTC or ETH.
+
+### Two entry windows, and only their intersection runs
+
+Also found by the audit. Entry is gated twice and independently:
+
+    settings.entry_from_seconds / entry_to_seconds   660 / 360, the defaults,
+        which NO launcher or .env overrides - checked in main.py before the rule
+        is consulted at all;
+    the rule's own entry_from_seconds / entry_to_seconds, from the strategy JSON
+        - checked again in kalshi_signal.py and kalshi_brti.py.
+
+So SOL's config said 800-250s while the service could only ever act between 660s
+and 360s, and gold's and silver's said 700-400s.
+
+**The fits are unaffected and behaviour is unchanged.** The corpora hold decision
+points at 360, 420, 480, 540, 600 and 660 seconds only, so gold's and silver's
+700-400 selected exactly `{420..660}` - which is what live ran - and SOL's
+800-250 selected exactly `{360..660}`, likewise. The three configs are narrowed
+to 660-420, 660-420 and 660-360: the same decision minutes, now stated honestly.
+
+What that removes is a trap rather than a bug. Had the Settings window later been
+widened, SOL would have begun trading at 780, 720, 300 and 250 seconds - none of
+which any corpus point covers, so none of which was ever measured. It also means
+the window rungs in `fit_instrument_config.py`'s ladder were never
+distinguishable on this data, and the script's comment claiming a 780..120s grid
+was wrong.
+
+### Measuring it again exposed a stale denominator
+
+With the window applied, the guard test's base is the points the rule can
+actually take. Gold and silver had been scored against a base that included the
+360-second rows their window excludes:
+
+    GOLD    318/1745 = 18.2%  244W-74L  76.7%  residual +0.0728
+    SILVER  233/1485 = 15.7%  185W-48L  79.4%  residual +0.0673
+    SOL    1308/6396 = 20.5%  962W-346L 73.5%  residual +0.0173
+
+SOL is unchanged to the contract, as predicted, because its window includes 360.
+
+### 77a. A six-lens audit of the uncommitted diff, and what it found (2026-09-25)
+
+Before pushing 67 changed files touching live trading code, six independent
+review passes ran over the working tree — secrets, live-behaviour risk, test
+integrity, knowledge capture, internal consistency, loose ends — each reporting
+only defects it could point at in the content. **59 findings: 6 blocker, 26
+important, 27 minor.** The adversarial verification stage was stopped after the
+audit phase: the material findings were verified first-hand instead, and ~120
+verifier agents on prose inconsistencies was not a good trade. So the triage
+below is mine, not a panel's, and is marked as such.
+
+The audit earned its keep twice over. It found a defect introduced by the very
+feature that was meant to prevent false alarms, and it found that the session's
+largest behavioural change was undocumented (now FINDINGS 77).
+
+### Fixed before the commit
+
+**The weekend closure ended in a false outage alert.** `venue_closed_gap_s`
+decides whether a gap IS a closure; it was also applied on every later poll, so
+once the reopen came within 30 minutes the closure lapsed and the outage path
+reported the whole 48-hour weekend as "NO MARKET AT THE EXCHANGE". That would
+have fired this Sunday on both metals — the exact alert-fatigue the feature was
+built to avoid. A closure now ends when the market opens, and past the expected
+reopen with no market it becomes a genuine outage again. Two tests pin both ends.
+
+**A test opened the LIVE gold database read-write.** `Store(ROOT / "gold15.db")`
+runs the store's schema DDL, so running the suite mutated a production trading
+database of a running service — and the suite was run many times on 2026-09-25
+with all five instances up. It also asserted `settled > 0` on live rows, so its
+verdict depended on how trading was going, and it passed by `return` whenever the
+file was absent. Rewritten against a temporary database with rows from two
+series, which pins the same scoping property and fails if scoping is removed. No
+other test touches a live database.
+
+**The banner could announce AUTO TRADING ON when execution was impossible.** It
+read the stored flag alone — the same unchecked-claim shape it had just replaced,
+in the other direction. It now names what is missing instead.
+
+**Two entry windows, only the intersection running** (FINDINGS 77), plus a guard
+that no config may advertise a window wider than the service's.
+
+**Per-instance credential files were ignored by name, not by pattern.**
+`.gitignore` listed `.env.eth` individually, so `.env.gold`, `.env.silver` and
+`.env.sol` were uncovered — the same shape of gap that leaked the credentials
+originally. Now `.env.*` with `!.env.example`.
+
+**Three stale statements** repaired: the test-config docstring still said SOL ran
+with automation off, the gold test quoted the superseded fit and asserted a band
+"entirely BELOW" BTC's when 0.60-0.80 overlaps 0.70-0.93, and the frozen contract
+named brti-3 while being brti-4.
+
+### Open, recorded rather than fixed
+
+**The shared-account exposure scope is inconsistent, and it touches a capital
+guard.** Three findings converge here: `_scoped_open` scopes by "is this a
+recognised instrument" rather than by this instance's series, so on one account
+each instance still counts the other four; `open_mark_detail` is still written
+from the unfiltered `per_ticker`, so the operator-facing "Open position" figure
+remains account-wide; and narrowing the `open_mark` row loosens the recovery
+add's held-exposure guard, which reads it. FINDINGS 70 said that row must stay
+account-wide. This is real money and a guard rather than a display, so it is not
+being changed in the same breath as a push — it is the next thing to do.
+
+**A transient fetch failure can lose a settlement margin permanently.** A failed
+settlement-facts fetch still marks the row as fetched with NULL strike and value,
+so that market's margin is unrecoverable, and the comment claims the flag means
+Kalshi published neither number.
+
+**"Intelligence NOT acting" will appear on every gold, silver and SOL alert** in
+their documented normal state — a line written as the exception becoming
+permanent furniture, which is the message-clarity failure the operator has
+objected to before.
+
+**`strategy_version` hashes `strategy.json`, not the per-instrument config**, so
+all five instruments share one digest and the refit of three configs does not
+change what stamps their decisions.
+
+**The metals launchers are gold's launcher copied**, so silver's and SOL's
+headers assert gold's measured residual and an exposure arithmetic that does not
+match what they set — on the one instance trading with no edge at all. The
+five-instance aggregate daily floor is $47 and is recorded nowhere.
+
+**Smaller, all confirmed:** the closure comment says 48 hours where the setting
+and its test say 53; FINDINGS 75c says four instances are in approval mode where
+75d's table shows two; `check_recent_window.py` cannot run for BTC;
+`measure_corpus_flow.py` hardcodes the project root; `fetch_trades.py` still
+defaults to the 1 GB truncated corpus that produced withdrawn finding 67; the
+four new watchdogs share one bot token and the watchdog's alert names no
+instance, so a give-up alert cannot be attributed; `tune_*.py` remain superseded
+but are now marked.
+
+**What the audit cleared.** `gate_binds` is decision-neutral — a gate whose
+threshold nothing can fail always passes, so excluding it from the count cannot
+change a qualification, verified independently against every caller. All five
+configs load with no unknown key. No secret is in the commit.
+
+## 78. The loss step waits for a 0.70-0.79 ask (2026-09-25)
+
+Operator instruction, shipped as instructed: "the recovery after a loss does not
+need to be triggered automatically, as we will make it wait for the best
+opportunity ... around the 70 to 79 range ... meaning recovery can happen 3 to 5
+trades later when the best opportunity presents itself, so that we are not making
+20 cent profit on a recovery trade where normal sizing can offer the same on a
+better opportunity."
+
+### What changed
+
+The upsize no longer fires on whatever trade comes next after a loss. It arms,
+waits for an ask inside 0.70-0.79, and fires there — which may be several markets
+later. Three bounds stop a wait becoming a standing upsize:
+
+* it expires unspent after `loss_step_wait_markets` (5) settled markets;
+* it fires ONCE per losing episode, and "already spent" is READ off
+  `trade_proposals` rather than trusted to a flag, so an order that failed after
+  a flag was written cannot hide it;
+* the budget never escalates — a second loss re-arms at the same $2.
+
+The arming loss and the count of markets since it both come from
+`Store.settled_bot_markets`, which is the same join, fee handling and early-exit
+arithmetic as `last_market_lost`. That is deliberate: a second, slightly
+different notion of "the bot lost" beside the reconciled one is how the
+2026-09-24 defect happened, where the operator's own 10-contract manual fills in
+the same market moved a figure meant to describe the bot.
+
+### The payoff reasoning is right, and it is not the whole calculation
+
+The operator's arithmetic is exact: the extra contract wins `1 - ask` and loses
+`ask`, so at 0.90 it risks 90c to make 10c and at 0.75 it risks 75c to make 25c.
+Spending the step at the top of the band earns about 20c, which base size would
+have earned anyway at a better price.
+
+What that reasoning leaves out is that expected value per extra contract is
+
+    p * (1 - ask) - (1 - p) * ask  =  p - ask
+
+which is the calibration residual itself. **The payoff ratio cancels.** So "where
+does an extra contract pay most" and "where is the market most mispriced" are the
+same question, and 25c at 0.75 beats 10c at 0.90 only if the win rate fails to
+make up the difference. On BTC it does not. Measured on 7,139 priced brti-4
+decision points over 64 days, ungated:
+
+| band | win% | per contract | 95% CI | per dollar |
+|---|---|---|---|---|
+| 0.70-0.75 | 73.1% | +0.0104 | [-0.0253, +0.0446] | +0.0138 |
+| 0.75-0.80 | 76.5% | -0.0053 | [-0.0518, +0.0407] | -0.0067 |
+| 0.80-0.85 | 81.4% | -0.0051 | [-0.0413, +0.0312] | -0.0063 |
+| 0.85-0.90 | 89.4% | +0.0242 | [-0.0076, +0.0533] | +0.0284 |
+| 0.90-0.93 | 94.1% | **+0.0240** | **[+0.0009, +0.0437]** | +0.0261 |
+
+    in 0.70-0.79   +0.0026 per contract, 21.7% of setups
+    outside        +0.0159 [+0.0004, +0.0315]
+
+On that population the chosen band is where the extra contract earns **least**,
+and the only cell whose interval clears zero is 0.90-0.93 — the one the
+instruction singles out as not worth taking.
+
+### Why that table is suggestive and not decisive
+
+It is UNGATED. The step only ever sizes a trade that has already passed every
+gate; it never causes one. The population that decides the question is therefore
+the qualifying subset, and the gates select on distance, momentum and level
+behaviour, all of which correlate with price. That measurement could not be made:
+BTC's deployed floors are brti-2-era and admit too few brti-4 points to score
+(FINDINGS 77 records that those thresholds are themselves now measuring a
+different quantity). So the honest position is that the band is unmeasured where
+it matters and contradicted where it could be measured.
+
+The operator decided with that in view and instructed it be shipped. Sizing is
+theirs, and it is implemented in full, with the interval above recorded so the
+decision can be revisited against live results rather than re-argued.
+
+### What it also fixed
+
+Two defects found while implementing, both introduced by the change itself and
+caught before shipping.
+
+**An early cut returned base size whenever the last market had won**, which
+killed the feature outright: the win rate is about 3 in 4, so the market after a
+loss usually wins, and the armed step has to survive exactly that. Every other
+test still passed. `test_it_survives_a_win_and_fires_later` now pins it.
+
+**The add-on stood down on the wrong condition.** It keyed on "did the last
+market lose", which was the same thing while the step fired immediately. Now the
+step usually waits, so that would have stood the add-on down for an upsize that
+never happened — removing one mechanism without engaging the other. It keys on
+the step actually firing.
+
+Both RECOVERY ARMED messages said "the next entry is sized to $X; a win resets
+it". Neither half is true any more, and they now state the band, the wait and
+that a win no longer resets it.
+
+## 79. XRP backtested and shipped as a shadow: no edge, and the first clean corpus (2026-09-26)
+
+Operator instruction: backtest XRP and implement it in the shadow. Both done.
+`KXXRP15M` exists with the same shape as the rest - `floor_strike` present,
+`/live_data/events/...` serving the per-second reference - so the whole pipeline
+applied unchanged.
+
+### What was built
+
+    4,262 settled markets      2026-08-12 .. 2026-09-26, 45 days, 67,992 candles
+    6,390 decision points      1,065 markets, stride 4
+    5,713 carry brti_retrace   89% of them
+
+**XRP is the first instrument fitted with all fourteen live gates visible.**
+`brti_retrace` and `brti_choppiness` were computed by
+`features_from_series` and then discarded by the backfill until 2026-09-25, so
+every earlier fit - BTC, ETH, gold, silver, SOL - scored candidate sets as though
+those two gates were absent while live enforced them (FINDINGS 75). XRP's corpus
+was built after that repair, so nothing here is fitted blind to a live gate.
+
+### The backtest says there is no edge
+
+    UNGATED   n=6,335   win 75.3%   mean ask 0.740   residual +0.0130 [-0.0064, +0.0324]
+
+That interval spans zero: over 46 days the market prices these contracts about
+right. Of **19,440 complete candidate gate sets**, 673 cleared the 15% volume
+floor AND the ungated baseline, and **not one reached tier A or tier B** - none
+demonstrably beat taking everything. The best:
+
+    price 0.55-0.90, gap 0-25bp, mom<=40, |accel|<=25, held>=30s, rej>=2,
+    window 660-420s, retrace <=0.60 AND required
+
+    n=1,458 (23.0% of points), 664 markets, win 76.7% at 0.741
+    residual      +0.0257 [-0.0029, +0.0537]   spans zero
+    vs ungated    +0.0127 [-0.0083, +0.0350]   does not show
+    first half    +0.0102 spans zero
+    second half   +0.0390 spans zero
+
+This is SOL's shape, not gold's: SOL ungated +0.0013, gold +0.0346. Under the
+real rule in-window it admits 27.4% - 1118W-340L, 76.7% at a 0.741 ask - against
+a blocked group winning 73.8%. Better than what it refuses, and not by enough to
+call an edge.
+
+Marginally nothing rescues it. No price bucket clears zero (0.55-0.65 reads
+-0.0004, 0.65-0.75 +0.0191 spanning zero), and the search was offered six
+narrower distance bands including gold's 1.5-6.0 and silver's 0.5-12.0 and
+preferred **none** of them - distance does not separate on XRP.
+
+### One genuinely new thing: the fit asked for retrace
+
+XRP's search chose `max_brti_retrace: 0.60` **and**
+`require_measurable_retrace: true`. Gold, silver and SOL all preferred `false`,
+on the reasoning that a window with no advance to give back is the target state
+on a level-maintenance instrument. XRP wanted the opposite, at a cost of about
+11% of setups. Recorded as measured, not as understood - it is the first
+instrument that could express the preference at all, which is itself the argument
+for having fixed the corpus.
+
+### Shipped as a shadow, and what that means here
+
+Automation is OFF and the launcher says why in the file rather than in a
+changelog. It is not in `MIRROR_INSTANCES`, so it copies nothing to the mirror
+account. The instance exists to RECORD: live per-second reference data and a gate
+set admitting 23% of decision points, which no backtest can reconstruct because
+Kalshi serves no historical order-book depth - fill probability and queue
+position are only ever answerable from data this system archives itself.
+
+Arming it later takes two deliberate acts, `AUTO_TRADE_ENABLED=true` in the
+launcher and `auto_switch.py --db xrp15.db --on`, because the stored row wins
+over the .env default so a restart cannot arm it by itself.
+
+### Two defects from generating the launcher by copy
+
+Recorded because the audit had already flagged this exact failure for silver and
+SOL - both are run_gold.ps1 with names swapped, so both assert gold's measured
+residual for instruments their own configs deny. Copying SOL's launcher for XRP
+reproduced it and added two live ones:
+
+* **`AUTO_TRADE_ENABLED=true`** came across from SOL. XRP would have started
+  trading unattended on an instrument with no measured edge, exactly against the
+  instruction to ship it in the shadow.
+* **`CORPUS_MARKET_PATH`** became `market_data_kxxrp15m_new.db`, a file that does
+  not exist, because SOL's line names a `_new` database.
+
+Both fixed, and the prose rewritten to describe XRP. A launcher generated by
+substitution carries the previous instrument's evidence, and evidence attached to
+the wrong instrument is worse than none.
+
+## 80. Kalshi does not price combos at the product, and the venue decides the edge
+
+Every combo script here was built on one premise: that the exchange prices a
+multi-leg combo as the PRODUCT of its legs - the independence assumption - so a
+same-direction combo on correlated assets is structurally underpriced. That
+premise is FALSE for the quoted path, and measuring it was only possible because
+the operator sent screenshots of the app's own buy ticket.
+
+Read off those screens, and cross-checked against live RFQ quotes:
+
+    legs                product   copula   app price   vs product   vs copula
+    0.63 0.62 0.74 up    0.2890   0.4732     0.5426       1.88x        1.15x
+    0.60 0.55 0.68 up    0.2244   0.4132     0.5435       2.42x        1.32x
+    0.61 0.62 0.82 up    0.3101   0.4798     0.5435       1.75x        1.13x
+
+The app charges 1.75-2.42x the product. Kalshi ALREADY prices the correlation
+and adds 13-32% on top. There is no independence mispricing to harvest there.
+
+BUT THE ORDERBOOK IS A DIFFERENT VENUE AND PRICES NEAR THE PRODUCT. A resting
+bid on a combo's own book filled at 0.0500 where the product was 0.0456 and the
+copula said 0.1219 - 41% of fair value, against the app's 113-132%. Same
+instrument, same minute, opposite side of the edge. WHERE you buy decides
+whether a combo is cheap or dear. That is the finding.
+
+The 40,578-point correlation measurement is untouched by this: it is a statement
+about the ASSETS (all five settle alike 45.4% where the product implies 19.3%),
+not about Kalshi's pricing. What was wrong was the inference from it to a
+tradeable edge on the quoted path.
+
+## 81. The combo RFQ API works; three details make it 404, and one makes it lie
+
+The documented flow (POST /communications/rfqs, quotes over the authenticated
+websocket, accept, verify fills) is real and reachable with our key. It 404s
+until all three of these are right:
+
+  * the combo MARKET must be created first, via
+    POST /multivariate_event_collections/KXMVECROSSCATEGORY-R, and its returned
+    `market_ticker` passed in the RFQ body. Without it: 404 not_found.
+  * the sizing field must sit at the TOP level. Nested inside an `rfq` wrapper
+    the server replies "Either contracts/contracts_fp or target_cost_dollars
+    must be provided" while ignoring the one you sent.
+  * a second RFQ on the same combo market returns 409 already_exists.
+
+Quotes come back on GET /communications/quotes?rfq_creator_user_id=<own id>;
+the id is on any row of /portfolio/orders. REST polling reaches the same rows as
+the websocket and needs no new dependency in a live money process.
+
+AND THE PRICE FIELD LIES IF READ NAIVELY. A quote carries `yes_bid_dollars` and
+`no_bid_dollars`: they are the maker's BIDS, what they would pay US. Buying
+costs `1 - no_bid`. Reading yes_bid as the purchase price made every combo shape
+look like it cost 1.5-2.2 cents. Checked arithmetically against a real fill on
+this account: quote no_bid 0.4750 -> 0.5250 a contract, 1.84 contracts filled
+for $0.97 = 0.527 each.
+
+ACCEPTANCE IS NOT A FILL. Of 8 accepted quotes on this account 6 confirmed and 2
+went to status `cancelled` - the maker has ~3 seconds. Read the fill, not the
+acceptance.
+
+## 82. Makers ignore most combo RFQs, and the shape of the ask decides it
+
+415 RFQs on this account, 10 ever quoted - 2.4%. The pattern is not random:
+
+    sized by contracts 4.44    3/5   60% quoted      2 legs    0/137   0%
+    sized by contracts 1.84    3/6   50%             3 legs    8/157   5%
+    sized by contracts 1111    0/37   0%             4-9 legs  0/30    0%
+    target_cost_dollars $2     0/5    0%
+    target_cost_dollars $5     0/1    0%
+    target_cost_dollars $11    0/2    0%
+
+A `target_cost_dollars` RFQ - the dollar box in the app - has never once been
+quoted here, and neither has a two-leg combo. Ask by small contract count, on
+three legs.
+
+## 83. The combo markup is not uniform, so every quote needs pricing
+
+One window, BTC+ETH+ZEC, all eight shapes quoted at once, quote against the
+fitted copula:
+
+    shape                    product   copula    payout   quoted   quote/fair
+    ALL UP                    0.7795   0.8397      1.3x   0.8720      1.04x
+    one opposite (ETH up)     0.0788   0.0316     12.7x   0.0320      1.01x
+    one opposite (BTC up)     0.0124   0.0236     80.7x   0.0260      1.10x
+    one opposite (BTC down)   0.0409   0.0126     24.4x   0.0610      4.83x
+    one opposite (ETH down)   0.0064   0.0105    155.3x   0.0530      5.03x
+    ALL DOWN                  0.0007   0.0187   1536.1x   0.0390      2.09x
+
+Same window, same legs: some quotes come back at 1.01-1.10x fair value and
+others at 3.6-5.0x. So the trade is never "buy this shape" - it is "buy this
+shape only when the quote prices near fair", which requires the model on every
+quote. combo_rfq.py refuses anything that fails --min-edge.
+
+## 84. A combo's return comes from the co-move, not from the payout ratio
+
+The operator's $1.00 all-up BTC+ETH+ZEC combo, bought when the legs were
+60/55/68, was worth $1.77 nine minutes later at 99.7/99.1/99 - up 78%, against a
+max payout of only 1.84x. The profit was not leverage in the payout sense; the
+combo simply repriced from 0.5435 to ~0.96 of max as the legs converged.
+
+Because a combo is a PRODUCT of its legs, a modest co-move in three of them is a
+large percentage move in the combo. That is the amplifier, and it is the one
+this system is actually equipped to exploit, since what it predicts is direction
+in the closing minutes.
+
+It also puts the markup in proportion: that entry was 1.32x fair value and still
+returned 78%, because a correct directional read on three correlated legs swamps
+a 32% entry cost. The markup is a drag, not a disqualifier - and worth avoiding
+via the orderbook where the trade allows it.
+
+Leverage in the PAYOUT sense does need an opposite leg, as the operator said:
+all-up pays 1.3x, one-opposite pays 8-241x. Those are different trades. The
+all-up trade wants a directional call and an early exit; the one-opposite trade
+wants a cheap quote and is a lottery ticket.
+
+## 85. Live combo record so far: six settled, six losses, and why that is not the whole story
+
+Read from the broker, not reconstructed: five combos executed through the RFQ
+path on this account and one bought by resting a bid, all settled for $0 against
+roughly $4.67 staked. That record is real and is the reason none of the above is
+being wired into an automated strategy yet.
+
+But the six are not one experiment. The five RFQ fills were bought at 1.13-1.32x
+fair value and held to expiry - structurally losing trades. The resting-bid fill
+was bought at 0.41x fair value on a 12% event that did not happen - a correctly
+priced trade that lost, which is what most correctly priced 12% trades do. And
+the operator's own all-up combo, cashed out rather than held, returned +78%.
+
+Entry price, venue and exit discipline separate these, and a six-trade tally
+that ignores all three teaches nothing. What it does justify: no automation
+until a measured sample exists, sized at $1, with every entry priced against the
+model and the exit taken on the move rather than at expiry.
+
+## 86. Kalshi's combo markup is real: it prices 3-leg baskets at rho 0.92 where reality is 0.69
+
+Section 80 established that the exchange does not price a combo at the product of
+its legs. Backing a one-factor copula out of its prices says WHAT it does charge:
+
+    3-leg baskets    implied rho  0.9176
+    8-leg baskets    implied rho  0.7155
+    fitted from settlement history          0.6944
+
+Two readings fit those numbers equally well from prices alone. Either Kalshi
+overcharges correlation on small baskets, or OUR rho is too low and the apparent
+markup is our own model error showing up wherever rho has the most leverage -
+which is exactly at few legs and mid-range probabilities. Prices cannot separate
+them. Outcomes can.
+
+THE TEST (scripts/test_which_rho.py). For all 40,578 (window, minute) points
+where BTC, ETH, SOL, XRP and NEAR were quoted at once, take each asset's own
+quoted probability, form all 26 subsets of size 2-5, predict P(all settle up) at
+a range of rho, and score against what happened. 1,055,028 predictions per rho.
+Scored by calibration error and by log-likelihood, which is a proper scoring rule
+and so cannot be gamed by a model that gets the average right and every case
+wrong.
+
+         rho      k=2      k=3      k=4      k=5   overall       logLik
+      0.6944   0.0122   0.0126   0.0097   0.0062    0.0102      -502494  ours
+      0.7500   0.0112   0.0158   0.0182   0.0213    0.0166      -503151
+      0.8500   0.0244   0.0372   0.0456   0.0514    0.0397      -506744
+      0.9176   0.0362   0.0551   0.0670   0.0752    0.0584      -511583  Kalshi
+
+rho = 0.6944 wins on both criteria, by 9,089 nats of log-likelihood over 0.9176.
+
+WHY THIS IS NOT CIRCULAR. The original rho was fitted to the FIVE-asset all-agree
+frequency and nothing else. The k=2, k=3 and k=4 columns are out of sample, and
+0.6944 wins every one of them. It is also scored at real mid-window quoted
+prices, which is where a combo is actually bought, not at the ~50% marginals of a
+window's open.
+
+WHAT IT MEANS FOR MONEY, measured on today's three entry styles:
+
+    style                legs    fair    paid   paid/fair   EV hold
+    early 3-leg ~60%        3  0.4132  0.5435      1.32x    -24.0%
+    late  6-leg >=85%       6  0.7470  0.7795      1.04x     -4.2%
+    early 8-leg ~80%        8  0.5104  0.5025      0.98x     +1.6%
+
+The firm, actionable result is the NEGATIVE one: a 3-leg combo bought at
+mid-range leg probabilities carries a ~30% markup and is a losing trade before
+anything else happens. The +1.6% on the 8-leg is inside noise and carries brutal
+variance - on the very window this was measured, NEAR went 82% to 9% and turned a
+$1.99 payout into a 17c expectation. No shape tested shows a reliable edge.
+
+## 87. RETRACTION of #86: the leg-count edge is refuted, and the rho it rested on was wrong
+
+Section 86 claimed Kalshi prices 3-leg combos at rho 0.92 where reality is 0.69,
+making them a ~30% markup, and that larger baskets are priced near fair. An
+adversarial review and two follow-up measurements killed it. Both defects are in
+OUR work, not the exchange's.
+
+DEFECT 1 - THE SAMPLE WAS COUNTED ELEVEN TIMES. The "40,578 aligned points" are
+3,788 distinct WINDOWS contributing ~11 rows each, at minutes 1..14 before the
+same close. Every row in a window shares ONE settlement outcome, so they are not
+independent observations. The 9,089-nat log-likelihood gap quoted in #86 is
+inflated about 11x; honestly it is ~800 nats. That still separates a pooled rho,
+but it is an order of magnitude less evidence than was claimed.
+
+DEFECT 2 - THE POOLED RHO IS WRONG, AND A POOLED RHO IS THE WRONG OBJECT. Fitted
+by maximum likelihood on the 3,788 INDEPENDENT windows, the all-5 rho is 0.8070,
+not the 0.6944 obtained by matching an all-agree frequency on the over-counted
+rows. And the pairwise values are nothing like equicorrelated:
+
+    SOL+XRP  0.9700     BTC+XRP  0.6986     SOL+NEAR  0.4171
+    BTC+SOL  0.7862     ETH+SOL  0.6509     XRP+NEAR  0.3424
+    BTC+ETH  0.7576                         ETH+NEAR  0.3044
+    ETH+XRP  0.7471                         BTC+NEAR  0.2582
+
+A spread of 0.71, which is 3.6x the entire 0.197 leg-count effect. A one-factor
+rho IS the average pairwise correlation, so walking a basket from 3 majors to 8
+names including weak alts can only DILUTE it. The leg-count gradient in implied
+rho is what an equicorrelated estimator produces when inverted against a
+heterogeneous truth - it appears even when every basket is priced exactly fairly.
+
+RE-MARKED AT THE CORRECTED RHO, the trade disappears:
+
+    basket                paid   fair@.6944  ratio   fair@.8070  ratio
+    3-leg BTC+ETH+ZEC   0.5435      0.4132   1.32x       0.4522   1.20x
+    3-leg 11:19 picks   0.5426      0.4732   1.15x       0.5108   1.06x
+    6-leg late >=85%    0.7795      0.7470   1.04x       0.7788   1.00x
+    8-leg all-up        0.5025      0.5104   0.98x       0.5714   0.88x
+
+The 8-leg lands at 0.88x fair - the exchange selling below fair value, which it
+does not do. That impossibility is the tell: the model, not the venue, is wrong.
+
+WHAT ACTUALLY MOVES THE EDGE, all measured without a copula:
+
+  * VENUE, about 3x. The combo's own orderbook filled at 0.41x fair in the same
+    minute the app path charged 1.13-1.32x (#80). Nothing else comes close.
+  * PER-QUOTE VARIANCE, about 5x. Same window, same three assets, all eight
+    shapes quoted at once: quote/fair ran 1.01x to 5.03x (#83). That swamps any
+    leg-count term by 25x.
+  * EXECUTABILITY. 4-9 leg combos have been quoted 0 of 30 times by RFQ (#82), so
+    "buy more legs" is only available on the app - the expensive venue.
+
+Leg count allegedly moves it 1.1x. It is not the variable.
+
+WHAT WOULD SETTLE IT, if it is ever worth revisiting: a NESTED ladder. In each of
+>=30 independent windows, at ONE timestamp, quote {A,B}, {A,B,C}, {A,B,C,D},
+{A,B,C,D,E} built from the SAME ordered legs drawn only from corpus-covered
+assets, recording each leg's individual ask (not just the product) and both sides
+of the combo quote. Nesting is the only design in which leg count is the only
+thing that changes, so composition and price level can no longer travel with it.
+Paired sign test within window. Anything less repeats this mistake.
+
+METHOD NOTE FOR NEXT TIME. The error that produced #86 was scoring a model on
+rows rather than on independent events, then reading a large likelihood gap as
+strong evidence. Count the events before quoting the evidence.
+
+## 88. Our own signals, taken as combos: the edge multiplies 3-6x, and the venue decides whether you keep it
+
+Every earlier combo test here priced arbitrary baskets - all-up, one-opposite,
+eight legs of whatever the app happened to show - and each was a bet on
+correlation alone. But this system does not sell correlation. It sells a measured
+entry edge on setups its gates admit. The operator's instruction was to use the
+exact signal, from trigger to settlement, and treat simultaneous ones as a combo.
+
+THE SIGNAL IS NOT REIMPLEMENTED. scripts/signal_combo.py builds the real
+`KalshiBRTIRule` from each deployed strategy_kalshi_*.json and calls the live
+`check_facts`, then applies the same entry-window test as
+`kalshi_signal.evaluate`. One signal per window per asset - the FIRST qualifying
+decision point, which is what the live loop takes. Counting later points in the
+same window is the row-counting error that produced the retracted #86.
+
+    asset  signals  days   win    mean ask   residual
+    BTC        993    68  85.3%      0.826    +0.0271   *
+    ETH       3320    68  84.2%      0.831    +0.0111   *
+    SOL       1096    68  71.5%      0.688    +0.0277
+    XRP        664    46  72.7%      0.713    +0.0140
+    NEAR       483    46  69.8%      0.663    +0.0346
+
+    * RETRACE GATE HELD OPEN. The BTC and ETH corpora have no `brti_retrace`
+      column at all, and both configs leave `require_measurable_retrace` unset
+      so the dataclass default True applies: the live rule demands a field the
+      archive never stored, and every archived row is correctly refused. Those
+      two are therefore NOT the deployed rule and are labelled everywhere.
+
+COMPARED ON RETURN PER DOLLAR STAKED, which is the only fair comparison - a
+combo contract costs the PRODUCT of the legs' asks while one contract of each
+leg costs the SUM, so a per-contract comparison flatters the combo for being
+cheaper. Paired within the same windows, day-clustered bootstrap, and
+Holm-Bonferroni at FWER 0.05 across all 16 baskets:
+
+    basket           n   all-win   cost  combo ROI  singles     diff        b/e  ret/risk
+    BTC+ETH+XRP     87     77.0%  0.509     +52.6%    +8.1%   +44.5%      1.51x  0.60/0.22  HOLM
+    BTC+ETH+SOL    142     66.9%  0.473     +41.6%    +4.7%   +36.9%      1.41x  0.40/0.12  HOLM
+    ETH+SOL        544     71.0%  0.571     +24.9%    +6.7%   +18.2%      1.24x  0.30/0.15  HOLM
+    BTC+XRP        112     73.2%  0.601     +20.5%    +6.8%   +13.7%      1.22x  0.27/0.18  HOLM
+    ETH+XRP        327     71.6%  0.605     +18.3%    +4.9%   +13.5%      1.18x  0.24/0.12  HOLM
+    BTC+ETH        714     79.6%  0.683     +17.2%    +4.1%   +13.1%      1.17x  0.28/0.11  HOLM
+
+Six of sixteen survive Holm. The combo multiplies return per dollar by 3-6x, and
+- the part that matters - RETURN PER UNIT OF RISK improves too, in every
+surviving basket. So this is not merely leverage buying variance.
+
+AND THE VENUE DECIDES WHETHER ANY OF IT IS KEPT. `b/e` is the most you can pay,
+as a multiple of the product, before the edge is gone: 1.17-1.24x on two legs,
+1.37-1.51x on three. Against that:
+
+  * the combo ORDERBOOK quotes near the product. A resting bid filled at 0.0500
+    against a product of 0.0456 - 1.10x - which is inside break-even for every
+    surviving basket.
+  * the app/RFQ path charges 1.75-2.42x the product (#80, #87). That is ABOVE
+    break-even for all six. Bought there, every one of these is a losing trade
+    even with the signal edge intact.
+
+So the strategy is: wait for two or three deployed signals in the SAME window,
+build the combo on exactly those legs, and rest a bid at no more than ~1.15x the
+product for two legs or ~1.35x for three. Never take the app quote.
+
+WHAT IS NOT ESTABLISHED. Five of the six surviving baskets contain BTC or ETH,
+whose rule was relaxed to run at all. The only baskets using purely deployed
+rules - SOL+XRP, NEAR+SOL, and the SOL/XRP/NEAR triples - did NOT survive. Until
+BTC and ETH archive `brti_retrace`, this is a strong hypothesis on a relaxed
+rule, not a measured result on the shipped one. The fix is to start recording
+retrace for BTC and ETH and re-run in a few weeks, which costs nothing.
+
+Co-occurrence is also rarer than the single-leg rate suggests: BTC+ETH fires
+together ~10 times a day, the three-leg baskets 1-2. Sizing has to account for a
+combo appearing in a minority of windows.
+
+## 89. The alerts we actually SENT, taken as combos - and why only one basket can be tested
+
+Section 88 answered the combo question by REPLAYING the deployed rule over the
+feature archive. The operator's correction was exact: use the signals that were
+already generated, the same ones that arrive on Telegram. That is a different
+and better question, and it is what `scripts/alert_combo.py` reads.
+
+WHERE THE REAL SIGNAL LIVES. Each instance's store carries an `observations` row
+per poll, and `alerted = 1` marks the window where the Telegram alert went out.
+The alert fires ONCE per window, at the first qualifying poll, and main.py
+records the snapshot at alert time deliberately - "so the stored contract price
+is the one the alert actually quoted". The first alerted row in a window IS the
+signal that reached the phone.
+
+THE ALERTS, as sent:
+
+    asset  alerts  days   win    mean ask   residual
+    BTC       492     6  76.0%      0.724    +0.0361
+    ETH       197     3  74.1%      0.737    +0.0039
+    SOL       106     2  75.5%      0.743    +0.0120
+    XRP        27     1  74.1%      0.743    -0.0019
+    NEAR       16     1  50.0%      0.745    -0.2450
+    GOLD       72     1  76.4%      0.729    +0.0352
+    SILVER     22     1  77.3%      0.734    +0.0383
+
+These win rates are LOWER than the replay's 82-85% and the asks are lower too,
+and that is correct rather than a discrepancy: the alert fires at the first
+qualifying poll, "typically while the price is still walking up through the 60s
+and 70s", so it quotes an earlier, cheaper, less certain setup than the one the
+trading path later takes. The alert and the trade are not the same event.
+
+ONLY ONE BASKET HAS ENOUGH HISTORY TO TEST.
+
+    basket         n  days  all-win   cost  combo ROI  singles    diff        b/e
+    BTC+ETH      195     3    60.5%  0.537     +11.7%   +1.2%  +10.5%      1.13x
+                                                  [+9.8%, +11.5%]
+
+Everything else spans one or two days. A day-clustered bootstrap over a single
+day resamples that same day on every draw, so its interval collapses to a POINT
+- rows like [+26.5%, +26.5%] - and its p-value floors at 1/draws. A first pass
+reported "26 of 26 baskets survive Holm-Bonferroni", which was an artifact of
+exactly this: zero uncertainty where there should be almost none available. The
+script now marks anything under three days UNTESTABLE and excludes it from the
+Holm family. A collapsed interval is a symptom of no data, never a strong result.
+
+WHAT BTC+ETH SAYS, and what it does not. Taking both legs as a combo turns
++1.2% per dollar into +11.7% per dollar on the same 195 windows. The direction
+matches the 68-day replay in #88, which is mild corroboration from an
+independent construction. But three days is three clusters, and three clusters
+is not a result.
+
+AND THE VENUE STILL DECIDES. Break-even is 1.13x the product of the legs' asks.
+The combo orderbook filled a resting bid at 1.10x (#80) - inside, by three
+points. The app/RFQ path charges 1.75-2.42x - far outside. So even if this holds
+up, it is only executable by resting a bid on the combo's own book, and the
+margin for error there is about three percent.
+
+NEAR IS BLEEDING AND SHOULD BE LOOKED AT SEPARATELY: 16 alerts, 50.0% win
+against a 0.745 mean ask, a residual of -0.2450. One day and sixteen alerts is
+far too little to condemn it, but it is the only instrument whose alerts are
+underwater and it is worth watching rather than filing.
+
+WHAT WOULD MAKE THIS TESTABLE: nothing but time. The alert record starts
+2026-09-21 for BTC and later for everything else, and the fix is to re-run this
+script in two or three weeks, when the shared windows span enough days for the
+day-clustered interval to mean something. Nothing needs to be built.
+
+## 90. The intelligence is not learning because the feature contract keeps resetting its evidence
+
+The operator's observation: hundreds of alerts have been sent and the
+intelligence layer has promoted nothing. That is correct, and the cause is
+structural rather than a shortage of alerts.
+
+FOUR FEATURE CONTRACTS IN THREE DAYS. `learning_data` excludes any live decision
+whose `feature_version` is not the current one - deliberately, because a decision
+taken under different definitions describes a cell that does not exist under
+these. On BTC that discards 6,395 of 8,982 decisions, 71%:
+
+    brti-1   1756 rows   09-23 01:04 .. 09-23 18:38   0.7 days
+    brti-2   4566 rows   09-23 18:49 .. 09-25 17:23   1.9 days
+    brti-3     73 rows   09-25 17:34 .. 09-25 18:08   34 MINUTES
+    brti-4   2587 rows   09-25 18:19 .. 09-26 20:08   1.1 days
+
+Every instance was reset by the brti-4 change on 09-25 18:19, so the WHOLE
+system's live evidence is at most 1.1 days old:
+
+    asset   current era   qualified evidence   alerts in that era
+    BTC           1.1d                   32                  102
+    ETH           1.1d                   46                  101
+    SOL           1.1d                   65                  101
+    GOLD          1.1d                    8                   10
+    SILVER        1.1d                    0                   10
+    XRP           0.4d                   19                   33
+    NEAR          0.2d                    7                   22
+
+177 qualified signals across seven live instruments. Silver has ZERO and cannot
+learn anything at all. Meta-labelling was measured (FINDINGS 38) to need ~10,700
+qualified signals; at the current ~16/day on BTC that is 1.8 years, and the next
+feature change returns it to zero.
+
+THE ALERTS ARE NOT THE LEARNING UNIT, which is the other half of the gap. An
+alert fires once per window at the first poll above the manual floor; evidence
+requires a `base_qualified` decision with a graded outcome. Roughly 379 alerts in
+the current era yield 177 qualified rows. That ratio is expected and is not the
+problem - the 1.1-day horizon is.
+
+AND SEPARATELY, THE LEARNER IS BEHAVING CORRECTLY. Fitting is not starved: it
+trains on 6,562 rows because the corpus is backfilled to brti-4. Of 29 arms
+fitted, 9 eligible, 11 testable cells, 3 pass the confidence bar and 0 survive
+Holm-Bonferroni; 0 of 2 execution cells survive. The arms' own recorded reasons
+say why, and they are not the reasons of a broken system:
+
+    "cell does not point against the base decision"          (most arms)
+    "veto proposed; train -0.0043 and validate +0.0288
+     disagree in sign"                                        (the one that did)
+
+So most cells AGREE with the deployed gates - there is nothing for a confidence
+arm to add - and the single dissenting cell fails to replicate out of sample.
+That is an honest learner finding the hand-fitted gates already capture what is
+available. `baseline_accept` +0.0151 against `baseline_reject` -0.1211 is the
+same statement from the other side.
+
+TWO SEPARABLE CONCLUSIONS, and they need different responses:
+
+  * LIVE EVIDENCE CANNOT ACCUMULATE while the feature contract moves. This is
+    fixable and the fix is a decision, not code: FREEZE THE CONTRACT. Every
+    change costs the entire live evidence base, and brti-3 lived 34 minutes.
+  * NOTHING CONTRADICTS THE BASE RULE even on 6,562 corpus rows. Loosening the
+    promotion bars to make the learner "do something" would convert this honest
+    null into shipped noise, and must not be done.
+
+A COSMETIC DEFECT THAT MAKES THIS HARDER TO SEE: 18 activations are logged with
+reason "no regression on the validation slice (+0.0000)" while `new_pnl ==
+current_pnl` exactly and `new_changes` is 0. The system is activating identical
+fits, so the activation log reads like progress when nothing has changed. Worth
+suppressing an activation when the comparison is exactly zero, so the log only
+records real movement.
+
+## 91. The LLM is not in the learning loop because it was never wired to it
+
+The operator asked why the local model does not appear in learning, noting the
+full lifecycle is collected for exactly that purpose. Checked directly; four
+separate reasons, and none of them is a malfunction.
+
+  1. IT IS NOT RUNNING. `settings.brain_url` is `http://127.0.0.1:8080/v1` and
+     nothing listens there, nor on 11434 or 1234. The runtime and three models
+     are present at `D:\Kalshi\llm\` and simply not started.
+  2. ITS ONLY WIRING IS POST-ALERT COMMENTARY, AND THAT IS OFF.
+     `brain_commentary_enabled` defaults False, disabled 2026-09-21 because
+     "the entry alert now carries the checks, the context, the confidence
+     arithmetic and the similar-regime read, so a second message restated all
+     of it in prose."
+  3. IT HAS NO CONNECTION TO LEARNING AT ALL. `brain` appears nowhere in
+     `learning.py`, `learning_runner.py`, `learning_data.py`,
+     `intelligence.py`, `intelligence_policy.py` or `adaptive.py`. It is
+     imported once, in `main.py`, on the alert path.
+  4. IT IS ARCHITECTURALLY FORBIDDEN FROM DECIDING, by its own docstring:
+     "Python computes every number; the model only writes prose" and "It never
+     gates a trade... the trading path is bit-for-bit unchanged."
+
+So it was never part of learning. The RUNBOOK classifies it as "commentary
+only" and "additive", and that is exactly what it is.
+
+THE OPERATOR IS RIGHT THAT THE DATA IS THERE. Per instrument the store holds
+`observations` (60 columns, including book depth, order state, exit reason and
+realised P&L per poll), `decision_records` (41 columns), `decision_details`
+(the full rendered narrative per decision), `intelligence_decisions` (50
+columns), `realised_events`, `executions`, `fills` and `recovery_adds`. Nothing
+reads any of it for learning.
+
+WHERE A MODEL CAN LEGITIMATELY HELP, and it is a real gap rather than a
+courtesy. The statistical learner keys on distance x price x momentum, declared
+IN ADVANCE and deliberately so - FINDINGS notes the keying was fixed before
+fitting precisely to stop it being chosen on which partition lit up. The
+consequence is that the learner can only ever learn WITHIN that keying. It
+cannot notice a pattern nobody keyed for, because such a pattern has no cell to
+live in. That is a structural blind spot, and it is exactly what reading the
+lifecycle record can address.
+
+THE DIVISION THAT PRESERVES EVERY EXISTING GUARANTEE:
+
+    the model PROPOSES a hypothesis, as a machine-checkable filter over the
+    lifecycle record - never a number, never a decision
+
+    the EXISTING pipeline disposes: the proposal is compiled to a filter, run
+    over the corpus, and tested by nested out-of-sample calibration, the
+    day-clustered bootstrap and the multiplicity correction already in place
+
+    nothing is adopted on the model's say-so, and no proposal can reach an
+    order without clearing the same execution bar as any other cell
+
+That keeps "Python computes every number" intact - the model contributes a
+QUESTION, and the arithmetic answering it is the arithmetic already trusted. It
+also makes a wrong hypothesis free: it fails its test and is discarded, which
+is the same fate as any cell that does not replicate.
+
+WHAT IT CANNOT FIX. The feature-contract churn of FINDINGS 90 still governs how
+much live evidence exists to reason over. A model reading 1.1 days of lifecycle
+is reasoning over 1.1 days of lifecycle.
+
+## 92. Two ways a healthy system was made to look broken, and one real trap
+
+Both of these happened while deploying the evidence-bar change, and both are
+recorded because the mistake is cheaper to read than to repeat.
+
+A STALE PID FILE IS NOT A DEAD SERVICE. `runtime/service.pid` is written ONCE,
+at startup, so a service up for seventeen hours has a seventeen-hour-old pid
+file and is perfectly well. Reading that age as staleness - and reading a
+two-minute-old log line as "stopped", when two minutes is an ordinary gap
+between windows - produced a confident report that BTC had been down for twenty
+minutes. It had not. It was polling, deciding and logging throughout, and the
+duplicate starts attempted against it were refused by the single-instance lock
+exactly as designed. The lock working is not the lock failing.
+
+What proves a service is alive is the LOG STILL MOVING. `full_circle_check.py`
+now tests that, and uses the pid file's age only to distinguish a hung service
+from a recycled PID when the log HAS stopped - two conditions needing different
+fixes.
+
+THE BTC SERVICE CANNOT BE KILLED FROM AN ORDINARY SHELL. It is started by the
+`BTC15Signal` scheduled task in a different security context: `taskkill /F /T`,
+`Stop-Process -Force` and WMI `Terminate` all return access denied, `Win32_Process`
+returns a null CommandLine and a blank owner, and `schtasks /end` reports
+SUCCESS while the process survives. Only an elevated shell can stop it. The
+other six instances launch from `scripts/run_*.ps1` and kill normally.
+
+AND THE REAL TRAP: `train_intelligence.py --help` OVERWRITES THE LIVE POLICY.
+The script took no arguments, so an unrecognised flag was not an error - it just
+ran, and replaced a live 29-arm brti-4 artefact with a 7-arm one carrying NO
+feature fingerprint, which `compatible()` treats as incompatible and would have
+refused on load. Nothing reached an order: the service held the good policy in
+memory, all 51 decisions in the following half hour still named
+`kalshi-brti-4-1790446662`, and the file was restored from
+`runtime/policies/kalshi-brti-4-1790446662.json` before any reload.
+
+It now requires `--write`, and says why:
+
+    refusing to overwrite the live policy without --write. The running service
+    loads that file; rewriting it is a deployment, not an inspection.
+
+A script whose only mode is "rewrite the artefact the live service loads" must
+not treat an unrecognised argument as consent. That `runtime/policies/` keeps
+every generation is what made this a five-minute recovery instead of an
+incident.
+
+WHAT ACTUALLY NEEDED THE RESTART, once the false alarm was cleared: BTC has been
+running since 00:07:31, which predates the evidence-bar and FDR changes, so it
+alone still holds the old constants in memory. The other six restarted at 17:20
+and carry the new ones. A policy is written at FIT time, so `min_evidence` moves
+from 120 to 100 on each instrument's next learning run rather than at restart -
+expected, and only a fault if it survives a settlement batch.
+
+## 93. The feature contract is frozen
+
+Operator decision, 2026-09-27. `brti-4` / `a641ab8e2a05aa44` is pinned as a
+literal in `tests/test_feature_contract.py`, and changing the contract now fails
+the suite with the cost named.
+
+WHY A PIN AND NOT A COMMENT. There were already seventeen tests on this
+contract, and all seventeen keep passing when it changes - they compare the
+contract to ITSELF, asserting that a changed lookback changes the hash and that
+a mismatch is refused at runtime. Every one of those is about the MECHANISM.
+None pinned the VALUE, so four contract changes in three days passed a green
+suite. The freeze is two literals:
+
+    FROZEN_FINGERPRINT = "a641ab8e2a05aa44"
+    FROZEN_VERSION     = "brti-4"
+
+and the only way past them is to edit them, in the same commit, which puts the
+reason in front of whoever does it.
+
+WHAT IT COSTS TO CHANGE, restated in the failure message rather than left in a
+docstring: `learning_data` excludes every live decision whose `feature_version`
+is not current - correctly, since a decision taken under other definitions
+describes a cell that does not exist under these. So a contract change DELETES
+THE LIVE EVIDENCE BASE. Measured on BTC: 6,395 of 8,982 decisions, 71%.
+
+THE GUARD WAS MUTATION-TESTED, because a guard nobody has seen fail is a guard
+nobody knows works - which is the same defect as the gold alert that counted
+five thresholds no input could fail as five passed checks (FINDINGS 74).
+`momentum_window_s` 300 -> 301 and `volatility_window_s` 300 -> 420 were each
+applied to the real module; the freeze failed on both and named the drift, and
+the contract was restored.
+
+ONE DEFECT THE MUTATION TEST FOUND IN THE GUARD ITSELF. The self-check
+originally built `FeatureContract(momentum_window_s=301)` from a literal. Under
+the 301 mutation that literal became the LIVE value, so the check collided with
+the thing it was checking and failed for the wrong reason. It now perturbs
+`fc.CONTRACT.momentum_window_s + 1`, derived, which cannot collide.
+
+THE BASELINE, recorded so the freeze's benefit is measurable rather than
+asserted - `runtime-combo/evidence_baseline_at_freeze.json`:
+
+    asset   qualified   brti-4 rows   oldest
+    BTC            44          3197   09-25 18:19 UTC
+    ETH            60          3372   09-25 18:19 UTC
+    SOL            78          3417   09-25 18:19 UTC
+    XRP            28          1572   09-26 11:48 UTC
+    NEAR           12          1299   09-26 14:34 UTC
+    GOLD            8           291   09-25 18:19 UTC
+    SILVER          0           290   09-25 18:19 UTC
+
+    230 qualified across seven instruments, none older than 1.7 days
+
+That was 177 a few hours earlier, so roughly 18 an hour system-wide. Against the
+operator's threshold of 100 per instrument, SOL (78), ETH (60) and BTC (44) are
+the ones that cross first, and they only cross because the contract stopped
+moving. Metals accumulate only on weekdays.
+
+TO UNFREEZE, which is allowed and will sometimes be right: change the contract,
+update both literals in the same commit, and record in FINDINGS what was reset
+and why it was worth resetting. The point was never that the contract must never
+change. It is that it must not change by accident, and four times in three days
+was an accident each time.
+
+## 94. A combo recovery lost to the current single-leg recovery on the real record
+
+Operator proposal, 2026-09-27: keep every recovery rule as deployed (armed by a
+loss, 5-market window, once per loss, recovery leg in 0.70-0.79, $2.00 budget)
+but make the ORDER a combo of that instrument plus another instrument whose own
+rule qualified at the same moment, adding one check - the combo's profit if
+right must net the loss being recovered to zero or beat it. The operator's
+instruction was to replay it on the signals actually generated and not to lean
+on earlier findings, so nothing from #80-#89 is assumed here.
+
+THE REPLAY (scripts/recovery_combo_replay.py). The bot's real trades, one per
+window, read the way `Store.settled_bot_markets` reads them, at the decision ask
+from `decision_records`. Partners are other instruments' real rule-qualified
+decisions from their own stores, taken as of the recovery's decision instant and
+never later - the no-lookahead requirement is an assert, not a comment. Sizing
+is replayed under today's rules for both policies from base 1, because
+`count > 1` in the record mixes a 2-contract base and an older recovery path.
+Held to settlement, no fees. Each instrument is replayed only from the first
+moment another instrument was recording, so a missing partner means one was not
+qualified, not that it was not logged.
+
+    policy                   fired  won  netted the loss   instance P&L
+    A  single-leg (deployed)    19   17               0          -0.70
+    B  combo                     6    4               4          -1.51
+
+    B - A   -0.82 over 4 days, behind on 4 of 4 days
+
+WHY B LOST, all three measured:
+
+  * THERE IS USUALLY NO PARTNER. In 19 of the in-band armed moments no other
+    instrument was rule-qualified at that instant, so B held back and the trade
+    went out at base size - while A recovered, and A's recoveries won 17 of 19.
+    Three more were held back by the net-zero check itself.
+  * THE CHECK BUYS A HARDER BET. To net a ~0.80 loss the combo must be cheap,
+    around 0.55-0.64, which means both legs must win. Combos won 4 of 6; each
+    loss cost 1.80-1.89 against A's 1.40-1.44.
+  * A WAS GOOD HERE. In-band single-leg recoveries won 89% over these four days.
+
+NOT AN ARTIFACT of the two choices most likely to manufacture it. Partner
+freshness from 60s to 900s changed nothing - identical results at every
+setting, so the absent partners were genuinely unqualified, not stale. Pricing
+does not rescue it either: B - A is -0.60 at 0.98x the product (the price the
+app actually quoted on this shape tonight), -0.82 at 1.00x (the orderbook) and
+-2.35 at 1.10x.
+
+ONE THING A NEVER DOES: net a loss. 0 of 19. Two contracts at 0.70-0.79 win
+0.42-0.60 against losses of 0.72-0.90, so the deployed recovery dents a loss and
+never clears it in one trade - while still earning +5.36 on its own recovery
+trades. B cleared the loss 4 times in 6. That is the real trade-off: B recovers
+completely when it fires and wins, but fires rarely and loses bigger.
+
+THE SAMPLE IS SMALL and this is a replay, not a proof: 19 and 6 recoveries over
+4 days. What it does establish is that nothing in the real record supports
+switching, and the direction was the same on every day and every setting.
+
+AND 87 OF 140 REAL TRADES WERE CASHED OUT EARLY (BTC 39/57, ETH 48/83), which
+this holds to settlement for both policies. The comparison is like-for-like, but
+neither total is what the account actually earned.
+
+SUPERSEDES #82 ON ONE POINT. #82 recorded dollar-target RFQs as never quoted
+(0 of 8). Tonight the operator's `target_cost_dollars` $2.00 RFQs on BTC-down +
+NEAR-up were quoted 3 and 4 times each, at 0.718-0.758 against a leg product of
+0.7296 - 0.98x. The shape of the ask still decides a lot, though: of about 104
+two-leg RFQs in that quarter hour only that one combination was answered, and
+BTC-down + ETH-down went 0 for 36. Executability, not price, is the binding risk
+for any combo recovery.
+
+## 95. Account-level recovery through a BTC+SOL combo: it almost never forms
+
+The operator narrowed #94 twice: the combo must be BTC+SOL only, and ANY loss -
+including ETH's - is recovered by that BTC+SOL combo, with ETH never upsizing.
+Replayed with `scripts/recovery_combo_replay.py --mode account` (now the
+default) over the span where both BTC and SOL were recording decisions, which is
+09-25 15:34 onward.
+
+Two readings had to be chosen and are switchable rather than buried: the 5-market
+life is counted in 15-minute WINDOWS, so three instruments settling per window
+do not shorten it to ~2 windows; and a window with several losing markets is one
+episode whose loss is their SUM (or, as the alternative, only the largest).
+
+    loss to net              0.98x    1.00x    1.10x    combos fired
+    sum of window losses     -1.19    -1.19    -1.19    0
+    largest single loss      -0.28    -0.32    -1.19    1 (won)
+
+    B - A on the whole account; A is today's per-instrument single-leg recovery,
+    which fired 13 times, won 11, and netted a loss 0 times
+
+THE COMBO HAS NOTHING TO FORM FROM. Over the whole record BTC and SOL were
+rule-qualified at the same instant in 14 of the 165 windows where BTC qualified
+- 8%. In the armed, in-band moments of this replay the other half of the pair
+was qualified 1 time in 17. So account-level B mostly just removes today's
+recovery, whose single-leg trades won 11 of 13, and loses exactly that upsize.
+
+AND WHEN IT CAN FORM, IT MAY NOT FILL: that evening BTC-down + SOL-down RFQs went
+0 for 17 quoted.
+
+The per-instrument BTC+SOL variant came out +0.45, but that rested on ONE combo
+(+1.08) and on skipping one losing SOL recovery - two events, not a result. The
+account-level rule the operator specified is the one reported here.
+
+The overlap is about 1.3 days, so none of this is conclusive. It is, again, the
+direction on every reading tried, and the 8% coincidence rate is a structural
+number rather than a noisy one: it is what limits the idea, and it will not be
+fixed by more days of the same.
+
+## 96. The operator's final pairing: each loss recovered by a combo with its SOL/BTC partner
+
+#95 rested on a misreading. The operator's rule, stated across three messages:
+each instrument recovers its OWN loss; BTC's partner is SOL, ETH's partner is
+SOL, SOL's partner is BTC only; BTC+ETH is never a recovery combo. Replayed with
+`scripts/recovery_combo_replay.py` (per-instrument, now the default; `ALLOWED`
+holds the pairing). Each instrument is judged only from when its partner was
+recording.
+
+                   today (A)                  combo (B)
+    BTC      4 fired, 4 won    -0.17     1 fired, won, netted   -0.18
+    ETH      7 fired, 6 won    +0.64     0 fired                 -0.13
+    SOL      2 fired, 1 won    -0.57     0 fired                 -0.11
+    total                      -0.10                             -0.42
+
+    B - A   -0.28 at 0.98x product, -0.32 at 1.00x, -1.19 at 1.10x;
+    identical at partner freshness 60s, 120s and 900s; behind on 0 of 3 days
+    (it was behind on the one day that differed and level on the other two)
+
+The one combo that formed was BTC-down + SOL-down at 05:15 on 09-26: 3 at 0.640
+against a 0.85 loss, won +1.08 and netted it. Every other armed, in-band moment -
+22 of them - had no partner qualified at that instant, and there the combo rule
+simply forgoes today's recovery, whose single-leg trades won 11 of 13.
+
+THE PARTNER RATES, over the whole record, at the same instant:
+
+    BTC qualified in 165 windows - SOL also qualified then in 15   ( 9%)
+    ETH qualified in  99 windows - SOL also qualified then in 20   (20%)
+    SOL qualified in  77 windows - BTC also qualified then in 15   (19%)
+
+ETH+SOL coincides twice as often as BTC+SOL, yet never landed on an armed,
+in-band ETH moment in this span. These rates are structural - they come from the
+instruments' own gates - and are what limits the idea; more days will narrow the
+error on B - A but will not lift them.
+
+Sample: 3 days, one combo. Not conclusive, but nothing in the record supports
+switching and the direction held on every setting.
+
+## 97. The 3-step combo recovery chain, tested forward on real opportunities
+
+Rule (operator 2026-09-27): combo 1 must clear the original loss L0; if it loses,
+combo 2 must clear at least 50% of combo 1's loss; then combo 3 clears L0 and the
+chain stops. $2 budget every step, never escalating; pairing BTC->SOL, ETH->SOL,
+SOL->BTC. The real record holds one recovery combo (it won), so the chain was run
+forward by resampling real opportunities (`scripts/recovery_chain_test.py`):
+trigger qualified in 0.70-0.79 with its partner qualified at the same instant.
+
+    availability      12 of 170 in-band recovery moments had a partner (7%)
+    real combos       6 of 12 won at a mean price 0.558
+    real single-leg   129 of 170 won at a mean ask 0.746
+
+    per original loss          mean    fully recovered   5th pct   worst
+    combo chain (x3)          -1.14             57.6%     -6.19    -5.83 exact
+    today's single-leg        -0.78              0.0%     -3.20    -5.29 exact
+
+    chain beats today's recovery once combos win about 56% or more:
+    50% -0.36   56% +0.22   60% +0.22   70% +0.80   80% +1.07 per loss
+
+Independent draws shown; day-clustered resampling of 3 days gives -2.65
+[-5.94, -0.59] for the chain and -1.89 [-5.26, +0.18] against single-leg, which
+is mostly 12 combos on 3 days rather than information. The operator's point
+holds - the chain fully recovers the loss 58% of the time and today's recovery
+never does - but on the 12 real combos (50% won) it costs more on average, and
+the break-even is the combo's own price. The 7% availability is the other limit.
+
+## 98. Combo recovery with an unqualified partner: the partner's PRICE decides it
+
+Operator, 2026-09-27: the recovery combo needs only ONE qualified side - the
+instrument recovering its loss, under today's rules - and the partner (SOL for
+BTC and ETH, BTC for SOL) trades whatever side its signal shows, so there is
+always a match. `PARTNER_MUST_QUALIFY = False` in recovery_combo_replay.py.
+
+ON ITS OWN IT IS THE WORST VERSION TESTED. On the real sequence:
+
+    partner rule             recovery rule        B - A (3 days)  combos  won
+    must qualify             either                   -0.32          1      1
+    signal side, any price   re-arm every loss        -6.00         11      5
+    signal side, any price   3-step chain             -7.10         12      5
+
+The qualified trigger leg won 9 of 12; the unvetted partner leg won 7 of 12 and
+sank four combos whose trigger won. The cause is specific: the NET-ZERO CHECK
+SELECTS CHEAP PARTNERS, because a cheap partner is what makes a combo cheap
+enough to clear the loss - and a cheap partner is a weak signal near a coin
+flip. Every losing partner was priced 0.57-0.66; every partner at 0.78+ won.
+
+THE SPLIT HOLDS ON THE WIDER POOL, not just those 12. All 98 real recovery
+moments with a partner on its signal side, by the partner's price:
+
+    partner priced   n   combo won   combo edge
+    below 0.70      44      27-38%   -0.10 to -0.14
+    0.70-0.85       39      71-91%   +0.17 to +0.34
+    above 0.85      15      50-67%   mostly fail the net-zero check
+
+and day by day the 0.70-0.85 band is positive on all three days (+0.43 n=2,
++0.20 n=32, +0.25 n=5), below 0.70 negative on two of three.
+
+WITH THE PARTNER PRICED 0.70-0.85, on the real sequence:
+
+    re-arm every loss   B - A +0.42   4 combos, 3 won
+    3-step chain        B - A +1.42   5 combos, 4 won
+
+The chain did what it was designed to: 09-26 11:00 ETH-&SOL- lost 1.81, and
+step 2 at 11:30 (target 50% = 0.91) won +1.27.
+
+WHAT THIS IS AND IS NOT. The 0.70-0.85 band was read off this data, so the +1.42
+is in-sample: FINDINGS' own rule is that a threshold chosen from its own buckets
+proves nothing until it holds on data it did not see. The per-day consistency is
+encouraging and is not that. 32 of the 39 band moments are one day, and the
+result rests on 5 combos. It needs forward validation before money moves on it,
+and quote availability for these shapes is still unmeasured live.
+
+## 99. Two single-leg recovery runs per loss instead of one
+
+Operator, 2026-09-27: keep today's recovery, and once its win rate is confirmed,
+allow a SECOND run so a loss is fully recovered before the loop closes. Replayed
+on every real bot trade (321, BTC/ETH/SOL): after a loss, today's recovery
+fires; if it wins but has not netted the loss, a second 2-contract run fires at
+the next in-band trade within 5 markets; then the loop closes. Same $2 per run,
+never escalating. No fees, held to settlement.
+
+                     total P&L   loops fully recovered   recovery trades won   worst loop
+    one run (today)     +4.92          0 of 38 (0%)            32 of 38 (84%)       -2.86
+    two runs            +6.66         15 of 29 (52%)           45 of 53 (85%)       -3.70
+
+    two runs ahead on every instrument: BTC +0.54, ETH +0.93, SOL +0.27
+
+WHY IT HELPS, and why that is conditional: a run adds one extra contract at an
+in-band ask, and an extra contract is worth exactly (win rate - ask). Two runs
+simply apply that edge more often. Across all 106 in-band trades the bot has
+made, it won 81.1% at a mean ask 0.753 - an edge of +0.058, 95% +/-0.074, which
+still spans zero.
+
+"HIGH WIN RATE" IS THE WRONG TEST. At a 0.75 ask the recovery needs 75% just to
+break even; 80% is only +0.05 a contract. The number to watch is win rate MINUS
+ask on in-band trades. Confirming +0.05 at 95% takes about 236 in-band trades,
++0.10 about 59; the bot makes roughly 15-20 a day across instruments, so a
+couple of days can rule out a clearly negative edge but cannot confirm a small
+positive one.
+
+## 100. The combo recovery is running in SHADOW, and the instances now restart at logon
+
+Operator, 2026-09-27: keep today's single-leg recovery live and run the combo
+recovery of #98 in shadow. `scripts/shadow_combo_recovery.py` is its own process:
+it reads the live stores READ-ONLY, never places or sizes anything, and writes
+only `runtime-combo/shadow_combo.db` (log: `shadow_combo.log`). The trading
+services were not touched or restarted.
+
+It STARTS FRESH - the chain began at 2026-09-27 03:48 UTC, stored in the db - so
+every decision it records is out of sample for the 0.70-0.85 partner band that
+#98 read off the earlier three days. It rebuilds from the stores on every pass,
+so a restart or a missed pass changes nothing, and it records a decision only
+once both legs have settled, because the chain's next step depends on the grade.
+
+VERIFIED AGAINST THE REPLAY before launch: `--report --since 2026-09-25T15:34`
+into a scratch db reproduced #98 exactly - the same five combos, 4 won, combo
+P&L +2.85, and whole-account today +0.35 vs combo +1.76, difference +1.42.
+
+    python scripts/shadow_combo_recovery.py --report     # results so far
+
+THE LOGON GAP WAS STILL OPEN. The Startup folder was empty: after a reboot only
+BTC (its `BTC15Signal` boot task) would have come back, and ETH, SOL, XRP, NEAR,
+gold and silver would have stayed down silently. `install_startup_fallback.ps1`
+is now installed for all six - NEAR added, it was missing from the default list -
+plus `BTC15Shadow-COMBO.cmd` for the shadow. Logon, not boot: an unattended
+reboot that stops at the lock screen still waits for a login. Each entry was
+run once by hand; the single-instance lock made the duplicate a no-op.
+
+A small trap on the way: the shadow's startup file was first written with
+`printf`, which turned `\b` in `D:\Kalshi\btc15-signal` into a backspace and
+produced `D:\Kalshitc15-signal` - a path that would have failed silently at
+logon. Rewritten with the file tool and verified.
+
+## 101. The wife's mirror stopped because API orders can only spend their market's shard
+
+The operator reported the mirror account had stopped trading. It had: from about
+12:50 UTC on 09-26 every mirror entry was refused - 15 on BTC, 23 on ETH, 2 on
+SOL over ~15 hours - logged only as "400 Bad Request".
+
+THE CAUSE. A Kalshi account's cash is split by `exchange_index` (shard), and an
+API order can spend only the shard its market lives on; every 15-minute crypto
+market is shard 2, which `GET /markets/{ticker}` reports as `exchange_index`. Her
+account held $30.37 in shard 0 and $0.09 in shard 2. Proven on BOTH accounts
+with resting post-only bids far below the market (an unfillable IOC reserves
+nothing and proves nothing): hers accepted $0.05 and refused $0.10 and $0.50
+`insufficient_balance`; the operator's refused $31 with $79.61 in total but
+$25.95 in shard 2.
+
+THE OPERATOR WAS RIGHT THAT NOTHING IS RESTRICTED - in the app. Her transfer
+history shows the app moving exactly an order's cost into shard 2 in the same
+second as the order: her manual DOGE fill at 04:13:39 carried an automatic
+$1.0092 transfer 0 -> 2, and earlier ones exist from 09-24. The API does no such
+thing. An earlier statement here that a $10 transfer had funded her DOGE order
+was wrong: that transfer was 44 seconds after it.
+
+THE FIX (execution.py, mirror.py, config.py; tests/test_mirror_funding.py):
+  * `KalshiExecutionClient.ensure_funds` does what the app does: before an
+    order it reads the market's shard and the balance there, and if short moves
+    the SHORTFALL plus a 2c-a-contract fee allowance from shard 0 via
+    `POST /portfolio/intra_exchange_instance_transfer`, then polls
+    `/portfolio/intra_exchange_instance_transfers/{id}` until `complete` -
+    Kalshi documents cross-shard transfers as non-atomic. Never a standing
+    float; never raises; a failure is noted and the order still goes out so
+    Kalshi's answer is what gets logged. Behind `auto_fund`, OFF by default.
+  * Mirrors turn it on (`mirror_N_auto_fund`, default True). The PRIMARY does
+    not: what the bot may reach on the operator's own account is a sizing call.
+    Its shard 2 holds $25.95 of $79.61 today and will drain the same way.
+  * `_post` keeps Kalshi's reason in the error instead of just "400".
+  * The mirror log carries a `funding:` note, so no transfer is silent.
+
+THE MIRROR NEVER FOLLOWED THE $2 RECOVERY, found while doing this. It sized every
+entry from its own base settings - 1 contract - including the entries the
+primary's loss step sized to 2. The loss step now marks a recovery entry
+(`trader.entry_is_recovery`, read and cleared once so it cannot leak), and the
+mirror sizes it from its own `mirror_1_recovery_budget`, $2.00 by operator
+instruction: 2 contracts at 0.70-0.79, still capped by the account's max of 2.
+
+Her shard 2 was topped up by hand with $10 to restart the mirror at once; from
+now the code keeps it funded. 16 new tests including one that reproduces the
+original failure; 69 across mirror, execution and loss step pass.
+
+## 102. At base 2 the recovery switched itself off; it now follows the base
+
+At 00:00 NY on 2026-09-27 the capital review moved all seven instances from a
+base of 1 contract to 2 ($79.61 at $30 a contract). Three pieces had been
+written for a base of one, and every one of them failed without an error.
+
+  * THE STEP BECAME A NO-OP. `loss_step_size` bought a flat $2: 2 contracts
+    anywhere in 0.70-0.79. 2 is not above a base of 2, so it returned the base
+    with an EMPTY reason - no upsize, no log line. Live at 00:49 on SOL
+    (KXSOL15M-26SEP270100-00): first trade after the 09-26 09:00 loss, ask 0.78
+    in band, 0 markets since. It went out at 2 with "auto: sizing 2 contracts - "
+    and nothing after the dash.
+  * THE MIRROR LOST ITS RECOVERY WITH IT. The wife's account follows the $2
+    recovery only when the primary actually upsizes (`entry_is_recovery`), so
+    the same SOL entry bought her 1 contract where yesterday's rule gave 2.
+  * THE STEP WAS SPENT BY ORDINARY TRADES. `upsized_since` read "spent" as any
+    entry with `count > 1` since the loss. At base 2 that is every entry, so
+    the first trade after a loss - at any price - used the step up. The SOL
+    entry above did exactly that; the step now reads as taken until a new loss.
+  * THE ADD-ON STAND-DOWN WAS BACKWARDS, at base 1 as well. It re-ran the step
+    at base 1 and the current ask. Once the step HAD sized a position, the
+    re-run found that very entry and answered "already taken", so the add-on
+    was cleared to rest behind a stepped position. On a base position whose
+    ask drifted into the band, it stood the add-on down for an upsize that
+    never happened - BTC 09-26 11:51 printed "standing down - position is sized
+    by the loss step" for a 1-contract entry. Its test passed because it never
+    wrote the position's own row.
+
+THE OPERATOR'S RULE: "Upsizing recovery must follow as well" - "automatically
+double" for the step and "automatically scale double" for the add-on. So both
+are now PER BASE CONTRACT, and at base 1 both are exactly what they were:
+
+                      base 1         base 2
+    loss step         2 contracts    4 contracts   ($2 per base contract, in band)
+    resting add-on    +1             +2
+    wife's mirror     2 on a step    2 on a step   (her base is 1, max 2)
+
+THE FIX (main.py, store.py, recovery_add.py, recovery_add_runner.py,
+messages.py, config.py):
+  * the step buys `contracts_for_budget(loss_step_budget, ask) x base`, still
+    capped at `loss_step_max_contracts` (8);
+  * "above base" means above the base THAT ENTRY WAS SIZED FROM:
+    `Store.base_tier_at(created_at)` returns the day's reviewed tier if the
+    review had been written by then, else 1 - exactly what sizing read. A
+    review that fails at midnight is retried every poll, so the first entries
+    of a day can be sized at 1 and later ones at 2; judging the early ones
+    against the later tier would let one loss fire the step twice;
+  * `add_on_stands_down` reads the entry row: stand down if and only if it
+    went out above its base;
+  * the add rests `recovery_add_max_contracts x base`, and `evaluate` weights
+    the combined average by the real counts, scores base + add, and charges
+    every added contract against the cap;
+  * RECOVERY ARMED states the contracts at today's base.
+
+Every piece was verified by execution before the fix (scratch stores, a replay
+of the SOL decision on a copy of its database) and each fix is pinned: reverting
+the step, the spent-check or the stand-down fails 8, 1 and 3 tests
+respectively. tests/test_recovery_follows_base.py is new; the two stand-down
+tests in test_loss_step.py were rewritten because they pinned the defect.
+
+AN INDEPENDENT REVIEW OF THAT FIX found its inference was still wrong in ways
+the tests did not see (24 findings, 22 confirmed by a second agent reproducing
+each; none reachable at today's live settings in the plain case). The root was
+one design choice: "was this entry the step" was INFERRED afterwards from
+`count` and the tier, and both lie -
+  * `record_fill` overwrites `count` with the FILLED count, so a 4-lot step
+    that filled 2 at base 2 read as a base entry: the step fired again on the
+    same loss, the add-on stacked behind it, the mirror recovered twice;
+  * the order-path base is `min(budget x tier, tier)`, not the tier, so with
+    /autosize below the ask the step (2 on a base of 1) never read as spent
+    and fired on every in-band trade of the episode;
+  * an IOC that came back empty still "spent" the step, so the retry went out
+    at base.
+So the facts are now RECORDED when the proposal is created - `base_count` (what
+the base rule produced) and `ordered_count` (what was sent) - and "upsized" is
+`ordered_count > base_count` on that row. Rows from before fall back to the
+tier. Only orders that traded or might have (not pending/unfilled/rejected/
+expired; 'failed' still counts - the order may exist) spend the step. The add
+is capped at the contracts actually held. The recovery half of the order path
+is now `main.recovery_sizing`, so a test runs the real sizing and the mirror
+mark (nothing that calls `primary_signal` has a trader). RECOVERY ARMED leads
+with the rule ("2x the base") and states the add-on too.
+
+LEFT AS THE OPERATOR'S CALL, from the same review:
+  * A step armed by a loss at base 1 fires at the base it fires at: 2x the
+    CURRENT base, so 4 after the move to base 2. The review found SOL carrying
+    one such arm from 09-26 09:00; by the deploy it had expired after its 5th
+    settled market (checked on copies of all seven databases at 04:1x NY:
+    nothing armed anywhere), so no step fires until the next loss.
+  * The instance daily loss floors ($5 on SOL/XRP/NEAR/SILVER) did not move.
+    A 4-lot step's worst case is about 64% of that floor, and the floor is
+    checked on realised P&L before an order, not against the order's own
+    worst case.
+
+## 103. The 102 deploy crashed ETH and SOL after every fill (NameError)
+
+The operator asked why the system was restarting on its own. Three restarts on
+2026-09-27 were crashes, all the same one, and all caused by FINDINGS 102:
+
+    05:36:40 SOL  KXSOL15M-26SEP270545-45  UP   x2   NameError main.py:2877
+    05:38:55 ETH  KXETH15M-26SEP270545-45  UP   x2   NameError main.py:2877
+    06:21:08 ETH  KXETH15M-26SEP270630-30  DOWN x2   NameError main.py:2877
+
+Every other restart that day was a deploy (00:22, 04:14, 06:30). BTC, still on
+the older build, did not crash.
+
+THE CAUSE. Lifting the recovery half of sizing into `recovery_sizing` left one
+later line in `primary_signal` reading `recovery_reason`, which no longer
+existed there. That line runs only AFTER AN ORDER FILLS, and nothing in the
+suite drives `primary_signal` with a trader - so 1,613 tests and a 12-mutant
+check all passed, and each service died on its first real fill. The watchdog
+restarted it in about 9 seconds.
+
+WHAT IT COST. The orders were already filled, so the money was real and the
+broker has it right: all three WON (+0.19, +0.44, +0.15 on the settlements).
+No window got a second entry. The wife's mirror booked her own orders
+normally. But the crash hit between the order and its bookkeeping, so each
+proposal is stuck at 'executing' with no fill recorded: the service did not
+manage them (no 90c cash-out, no fill message), the one-position guard does
+not count 'executing' - only the 120s spacing and the entry deadline stopped a
+second buy in the 06:30 window - and `settled_bot_markets` (fill_price IS NOT
+NULL) cannot see them, so they do not count toward a loss step's wait.
+
+THE FIX (06:30, source 26e0487c327a on all six non-BTC instances):
+`recovery_sizing` returns `recovery_reason`; `ruff --select F821,F822,F823`
+over src/ and scripts/ is now a test (tests/test_no_undefined_names.py) and
+finds exactly this line on the broken build.
+
+NOT DONE: booking the three fills from the broker into the local record
+(`record_fill` + `finish_proposal`, the service's own calls) - the tool's
+permission check refused a script that opens the live databases for writing;
+left for the operator.
+
+## 104. One recovery per losing episode: a losing recovery trade arms nothing
+
+Operator, 2026-09-27, after SOL lost two 4-contract recoveries in a row (16:00
+-2.98, then 16:15 -3.32, each armed by the loss before it): "Remove the back to
+back it should only happen once."
+
+THE RULE. The loss step arms on the most recent losing bot market. If that
+market was itself sized by the step - its entry went out above the base it was
+sized from (`Store.window_was_upsized`, the same recorded base-vs-ordered test
+as FINDINGS 102) - nothing is armed and the trade goes out at base: "last loss
+was the recovery trade itself - no second recovery". The next ORDINARY loss
+arms normally. A winning recovery changes nothing.
+
+WHAT IT WOULD HAVE DONE ON THE RECORD (all 35 steps, broker P&L, replayed):
+three steps were armed by a losing step -
+
+    09-24 17:45 ETH  6 contracts  won  +1.08  -> at base +0.18   (-0.90)
+    09-26 07:45 ETH  2 contracts  won  +0.49  -> at base +0.24   (-0.25)
+    09-27 16:15 SOL  4 contracts  lost -3.32  -> at base -1.66   (+1.66)
+
+net +0.51. Three cases decide nothing; the point of the rule is the bound - no
+episode can now put two upsized losses back to back.
+
+For context, measured the same day on the broker record: all recovery sizing
+together (35 steps, 7 filled add-ons) added +2.22 to the operator's account
+(+0.44 all time, -1.78 without it); today's 2x-base steps cost -3.88 of that.
+The wife's account followed the recovery only from today: -1.92.
+
+tests/test_recovery_follows_base.py pins it (three tests fail with the rule
+removed). test_loss_step.py's fixture wrote every ordinary arming loss at 2
+contracts - at base 1 exactly what the step buys - so it now writes them at
+base size, 1, as live ones are; its assertions are unchanged.
+
+## 105. The recovery is a combo at base size; nothing upsizes any more
+
+Operator, 2026-09-27: "replace the single recover into a Combo with same base
+size, no more up scaling ... everything is kept just as design"; "that's my
+decision, ship it live and verify"; "update all messaging systems and update all
+tracking to reflect combo"; and, after the first cut: "same direction do not get
+rejected - combo accept any direction, either same or opposite".
+
+THE RULE (combo_recovery.py, main.place_combo_recovery):
+  * WHEN - unchanged: the loss step decides it (armed by a losing bot market,
+    this entry's ask 0.70-0.79, 5 markets, once per episode, never back to
+    back). It no longer changes the size: it says a recovery is due.
+  * WHAT - this entry plus a PARTNER as one combo: SOL for BTC and ETH, BTC for
+    SOL; the partner on whatever side its own signal shows, priced 0.70-0.85,
+    read no later than the trigger and no older than 120s, then RE-READ from
+    its market before it may set a price.
+  * SIZE - the base count (2 at base 2). The wife's mirror copies a confirmed
+    combo at her own base (1), with the same price check.
+  * PRICE - the cheapest quote at or below the CHEAPER LEG's ask, same or
+    opposite direction. A combo pays only if both legs win, so it is never
+    worth more than its cheaper leg. The first cut capped at the legs' PRODUCT
+    (the shadow's assumption) and live quotes showed that refuses nearly every
+    same-direction pair: Kalshi prices correlation in.
+        18:37  BTC-DOWN 0.975 + SOL-DOWN 0.986  8 quotes, cheapest 0.983
+        18:47  BTC-DOWN 0.64  + SOL-DOWN 0.54   21 quotes, cheapest 0.428
+               (product 0.3456 = 1.24x; under the cheaper leg 0.54: BUYS)
+        18:52  the app, BTC-UP 76 + SOL-UP 88: $10 pays $13.91 = 0.719
+               (product 0.669 = 1.075x; under 0.76: BUYS)
+        19:04  BTC-UP 0.63  + SOL-UP 0.84   21 quotes, cheapest 0.688
+               (ABOVE the cheaper leg 0.63 - dominated by BTC-UP alone: REFUSED)
+    Two-leg RFQs WERE quoted every time (8-21 quotes in 25s) - the "2 legs
+    0/137" of FINDINGS 82 did not hold today.
+  * THE DROPPED CHECK - "the combo's win must cover the whole loss" can never
+    pass at base size (2 at ~0.56 wins ~0.88 against a 2-contract loss of
+    ~1.60), so keeping it would mean the combo never fires. Base size was the
+    operator's explicit constraint.
+  * OUTCOMES - bought: the window's trade, held to settlement, mirrored, told.
+    Nothing bought after a quote round: the entry is decided again next poll,
+    single-leg at base size (never on a half-minute-old decision crossing to
+    the 0.95 ceiling). Unknown (a lost or 5xx accept answer, a quote still
+    accepted/confirmed at the deadline, an executed quote with no readable
+    fill): HELD, nothing else sent, settled from the broker's fills within
+    minutes (`Store.reconcile_combos`). Any combo row but 'unfilled' blocks a
+    single leg in its window.
+  * THE ADD-ON is off (RECOVERY_ADD_ENABLED=false, shadow): it added contracts.
+
+TRACKING. A combo is a `combo_recovery` proposal on the trigger's window
+(legs, price check and outcome in its note); it spends the step; the local
+loss rebuild leaves it to the exchange figure (the trigger's `won` is not the
+combo's); lifetime record, open positions and /ledger count this system's
+combos as the instrument's own (the operator's own combos stay foreign); its
+ledger row is dated by the trigger window. MESSAGES: RECOVERY COMBO BOUGHT /
+OUTCOME UNKNOWN when placed, RECOVERY COMBO WON/LOST once Kalshi books it (the
+window's usual recap steps aside), RECOVERY ARMED describes the combo, the
+standing recovery line no longer says "extra sizing allowed".
+
+REVIEWED BEFORE SHIPPING: an independent review found 21 issues, 18 confirmed;
+the money ones fixed before deploy - an accept still pending at the deadline
+had been booked as nothing bought with a single leg sent on top (HIGH), a 5xx
+accept treated as nothing, the stale fallback order, /ledger pricing a combo
+by its trigger leg, unknown combos held forever, fills summed across both
+instances' positions on the same combo market. tests/test_combo_recovery.py.
+
+COMBO FUNDING (same evening). Combo markets settle in exchange shard 1, which
+nothing funded: the operator's account held $0.28 there against $103 in shard 0
+and $29 in shard 2, so every combo accept on the main account would have been
+refused (the app moves the cost itself; the API does not). Operator: "auto-fund
+combos". Before each recovery combo's RFQ the main account now moves the
+shortfall for the most it may pay - base count x (cheaper leg + 2c fee
+allowance) - from shard 0 into the combo's shard (`combo_auto_fund`, default
+on; `ensure_funds(force=True)`), so a good quote is accepted without waiting on
+a transfer. The 15-minute orders stay unfunded, as before. The wife's account
+funds its combo the same way through its existing auto-fund.
+
+## 106. The base size scales with capital, uncapped
+
+Operator, 2026-09-27 21:xx: "Auto scale and contract should not be cap, it
+should scale as capital growth." The account stood at $132.95 after a deposit;
+the daily review gives one base contract per $30 of reconciled capital, but
+`max_base_contracts` = 2 held it at 2 (the capital supports 4).
+
+  * `max_base_contracts` = 0 now means NO ceiling (`capital.tier_for`). The
+    tier is still reviewed once a day, at midnight New York, from reconciled
+    capital (cash plus committed cost, never unrealised gains): at $132.95 the
+    next review gives base 4.
+  * The loss step's own count was still capped at 8 (`loss_step_max_contracts`).
+    Since the recovery became a combo at base size that count only answers "is
+    a recovery due" (count above base) - so at a base of 8 or more the capped
+    count would have equalled the base and ended every recovery silently. It
+    is uncapped; no order is ever sized from it.
+  * Everything sized from the base follows: normal entries and the recovery
+    combo. The wife's mirror is configured separately (fixed 1 contract, cap 2)
+    and does not scale.
+
+WHAT DID NOT SCALE, left as the operator's call: the daily loss floors ($5 on
+SOL/XRP/NEAR/SILVER, $10 ETH, $20 BTC) are fixed dollars. At base 4 one loss is
+about -$3.20, so SOL's floor stops it after two. And instruments lose together
+(same-window co-loss 67% against a 16% base rate, measured the same evening on
+394 trades): a bad window on three instruments at base 4 is about -$10.
+
+LOSS FLOORS SCALE TOO (same evening). Operator: "loss limit must scale", with
+today's limits counted as right for today's base of 2. The day's floor is now
+the configured limit x today's base / 2 (`main.scaled_loss_limit`,
+`loss_limit_reference_base` = 2): unchanged today; at base 4 SOL/XRP/NEAR/
+SILVER $10, GOLD $14, ETH $20, BTC $40 - the same number of losses per day as
+today, whatever the size. A Telegram override scales the same way. Before the
+day's capital review the base reads 1, so the floor is briefly tighter, never
+looser. tests/test_loss_limit_scaling.py.
+
+## 107. The learning loop adopts what it learns; the local model runs in every cycle
+
+Operator, 2026-09-28: "verify system is learning from loses", then "do so the
+system learn and adapts". Verified on the live record that morning:
+
+  * BTC activated fresh fits, but none had changed a live decision since 09-26.
+  * ETH (since 09-27 02:17) and SOL (since 09-26) REFUSED EVERY FRESH FIT. The
+    running policy was compared with the fresh fit on the VALIDATION slice -
+    the slice its own promoted rule had been selected on - so it won by
+    construction. The loop was learning and throwing the learning away.
+  * The one live rule working was SOL's veto. It blocked 34 entries, which
+    went 19 won / 15 lost. Taken, they would have lost $2.36 per contract in
+    total (fee-free), so the veto saved that.
+  * The local model (qwen2.5-1.5b, 127.0.0.1:8080) had run exactly once, by
+    hand, for BTC.
+
+THE CHANGE.
+
+  1. FRESH FITS ARE JUDGED ON THE HOLDOUT, the newest third of the
+     chronological split. Neither policy was selected on it.
+  2. EACH RUNNING RULE THE FRESH FIT DID NOT RE-PROMOTE GETS ONE VERDICT
+     (`learning.carry_forward`):
+       - running artefact cannot act (changed feature contract, retired
+         features, superseded method): NOTHING is carried;
+       - live record condemns it (>= 20 changed orders, net cost): let go, and
+         left out of BOTH sides of the comparison (`learning.without`) so
+         dropping it cannot re-freeze adoption;
+       - live record supports it (changed orders, net gain): carried;
+       - no live verdict: judged on the holdout, fresh policy with the rule
+         against without it, and carried only if it adds value there.
+     The activation reason lists what was kept, let go and dropped.
+  3. THE LIVE RECORD CAN DECIDE. Every acting rule stays on the candidate
+     watch list (`candidate_payload(policy=...)`). The forward record keeps the
+     poll where a candidate first DISAGREED with the rule, not the first poll.
+     Before this, SOL's forward record had counted 8 of its veto's 35 live
+     windows. Seven were lost because refits had dropped the cell from the
+     watch list; the rest were first polls taken before the rule accepted.
+
+THE REVIEW CAUGHT TWO THINGS THE FIRST VERSION GOT WRONG (adversarial review,
+2026-09-28, 7 of 8 findings confirmed by reproduction):
+
+  * The first version carried rules out of ANY running policy, including one
+    that cannot act. At a feature-contract bump the service withdraws the
+    running rules on load and a bootstrap fit follows. Carrying from that
+    artefact would have silently resurrected a rule fitted under definitions
+    this build does not compute. That exact sequence happened at brti-2 -> 3
+    and brti-3 -> 4, both times to ETH's veto.
+  * It kept a rule forever when its live record was empty. ETH's veto has had
+    0 live changes since brti-4 (every such setup fails the distance gate),
+    so it could never reach the 20 needed to let it go. On the holdout it
+    blocked 181 decisions and cost $1.89 per contract.
+
+A second check of the fixes found four more, all fixed:
+  * Rules were judged one after another against a policy whose enable flags
+    were set only at the end. A second rule was credited with the first
+    one's effect, and a -2.75 veto read +6.50. Flags are now set at each
+    carry.
+  * A REFUSED fit wrote a watch list without the running rules, which stay
+    live. Rules acting in either policy are watched now.
+  * Quiet slots were counted from each instance's own finish, so BTC and XRP
+    would have hit the model in the same second every 6 hours. Slots are now
+    owned by the clock: window index mod 8.
+  * A carried rule overwrote the fresh fit's confidence for its cell. It now
+    brings only its execution fields.
+
+REPLAY on fresh copies of the live stores, the real `_train`, with each
+instrument's strategy file (09-28 ~08:00):
+
+  * ETH: veto DROPPED (no live verdict; -$2.62/contract over 180 blocked
+    decisions on the holdout). ACTIVATES.
+  * SOL: veto CARRIED (live record +0.95 over 11 changed orders). ACTIVATES;
+    its evidence bar becomes 100 (from 120).
+  * BTC: nothing acting. ACTIVATES.
+
+THE LOCAL MODEL IS IN THE LOOP (`hypotheses.py`; scripts/lifecycle_hypotheses.py
+is now a wrapper). After every completed learning run, the instance's recorded
+lifecycles - losses included - go to the local model. It proposes conditions
+that separate winners from losers, and each proposal is tested. Nothing the
+model says changes an order: a survivor is a candidate for keying that must
+still clear the promotion bar.
+
+  * THE TEST. The day-clustered bootstrap reported p = 1/3000 whenever every
+    day agreed in sign, which chance does 25% of the time over 3 days. BH then
+    passed random filters in 27-98% of runs (null simulation on each store's
+    real rows). Now an exact day-level sign-flip test is used: with D days no
+    p below 2^(1-D). On today's 3-8 days of history nothing can survive
+    before ~7 days, and that is the honest answer.
+  * A reply cut off at the token limit used to parse to NOTHING and be
+    recorded as a healthy model that proposed 0 (SOL, every observed run).
+    Complete proposals are now recovered and the cut is reported. Up to 8
+    proposals, 1200 tokens.
+  * BH is keyed by position, not by the model's names, which repeat. A
+    losing slice is worded "trails the rest by X - one to avoid".
+  * TIMING. Each instrument owns the windows whose index mod 8 is its
+    position (BTC, ETH, SOL, XRP, NEAR, GOLD, SILVER; `SLOT_ORDER`). The call
+    starts 10s after the open and times out at 200s, so it ends before
+    entries open at +240s. The wait is at most 2 hours. It runs on a daemon
+    thread, so a crashing service is not held (with service.lock) until the
+    call returns.
+  * OUTPUT. `<policy dir>/hypotheses.json` and `hypotheses_history.jsonl`, a
+    log line "learning: local model [ASSET] ...", and a Telegram message only
+    when something survives.
+  * RESIDUAL BIAS, stated. The model picks thresholds after seeing a summary
+    of the same rows it is tested on, and the message says to treat
+    survivors as leads.
+
+tests/test_learning_adapts.py.
+
+## 108. Only BTC and GOLD trade live; ETH and SOL go back to shadow
+
+Operator, 2026-09-28 09:0x, final: "only gold and BTC are allowed to trade
+live". ETH and SOL return to shadow (they record and alert, and an order needs
+Telegram approval). XRP, NEAR and SILVER stay in shadow. GOLD automation is
+enabled by this explicit authorization.
+
+THE EVIDENCE BESIDE IT (fee-free, per standing instruction):
+
+  * BROKER RECORD, automatic trades (settlements and fills derived
+    independently, agreeing to the cent): BTC +$10.62 over 264 (85% won,
+    +2.3c a contract); ETH -$12.31 over 141 (combos included, -4.4c); SOL
+    -$4.78 over 40 (-5.4c). BTC alone +$10.62, BTC+SOL +$5.84, all three
+    -$6.47. ETH was +$2.54 before 09-28 and lost $14.85 that day at base 4.
+  * THE SAME SIGNAL ANALYTIC ON EVERY INSTRUMENT (1 contract, recorded price,
+    settled outcome). Would-trade decisions (rule-qualified, not vetoed, band
+    held 60s; it reproduces BTC's real result, +2.5c): BTC +2.5c (188), GOLD
+    +3.6c (49), NEAR -1.2c, ETH -1.4c, XRP -1.4c, SOL -2.3c, SILVER -13.0c.
+    Every alert as sent: GOLD +5.9c (131), BTC +3.5c (661), SILVER +1.3c,
+    SOL +0.9c, XRP -0.8c, ETH -1.0c, NEAR -5.1c.
+  * PAIRED WITH BTC on shared days, alerts: BTC+GOLD +$18.75 vs BTC alone
+    +$11.04, and GOLD lost in 10 of BTC's 33 losing windows. ETH lost in 54 of
+    BTC's 89: it deepened BTC's bad windows instead of offsetting them. On the
+    3 days all four had alerts: BTC +$7.78, BTC+GOLD +$16.29, BTC+GOLD+SILVER+
+    SOL +$19.65 with a worst day twice BTC+GOLD's. On would-trade decisions
+    (2 days): BTC +$3.40, BTC+GOLD +$3.68, the four together -$2.74.
+  * NOT PROOF. Every 95% interval spans zero. GOLD has 4 days and closes
+    about 48h every weekend.
+
+HOW IT WAS APPLIED. The switch is the STORED `auto_trade_enabled` row, which
+wins over the launcher's default (`main.auto_is_on`). It was set with
+`scripts/auto_switch.py`: ON for gold15.db, OFF for eth15.db and sol15.db,
+and an explicit OFF for xrp15/near15/silver15, which had relied on the
+default. run_sol.ps1 no longer defaults auto on, run_gold.ps1 does, and all
+three launchers carry the decision. ETH, SOL and GOLD were restarted at a
+window open after a broker flat check.
+
+WHAT FOLLOWS FROM EXISTING CONFIGURATION:
+  * The mirror copies GOLD (MIRROR_INSTANCES lists gold) at 1 contract, cap 2.
+  * GOLD has no combo partner, so its recovery is a single entry at base size.
+  * GOLD's floor scales with the base: $14 a day at base 4.
+  * OPEN: BTC's recovery combo takes its second leg from SOL
+    (combo_recovery.PARTNERS), so a BTC recovery still carries SOL exposure.
+    Put to the operator.
+
+CORRECTION, SAME MORNING (independent recheck, after the decision was
+applied). The GOLD evidence above does not hold under the gates the live code
+applies. The auto path's 60s settle timer (main.py ~2888) measures
+strategy.json's 0.70-0.93 band FOR EVERY INSTANCE, while the recorded
+`band_hold_s` uses the instrument's own band (GOLD 0.60-0.80). The live
+decline log confirms this on SOL: 58 of its would-trade windows were refused
+"price has only held the band", and SOL never ordered below 0.70.
+
+  * GOLD's +3.6c came entirely from asks below 0.70 (22 signals, +$2.52).
+    At 0.70 and above it was -$0.77, and that is the only range the deployed
+    auto path can trade.
+  * Under the live gates: GOLD -$0.35 over 30 (-1.2c, CI -15c..+10c);
+    BTC+GOLD +$3.52 vs BTC alone +$3.87 on shared days, and +$3.77 vs +$4.12
+    over the whole record. No shadow instrument improves on BTC alone.
+  * The +3.6c also rested on one day (09-25; without it -0.6c) and on about
+    33 trading hours across two rule versions (brti-2 band 0.65-0.75, brti-4
+    0.60-0.80).
+  * "GOLD lost in 0 of BTC's losing windows" was 0 of 2. GOLD was closed for
+    8 of BTC's 11 losing windows on its days.
+  * The daily loss floor is ACCOUNT-WIDE: auto_state takes the whole
+    account's settlements. ETH was stopped on 09-24 at its own -$1.17, and
+    SOL on 09-26 at its own -$1.55. BTC's losses can stop GOLD and vice versa.
+  * Grading from Kalshi's official settlement values changed no number.
+
+Put to the operator at once. GOLD stays ON unless the operator says otherwise:
+the decision is theirs, and the evidence is recorded beside it.
+
+THE OPERATOR'S ANSWER TO THE CORRECTION (same morning):
+  * GOLD: "Use the numbers that work for Gold ... the one that shows Gold did
+    not lose together with BTC". Gold stays ON, and it trades on its OWN band.
+    The auto path's settle timer now measures the instrument's own band
+    (`settle_rule = kalshi_rule`), so gold can enter 0.60-0.80 as its rule
+    qualifies. BTC and ETH carry 0.70-0.93 in both files and are unchanged.
+    The evidence for gold is the would-trade analytic (+3.6c over 49), with
+    the caveats above: it rests mostly on 09-25, and GOLD was closed for 8
+    of BTC's 11 losing windows.
+  * BTC's recovery: "BTC AND GOLD ONLY I SAID". BTC no longer has a combo
+    partner (`combo_recovery.PARTNERS`). Its recovery is a single entry at
+    base size, and nothing upsizes. ETH/SOL keep their partners on paper but
+    are in shadow.
+tests/test_live_instruments.py pins the settle band, the partner map and the
+launchers.
+
+REVIEW OF THE BTC+GOLD CHANGE, before deploy (fixed):
+  * THE ENTRY CEILING WAS BTC'S. Every IOC is sent AT `max_entry_price`
+    (0.95) and the mirror copies it. For gold (band 0.60-0.80, negative
+    above 0.85 on every sample; its ask jumps >=10c between polls 3.8% of the
+    time, against 1.05% for BTC) a 0.66 setup could fill at 0.95. The auto
+    path's ceiling is now min(0.95, the rule's own max_ask + entry_slippage):
+    gold 0.85, BTC and ETH still 0.95. On BTC, 62 of 265 fills already came
+    in >=3c above the decision ask, and 19 above the `limit_submitted` the
+    executions archive recorded, so that column misstates the real limit.
+  * The status line said "recovery by combo at base size" on every BTC and
+    gold message. It now says "every entry at base size, no combo".
+  * With no partner, "recovery due" was never spent, so it labelled every
+    in-band entry for five markets and re-armed after a loss. Instruments
+    with no partner now carry no recovery label. The count was always base.
+
+OPEN, put to the operator (pre-existing, not changed):
+  * The daily floor's exchange half is ACCOUNT-WIDE. One -$13 BTC market stops
+    gold at -$14 while gold is flat.
+  * `execution.market_open_ms` reads the ticker's ET close as UTC. Markets
+    closing 00:15-03:45 ET (00:15-04:45 in EST) fall outside their own New
+    York day. That turns off the account-wide half of the floor overnight
+    and drops them from Telegram's "today" (09-28: -$20.15 across 17 markets
+    missing, today -0.31 shown vs -21.36 real). An instance's OWN trades still
+    count through the local rebuild.
+  * The local rebuild prices a trade by the window's FIRST recorded side. A
+    trade placed after a side flip books the opposite result (e.g. SOL
+    271615: +0.68 booked, -3.32 settled). This affects BTC 4/265, SOL 2/39 and
+    ETH 1/137 fills.
+
+NO RECOVERY AT ALL (operator, same morning): "does the system even need
+recovery ... we need no recovery at all ... The current Gold and BTC can
+actually run without recovery base on the report we have already seen."
+`config.recovery_enabled` = False, the master switch:
+  * no loss step: every entry is base size, and no entry carries a recovery
+    label;
+  * no RECOVERY ARMED / SIZE ENDED message (the deficit is still folded each
+    poll as bookkeeping; nothing reads it to size an order);
+  * no recovery line on any trading or money message.
+The resting add-on and the upfront upsize were already off. The test suite opts
+back in (tests/conftest.py) so the mechanics stay tested for re-enabling;
+tests/test_live_instruments.py pins the OFF default.
+
+NEXT, being measured: the operator's late high-probability combo idea: BTC +
+GOLD legs at 90-98% about 2 minutes before close, $1 a ticket, every window,
+about 10% a win.
+
+## 109. The late high-probability BTC+GOLD combo: fairly priced, so the quote decides
+
+Operator, 2026-09-28: "the combo system can be another strategy at very high
+probability like 95, 90, even 98% at close to 2 minutes expiry. Every single 15
+minutes. Making 10% and testing that strategy with just $1." Two manual $1
+BTC+GOLD combos that day both won (+$0.111 each fee-free, both filled at
+0.899). Measured read-only before building anything:
+
+  * LEGS AT 2 MINUTES ARE FAIRLY PRICED. For 90-98% favourites at 120s, BTC is
+    -1.0c a contract (2,617 windows, 76 days, CI -1.8..-0.3) and GOLD -0.2c
+    (51 days). The favourite premium of FINDINGS 1 is real 6-7 MINUTES out
+    (BTC +1.6c, GOLD +1.8 to +2.4c, clear of zero) and gone by 3 minutes.
+    The "sure thing" loses about 1 time in 20: 10-14% at 0.90-0.92, about 2%
+    at 0.97-0.99.
+  * THE COMBO. Both legs in 0.90-0.98 at 120s: 284 tickets over 43 GOLD days.
+    Both won 88.03%, against 90.62% implied by price. The legs are
+    independent (phi -0.06; 0 double losses). At $1 a ticket: -$7.95
+    (-2.80%) at the leg product; -$4.87 at 1c under; -$19.79 at the 4.8c
+    markup seen on a $10 quote. Break-even is 2.53c UNDER the product
+    fee-free (3.31c with the fee). At the product the loss is not proven
+    (CI spans zero); at the markup it is.
+  * NOT EVERY 15 MINUTES: about 7 qualifying windows per GOLD weekday, none
+    on Saturdays. "10% at 95-98%" is arithmetically impossible (a win at p
+    returns (1-p)/p: 5.3% at 0.95, 2.0% at 0.98). 10% needs about 0.95 x
+    0.95, and that bucket won 87.34% against 90.9% needed.
+  * QUOTES. Makers answer in 15-157 ms right up to the close. At $1 the best
+    quote is a median 1.007x the product (0.879-1.040; 11 of 36 at or under).
+    Accept-to-fill takes 1.1-4.5s. FINDINGS 82's "makers rarely quote" was an
+    artifact: GET /communications/quotes keeps only ACCEPTED quotes and quotes
+    on still-open RFQs.
+  * A $1 test would take about 833 tickets (about 120 GOLD weekdays) to tell
+    88.0% from 90.9%. A few weeks would measure the PRICE obtained against
+    the product, which is what decides it.
+Scratch: late_combo/ (session scratchpad). Put to the operator.
+
+DECISION (operator, same day): "Drop it". Not built. The measurement stays as the record, and the 6-7-minute favourite premium is the open lead if combos are ever revisited.
+
+## 110. The daily loss limit: right day, right side, own instrument; alerts for BTC and GOLD only
+
+Operator, 2026-09-28: "address all 4", then "everything goes out now" and gold
+"must be live right now". Shipped together at a window open.
+
+  * THE CLOCK. `market_open_ms` read the ticker's New York CLOSE as UTC, so
+    every stored `window_ms` sat 3h45m early. Markets closing 00:15-03:45 ET
+    fell out of their own day: on 09-28, 17 markets and -$20.14 were missing
+    (-2.01 counted, -22.15 real). The fix re-derives 14,684 stored values
+    across the 7 stores, on every Store() open, idempotently. The ticker read
+    in New York time agrees with Kalshi's own times 4,305 of 4,305. The "one-
+    time" day-boundary carry had re-run at every midnight and would have
+    double-counted the previous evening once the clock was right, so it is
+    retired. Settlement lands 5-8s after close, not "hours late"; the
+    comments now say so.
+  * THE SIDE. The local rebuild graded a trade by the signal's first side
+    (`TRADE_WON_SQL` now: broker result on the trade's own ticker, else the
+    signal re-expressed for the held side, NULL for combos). 3 held trades
+    were ever mis-graded ($8 gross, $0 net); SOL 271615 lost $3.32 and was
+    booked +$0.68.
+  * SEPARATE FLOORS. The floor's exchange half read the WHOLE account, so one
+    instrument's losses stopped another. With the clock fixed, the morning's
+    ETH/SOL/BTC losses would have stopped gold at $14 while gold was flat.
+    Each store now counts its own series and the combos it bought, which is
+    what the launchers always said ("each carries its own daily loss floor").
+  * TELEGRAM. Only instruments on `telegram_alert_instruments` ("BTC,GOLD"),
+    or any instance that is auto-trading, send alerts. A shadow keeps quiet
+    except for money that actually moved; its session reaches Telegram in one
+    combined SHADOW SUMMARY per session close, sent by BTC: alerts as sent and
+    the would-trade decisions, graded, at one contract, fee-free.
+  * Also on 09-28: the 3 rows the 09-27 NameError left at 'executing' (ETH x2,
+    SOL x1, all won) were booked from the broker's fills, without Store()'s
+    migrations. The Telegram token and Kalshi key ID in the committed
+    .env.bak files are on a PUBLIC GitHub repo; the private key never was.
+    Rotation is the operator's.
+tests/test_loss_limit_clock.py, tests/test_telegram_shadow.py.
+
+GOLD'S BAND = BTC'S (operator, same afternoon, 13:17 ET): "set gold to 70-93
+same as btc". strategy_kalshi_gold.json min_ask 0.70, max_ask 0.93. It is
+re-read every poll, so no restart was needed. The order ceiling follows
+(min(0.95, 0.93 + 0.05) = 0.95). AGAINST the measurement, recorded in the
+file's _band_comment: on gold's live alerts to date, 60-70c made +10.3c a
+contract (55 signals, 76% won), 70-80c 0.0c (54, 74%), 80-93c +5.8c (30,
+90%); the 49-day corpus fit put the edge at 0.60-0.80 and found the residual
+negative above 0.85 on every sample. The tests now allow a band equal to
+BTC's only as a recorded operator decision.
+
+## 111. A second strategy in parallel: ALL-SIGNAL $1 on BTC and GOLD
+
+Operator, 2026-09-28: "this one should be running alongside with the main
+strategy already running... trade at a pace one dollar... execute all their
+generated signal every 15 minutes. And the main strategy running right now
+should keep running as it is. So basically, you will be running two
+strategies in parallel."
+
+WHAT IT DOES. On every signal of a listed instrument (`allsignal_instruments`
+= "BTC,GOLD": the alert, the first actionable poll of each window) it buys
+that side for `allsignal_stake` = $1 - whole contracts, one at 50c and up,
+more below - as an IOC at the signal's price plus the usual slippage. No
+strategy gate, no band, no intelligence, no daily floor of its own.
+
+HOW IT STAYS OUT OF THE MAIN STRATEGY'S WAY.
+  * Its own book, `allsignal_trades`. None of the main strategy's 40-odd
+    trade_proposals queries, guards or reports sees a $1 trade, so the
+    one-position guard, trade counts, /ledger and recaps are unchanged.
+  * It is placed in the background on the alert, so the main poll never
+    waits on it.
+  * It uses the primary client and is NEVER mirrored to the wife's account.
+  * The exchange books one position per market for both strategies, so the
+    main strategy's daily floor takes the all-signal strategy's own graded
+    money back out (`auto_state`). The $1 test cannot stop or excuse it.
+  * The main strategy's exits sell only its own count (reduce_only), leaving
+    the $1 contracts. When the two hold opposite sides, Kalshi nets the pair
+    at $1, which is the same money as both settling.
+  * It stops with /auto off (the kill switch stops everything), and on its own
+    with scripts/allsignal_switch.py --db <store> --off.
+Reported once a session in the SESSION SUMMARY (real money, separated from
+the shadow lines), not trade by trade. The evidence it is measured against:
+FINDINGS 110's every-signal replay, +3.8c a contract over 483 signals (BTC
++3.1c, GOLD +5.3c), with a longest losing run of 6 in one broad-market hour.
+tests/test_allsignal.py.
+
+REVIEW BEFORE DEPLOY (adversarial, 2026-09-28; fixed):
+  * The midnight capital review undercounted. It runs seconds after 00:00,
+    while the 23:45 $1 position is still open; its cost was out of the cash
+    and not added back, so the main strategy's tier could drop for the day
+    ($120.50 read as $119.75, base 4 -> 3). Open all-signal positions now
+    count in `open_position_cost`.
+  * Interrupted orders are now reconciled. A restart, a cancellation or a
+    lost response left rows 'claimed'/'failed' for good, and their real
+    result landed in the main floor. `allsignal_reconcile` now settles them
+    from the broker's synced fills: the buy on that ticker within a minute of
+    the claim that is not a main-strategy order. A fallback price is refined
+    the same way.
+  * Grading now runs straight after every settlement sync, before the broker
+    reads that can fail (a 429 streak was seen live).
+  * The fill lookup retries four times, like the main path.
+  * Each session summary counts windows by when they SETTLED, so the one
+    closing at the boundary is no longer reported "open" and then never.
+  * The main strategy's settlement recap takes the $1 contract back out of
+    the market's broker P&L.
+KNOWN AND ACCEPTED: in about 1.5% of the main strategy's windows it buys the
+side opposite the alert, and Kalshi nets the two positions. Money totals stay
+exact (settlement = all-signal graded + main as-if-held; the floor
+subtraction is right), but the split between the two books is notional there,
+and a main cash-out may sell one fewer contract than it records. Changing it
+would change the main strategy, which the operator ruled out.
+
+MAIN STRATEGY TO SHADOW; $1 ON BOTH ACCOUNTS (operator, 15:3x ET): "pause the
+main strategy and let it run in shadow while we let the new strategy run on
+both my wife and mine with the $1 trading all signals... That way we can
+evaluate better."
+  * The main strategy has its OWN switch now (`main_strategy_on`, stored row
+    main_enabled; scripts/strategy_switch.py). OFF on btc15 and gold15: it
+    records every decision and places no new entry, and positions it holds are
+    still managed to the close. /auto stays the kill switch for BOTH.
+  * The all-signal order goes through the mirroring client (`allsignal_mirror`
+    = True). A FILLED $1 order is copied to the wife's account, sized there by
+    `MirrorTarget.allsignal_budget` ($1), capped by her max_contracts (2). The
+    budget is keyed on the order's strategy, not shared state, so a main-
+    strategy entry in flight cannot be sized by it.
+  * Before the switch (14:15-15:45 ET), every signal was traded, 12 of 12, and
+    every main-strategy window also had its $1 trade. $1 results over 10
+    settled: BTC 5-0 +$1.24, GOLD 4-1 +$0.41 (fee-free).
+
+TELEGRAM FOR THE NEW STRATEGY (operator, 16:1x ET): "clean up the alert
+telegram messaging to show only the new stats for these new strategy and
+execution. These current messages should be owned by the old system; for the
+new system we create a cleaner version that tracks its execution and overall
+and daily win rate."
+  * One message per $1 trade (`messages.allsignal_trade_message`), sent at
+    execution (open: side, window, signal price, fill price, both accounts)
+    and EDITED IN PLACE when it settles (WON/LOST and amount). Each carries
+    today's and overall record, for the instrument and for BTC+GOLD combined:
+    wins-losses, win rate, P&L, fee-free.
+  * The old system's messages follow the old system. With the main strategy
+    paused, BTC/GOLD's signal, settlement, session and learning messages are
+    quiet like any shadow's; money the old system still moves (its last exits)
+    is still reported. Re-enabling main brings them back.
+  * The session summary carries the new strategy only: each instrument's
+    session plus today and overall. Shadow instruments are recorded, not
+    sent.
+  * `allsignal_trades` gained tg_message_id and reported_ms via _add_columns
+    (the table already existed in the live stores).
+
+LOCKED (operator, 2026-09-28 ~16:35 ET): "From now that strategy is locked in -
+freeze everything, except when I tell you to change base size." The state
+frozen:
+  * BTC and GOLD. Every signal, $1 a trade, on the operator's account and the
+    wife's. No gate, band or intelligence; no daily floor of its own. /auto
+    stays the kill switch.
+  * The main strategy is paused (shadow) on both.
+  * Telegram: one message per trade, edited in place at settlement, with
+    today and overall; the session summary is the new strategy only.
+  * The base size (`allsignal_stake`, her `allsignal_budget`) changes ONLY on
+    the operator's instruction.
+tests/test_allsignal_locked.py pins the settings and fingerprints the order
+path: any other edit fails the suite until it is re-approved.
+
+ACCOUNT BALANCES IN THE SUMMARY (operator, 17:0x ET): "let the message track
+account starting balance in the message and current balance". The session
+summary shows each account's start and current value: cash plus open positions
+at cost (`KalshiExecutionClient.account_value`). The start is REBUILT from the
+broker, since Kalshi keeps no balance history (scripts/allsignal_baseline.py):
+value now minus the settled P&L of every market opened since. Both accounts
+start at 15:45 ET 09-28, when the $1 strategy began running ALONE on both;
+from 14:15 the operator's account would have included the old strategy's last
+four trades (+0.91 account-wide against the $1 book's +3.63). Stored in
+btc15.db settings_text 'allsignal_start_balances': You $112.12, Wife $28.56.
+The trading code (locked) is untouched; tests/test_allsignal_locked.py passes.
+
+SETTLEMENT NOTICE (operator, 18:0x ET: "the recent three settles never fire
+the telegram messages"). They did - as EDITS of each trade's message, and a
+Telegram edit is silent: no notification, nothing new at the bottom. Each
+settlement now also sends a short reply to the trade's message
+(`allsignal_settled`). Deployed 18:15 ET. The broker showed exactly one entry
+fill per market on both accounts and no exits: nothing was cashed out.
+
+THE CASH-OUT, ON THIS BOOK TOO (operator, 18:1x ET: "cash out was never
+supposed to be out - cash out must be part of the system at all levels ... it
+cashes out at max profit, no need to wait for expiry"). It was never on: the
+main rule (`cash_out_exit`) reads `trade_proposals`, and the $1 strategy books
+in `allsignal_trades`, so every $1 trade from 14:15 rode to settlement. My
+omission, not a decision.
+  * `main.allsignal_cash_out` is the main rule exactly - cash_out_capture 0.90,
+    cash_out_min_bid 0.90, cash_out_at_bid 0.98, all judged on the quoted bid
+    minus exit_slippage 0.01; never inside the last 60s; never at or below
+    the price paid; one attempt per window; crossing down to min_exit_price.
+  * Through the mirroring client, so her account sells too. Gated by /auto
+    only: a held position is managed to the close even with the $1 switch
+    off, as the main strategy's are.
+  * A full exit is graded AT THE SALE and announced then: the trade's message
+    flips to "CASHED OUT +$x.xx - sold 99c with 4m00s left" and a reply says
+    the same. A miss or a partial sale gets its own reply. Net figures carry
+    the exit fee (`exit_fee`); capital counts only what is still held.
+  * Pinned in tests/test_allsignal_locked.py (settings + fingerprint + the
+    poll-loop call), at the operator's instruction.
+
+EVIDENCE BESIDE THE DECISION (replay, read-only, 1-minute candles, the rule's
+trigger minus slippage, never the candle high): 32 filled $1 trades, 14:15 to
+18:15 ET. The rule would have fired on 18. All 18 won anyway; none of the 7
+losers ever bid above 0.88 in a minute the rule could act, so none was saved.
+Held +2.273, with cash-out +1.799: -0.474 over the afternoon (BTC -0.276, GOLD
+-0.198), 2-4.6c a cash-out. At the observed best bid with no slippage it is
+still -0.159. The cost is the PROPORTIONAL gate on cheap entries: bought at
+0.54-0.73 it fires at a quoted 0.955-0.98, not 0.99. The 1c the operator has
+seen is the absolute 0.99 trigger on expensive entries. One afternoon settles
+nothing, and it agrees in sign with the config's -$0.0006/contract. Shipped on
+the operator's word; the numbers are here for the next review.
+
+THE THREAD READS IN TIME ORDER (operator, 19:0x ET: "the messaging is messed
+up. This last sequence doesn't look right"). Nothing was wrong with the events
+or the numbers: every message went out on time. The layout was: each result
+EDITED the trade's entry message AND was sent as a reply, so every result
+showed twice - once back at the entry's time (18:34 read "GOLD WON" and "BTC
+CASHED OUT" before either happened) with a record frozen at the edit, which
+also made the totals look out of order (29W-7L above 28W-7L). Now:
+  * the entry message is never rewritten and carries no record;
+  * the result - WON / LOST / CASHED OUT - is a reply to it, with today's and
+    overall record, so the record only moves forward down the thread;
+  * a signal whose $1 order bought nothing now says so ("NOT FILLED" /
+    "ORDER FAILED"), once, recent windows only (GOLD 18:45 missed its IOC at
+    0.78 and the window looked skipped).
+Messaging only; the locked order path and cash-out fingerprints are unchanged.
+
+LOOPS CLOSED (operator, 19:4x ET: "let close these loop now").
+  * THE SALE PRICE COMES FROM THE BROKER. BTC 18:45's cash-out was booked and
+    announced at the 0.974 quote (+$0.26); the broker filled 0.99 in three
+    pieces (+$0.28). One fill read came back empty - Kalshi's fills feed lags
+    the order ack - and the quote stood in. The cash-out now reads the price
+    back with the entry's retries (4 reads, 1.5 s apart), and
+    `Store.allsignal_reconcile_exits` confirms every exit from the synced
+    fills table (exit_fee NULL = unconfirmed) and re-grades it. The existing
+    18:45 row is corrected on the first sync after the deploy. The main
+    strategy's record has the same fault on 45 of 241 historical exits; it is
+    paused and its money figures already come from the broker's settlements.
+    CASH_OUT_CODE re-pinned on the operator's word.
+  * "SOME ALERTS DON'T TRIGGER AFTER THE TRADE CLOSED." Audited every $1 trade:
+    since the 18:15 deploy every closed trade sent its result. The 14 trades
+    from 16:15 to 17:45 have none - their results were silent edits (fixed
+    18:15); GOLD 18:45 bought nothing and said nothing (fixed 19:30). Results
+    also waited 60-90 s for the once-a-minute sync although graded seconds
+    after the close; they are now sent wherever the trade is graded.
+
+MIRROR ACCOUNTS FOLLOW A SWITCH PER INSTRUMENT (operator, 20:0x ET: "make the
+wife mirror account or any other mirror account follow an on/off flag per
+asset ... now I want it to only trade BTC"; then: m2 is Uncle George's account,
+"make sure he gets the BTC trade as well").
+  * `main.mirror_on(store, name)`: row mirror_<m1|m2>_enabled in each
+    instrument's store, no row = on, read on every mirrored order - a switch
+    takes effect on the next entry with no restart. Set with
+    scripts/mirror_switch.py (--mirror wife|george --asset GOLD --on|--off;
+    no arguments prints every account x instrument).
+  * It gates NEW positions only (entry, add, combo). An exit still reaches an
+    account that holds what this process bought for it; a switched-off account
+    holding nothing of ours gets no blind reduce-only sale. A switch that
+    cannot be read copies nothing new (fails closed).
+  * MIRROR_INSTANCES stays the outer gate (read at startup).
+  * Set now: Wife and Uncle George ON for BTC, OFF for GOLD, ETH, SOL, SILVER,
+    XRP and NEAR - "only BTC" survives any instrument being switched on later.
+    From 20:15 until this deploy GOLD was simply left out of MIRROR_INSTANCES.
+  * Messages name who copies: the entry line "+ Wife + Uncle George", the
+    summary footer "Wife copies BTC · Uncle George copies BTC", and a balance
+    line per account (Uncle George starts at $10.00, 09-28 20:2x).
+  * Uncle George's first copy (BTC 20:15-20:30, 20:19:12) was refused, 401
+    authentication_error, on the order and the balance read. His credentials
+    in .env changed after the process read them at 20:15:22: the same pair
+    read afresh at 20:2x returned 200 ($10.00 on exchange index 0). A restart
+    picks them up; credentials are read once, at startup.
+
+
+### 111 addendum ? 2026-09-29: operator-authorized BTC-only daily profit pause
+
+The operator explicitly requested: "APPLY THE 3% TARGET TO THE CURENT RUNING SYSTEM", then "ONLY BTC ON ALL ACCOUNT , PRIMARY AND ALL MIRRORS ... RECORD AS STARTING NOW WITH ALL THE NOW CAPITAL AS STARTING POINT". This supersedes the earlier strategy freeze for this change.
+
+New BTC entries and adds stop per account when BTC realised profit after fees reaches 3% of that account's recorded starting capital. The hit is durable across restarts and cannot be undone by a subsequent loss. Existing exits remain available. First activation records current broker capital and starts a fresh period; later periods reset on the New York calendar day. A missing or stale broker reconciliation blocks entries. Mirrors retain their own targets; since they copy primary fills, a primary pause also prevents further copies. Gold and all other instruments have new execution disabled; research continues.
+
+State is persisted in runtime/daily_profit.db with capture/start timestamps, opening capital, target, realised P&L, peak, pause timestamp, and notification status. V2 broker fill action is the YES-book direction, so outcome_side is the acquired leg; the guard nets opposite legs and settlement residuals without double-counting cash-outs. Telegram shows after-fee results, fresh-run statistics, opening capital, per-account target, and active/paused status. The order-path pin is updated for the newly authorized paused-result branch; cash-out behavior and $1 sizing remain pinned.
+
+2026-09-29 follow-up: operator requested primary base budget $5 and every mirror $2, plus organized Telegram messages. ALLSIGNAL_STAKE=5, MIRROR_1_ALLSIGNAL_BUDGET=2, MIRROR_2_ALLSIGNAL_BUDGET=2; old mirror count caps removed so dollar sizing determines contract count. Entry messages, results, misses, summaries and per-account target panels show configured budgets. Existing profit-period opening capital and targets are preserved. Cash-out source pin updated only for passing the message budget. Restarted mirrors recover their held count from broker positions for reduce-only exits.
+
+## 112. The daily 3% target, the $5/$2 all-signal, BTC only - and the incident that followed (2026-09-29)
+
+An IDE session (operator-directed) changed the live setup at ~18:03 ET: BTC only
+on the primary, the Wife's (m1) and Uncle George's (m2) accounts; GOLD and the
+rest shadow; all-signal at $5 on the primary and $2 on each mirror; a 3% daily
+profit target after fees per account, pausing NEW entries until 00:00 New York
+(exits continue); fresh start Primary $104.77 / Wife $25.39 / Uncle George
+$19.03. New module src/btc15_signal/daily_profit.py; state in
+runtime/daily_profit.db.
+
+The operator then reported: trades failing, Telegram not properly formatted, "it
+keeps restarting", "a cmd that keeps opening and closing". Found and fixed:
+  * TRADES FAILING: every $5 primary order was refused `insufficient_balance` -
+    BTC's shard 2 held $4.38 with $98 on shard 0. The primary never auto-funded
+    (only mirrors did). Moved $40 by hand at 18:55; `config.kalshi_auto_fund`
+    (default True) now funds each order's shortfall on the primary too, and
+    every transfer is logged ("funding [ticker]: ..."). First trade after: 19:00
+    UP x6 @0.81 primary, x2 on each mirror.
+  * THE FLASHING WINDOW: each watchdog's once-a-minute liveness launch of
+    run_service.py ran `git` three times (revision label); git is a console
+    program and, started from pythonw, got its own window - a flash every few
+    seconds across seven watchdogs. revision._git now passes CREATE_NO_WINDOW;
+    verified: 0 visible console windows over 70 s. Effective without restart.
+  * "KEEPS RESTARTING": the IDE session's three deploys (18:03/18:05/18:13); no
+    instance restarted after. The watchdog's 60 s probe is by design.
+  * TELEGRAM: the IDE appended a ~12-line capital/target footer to EVERY message.
+    Now (operator: "the signal should only be the trade; the result should be
+    the one containing account summary and stats"; "where are the icons and
+    design and table formatting"): entry = the trade (icons, no stats); result
+    = outcome + stats (net, since the fresh start) + an aligned <pre> account
+    table (start / today / target / status), re-read from the broker right
+    before sending (2 s after a sale, so mirrors' fills are in). Failed orders
+    say why. The 3% pause is announced once; its refusals are not repeated.
+    The rate in every text follows `daily_profit_target_rate`.
+  * DAILY TARGET: verified live - all three accounts paused at 19:25:03-04 after
+    the 19:15 cash-out (You +3.34/3.14, Wife +1.33/0.76, Uncle George
+    +1.33/0.57); independent recomputation from the broker matched to the cent.
+    A 17-agent review confirmed and these were fixed:
+      - MIDNIGHT (high): the 23:45-00:00 market settles ~6.5 s after midnight;
+        its result was booked into the new day, and counted twice when the
+        opening was captured after it settled. Now the opening waits for
+        00:00:30 and a market that closed at or before the period start is
+        never in its P&L.
+      - silent fail-closed blocks: an outage is announced once (and its end);
+        refused signals report "NOT FILLED - the 3% target check could not
+        read Kalshi"; a failed read is retried at once, not after 15 s.
+      - the monitor can no longer die silently.
+      - 8 suite tests read the live .env: conftest pins RECOVERY_COMBO_ENABLED
+        and the default-size test uses Settings(_env_file=None).
+    Left as is (dormant, recorded): mirror adds and recovery combos do not
+    consult the pause; recovery is off.
+  * ADWARE on the box (Lavasoft/Adaware Browser Assistant + Web Companion,
+    Defender-flagged; plus a HealthCheck{...} task starting node.exe from a GUID
+    folder): 6 Run entries removed, 3 tasks disabled, processes stopped, folders
+    quarantined - backups in C:\Users\admin\Quarantine_2026-09-29. The operator
+    should run a Defender offline scan and rotate all Kalshi keys and the bot
+    token.
+  * DISK: C: had 0.21 GB free; 3.5 GB of review DB copies removed (C: 15 GB
+    free). hiberfil.sys (22.4 GB) can go with `powercfg /h off` (admin).
+
+DAILY TARGET STUDY, on the RECORDED signals and outcomes only (scripts/target_study.py,
+seconds; operator: run studies on the data we collect, not long simulations).
+650 BTC alerts 09-22 23:00 -> 09-29 20:00 (8 NY days, first and last partial),
+won 75.8% at 0.730; sized like live, after fees, held to the recorded result.
+Total after fees, per account (share of NO target):
+  target      You $5/$104.77     Wife $2/$25.39    Uncle George $2/$19.03
+  none         +61.87              +23.25            +23.25
+  3% (live)    +17.02 (28%)        +5.12  (22%)      +8.11  (35%)
+  5%           +29.99 (48%)        +8.35             +6.36
+  6%           +40.92 (66%)        +11.05            +6.36
+  8%           +50.52 (82%)        +12.75            +11.05
+  10%          +36.21              +17.54            +12.75
+  15%          +57.29              +23.22 (100%)     +18.91
+  20%          +76.91              +19.84            +23.22 (100%)
+After You reached 3%, the rest of those days' 446 signals still won 76% and made
++44.85 (+$0.10 a trade) - but unevenly: 09-25 +22.17, 09-27 +28.80, 09-28 -19.30,
+09-29 -4.24. The target's value is days like 09-28 (up early, lost later): 8% kept
++8.94 there against -15.75 with no target. Worst day at 5-8%: -11.51 (09-26, a day
+that never reached any target), at none -15.75. At $5 a single win is ~1.5-2.5% of
+$105, so 3% is reached after about two wins, early in the day. Eight days, driven
+by two or three of them: 10% (+36) below 8% (+51) and 20% (+77) above none (+62)
+are the noise showing, not a curve to fit.
+
+TARGETS RAISED (operator, 2026-09-29 20:1x ET: "let's move to 8% and 15% ... we can
+reevaluate after 2000 signals collected ... let today continue trading"):
+  * `daily_profit_target_rate` 0.08 (primary), `mirror_daily_profit_target_rate`
+    0.15 (each mirror); .env set to match. The table header names each rate.
+  * TODAY re-targeted in runtime/daily_profit.db at 20:14 ET (backup
+    daily_profit_before_8_15.db in the session scratchpad): You $8.38, Wife $3.81,
+    Uncle George $2.85; the 19:25 pause lifted (each was below its new target),
+    so trading resumed from the 20:15 window. Telegram notice sent (msg 5705).
+  * `main.remind_target_review`: once 2,000 BTC signals are recorded since
+    09-22 23:00 ET (650 at the change), one Telegram reminder to re-run
+    scripts/target_study.py on the recorded outcomes.
+
+RULE-BASED vs ALL SIGNALS under the live targets (operator, 09-29 20:2x ET), on the
+recorded signals and outcomes (scripts/rule_vs_all.py, seconds). 09-22 23:00 ->
+09-29 ~20:15, 8 NY days. ALL = 652 alerts, 75.6% won at 0.730. RULE = the main
+strategy's first qualifying poll per window (intelligence_decisions.base_qualified,
+237 windows), 84.8% won at 0.822. Totals after fees:
+                     ALL, target    RULE, target    ALL, none   RULE, none
+  You  $5 / 8%          +50.52          +6.32         +52.83      +22.95
+  Wife $2 / 15%         +23.22          +5.02         +20.24       +7.61
+  U.George $2 / 15%     +18.91          +1.04         +20.24       +7.61
+Worst day: ALL -11.51 (You) / -3.01 (mirrors); RULE -20.89 / -7.64 (09-26).
+The rule wins more often but pays 9c more per contract, so a win earns less and a
+loss costs more, and with ~30 signals a day against ~82 it reached the target on 4
+of 8 days (ALL 6 of 8). All signals are the better base at these targets on every
+account. Eight days; rule entries at the recorded quote (real main-strategy fills
+ran ~1c worse); both held to the recorded result.
+
+WORST DAYS (operator, 09-29: "what could we have done to help in those worst days"),
+on the recorded signals and outcomes (scripts/worst_days.py; You, $5, 8% target):
+  * 09-28 and 09-29 were good mornings and bad afternoons - the 8% target already
+    caught them (+8.94 / +8.63 against -15.75 / -8.80 with no target).
+  * 09-26 never got going (high +1.31, low -40.77 at no target, 72% won at ~70c
+    where break-even is ~70%); ended -11.51. Losses were ordinary signals (avg 69c,
+    not cheap) and short runs (max 3 in a row).
+  * Protections fixed in advance, scored on ALL 8 days (live: +50.52, worst -11.51):
+      daily loss stop -3% / -5% / -8%   -10.02 / +23.67 / +28.90 - HURTS (cuts
+                                          days that dip then recover to target)
+      pause 1 h after 2 losses in a row  +62.78, worst day +0.87 - best, but
+      pause 1 h after 3 losses in a row  +25.29, worst -16.66 - so partly luck of
+                                          which trades a pause skips
+      give-back stop (keep 50% of peak)  +14.77 - hurts
+  * Time of day: no stable pattern (adjacent hours swing +/-20); evening block
+    -3.7c/signal over 156, inside noise.
+  Nothing adopted. The 2-loss pause is the idea to watch, shadow-only, to the
+  2,000-signal checkpoint.
+
+SKIP-AFTER-LOSS AND A 2-MINUTE SIDE HOLD (operator, 09-29 21:xx: "skip the next signal
+after a loss instead of the 1 hour pause, and the next signal must choose the side only
+when the side holds for 2 minutes before entry"), on the recorded signals and polls
+(scripts/skip_and_hold.py; 653 signals, 8 days; You $5 / 8%):
+  every signal (live)                      +50.52  worst -11.51
+  skip next after a loss                   +26.15  worst -13.89
+  2-min side hold on every entry            +2.22  worst -21.28
+  skip next after loss, then 2-min hold    +17.62  worst -12.60   (the proposal)
+  skip + hold on all                       +14.04  worst -21.49
+  (ref) 1 h pause after 2 losses           +62.78  worst  +0.87
+Mirrors rank the same way. Why: the signal right after a loss won 76.6% (121/158)
+against 75.5% overall - losses do not predict losses, so skipping discards ordinary
+winners. The hold waited on 195 signals (30%): the price rose 69.9c -> 72.5c and the
+win rate did not improve (75.4% -> 74.9%); the side flipped on only 7. Same lesson
+as the timing studies: waiting pays more for the same side. And since losses carry
+no streak, the 2-loss pause's +12 is almost certainly the luck of which trades it
+skipped (the 3-loss version lost 25). Nothing adopted.
+
+WHAT THE LOSING SIGNALS HAVE IN COMMON (operator, 09-29 21:xx), recorded signals only
+(scripts/loser_profile.py [btc15.db|gold15.db]; facts at the alert poll, thirds,
+both halves). ~30 slices tested, so only patterns that repeat on the OTHER
+instrument are kept:
+  * PRICE NEAR THE TARGET LINE (within ~3.5 bps): BTC won 68.8% vs 80.7% when well
+    clear on the side; GOLD 65.2%, and lost money in both halves.
+  * THE EARLIEST ALERTS (first qualifying moment, >= ~652 s left) win most: BTC
+    81.6%, GOLD 80.0%, profitable in both halves on both. (The specific weak band
+    just after it, 623-654 s, did NOT repeat on GOLD - GOLD's weak ones were later.)
+  * In money: BTC ($5, 8% target) every signal +50.52; skip near-line +31.89; first
+    moment only +26.27; both +11.82 - the win rate rises and the profit falls
+    (BTC's near-line signals are priced cheap enough to pay, and fewer trades
+    reach the target later). GOLD ($5, no target, shadow): +11.00 -> +18.33 /
+    +25.96 / +33.27, worst day -22.81 -> -4.52.
+  Decision: BTC unchanged (every signal). Both filters are the GOLD candidates;
+  partly in-sample - confirm on new signals at the 2,000-signal checkpoint.
+
+CORRECTION to the WORST DAYS note above: 09-28 was NOT "a good morning and a bad
+afternoon". Every signal at $5 from midnight fell to -31.60 first, recovered to the
+8% target only at 19:45 ET (80 trades), then fell to -15.75 by the close. When the
+target is reached (You, $5, 8%): 09-23 02:15, 09-24 05:15, 09-25 02:45, 09-27 06:30,
+09-29 05:00 (10-27 trades); 09-28 19:45 (80); 09-26 never (-11.51, low -40.77). The
+target stops a day early on a normal day; it does NOT bound the dip before it is
+reached.
+
+MARTINGALE / STAKE PROGRESSIONS (operator, 09-29: "martingale after a loss, and on a
+win reduce the size"), recorded signals (scripts/stake_progressions.py; $5 base, 8%
+target, $104.77 account). 8 days: flat +50.52 (deepest drop -42.08); x2 reset
++72.20 (biggest bet $39.76, drop -58.86); x2 halve-on-win +76.68; +$5/-$5 steps
++70.24; full-recovery +87.53 (a $64.60 bet). They "won" only because the longest
+run in these 8 days was 4. At 73c a win pays ~$1.54 against a ~$4.75 loss, so a
+doubling does not even recover one loss. Cost of k losses in a row (73c, $104.77):
+  flat: 5 -> -22.31, 8 -> -35.70 (never wiped)
+  x2 (cap $40): 4 -> -74.38, 5 -> ACCOUNT WIPED
+  +$5 steps: 5 -> -74.38, 6 -> WIPED
+  full recovery: 3 -> -85.54, 4 -> WIPED
+Chance of at least one such run (loss rate 24.5%, losses independent): 5 in a row
+6% per day, 36% per week, 59% before the 2,000-signal checkpoint; 6 in a row 10%
+per week, 20% by the checkpoint; 4 in a row 84% per week. Not adopted; sizing
+stays flat (the operator's call - these are the numbers for it).
+  x1.25 variant (operator: "multiply only by 0.25"): x1.25 after a loss, reset on a
+  win +52.54; with /1.25 after a win +53.99 (flat +50.52) - +$2-3.5 in 8 days,
+  inside one trade's noise; worst day -8.75 vs -11.51, deepest drop -45.5 vs -42.1.
+  Streak cost at 73c: 6 in a row -54.30 (flat -26.78), 8 -97.44 (flat -35.70), 10
+  wipes $104.77. Mirrors at $2 x1.25: 6 in a row ~-$20 wipes Uncle George's $19.
+  Not adopted; if tried, primary only and capped at $10 (8 in a row ~-$63).
+
+CORRECTION to "WHAT THE LOSING SIGNALS HAVE IN COMMON": observations.distance_bps is
+UNSIGNED (decision.py: abs(distance)/target), and a signal's side is always the side
+the price is on (UP: btc > target on all 423 alerts; DOWN: below, all 395). So
+distance_bps IS the cushion on the signal's side. The "toward side" column there
+multiplied it by the side's sign, so its thirds mixed UP-far / near-line / DOWN-far;
+the near-line conclusion and the |distance| >= 3.5 filter used the plain value and
+stand.
+
+AFTER A LOSS, WAIT FOR A CUSHION (operator, 09-29: "wait for a better price distance
+... on the next signal after the loss, study that day"; scripts/wait_after_loss_day.py,
+recorded polls). 09-26, the 27 signals right after a loss: at the alert +2.80 (21 W /
+6 L); wait for <=70c -2.99; wait for >=5 bps cushion +10.63 (skipped all 6 losers -
+avg 1.7 bps from the line, vol 0.27 - kept 13 winners); both +2.13. All 7 full days,
+after-loss signals only, no target: alert +12.15, <=70c +0.19, >=5 bps +27.09 (helped
+on 09-24, -26, -28, -29, cost on 09-23, -25, -27). FULL DAYS with the live $5 / 8%
+target (every other signal at the alert):
+  live +43.36 | after a loss wait >=3 bps +56.97, 4 +62.76, 5 +59.40, 6 +56.10,
+  8 +66.61 - every setting better, every day positive (09-26 -11.51 -> +0.4..+8.5).
+The same wait on EVERY signal is unstable under the target (3 bps +13.65, 5 bps
++18.98, 8 bps +60.56). Why the after-loss form: losses stay independent, but a bad
+day has more of them, so the filter engages most on bad days and seldom on good ones
+(which still reach 8% fast). Designed after seeing 09-26, 7 days: in-sample.
+First rule to survive a threshold sweep. Operator to choose: adopt at 4-5 bps, or
+shadow to the 2,000-signal checkpoint.
+  ADOPTED (operator, 09-29 22:xx ET: "adopt 5 and ship it live"): config
+  `allsignal_after_loss_cushion_bps` = 5.0, `allsignal_cushion_min_left_s` = 120.
+  main.allsignal_on_alert replaces the direct spawn at the alert; after a losing
+  filled trade TODAY (an unknown result counts as a loss; a skipped window keeps the
+  state, as in the study) it waits in ALLSIGNAL_WAIT and main.allsignal_cushion_poll,
+  run on EVERY poll after primary_signal, enters at the first poll >= 5 bps clear on
+  the alert's side (that moment's ask), or records 'skipped' with under 2 min left
+  (Telegram "SKIPPED" with the reason; the entry says "after a loss: waited Ns for
+  X bps clear"). Mirrors follow the primary's fill as always. Pinned in
+  tests/test_allsignal_locked.py; tests/test_allsignal_cushion.py.
+
+WHY A $ ORDER MISSED, AND THE FIX (operator, 2026-09-30 ~01:00 ET: "why it did not
+fill", "retry 60 after check is everything still aligned", "fix the cause").
+  * 00:45 window, DOWN signal 68c, IOC cap 73c: decided 00:49:54.742, Kalshi's
+    created_time 00:49:57.932 - 3.2 s late; the price was running toward DOWN (cushion
+    2.6 -> 6.3 bps, ask 64 -> 68 -> 82c), the <=73c offers were gone, the order was
+    cancelled with 0 filled (confirmed on Kalshi; mirrors placed nothing). The recorded
+    ask was back at 68c 13 s later.
+  * Decision->Kalshi on every $ order: median 1.46 s before 09-29 18:03, 1.64 s after,
+    worst 10.29 s; recent fills 1-4c above the signal. Each Kalshi call is only
+    ~60-80 ms. CAUSE: the order runs as a background task and only advances when the
+    poll loop yields; every await before its POST (the daily-target broker read, the
+    shard lookup, the balance read) put it back behind the poll's other work.
+  * 10 of 135 $ orders did not fill (7.4%; 3 were the 09-29 shard-balance failures);
+    in 9 the recorded ask was back under the cap on the next poll (~12 s).
+  * FIX: (1) the order goes out first - primary_signal and the poll yield
+    (asyncio.sleep(0)) right after spawning it; (2) nothing awaits the network before
+    the POST: block_reason uses the monitor's fresh figures (<30 s, no error), the
+    balance is read in the background every 15 s (daily_profit._monitor_one) and
+    ensure_funds spends that cache (reserving locally), and the market's shard is looked
+    up at the start of its window (prewarm_order_path); (3) main.allsignal_retry_poll:
+    60 s after a miss, on the first poll where everything still lines up (>= 2 min left,
+    price on the signal's side, ask <= the original cap, the after-loss cushion if it
+    applies), the same order is sent again; repeated every 60 s; the NOT FILLED message
+    waits until no retry is possible. Pinned: RETRY_CODE.
+  Pre-deploy reviews (2026-09-30 01:0x-02:3x) changed the fix before it shipped:
+  - HIGH: one asyncio.sleep(0) did not send the POST - httpx needs ~7 loop turns, so
+    the order still left after primary_signal's synchronous alert build. Now
+    execution.ORDER_SENT/fresh_order_event is set once the entry POST is answered, and
+    main.await_order_sent holds the alert on it (<= 2 s, once per attempt, only for a
+    'claimed' row). Measured on a real client and socket (80 ms RTT, 400 ms build):
+    POST at 449/511 ms before -> 17/105 ms after.
+  - Retry fills recoverable: attempt_ms/retries columns; allsignal_reconcile searches
+    around the latest attempt, only fills shaped like the entry (UP buy/yes, DOWN
+    sell/no) and never for a 4xx refusal.
+  - Balance cache: insufficient_balance -> clear, top up, resend once (new
+    client_order_id); reservations on every path, kept across an in-flight read.
+  - Prewarm: primary + mirrors, once per window in insertion order (sorted() put OCT
+    before SEP and would have re-warmed every poll from 10-01), only where the $
+    strategy is on. Mirror job limit 15 -> 25 s (room for a resend).
+  THE REST OF THE DELAY (2026-09-30 03:xx). First live order after the 02:45 deploy
+  reached Kalshi 1.10 s after the poll began - and BEFORE the alert's own work (the
+  order-first fix worked). The loop's own timings (executions.timing, last 60 main
+  orders) showed the rest sits BEFORE the price is read: telegram ~716 ms median every
+  poll, settlement_sync ~1,246 ms once a minute (total median 1.39 s, p90 2.7, max
+  5.35). A review then found most of the Telegram time is CPU, not network: a new
+  httpx.AsyncClient per call loads the certificate bundle - 270-470 ms with the event
+  loop blocked - on every Telegram read AND send. Fixes: Telegram reuses ONE client
+  (closed on shutdown); while a $ entry is imminent (allsignal_urgent: alert pending in
+  the entry range, a cushion wait, a retry due) the poll reads the price first -
+  Telegram runs beside it as a background task (one reader at a time, failures
+  logged; a command arriving just then applies from the next poll) and the Kalshi sync
+  waits, at most 90 s.
+
+## 113. A pause stops orders, never recording (2026-09-30)
+
+OPERATOR (2026-09-30 ~08:00): "even if the target is hit, the shadow system should still
+continue collecting data and signal an outcome of signal because that's what allow us to
+do our 2000 evaluation ... Every system collecting data in the shadow still continue
+collecting their data."
+
+MEASURED FIRST (rows per hour, 09-30 00:00-03:00 trading vs 03:00-08:00 with all three
+accounts paused by the daily target): every recorder on all seven instances kept its
+rate - observations ~280-320/h, alerts 8/h, predictions 4/h all graded, intelligence
+~100/h, shadow_decisions 4/h, $ book rows 4/h (status 'paused'), hourly ladder ~51/h,
+settlement reference ~600-650/h and 4 reconciliations/h. Only 'allsignal-cashout' rows
+stopped - they mark a real cash-out of a held position, and nothing was held. Of the 20
+BTC signals after 03:00, 19 were usable by scripts/target_study.py (side, ask at the
+alert, predictions.won); the 20th had not settled yet. The pause lives inside the order
+call (execute_with_take_profit -> 'paused'), so it cannot reach a recorder.
+
+THE AUDIT (workflow wf_067657f0-648, 20 agents, every pause/stop mechanism + adversarial
+verification) found no pause that stops recording, and seven other ways recording
+stopped or could stop. Fixed:
+  1. MEDIUM, happening now: a poll with no usable 15-minute quote `continue`d past the
+     hourly ladder (and reconciliation). Since 09-24, 204 of 211 hourly.db gaps > 90 s
+     were such polls, in the last 1-3 minutes of a window; 35 of 143 chains lost their
+     last snapshot. -> main.record_shadows on that path.
+  2. MEDIUM: the poll loop caught only network-shaped errors. A bug (TypeError,
+     NameError, sqlite) ended the process, and after 7 exits an hour the watchdog
+     returned for good - every recorder on the instance down until someone noticed.
+     -> main.report_cycle_error: the poll carries on; traceback once per error per
+     15-minute window; Telegram "SOFTWARE ERROR" once per error per New York day, from
+     every instance. The trading block has its own try, so the recorders and exits
+     behind it still run in the same poll.
+  3. The settlement sweep ran before any recording and was unguarded: one market whose
+     result could not be read aborted every poll. -> each read guarded, sweep in its own try.
+  4. hourly_shadow promised "never raises" but let sqlite errors out -> catches Exception.
+  5. DailyProfitGuard.block_reason raised on a locked daily_profit.db -> fails CLOSED.
+  6. Gold/silver slept a flat 600 s through the weekend closure, waking up to 10 min
+     after the reopen (~10% of reopens would lose the first window's alert and
+     prediction) -> sleeps to reopen + 30 s at most.
+  7. Settlement reconciliation read one page of 50 markets: an outage > 12.5 h lost the
+     rows before it for good -> pages back (200/page, at most 4) to a reconciled market.
+  Watchdog: past 6 restarts an hour it now says so once and retries every 15 minutes;
+  a run of >= 10 minutes resets it. It never stops for good.
+  Not changed, on purpose: decision_records stays empty while the main strategy is
+  paused - it is the order path's own audit; the rule's shadow (verdict, band hold,
+  graded outcome) is in intelligence_decisions, which rule_vs_all.py reads.
+  scripts/strategy_switch.py's docstring corrected; main_strategy_on's (which says "it
+  still records every decision") is inside the LOCKED fingerprint, so it stays as is and
+  this note is the correction. A kill in the <= 2 s between an alert's claim and its
+  predictions row would lose that row (0 of 3,269 windows so far); restarts are made at
+  window opens, where no alert can be in flight.
+  Tests: tests/test_recording_never_pauses.py.
+  PRE-DEPLOY REVIEW (wf_f4f9d41f-773, 15 agents) changed four things before it shipped:
+  - MEDIUM: surviving errors dropped a failed /auto off. updates() moves the offset past
+    the batch before handlers run; the old crash-and-restart was what re-read it. Now a
+    failed COMMAND rewinds the reader (read again next poll, 3 tries, then "COMMAND
+    FAILED"); a failed BUTTON is never replayed (a replayed Execute could order twice).
+  - MEDIUM: the error alert went through btc15.db (claim, one attempt): a DB fault or one
+    failed send meant no Telegram at all, where the old crash path alerted 7 times via
+    the watchdog. Now it sends directly, retries a failed send after 5 min, says what did
+    not run (orders / settlements / rest of the poll), and repeats hourly with a count
+    while the error recurs.
+  - MEDIUM: waking at reopen+30 s landed inside Kalshi's listing delay (gold median 34 s,
+    p90 48 s, n=303); with the gap still timed from Friday the first poll re-closed for
+    600 s or raised a false 48 h NO MARKET alert (simulated: misses 16% -> 44%). Now a
+    passed reopen ends the closure (main.end_closure_at_reopen) and the loop polls
+    normally until the market lists.
+  - LOW: the watchdog's backoff flag survived a hand-started service, so a later failure
+    episode was silent. A held lock now resets it.
+  A second check of those fixes (wf_c5817852-bbf) added: failure texts never carry the
+  bot token (an httpx error's text includes the URL); only an alerting instance repeats
+  an error hourly, shadows once a New York day (one shared-code bug would otherwise be
+  ~168 messages a day); only a real closure (>= 30 min) is ended at its reopen; the
+  watchdog retries an undelivered KEEPS FAILING and survives a failed process launch.
+  The watchdogs keep their code in memory: this deploy restarts them too
+  (RUNBOOK updated). Every LOCKED and trading function is byte-identical to before.
+  2,000 SIGNALS: 698 on 09-30 at ~95 a day -> about 10-14, not within a week.
+
+## 114. A 5% target per SESSION instead of per day: worse on every account (2026-09-30)
+
+OPERATOR: "Now test 5% target per session let see". Measured on the recorded signals
+and outcomes only (scripts/session_target_study.py; same inputs, sizing and fixed account
+sizes as scripts/target_study.py): 703 BTC signals, 09-22 to 09-30, 9 NY days, 31
+sessions (asia 20-03 ET, europe 03-09, us 09-17, late-us 17-20). Held to the result, no
+cash-out, no cushion.
+
+  9-day total          no target   daily (live)   5%/session   (3%..8%/session)
+  You  ($5, $104.77)     +72.88     +60.22 (8%)     +18.13      -23.43 .. +63.61
+  Wife ($2, $25.39)      +29.31     +27.29 (15%)     -3.86       -7.26 .. +8.03
+  George ($2, $19.03)    +29.31     +21.98 (15%)     -5.06       -8.85 .. +3.42
+  Worst day, You: -35.47 per session vs -11.51 daily; losing days 2 vs 1.
+
+WHY: a session target cuts a WINNING session short (09-28 US: +5.42 taken, +17.56 there)
+but lets a LOSING session run to its end (09-28 asia -16.76, 09-29 US -28.41). Four
+resets a day are four chances to meet a bad run; the daily target is hit early on most
+days (7 of 9) and then sits out the rest, bad runs included. 09-28 and 09-29 carry most
+of the gap (You -35.47/-21.55 per session vs +8.94/+8.63 daily); per session was ahead
+on 4 of 9 days. Every rate from 3% to 8% per session is below the live daily rule on
+all three accounts. n = 9 days - small, but not close.
+
+## 115. After the target on 09-30: the rest of the morning won (one day)
+
+OPERATOR: "After we had reached our target how did the market do up to now". Recorded
+signals and outcomes after each account's own pause (scripts/after_target_day.py
+2026-09-30, at 11:19 ET; held to the result, no cash-out, no cushion): 33 BTC signals
+after 03:00, 27 won (82%, against 76% over the 703-signal record). Kept trading, You
+would be +20.55 instead of +9.33 (+11.22; path never below the pause point, peak +17.33
+at 07:00, then -14 over 07:00-09:59 before recovering); Wife +8.35 instead of +4.03;
+Uncle George (paused 02:28) +8.42 instead of +3.16. One day, and not over: the 9-day
+study (FINDINGS 112/114) has the same target costing on days like this and saving on
+09-28/09-29. The decision stays with the 2,000-signal review; rerun the script daily
+to build the after-target record.
+  COMPARED WITH 09-29 (scripts/day_compare.py 2026-09-29 2026-09-30, at 11:22): same hours
+  00:00-11:59, 09-29 48 signals 79% +8.39 vs 09-30 45 signals 84% +23.76 (You, $5). 09-29
+  as a whole: 96 signals, 75%, -5.48; an 8% target from midnight would have been hit at
+  05:00 (+8.63) and sat out -14.11. Both mornings dipped 07:00/08:00-09:59.
+  HOUR OF DAY, A HYPOTHESIS ONLY (711 signals, 9 days, ~30 a bucket): 08:00 ET 62.5% won,
+  -25.75, losing on 6/8 days; 09:00 -13.39; 15:00 -24.13; 20:00 55.6%, -35.64, 5/7 days.
+  Plausible cause - the 08:30 US data, 09:30 equity open, 20:00 Asia open - but 24 buckets
+  of ~30 signals will show a couple this bad by chance (20:00 is about -2.5 SE, 08:00
+  about -1.8). Test at 2,000 signals with a paired skip-vs-trade comparison before any
+  rule; do not pick hours from their own buckets.
+
+## 116. After the daily target: drop to a lower base instead of pausing (2026-09-30)
+
+OPERATOR: "after we hit the 8% at $5 base then we move to lower base for all remaining
+of the day at $2 base until midnight and back to $5 again. Test that over all the 9
+days." Then: "did you put in play the new implementation 5 bps required after a loss" -
+the first run did NOT (held every signal at its alert); the rerun below does, exactly as
+main.allsignal_on_alert/allsignal_cushion_poll (scripts/target_rules_live.py; 0 = off).
+712 BTC signals 09-22 23:00 to 09-30 11:15, fixed capital as target_study.py, held to
+the result; mirrors copy the primary's taken signals, as live. Recomputed independently
+to the cent (workflow wf_6babaa5d-2bd, own script, did not read ours).
+
+  WITH the 5 bps cushion   You $5    worst   losing   Wife     George
+  no target                +98.29    -6.12     1      +35.16   +35.16
+  pause at target (live)   +76.26    +0.48     0      +24.94   +22.71
+  $2 after 8% ($1 after 15% mirrors)  +85.93  +0.48  0  +31.98   +28.69
+  WITHOUT the cushion: no target +80.92, pause +60.22, $2 after +69.30 (You).
+
+  $2-after beat pausing on 5 of 8 target days; the $2 part gave back on 09-28 (-6.15 vs
+  pause) and 09-24 (-0.38). Under it, 190 signals came after a loss: 109 entered at the
+  alert, 41 after waiting, 40 skipped.
+  CAUTION: the 5 bps cushion was chosen on these same days (FINDINGS 112), so every
+  with-cushion row is in-sample and flattering; the pause-vs-$2 comparison shares it and
+  is fairer. 9 days (09-22 is one hour). Operator's decision; confirm at 2,000 signals.
+  Mirror pause figures are lower than the independent ones given first (27.29/21.98):
+  live, a mirror stops when the primary pauses.
+  ROBUSTNESS (method review wf_ddf2a224-3fd, recomputed independently to the cent):
+  - The ranking for You - no target > $2 after > pause - held in every variant: cushion
+    on/off, fixed vs compounding capital, targets 7-10%, full days only. It flips only
+    if live execution costs >= ~$0.015 per contract (measured live gap ~$0.0045).
+  - The SIZE of the gaps does not hold: on the 7 full days (09-23..09-29, no cushion)
+    You is +48.98 / +43.36 / +46.84 (none / pause / $2 after); $2-after minus pause
+    averages +1.25 a day with SE 2.31 - inside the noise.
+  - Hits are thin: 4 of 7 crossed the target by $0.56 or less (09-29 by $0.25). 09-28
+    crossed at its peak (+8.94 vs 8.38) - trim $0.56 and pause loses 24.69 there.
+    Live execution (cash-outs at 0.98-0.997, 7% unfilled, fills above the ask) moves
+    hit times: 09-30 replay crossed at 02:15, live at 03:00.
+  - allsignal_trades.pnl is BEFORE fees: 09-30 book 10.265 - 0.935 fees = broker 9.3303.
+  NO TARGET, CUSHION ONLY (operator: "what about the no target but requiring 5bp after a
+  lose"): You +98.29 (7 full days +67.15), 1 losing day (09-28 -6.12); Wife/George +35.16.
+  Its cost is depth, not days: the deepest drop from a high is -40.32 (~38% of a $105
+  account, 09-27 peak to 09-28 low; 09-28 fell to -26.94 intraday), against -26.94 for
+  pause and -31.71 for $2-after. Every with-cushion figure is in-sample (FINDINGS 112).
+
+## 117. DECISION: primary $6 base, $3 after its 8% target until midnight (2026-09-30)
+
+OPERATOR: "Make primary account base size 6 and apply $3 after the 8% target hit only to
+mine the primary; the mirrors stay at the pause when hit target, so only these to
+primary, the others continue as usual."
+IMPLEMENTED: .env ALLSIGNAL_STAKE 5 -> 6, ALLSIGNAL_AFTER_TARGET_STAKE=3 (config default 0
+= the old pause). main.allsignal_stake_now sizes each new $ entry: $6, or $3 once the
+PRIMARY's guard has reached today's target, until 00:00 New York; the stake is recorded
+on the allsignal_trades row (new column `stake`) and every message names it. The primary
+guard alone has after_target_stake=3: past its target it no longer blocks, but unknown
+figures still do. Mirrors unchanged: $2 each by their own budgets, paused by their own
+15% targets. BEHAVIOUR CHANGE FOR THE MIRRORS: they no longer stop when the primary
+reaches its target first - they copy its $3-phase fills until their OWN 15%.
+LOCKED_CODE and CASH_OUT_CODE re-pinned on this instruction (tests/test_allsignal_locked.py).
+Tests: tests/test_after_target_stake.py.
+EVIDENCE BESIDE IT (scripts/target_rules_live.py 5 6 3 115.39: recorded signals and
+lifecycle, 5 bps cushion as live, 713 signals 09-22 23:00 to 09-30, held to the result):
+  You: $6 then $3 +101.69 (1 losing day, 09-26 -1.27) vs pause at $6 +78.75 vs no target
+  +128.29 (2 losing days, worst -5.99). Mirrors as live now (pause at 15%, copying until
+  then): Wife +29.19, George +23.28 (vs +21.47 / +20.84 when they stopped with the primary).
+  Same cautions as 116: the cushion is in-sample; the gap to pausing is within the noise
+  on 7 full days; hits are thin. Review at 2,000 signals.
+  PRE-DEPLOY REVIEW (wf_2f6943e5-bac, 11 agents; all findings low) changed it before it
+  shipped:
+  - Only the $ strategy passes the primary's target: block_reason(ticker, strategy) lets
+    strategy "allsignal" through at $3; the main strategy, recovery adds and manual presses
+    still pause at the target, as before (they would otherwise have traded at full size).
+  - The ENTRY'S SIZE decides past the target (second check, wf_2d16f49d-79c): any $ entry
+    larger than $3 is refused - whatever the timing - and announced as skipped; a retry
+    after the target is resized to $3 (RETRY_CODE re-pinned).
+  - The notice has its own state ('lowered'), so today's switch is announced once.
+  - The accounts table says NO DATA before HIT $3 when figures are stale (entries blocked).
+  - SKIPPED labels and the session summary name the lower stake; LOCKED_CODE now also
+    hashes main.allsignal_stake_now (the rule that sets the live size).
+  Known, harmless: prewarm pre-funds $6 after the target (moves cash between shards of
+  the same account only).
+  WATCHDOG, same deploy (operator 12:36: "I see nothing in telegram all are just the old
+  restart"): a 10:50 "SERVICE RESTARTED - died on startup after 0 min" came from ONE
+  failed once-a-minute check (it imports the whole app before it finds the lock held);
+  no service stopped (PIDs unchanged since 09:30, no restart in any log). Its output was
+  discarded, so the cause is unknown. Now a check that fails while the service holds its
+  lock is logged, not reported as a restart (Telegram only at 10 in a row); every check
+  failure and restart is kept in runtime*/watchdog.log with the output; messages name
+  the instance.
+  MESSAGES (operator 13:0x: "should be specific about what is paused"): the accounts
+  table under every result names who is paused and who continues - "Primary · target
+  hit · $3 per signal until 00:00 ET, then back to $6" / "Wife and Uncle George · target
+  hit · no new BTC entries until 00:00 ET" / "<name> · Kalshi figures unavailable".
+
+## 118. The 5 bps cushion live, first day (2026-09-30, verified wf_234f8d7c-e2d)
+
+OPERATOR: "Now check how it has been doing and how the 5bp help out?" (scripts/
+cushion_live_review.py 2026-09-30, recomputed independently to the cent.)
+MONEY (broker settlements = book, net of fees): primary +13.83 on 106.05 (+13.0%): +9.33
+at the $5 phase (10W-1L, target at 03:00), +4.50 at $3 since 12:45 (13 trades, 11W-2L;
+holding to settlement would have been +4.71 - cash-outs cost 0.21). Mirrors paused all day
+at +4.03 / +3.16.
+CUSHION LIVE: 3 after-loss signals, no skips. 00:30 already 5.92 bps clear -> entered at
+the alert (0.00); 13:00 waited 34 s (2.87 -> 5.10 bps), +1.12 vs the alert - +0.62 from the
+wait (66c -> 60c, one more contract), +0.50 from a fill at 50c against an 11 s stale 60c
+recorded ask; 15:00 waited 11 s, -0.16 - fill slippage (70c ask, 74c fill), not the wait.
+Net +0.96. n = 3: no conclusion.
+REPLAY, every signal of the day at $6 (recorded lifecycle): +39.07 without, +42.30 with
+(+3.24); 11 after a loss: 6 at the alert, 3 waited (04:00 -0.96, 13:00 +0.91, 15:00 0),
+2 skipped (12:45 loser +5.72, 12:30 winner -2.44). One skipped loser carries the day.
+
+## 119. A second target at the lower stake: close the day at 8% + 8% (2026-09-30)
+
+OPERATOR: "after the 8% on the $6 ... then on the $3 we can close the day at another 8%
+... 16% target for the day". scripts/target_rules_live.py 5 6 3 115.39 (rule lower_stop,
+SECOND_RATE 0.08), recorded signals + lifecycle, live cushion, mirrors as live; 735
+signals; recomputed independently to the cent (wf_a80be1cd-999).
+  You: close at 16% +105.27 vs $3 to midnight (live) +103.26 vs pause at 8% +78.75 vs no
+  target +132.55; worst day -1.27 for all three target rules. Mirrors unchanged (+29.19 /
+  +23.28): on every closing day both had already paused at 15%.
+  The second 8% ($9.23 from $3 trades) was reached on 3 of 9 days: 09-23 closed 10:30, the
+  rest of the day would have lost 6.99 (close helped); 09-27 closed 11:15, the rest won
+  +3.21; 09-30 closed 06:30 in the replay, the rest +1.77 by 17:00. Net +2.01 - noise.
+  Not adopted (operator's call); the live rule stays $3 to midnight.
+
+## 120. DECISION: the primary's stake follows the day against its target (2026-09-30 17:5x)
+
+OPERATOR (after a $3 afternoon took the day from +13.83 back to +4.67, under the 8.48
+target): "invalidate the daily target hit and trade size back to the $6 and then continue
+the cycle until the target is hit and then back to the $3 until midnight and then reset."
+TESTED FIRST (scripts/target_rules_live.py 5 6 3 115.39, rule 'follow'; 737 signals,
+live cushion, mirrors as live; recomputed independently to the cent, wf_7be87c25-008):
+  You: follow +118.20 vs $3-to-midnight (live) +97.87 vs close at 16% +105.27 vs pause
+  +78.75 vs no target +120.94. Worst day -1.27 (as the other target rules), 1 losing day;
+  beat the live rule on 09-23/24/25/29, behind on 09-28 (+1.04 vs +3.20). 24 flips to $3,
+  18 back to $6 (42 signals at $6 after the target had been reached). Mirrors unchanged
+  (+29.19 / +23.28). Cushion OFF: follow +102.04 vs live +82.22. In-sample; 9 days.
+IMPLEMENTED: main.allsignal_stake_now = $3 while the primary's realised day P&L >= its
+target, else $6; DailyProfitGuard.block_reason's size gate applies only while at/above it
+(other strategies still pause once the target was reached); notices on each change of
+side ("TARGET REACHED [AGAIN]" / "BACK BELOW TARGET ... Back to $6"), table HIT $3 /
+BACK $6. Mirrors: unchanged. LOCKED_CODE re-pinned.
+
+## 121. A third mirror account (2026-09-30 ~19:xx)
+
+OPERATOR: "I added MIRROR 3 enable it to trade same as the other MIRRORs". The code read
+only m1/m2: config gains mirror_3_* (same fields; label "Mirror 3" until MIRROR_3_LABEL
+names it), mirror.MIRROR_SLOTS = (1, 2, 3), scripts/mirror_switch.py knows m3. Same
+treatment as the others: $2 per BTC signal (MIRROR_3_ALLSIGNAL_BUDGET), copies the
+primary's fills, own 15% daily target, auto-funds shard 2 from shard 0, recovery off,
+per-asset switch ON for BTC and OFF for ETH/SOL/XRP/NEAR/GOLD/SILVER (as Wife and Uncle
+George). Read-only check before going live: key works, $10.18 ($8.99 shard 0, $1.19
+shard 2), nothing open. Its first day's target starts at activation (15% of ~$10.18).
+Tests: tests/test_mirror_three.py.
+
+## 122. A safeguard that locks the day on returning to the target: worse (2026-09-30 ~21:xx)
+
+OPERATOR: "when we hit the 8% and at $3 and then we go back down in loss pnl for the day
+we trigger a safeguard that will pause trading once we hit the 8% back again." Two
+readings tested on top of the live follow rule (scripts/target_rules_live.py 5 6 3 115.39,
+rules guard_below / guard_loss; 750 signals to 09-30 21:00, live cushion; recomputed
+independently to the cent, wf_f48bdd89-a02):
+  follow (live) +117.64 | A: armed by falling back below 8%, locks at the next 8% +96.97
+  (locked 5 days; the rest of those days would have made +4.25, +8.54, +10.18, +6.89 and
+  -9.19 on 09-28 - the only day it helped) | B: armed only by going below $0, locks at the
+  next 8% +109.67 (fired once, 09-25: fell to -0.71 at 10:00, closed 11:30 at +11.71; the
+  rest of the day made +7.97) | no target +119.93. Worst day -1.27 for all three.
+  On this record a return to the target after a dip has usually been followed by more
+  profit. Not adopted; recheck at 2,000 signals.
+
+## 123. Mirror targets scale with the account: % of opening, capped at 7 wins (2026-10-01)
+
+OPERATOR: Wife at $2 peaked +4.43 against a 4.56 target (15% of 30.40) on 10-01 and gave
+it back, while Uncle George (3.47) and Affoue (1.22) locked theirs; "keep her at $3, just
+design a scale mechanic that auto adjusts the % based on account growth."
+WHAT DECIDES THE HIT RATE is the target in WINS at the stake, not the %: a win = what the
+stake makes at a typical 75c entry (contracts_for_budget(stake, 0.75) x 0.25 = $0.50 at
+$2, $1.00 at $3 - $3 buys 4 contracts at 65-75c, twice $2's 2). Measured on the mirrors'
+recorded copies 09-23..10-01 (follow rule, cushion; scratchpad wins_sweep.py):
+  $2: 4-9 wins hit 8 of 9 days (+16.48..+35.05); 10 wins 6/9; 12 wins 5/9.
+  $3: 4-7 wins hit 8 of 9 (+36.16..+58.30); 8 wins 7/9; 9 wins 6/9.
+  Wife at $2 needed 9.1 wins - the edge; at $3 she needs 4.6.
+IMPLEMENTED: a mirror's day target = rate x opening, but never more than
+MIRROR_TARGET_MAX_WINS = 7 wins at its stake (DailyProfitGuard.day_target, at the
+00:00:30 capture). As an account grows the % falls and the target stays reachable: Wife
+$3 caps at $7.00 (15% until $46.67, 11.7% at $60); George and Affoue $2 cap at $3.50 (15%
+until $23.33). The primary has no cap. The table header and the DAILY TARGET ACTIVE notice
+show each account's effective %. First applies at the 10-02 opening. In-sample; 9 days.
+
+## 124. BNB: an eighth instance, SHADOW ONLY (2026-10-01)
+
+OPERATOR: "In the shadow tracking signal and life circle let add BNB". Kalshi lists
+KXBNB15M ("BNB 15 Minute", fifteen_min, CF Benchmarks, CRYPTO.pdf terms) - the same
+structure as NEAR. The reference comes from Kalshi's /live_data/events/{event}, which is
+generic, so nothing BNB-specific was needed there.
+ADDED: surface.asset knows BNB (the corpus guard depends on it - FINDINGS on NEAR);
+shadow_summary.STORES BNB -> bnb15.db; learning_runner.SLOT_ORDER gains BNB (slot 7 of 8);
+scripts/run_bnb.ps1 (own runtime-bnb/, reference and policy paths, AUTO_TRADE_ENABLED false,
+LEARNING_ENABLED false - no BNB corpus yet, the corpus paths name BNB's own future files);
+strategy_kalshi_bnb.json = SOL's COVERAGE band copied (0.55-0.90 asks, 0.5-12 bp), labelled
+as not fitted on BNB - it only decides what is marked rule-qualified; alerts, lifecycle and
+outcomes are recorded either way. bnb15.db created with auto, main, $ and m1/m2/m3 mirror
+switches stored OFF before the first start; BNB is in neither ALLSIGNAL_INSTRUMENTS nor
+MIRROR_INSTANCES, and TELEGRAM_ALERT_INSTRUMENTS=BTC mutes its alerts. Startup launcher
+BTC15Signal-BNB.cmd installed. scripts/full_circle_check.py and the instrument tests cover
+it. Refit its config on its own record after a week or more.
+
+## 125. The live rules on ETH, SOL and GOLD (2026-10-01, verified wf_75a528cb-1f4)
+
+OPERATOR: "under the current live rules system how would ETH, GOLD and SOL have performed
+on those 9 days". STUDY_DB=<db> scripts/target_rules_live.py 5 6 3 115.39 (each
+instrument's own recorded signals and lifecycle; $6 below the 8% target, $3 at/above;
+cushion as live; held to the result); recomputed independently to the cent.
+  BTC  (10 days)  live rules +128.18 (cushion off +116.25), worst -1.27, 1 losing day
+  ETH  ( 8 days)  +38.61 (off +44.76), worst -30.93 (09-28), 2 losing days
+  SOL  ( 7 days)  +30.81 (off +14.48), worst -66.76 (09-28), 2 losing days
+  GOLD ( 7 days)  -27.84 (off -16.68), worst -28.97, 4 losing days (09-28..09-30 in a row)
+09-28 hit ETH, SOL and GOLD hard while BTC made +1.04: the target only lowers the stake
+on the way UP; below it a bad day keeps betting $6 with no daily loss stop. The 5 bps
+cushion (fitted on BTC) helped SOL, hurt ETH and GOLD. BTC-only stays; ETH/SOL would need
+a daily loss stop before going live; not GOLD under these rules. 7-8 days each.
+
+## 126. A daily LOSS stop on top of the live rules, per instrument (2026-10-01)
+
+OPERATOR: "what could a daily stop loss look like and how it would help them".
+scripts/loss_stop_sweep.py (target_rules_live.py rule follow_stop, STOP_RATE): live rules
+($6 below 8%, $3 at/above, 5 bps cushion) + no new entry once the day is down X% of 115.39;
+recomputed independently to the cent (wf_306ca78c-5f8, freeze 10-01 12:00).
+              none      -5%      -8%     -10%     -15%     -20%
+  BTC     +128.34   +58.52  +101.99  +101.99   +88.86  +100.95
+  ETH      +39.23    +1.65    +1.86    -3.96    +7.66    -0.02
+  SOL      +30.99    +7.50   +69.36   +62.98   +50.49   +40.37
+  GOLD     -24.65   +32.69   +20.06   +20.06    -0.84   -21.23
+  SOL's 09-28 -66.76 -> -10.27 at -8%; GOLD's 09-28..09-30 ~-27 each -> ~-12.
+SOL and GOLD lose in long one-way runs, so a stop caps them (-8..-10% works for both);
+BTC and ETH dips usually recover the same day, so a stop locks losses in (as for BTC in
+FINDINGS 112). The day can end past the stop: it is checked after the trade that crosses
+it settles (BTC/ETH reach -14.59 at -8%). If SOL or GOLD ever go live, pair them with a
+-8..-10% daily stop; none for BTC. 7-8 days each. Nothing changed live.
+  CORRECTION (same day): listing BNB as an EIGHTH name in learning_runner.SLOT_ORDER filled
+  the 8-window cycle, so an UNLISTED instrument got the unreachable slot 8 and
+  hypotheses_delay_s looped forever - the full suite hung at test 1,033 twice (my
+  30/60-minute limits read it as a timeout). No live effect: every running instance is
+  listed and none had loaded the change. BNB is unlisted again (it takes the spare slot 7;
+  its learning is off), and hypotheses_slot now always returns a reachable slot.
+  LIVE: BNB started 2026-10-01 13:40 under its watchdog after the full suite (1904) passed;
+  connected to KXBNB15M-26OCT011345-45; first signal 13:49:31 (DOWN, reference 773.23),
+  lifecycle, intelligence and reference rows writing (BRTI-equivalent 54/57 ok, as NEAR);
+  $ book empty, auto/main/$ switches off.
+
+## 127. WHAT THE FIRST 10 DAYS ESTABLISH (2026-10-01, workflow wf_e414dad7-a30, 4 angles)
+
+OPERATOR: "Base on the current 9 days and our live strategy, what can we establish about
+our system performance, before we get the 2000 trades?" Direct arithmetic on 804-805 BTC
+signals (09-22 23:00 .. 10-01 ~14:30) and the live book; scripts in scratchpad/assess/.
+ESTABLISHED
+- The signal beats Kalshi's price BEFORE fees: won 76.2% at an average ask of 0.733, edge
+  +3.0 pts (p 0.01-0.03 on every test), the same for UP and DOWN.
+- Execution delivers the signal: fills average 0.05c better than the ask; book = broker to
+  the cent on 216 entries, 104 exits and every daily figure; fee model exact; fill rate
+  94-97% (retry recovered 5 of 8 misses, all winners).
+- Losses do not cluster (after a loss 77.8% won vs 76.1% after a win; longest losing run 3).
+- The target rules change the SHAPE of returns, not the expected value: daily SD 8.8 vs 13.2
+  with no target, same money; they do not reduce intraday dips (09-28 -31.8, 09-26 -21.7).
+NOT ESTABLISHED
+- Profit AFTER fees: +1.6c/contract, 95% CI [-1.2, +4.5]; the fee takes ~45% of the gross
+  edge. 2,000 signals (~1,190 after the current rules) give only ~35% power; ~3,700
+  post-rule signals for 80%.
+- Every fitted rule (5 bps cushion, 8% target, follow $6/$3, 15% mirror target, 7-win cap,
+  no BTC loss stop): per-signal effects indistinguishable from zero; dollar advantages come
+  from 1-2 days (09-26, 09-28). Cushion out of sample so far: -1.18 replay, -3.05 live
+  (waits pay ~8c more). 8% ranked 4 of 10 at the decision, below the median today.
+- Leads only (picked after looking): asks 0.65-0.70 (39% of signals) show no edge and lose
+  ~1.9c after fees; asks >= 0.70 carry it (+4.1c). Hours 08/09/15/20 ET weak. Not rules.
+RISKS FOUND
+- Mirrors: no downside cap, full stake on the bad days. Wife at $3 fell ~49% intraday on 09-28
+  (replay); Affoue at $2 on $8.10 is wiped out by a 09-28 morning (cash-limited -89%).
+- Cash-out costs money so far: -$4.28 over 104, all winners sold, no loser saved.
+- REPORTING GAP: a held 23:45 position settles at 00:00:06 and lands in NEITHER day's
+  daily_profit figure (09-30 showed +8.08; the real day by window was +2.26, -5.81 hidden).
+PRE-REGISTERED 2,000-signal checklist T1-T10 (signals from 10-02 00:00 only): base edge,
+cushion (with an after-win control), follow vs $3-to-midnight, target vs none (money, risk,
+mechanism), target rate, mirrors, BTC loss stop, cash-out, execution, parked hypotheses -
+see the overfit agent's output (wf_e414dad7-a30 journal).
+
+## 128. The midnight count gap, closed (2026-10-01)
+
+OPERATOR: "Address the midnight count gap." A position held to settlement in the 23:45
+window settles ~00:00:06 - after the old day's last refresh - and the new day leaves it
+out on purpose (its result is already in the new opening, read at 00:00:30). So it was
+counted in NEITHER day. FIX: DailyProfitGuard.close_out - for the first 30 minutes of a
+day, each refresh recomputes the PREVIOUS day from scratch from the same broker events:
+every event from its start to now for markets that closed after its start and by midnight.
+Idempotent; never touches the new day; prints when it changes a figure. Tests:
+tests/test_daily_profit_closeout.py. BACKFILLED (scripts/backfill_day_closeout.py, broker
+reads only, past rows only; copy of the DB kept): 09-30 You +8.08 -> +2.26 (the -5.81 23:45
+loss), Affoue -0.42 -> -2.08 (her copy of it); Wife, Uncle George and every 09-29 figure
+unchanged (paused / cashed out before midnight). Affoue is being funded to ~$100 on 10-01:
+from 10-02 her target is the 7-win cap $3.50 (~3.5%), and she is ~50 stakes deep.
+
+## 129. The mirrors' STAKE scales with the balance at midnight - 2% (2026-10-01)
+
+OPERATOR: "I thought you had the auto scale for the mirrored account as the account
+balance changes every day at midnight but a nice safe scale. Only my primary is
+controlled manually on aggressive." Until now only the mirrors' TARGET % scaled (123);
+their stakes were fixed in .env. IMPLEMENTED: at each 00:00:30 opening a mirror's $
+stake for the day = 2% of its opening in whole dollars (MIRROR_STAKE_SCALE_RATE=0.02),
+never below its own MIRROR_n_ALLSIGNAL_BUDGET (the operator's stake stays the floor:
+Wife $3, George $2, Affoue $2) and never above $6 (MIRROR_STAKE_SCALE_MAX, the primary's
+base). Stored in profit_days.stake (new column, migrated); the 7-win target cap uses it;
+DailyProfitGuard.sync_stake points the mirror's MirrorTarget at it every refresh, so the
+copier and the pre-funding size by it with no change to the LOCKED code. The midnight
+"DAILY TARGET ACTIVE" notice says each mirror's stake. The primary is untouched.
+WHY 2%, NOT 3% (scripts/mirror_stake_scale_study.py; recomputed independently, every
+number matched): the live rule took 764 of 808 recorded signals, 593 won (77.6%) vs a
+75.5% break-even - 1.4 standard errors, real money so far, not yet proven. Worst seen:
+3 losses in a row, ~4.3-4.9 stakes from a high. If the edge were zero, a 1-in-44 day is
+~11 stakes: 22% of the account at 2%, 33% at 3% (the primary's 5.6% would be ~60%).
+2% = about a quarter of the measured Kelly fraction. Steps: $2 below $150, $3 from $150,
+$4 from $200, $5 from $250, $6 from $300. Nobody's stake changes on 10-02 (Affoue ~$100
+-> $2; Wife and George are at their floors). TENSION, SAID: at their set stakes Wife
+($3 on ~$35, ~9%) and George ($2 on ~$27, ~7%) risk MORE per signal than the safe rate
+and than the primary; the scale only raises. Lowering them is the operator's word only.
+The target pause limits nothing on a losing day (it stops a mirror only when it is up).
+REVIEW BEFORE DEPLOY (two independent passes; every claim checked against the code):
+- HIGH, FIXED: MirrorTarget is a FROZEN dataclass, so the first version's assignment of
+  the new stake raised, the error was swallowed, and every copy would have stayed at the
+  floor while the target and the Telegram notice used the scaled stake. All its tests
+  passed because they used a stand-in object. Now the guard holds the live mirror and
+  swaps in a copy of its target; tests drive the real MirrorTarget and _Mirror._apply,
+  and fail when the bug is put back (3 of 10).
+- FIXED: the stake stored at midnight overrode the operator's mid-day change (as Wife's
+  $2 -> $3 on 10-01) and the off switch. The day's stake is now the opening under the
+  CURRENT settings; the stored column is a record.
+- FIXED (close-out, 128): the broker read reached back a flat 24 h, so on 11-02 the
+  25-hour DST day 11-01 would have been rewritten without its first hour. It now reads
+  from the previous New York midnight.
+- Hardening: a rate above 5% or no ceiling scales nothing (the operator's stake).
+OPERATOR DECISION (2026-10-01, evening): "All mirror accounts will be topped up so let
+them grow and catch up to the scale we have set for them." The floors STAY (Wife $3,
+George $2, Affoue $2); nobody is lowered. Top-ups bring each account up to where its set
+stake IS the 2% scale (Wife $150, George and Affoue $100), and the scale raises it from
+there. The opening counts ALL cash (every shard) plus open positions at cost, so a top-up
+landing before 00:00:30 ET sets the next day's stake and target; one after it waits a day.
+SECOND REVIEW PASS (both confirmed, both FIXED):
+- After a mid-day settings change + restart the stake followed but the stored target (its
+  7-win cap) did not: lowered from $6 to $2, a $14 target is 28 wins - no pause that day.
+  Now a mirror's target and stake are re-derived from the opening under the current
+  settings until the day pauses (latched), and a moved target is announced again. The
+  primary's record is never re-derived.
+- close_out ran only 00:00-00:30; an outage across it left the 23:45 settlement in
+  neither day again. It now runs all through the new day (idempotent).
+Mutation-checked: removing either fix fails a test.
+
+## 130. Signals below 70c: a lower win rate, priced in - and a floor would have cost money (2026-10-01)
+
+OPERATOR: "in our analysis earlier we found that signal below 70 cent had low win?" The
+earlier result (98) was COMBO PARTNERS priced below 0.70 (27-38% combos won). On the $
+strategy itself (scripts/entry_price_bands.py; recomputed independently, it matched):
+767 live-rule entries 09-22..10-01, net of fee, per $1 at the $6 contract count:
+  below 0.70  280 entries (36%), 67.1% won at a mean 0.663 ask: -0.8c per $1 [-9.1, +7.6]
+              - break-even, NOT a loser; the low win rate is the low price. 4 of 10 days
+              negative (09-25 -27, 09-26 -26), 6 positive (09-23 +25).
+  0.70 and up 487 entries, 83.6% won: +5.0c per $1 [+0.7, +9.3] - all the profit.
+  difference +5.7c [-3.7, +15.2] - not proven.
+BUT A 0.70 FLOOR WOULD HAVE COST MONEY UNDER THE LIVE RULES (totals, 10 days):
+                            all signals   floor 0.70
+  flat $6, no cushion         +111.74      +151.43   (+39.69)
+  flat $6, cushion            +130.31      +128.02   (-2.29)
+  follow $6/$3, no cushion    +110.98      +119.53   (+8.55)
+  follow $6/$3, cushion LIVE  +124.66       +99.81   (-24.86; worse on 7 of 10 days,
+                                                      worst day -4.44 vs -1.27)
+  "wait until the ask reaches 0.70" instead: +109.53, worse on 6 of 10 days.
+WHY: the 5 bps after-loss cushion already removes the cheap entries that lose - it is
+the same job done better. What a floor removes under the live rules is mostly cheap
+entries taken after a WIN, which paid, and which also reach the 8% target sooner.
+NOT A RULE: the 0.70 cut was picked after looking (127's lead), in-sample, 10 days. It
+stays a parked hypothesis for the 2,000-signal review, judged on signals from 10-02 only,
+and must be tested WITH the cushion, since alone it measures a different system.
+DEPLOY INCIDENT, SAID (129): the first suite-then-restart run tested the close-out code,
+but the stake-scale patch was applied at 15:30 while that suite ran; the suite passed on
+the modules it had already loaded and the restart at 15:45:18 loaded the NEW, untested
+first version (the frozen-target defect) - live until 16:30:11. I told the operator
+"nothing was restarted"; that was wrong, found from watchdog.log. Effect: none - all three
+mirrors were paused for the day (no mirror orders), today's rows had no stored stake so
+the failing assignment never ran (no "stake not applied" in the log), the primary traded
+at its own $6/$3, close-out was outside its window, no errors. The 16:30 restart runs the
+code the final suite (1922 passed) tested. FIX: suite_then_restart_btc.sh fingerprints
+src/, scripts/, .env and strategy*.json before the suite and refuses to restart if they
+changed; restart_btc_at_open.sh re-checks at the flat moment.
+
+## 131. Could luck have produced this record? (2026-10-01, the operator's question)
+
+OPERATOR: "96 signals a day and coming out in profit, in simulation and live, through
+different sessions... nine days, ~800 signals, daily profit. Luck cannot give you such a
+result if it is not the system." Asked exactly that way, on the recorded signals:
+- 817 signals at the alert won 76.4% where Kalshi's prices implied 73.3%: a system with
+  no edge does that ~2 in 100 (z 2.05). The 773 live-rule entries: 77.6% vs 74.1%,
+  ~1 in 80 (z 2.26).
+- Not one lucky stretch: beat the price on 9 of 10 days (09-28 the one tie, 72.3% vs
+  72.4%; 09-22 and 10-01 partial) - ~1 in 90 with no edge - and in all four sessions
+  (Asia +54.30, Europe +52.42, US +29.73, US late -0.28 at a flat $6).
+- The daily profit is not the target rule's doing: at a flat $6 with no target, 8 of 10
+  days were positive (losers -1.27, -5.99).
+VERDICT: the edge is ESTABLISHED; the system works under its rules; the money is real
+and net of fees. What remains open is the SIZE of the margin, which is thin: 77.6% won
+vs a 75.4% break-even with fees, +2.2c per contract [-0.7, +5.1] (z 1.49) - that sets how
+hard it can be sized, and is what the 2,000 signals narrow. BTC-specific so far (125).
+
+## 132. The cash-out stays under watch for the 2,000-signal review (2026-10-01)
+
+OPERATOR: "when we do the 2000 signals evaluation, we will have to verify if we still
+need to keep the early cash out or remove the cash out... so far it makes us lose about
+$4... make sure that we are not leaving money on the table while it adds nothing."
+On the pre-registered checklist (127). MEASURE: scripts/cashout_review.py [since] - for
+every $ trade the primary sold early, the sale (contracts x price - fee) against holding
+to settlement (contracts x won), from allsignal_trades; same entry either way.
+SO FAR (09-28..10-01): 114 of 231 filled trades cashed out, ALL 114 winners, 0 losers
+saved: -4.74 (-4.2c per cash-out; mean sale 0.990). By day -0.07, -0.93, -1.73, -2.01.
+Each loser it ever saves is worth roughly a contract count x 0.99, so the cash-out breaks
+even at about 1 reversal per ~100 cash-outs; none in 114 so far. The mirrors copy the
+primary's exits at their own size, so the cost scales with them. THE REVIEW: run
+`cashout_review.py 2026-10-02` on the 2,000 signals; keep it only if the losers it saves
+outweigh the winners it sells. The cash-out is LOCKED (CASH_OUT_CODE) - removing it is the
+operator's decision at the review.
+
+## 133. $1,000 on the primary: what the record says, the risk, and the size (2026-10-01)
+
+OPERATOR: "If I funded $1,000 on the primary and traded with this system, what would the
+daily profit look like? The risk, and the recommended trade size and risk on that $1,000?"
+scripts/thousand_dollar_study.py: recorded BTC signals 09-22..10-01, live rules (5 bps
+cushion, 8% target with the follow rule: stake halves at/above it), stake = % of each
+midnight opening, compounding; the LIVE cash-out modelled from recorded bids (calibrated:
+120 modelled vs 114 live cash-outs, 108 the same trades, 0 losers saved in both).
+Recomputed independently to the cent (wf_f18fa8da-ae5); liquidity checked on the archived
+book at every signal (820/821): no constraint up to ~$100-500 per signal (best level median
+~4,100 contracts); fill risk is price movement (4% of signals > 5c past the ask), not size.
+  $1,000 at 2% ($20/$10), with the cash-out: -> $1,582 in 10 days; full days +9.3, +2.9,
+  +5.6, -1.2, +9.9, -4.1, +5.8, +8.3 %; worst intraday -11.3% (09-28); max fall -13.6%.
+  At 5.6% (today's primary aggression, $56): -> $2,919, but intraday -32% on 09-28, max
+  fall -36.8%. Held to result (no cash-out) 2% -> $1,729: the cash-out costs ~15 points at
+  this size (-0.61c per contract traded, a quarter of the edge) - review item 132.
+RISK beyond the record: net edge +2.34c/contract [-0.53, +5.21]; a 2-SD day at ZERO edge
+= -22% at 2%, -34% at 3%, -64% at 5.6%; 5 losses in a row ~68% likely within a month
+(-10% at 2%, -28% at 5.6%). Real days were calmer than trade odds predict (p~0.01) - not
+assumed to last. Forward expectation at 2% after the cash-out ~+3.6%/day, range about -1%
+to +11% (in-sample; the rules were fitted on these days).
+RECOMMENDED (advice; sizing is the operator's): 2% of the midnight opening, 1% after the 8%
+target (follow rule), recomputed each midnight; at most 3% until the net margin on
+post-10-02 signals has a lower bound above ~0.4c; no profit-limiting daily stop (every
+-4..-10% stop lowered the result at 2%: +40-56% vs +72.5%) but a -15% circuit breaker
+(never fired on the record; caps a broken day); drawdown ladder at midnight: >=20% below
+the high -> 1% until back within 20%; >=35% -> stop entries and review. Primary sizing is
+LOCKED: implementing it needs the operator's word.
+
+## 134. Forecasting the next window before / at its opening: no edge in the archive (2026-10-01)
+
+OPERATOR: a side model forecasting each 15-minute window's settlement at open-60s (PRE,
+nothing from inside the window) and at open (OPEN, strike + opening data); "Kalshi only",
+"never use anything related to Binance". Workflow wf_db2be930-eb0 (scratchpad/forecast:
+build_dataset.py, evaluate.py, results.txt): 4,103 instrument-windows, 8 instruments,
+Kalshi reference series (brti_features) + Kalshi quotes + Kalshi official results; walk-
+forward by New York day (7 test days); fixed L2 logistic model, BTC-only and pooled.
+- PRE vs 50%: pooled 51.75% [49.4, 54.1], Brier WORSE than 0.5 (skill -0.035); BTC rows
+  54.5% [50.6, 58.5] not replicated by the BTC-only model (52.0%). No edge.
+- OPEN vs Kalshi's opening price: the price is right 57.7% (BTC 59.2%) - it is seen ~20 s
+  after open, so it already carries in-window movement. The model does worse (skill
+  -0.049 [-0.075, -0.017]); buying its side when it beats the ask + 2c: 1,823 trades,
+  52.3% won vs 53.9% break-even, -1.7c/contract, positive on 1 of 7 days.
+- No pre-open quotes exist (0 of 1,006 BTC markets quoted before opening).
+- Needed to detect a 2-point edge: ~4,900 independent windows vs 50% (~51 days of BTC;
+  ~18 days pooled - instruments agree 70% of the time in the same window, so they are not
+  independent); ~5,500 paired windows vs the opening price; and at ~52c asks plus fee a
+  trade needs ~4 points over the opening price to make money.
+AUDIT (independent): no look-ahead leakage in what was evaluated; every feature
+recomputed for all 4,103 rows. BUT the builder read 41 pre-cutover (Binance-era) BTC
+observation fields (final_price/side) as a label cross-check - none reached the dataset
+(37 dropped, 4 matched Kalshi exactly) - against the operator's rule: any future build
+reads BTC observations only from window_open >= 1790135100000 (the Kalshi-only cutover).
+Consistent with FINDINGS 36 (no model beats the price, 6,428 markets) and 76 (48 rules at
+the money, none). Nothing built or changed live.
+
+## 135. A daily CAP on the primary: stop for the day at ~20% (2026-10-02)
+
+OPERATOR: "look for the max average profit target so that we are not letting profit go
+up and down throughout the day and maybe not able to recover on a bad afternoon... once
+reached after the first target, primary is done for that day. Test that."
+scripts/upper_target_sweep.py (recomputed independently to the cent, wf_f5a49bba-6f8):
+live rule on the recorded signals ($6 below 8%, $3 at/above, 5 bps cushion, held to the
+result) + no new entry once the day reaches CAP% of 107.33. 9 full days 09-23..10-01:
+  no cap (LIVE) +113.77 (795 trades)   8% +72.94    10% +88.37    12% +106.77
+  14% +107.32   16% +121.93   18% +131.75 (576)   20% +132.22 (611)   22% +124.64
+  25% +118.80   30% = no cap.
+WHY: the live days peaked at +17..+27% and gave back $6.87 a day on average (09-28 peaked
++13.40, closed -1.26; 09-30 +25.06 -> +14.55). A cap at 16-22% beats no cap at every
+step - a plateau, not a single lucky point - by locking 4-5 of the 9 days near their high;
+it never touched the two losing days (09-26 peaked +4.8%, 09-28 +12.5%; only a 12% cap
+would have saved 09-28, and it costs more on the good days).
+In-sample: best of 11 levels on 9 days; +$18 over 9 days comes from 4 days. Implementing
+it changes the LOCKED strategy - the operator's word only.
+IMPLEMENTED (operator, 2026-10-02: "I authorize implement the 20% daily stop on the
+primary"): DAILY_PROFIT_STOP_RATE=0.20 -> DailyProfitGuard.stop_rate on the primary only.
+Once the day's realised P&L (net, broker) reaches 20% of the midnight opening, block_reason
+refuses EVERY new entry until 00:00 New York ("BTC 20% daily profit target cap reached;
+done until midnight New York" - "profit target" keeps the per-signal miss notice quiet);
+latched in profit_days.capped_ms (migrated), so a later loss does not reopen the day; the
+live figure counts too, so a settlement since the last refresh cannot let one more entry
+through. Exits, cash-outs and recording are untouched; no LOCKED function changed (the cap
+lives in the guard, which the order path already consults). Telegram: one "DAILY CAP
+REACHED" notice, CAPPED in the accounts table, the cap named in the midnight notice.
+The mirrors copy only primary fills, so they also stop when the primary does - they have
+normally paused at their own 15% long before. REVIEW (wf_56943a2c-dff): nothing slips past
+the cap; two Telegram-only defects FIXED before deploy - the outage pair said "New BTC
+entries allowed again" on a capped day, and with the cap switched off mid-day the display
+still said CAPPED with a $0.00 cap (now shown only while the cap is in force). Tests:
+tests/test_primary_daily_cap.py (11), mutation-checked.
+
+## 136. A give-back stop on top of the 20% cap: worse at every level (2026-10-02)
+
+OPERATOR: "give back no more than $X from the day's high - test that". scratchpad
+giveback_stop_sweep.py (recomputed independently to the cent, wf_c4f3b636-e82): the live
+rule + the 20% cap, plus: once the day's realised high reached 8% ($8.59 of 107.33), done
+for the day if the P&L falls GIVE below that high. 9 full days 09-23..10-01:
+  none (live) +132.22 | give 2% +87.28 | 3% +100.09 | 4% +100.09 | 5% +91.54
+  6% +99.47 | 8% +113.13 | 10% +105.29 - every level $19-$45 WORSE.
+  Armed from the first trade (also a daily loss stop): 4% -31.52 .. 10% +54.57, $78-164 worse.
+It does fix 09-28 (-1.26 -> +2.21..+9.94) but cuts the good days that dip and recover
+(09-24 +17.91 -> +2.08; 09-25 +22.16 -> +6.70; 09-29 +16.50 -> +9.41), and the money
+"given back" mostly RISES (the day stops before the higher high it would have reached).
+Same mechanism as the BTC loss stop (126): BTC's intraday dips recover the same day.
+NOT ADOPTED. The 20% cap alone stays.
+
+## 137. Can the next LOSS be predicted? No - not beyond the price (2026-10-02)
+
+OPERATOR: "Do we have some pattern in how the signals are coming in daily, like we can
+predict when a losing trade is about to kick in (the probability of the next signal to
+lose), based on the data, the signal regime and time of day?" Workflow wf_f8dda617-53f,
+three independent analyses, Kalshi-only signals (window_open >= 1790135100000): 885
+signals, 841 live entries (cushion), 11 NY days; scratchpad/losspat.
+- PATTERNS: 61 tests (hour, session, weekday, signal # in day, previous result, run
+  length, time since last loss, volatility, distance, momentum, elapsed, day-P&L state,
+  cushion entry, ask band) - NONE survives Benjamini-Hochberg at 10% (best p 0.014,
+  q 0.38). Closest: high volatility +3.7c, under 20 min since a loss +4.0c, hour 11 +11c,
+  hour 20 ET -18c (lost on 6 of 9 days - the only hour bad in both halves), day already
+  at/above 8% -1.4c (partly a sequence artifact: chance alone gives most of that gap).
+  The 127 lead "hours 08/09/15/20 weak" does NOT replicate: worst-4 hours picked in one
+  half are -8c (p 0.40) / -4c (p 0.58) in the other; hour patterns of the halves r=+0.12.
+  The 130 "below 0.70" lead also did not repeat in the second half (+0.0 vs -8.1c).
+- SEQUENCE: losses do NOT cluster. After a loss the next entry lost 17.4% vs 22.9% priced
+  (after a win 24.2% vs 26.7%); runs test: no clustering (p 0.68 all, 0.95 live); longest
+  live losing run 3 vs ~4.2 expected by chance; losses per clock hour = chance (p 0.52);
+  volatility regime neither causes nor hides clustering. The cushion's real job: the 44
+  signals it skipped lost 45.5% vs 33.6% priced; net +$1.95 per contract over 10 days.
+- PREDICTION, walk-forward (7 test days, 567 entries, L2 logistic on 27 fixed features):
+  WORSE than the price itself (Brier 0.199 vs 0.168; AUC 0.59 vs 0.65); skipping what it
+  flagged lost money at every margin (m 0..0.10: -1.82..-21.43 at $6).
+- NEEDED: a 2-point loss-rate edge ~3,300 entries (~40 days); inside a 25% skip group
+  ~13,300 (~158 days). The price already carries the win probability; the edge is the
+  signal itself, not its timing. CANDIDATE to pre-declare for the 2,000 review: hour 20 ET
+  (a single hour, q 0.38 - not a rule). Nothing changed live.
+
+## 138. 10-02, first big losing day under the live rules - and "against the 1h trend" tested (2026-10-02 13:00)
+
+BROKER, 13:00 ET: primary -16.07 (-13.4% of 119.67) after a high of +13.86 (target hit
+04:45); mirrors all paused at their targets by 05:15 (Wife +6.59, George +3.78, Affoue
++1.62). 47 graded $ trades won 68% at a mean 0.720; UP won 14/28 (priced ~74%), DOWN 18/19.
+BRTI rose to ~87,100 by 09-10h then slid ~200 bps to 85,127; seven $6 UP losses 09:00-12:15
+took the day from +8.57 to -16.07 (the follow rule put the stake back to $6 below 8%).
+A fall of ~$30 = ~5 stakes from the high: inside the risk range of 133 (5-loss runs ~monthly).
+HYPOTHESIS FROM TODAY, TESTED ON THE PREVIOUS DAYS ONLY (Kalshi BRTI 60-min move before the
+alert): with the 1h trend +2.26c [-3.2, +7.7] n=211; AGAINST +1.44c [-5.5, +8.4] n=146;
+flat hour +1.60c n=430 - NO difference on the record. Today: against the trend 43% won,
+-28.9c (n=14). One day; pre-declare "against the 1h trend" with hour 20 ET for the 2,000
+review. The give-back stop (136) and pause-at-target would have helped today; both stay as
+they are until the review weighs days like this one with the rest. Nothing changed live.
+
+## 139. Why the signal keeps going against the trend, and what would have helped (2026-10-02)
+
+OPERATOR: "Why do these keep choosing to go against the trend - all 4 losses. Check what
+could have helped the signal quality." MECHANISM (src/btc15_signal/model.py:18): ~4 min into
+each window, side = the side of the strike BRTI is on; the score uses only normalized
+distance and 5-min momentum - no longer trend. In a slide, an early intra-window bounce puts
+the price above the strike with fresh +5..+17 bps momentum, so it scores as a strong UP;
+11:45, 12:00, 12:15, 12:45 were exactly that (primary -21.40 at 13:04).
+TEST (wf_c60a3eb6-f12, scratchpad/trendfix; 16 pre-registered rules, live rules incl.
+cushion, follow, 20% cap; recomputed independently to the cent; no look-ahead):
+  previous 9 days: UP +1.6c, DOWN +1.5c per contract - neither side worse; against-trend
+  signals within ~1 SE of the rest under every definition. TODAY: UP won 14/29 vs 21.8
+  expected (z -3.4) - nothing like it in the record (worst side-day -1.0 SD).
+  Rules (change vs live, previous 9 days / today): skip vs 60m>10bps +1.64 / +33.25;
+  vs 15m>10bps +3.40 / +5.33; vs 60m>20bps -36.94 / +25.88; vs 30m>10bps -20.80 / +30.21;
+  half stake -14.77 / +5.74; confirm 10/15/20 bps -35.61/-33.34/-25.94 / +5..+17;
+  day trend -34.86 and -5.09 / -32.60 and -21.49; side cooldown -7.35 / +1.96.
+  The best previous-days result (+3.40) is what chance gives (69% of shifted-flag runs).
+VERDICT: nothing would have helped without hurting the record or fitting today; what
+protected money today was money management (the mirrors' pause at target), not signal
+quality. PRE-DECLARED for the 2,000-signal review (judge signals from 10-03 ONLY): primary
+hypothesis = against the 60-min trend by > 10 bps (trendfix.py definition), test = flagged
+minus rest net per contract at the alert price, pass = <= -3c and >= 2 SE below zero AND the
+skip rule does not lose vs live day by day; secondary (report only) = 15-min > 10 bps;
+expected underpowered at 2,000 (~1.2 SE) - carry to ~3,000 new signals if inconclusive.
+Also re-weigh pause-at-target and the give-back stop with days like 10-02 included.
+Nothing changed live.
+
+## 140. The trend skip applied ONLY after a loss (2026-10-02)
+
+OPERATOR: "What [about] apply that only after a loss" (the cushion's moment). The audited
+trendfix.py engine + one condition: when the day's last taken entry lost, skip a signal
+that is against the trend (a skipped signal leaves the last result a loss, as the cushion
+does). Recomputed independently (wf_3740bc9a-dc6) - previous days to the cent.
+  change vs live            previous 9 days (better/worse days, signals skipped)   today
+  after loss, 15m > 10 bps  +0.22  (3/4, 17 skipped: 10 won = 59% vs ~71% priced)  +11.67
+  after loss, 15m > 20 bps  -1.29  (2/2, 7)                                         +6.11
+  after loss, 30m > 10 bps  -1.18  (2/5, 26)                                        +11.67
+  after loss, 30m > 20 bps  +0.69  (3/1, 10)                                        +6.11
+  after loss, 60m > 10 bps  -10.62 (3/6, 69)                                        +23.29
+  after loss, 60m > 20 bps  -22.99 (3/5, 50)                                        +22.62
+After a loss on the previous days: against the 60m trend -0.8c (n 52) vs +0.2c the rest -
+no difference; against the 15m trend -13.7c (n 17, SE 12c) - in the right direction, far
+from proven. READ: applied only after a loss the short-trend versions are ~free on the
+record (they touch ~2 signals a day) and help on a day like 10-02; the 60m version costs.
+Evidence for a benefit is weak (17 signals, found on the day it is tested on). The cushion
+code is LOCKED (CUSHION_CODE): adopting needs the operator's word. Otherwise pre-declared
+for the 2,000 review with 139.
+
+## 141. The 15-min after-loss rule in shadow on BTC: fewer repeat losses (2026-10-02 13:50)
+
+OPERATOR: "After each loss, did the rule-based system running in the shadow have the same
+consecutive loss or did it do better? ... BTC running in the shadow with the rules."
+Same BTC signals 09-23..10-02 (13:15 window), the audited trendfix engine; LIVE vs SHADOW =
+live + "after a loss, skip a signal against the 15-min BRTI trend by > 10 bps":
+                         LIVE        SHADOW (15-min rule)
+  net                    +104.49     +116.38
+  next trade after a loss lost   30/146 = 21%   23/145 = 16%
+  losing streaks 1 / 2 / 3+      96 / 16 / 7    106 / 15 / 4  (longest 3 both)
+The rule acted 18 times: avoided 8 losses (+37.28: 09-24 x2, 09-28 01:45/03:15/03:30,
+09-29, 10-02 10:15/12:15), missed 10 wins (-13.93, $0.45-3.01 each). Asymmetry: a skipped
+loser saves the stake (~$5-6), a skipped winner gives up ~1/3 of it, so it pays above ~1
+loser caught in 3; it caught 8/18. Knock-on path effects (09-25) leave +11.89 net.
+Small sample, idea suggested by 10-02. OPERATOR: "keep our 15 minutes in mind for
+implementation" - the PENDING candidate; implementation (in the LOCKED cushion code) on
+the operator's word, with tests + review before live.
+
+## 142. The 15-min skip after TWO losses instead of one (2026-10-02 14:01)
+
+OPERATOR: "test the 15 minutes to only trigger after two losses, not at the first loss."
+Same engine; the skip arms only when the day's last TWO taken entries both lost (a skipped
+signal leaves the streak as it is). 09-23..10-02 (live now +107.41 with today's later
+windows):
+                         net (vs live)    acted  avoided / missed         days +/-  repeat-loss  3+ streaks
+  live                   +107.41           -      -                       -         20%          7
+  after 1 loss           +116.38 (+8.97)   19     8 (+37.28) / 11 (-16.85) 4/4      16%          4
+  after 2 losses         +121.64 (+14.23)   4     2 (+11.05) / 2 (-2.48)   3/1      19%          5
+After-2 acted: 09-28 03:30 UP (avoided -5.48), 09-29 08:30 UP (missed +1.14), 10-01 14:15
+DOWN (missed +1.34), 10-02 12:15 UP (avoided -5.56). It breaks the third loss in a row and
+avoids after-1's cost on normal days (09-25 -6.38) but rests on 4 events; after-1 cuts more
+repeat losses on trending days but interferes ~2x a day. Neither proven better than the
+other. Both PENDING the operator's choice (memory btc15-pending-15min-rule).
+AFTER THREE LOSSES (operator: "test after 3 losses"): never acts - +107.41, identical to
+live. Three-in-a-row happened 7 times in 10 days and the NEXT signal won every time (7/7:
+09-24 14:15, 09-28 03:45 / 20:45 / 23:15, 09-29 15:45, 10-02 06:30 / 12:30), none against
+the 15-min trend; no 4-loss run exists. The useful moment is after the 2nd loss.
+
+## 143. After two losses, never against the 15-min trend - chosen, mirrors checked, built (2026-10-02)
+
+OPERATOR: "the 15 minutes after 2 losses is the one I want live, nothing else changes to the
+live rule. But before that test that with the mirrors hitting their targets."
+MIRRORS (copy the primary's fills at their own stake, pause at their own target; openings
+of 10-02; 09-23..10-02): targets hit 9/10 with and without the rule; Wife +51.62 -> +52.26,
+Uncle George +33.07 -> +32.85, Affoue +16.48 -> +15.84 (only 09-28 differs: targets hit at
+16:30 instead of 18:00). Primary +107.41 -> +121.64. The rule leaves the mirrors as they were.
+BUILT: main.allsignal_loss_streak / brti_trend_bps / allsignal_trend_skip, called at the top
+of allsignal_on_alert - after the day's last TWO taken $ trades both lost (unknown result =
+loss), a BTC signal against the 15-min Kalshi BRTI move (brti_features; valid at t only if
+ts_ms and received_ms <= t, <= 60 s old, stale=0) by > 10 bps is recorded 'skipped' (the
+miss notice says why) and no order is sent; the streak stands until a trade is taken.
+ALLSIGNAL_TREND_SKIP_AFTER_LOSSES=2 (_MINUTES 15, _BPS 10); default 0 = off; BTC only;
+errors let the signal through. CUSHION_CODE re-pinned 07d0c8be54297726 with the three new
+functions inside the lock. Tests: tests/test_allsignal_trend_skip.py (11), mutation-checked
+(4 of 4 caught).
+
+## 144. The primary under the mirrors' rule (pause at target) - 10 days (2026-10-02 14:19)
+
+OPERATOR: "If primary followed the target rule like the mirrors, what would its result be?"
+trendfix engine, 09-23..10-02 (today through the 14:00 window), $6, cushion; C 107.33 /
+today 119.67:
+                                total    trades  losing days  worst    today
+  now: $6/$3, 20% stop          +109.77   668     3            -22.45   -22.45
+  now + after-2 rule (going live) +124.00 664     2            -16.88   -16.88
+  PAUSE at 8% (mirror-style)    +83.32    251     1            -1.27    +10.38
+  PAUSE at 8% + after-2         +86.39    245     1            -1.27    +10.38
+  PAUSE at 15% (mirror rate)    +89.14    458     3            -22.45   -22.45
+Pause at 8% is the steadiest (+8.6..+11.7 on 9 of 10 days, one losing day -1.27, today
++10.38) but makes $26-38 less: it gives up the good days' upside (09-23 +21.85 -> +10.14).
+The current rule + after-2 makes the most and carries the bad days (today -16.88). In-sample.
+Nothing changed.
+REVIEW (wf_70bd5fd9-d9d, before deploy): the live functions reproduce the study exactly on
+the live archives (same skips: 09-29 08:30, 10-01 14:15, 10-02 12:15; 09-28 03:30 predates
+the $ book; brti trend equal on all 897 signals). Two defects FIXED: (1) an UNKNOWN result
+counted as a loss and the skip is final - two WINNERS still unsettled at 09-29 21:34 would
+have armed it (the signal was DOWN, so nothing happened); now only KNOWN losses arm it (the
+cushion still waits on unknown, as before); (2) the skip's DB write was unguarded on the
+alert path - now guarded. Refuted: cash-out P&L in the streak. CUSHION_CODE re-pinned
+e8307b4332e4a14c. 14 tests, mutation-checked. Full suite + fingerprint-guarded restart
+started 2026-10-02 ~14:40.
+
+## 145. Every instrument's shadow record side by side (2026-10-02 14:47)
+
+OPERATOR: "how has gold been doing" / "check all the others". Kalshi-only signals
+(window_open >= 1790135100000), every primary signal at its alert price (no cushion - it is
+BTC-only), net of fee; "rules" = the primary's $6/$3 at 8% of 107.33, stop at 20%. All eight
+instances recording (last observation 4-10 s old).
+  inst   signals days  won    break-even  net/contract [95%]       flat $6   rules    losing days
+  BTC    899     11    75.6%  74.6%       +1.03c [-1.7, +3.8]      +76.23    +93.62   3/11
+  ETH    759     9     75.1%  75.9%       -0.78c [-3.8, +2.3]      -26.68    -1.31    4/9
+  SOL    668     8     75.4%  75.5%       -0.03c [-3.2, +3.1]      -4.40     -38.50   4/8
+  XRP    588     7     71.1%  75.1%       -3.99c [-7.6, -0.4]      -187.16   -182.75  4/7
+  NEAR   576     7     72.6%  76.2%       -3.64c [-7.2, -0.1]      -160.98   -152.06  6/7
+  BNB    100     2     74.0%  73.4%       +0.60c [-7.9, +9.1]      +8.50     -10.21   1/2
+  GOLD   519     8     71.9%  73.7%       -1.80c [-5.6, +2.0]      -81.50    -76.77   6/8
+  SILVER 469     7     72.7%  74.7%       -1.98c [-6.0, +2.0]      -62.22    -40.68   2/7
+Only BTC wins more often than its price (and with its cushion, 77.6% vs 75.5%). ETH and SOL
+are at break-even; XRP and NEAR lose beyond chance (their intervals sit below zero); GOLD
+and SILVER lose but within noise; BNB is too new. None qualifies for live; all stay shadow.
+XRP/NEAR: the configs fitted on Binance-era data (75) do not hold on Kalshi - refit or drop.
+LIVE 2026-10-02 15:00:11 (suite passed on code ce446088b6b29941; BTC 21020 -> 6704, started 15:00:23 clean; settings loaded: after 2 losses, 15 min, 10 bps).
+
+## 146. Losing streaks vs volatility; the low-volatility cushion lockout (2026-10-03 08:23)
+
+OPERATOR: "were the consecutive three to five losses happening because of high volatility
+days?" scripts/loss_streak_volatility.py on the ACTUAL live $ trades 09-28..10-03 08:00
+(352 trades, 86 losses; Kalshi BRTI): 4 losing streaks of 3+ (15 losses):
+  09-28 20:00-20:30 3 (DDU)    15m vol pct 48, |60m move| pct 22 (-6 bp)   typical
+  09-28 22:15-23:00 4 (UDUU)   pct 69, move pct 26 (+9 bp)                 moderate
+  09-29 15:00-15:30 3 (UUU)    pct 24, move pct 57 (+23 bp)                LOW vol
+  10-02 11:45-13:00 5 (UUUUU)  pct 81, move pct 69 (-34 bp)                high vol + downtrend
+Streak losses 0.85 bp 15-min vol vs 0.77 for wins and other losses. Loss rate by vol third:
+low 26.5% (priced 27.5%), middle 20.5% (26.3%), high 26.5% (25.5%) - no volatility effect.
+The widest-range day (09-30, 313 bp) had no 3+ streak. VERDICT: volatility does not explain
+the streaks; only the worst (10-02) was high-vol, and it was a TREND (bounce in a slide) -
+what the after-2-losses rule (143, live 10-02 15:00) addresses.
+10-03, the opposite case: very LOW volatility (0.22 bp avg 15-min vol, 39 bp range by
+08:00). After the 04:30 loss the cushion skipped every signal to 08:13+ (price never 5 bps
+clear); 19 cushion skips today would have won 13 (68%) yet netted -12.87 at $25 - the skips
+saved money overall, but kept the primary out from 04:45 (incl. 7 would-be winners 06:45-08:00).
+SIZING (operator, .env 2026-10-02 23:41, restart 23:58, same code): primary funded to
+~$996, ALLSIGNAL_STAKE=25, ALLSIGNAL_AFTER_TARGET_STAKE=10 (2.5% / 1%); Affoue ~$120.71.
+SATURDAYS (operator: "is this our second or third Saturday?"): 10-03 is the SECOND Saturday
+of Kalshi-only signals (record starts Tue 09-22 23:45) and the FIRST of live $ trading
+(live from Mon 09-28 14:15). Both are the calmest days on record and both below break-even:
+09-26 97 signals won 71% at 0.72, BTC range 82 bp, 12-s vol 0.36 bp (live-rule replay
+-1.27 at $6, cushion skipped 28 of 96); 10-03 to 08:15 36 signals won 69% at 0.71, range
+46 bp, vol 0.25 bp (weekday ranges 189-382 bp). Sunday 09-27 was strong (+22.79). Two
+days: a lead only - pre-declare "quiet day / Saturday" for the 2,000 review.
+
+## 147. Quiet days: take every signal instead of the cushion's skips? No (2026-10-03 19:30)
+
+OPERATOR: "evaluate all the Saturday signals and the skips - if taking all on quiet days
+would have helped, make a check for quiet day and take all only on quiet days, verify."
+scratchpad/trendfix/quiet_take_all.py (recomputed independently to the cent,
+wf_1d78b1e1-094): the live setup since 10-02 23:41 ($25/$10 on 995.93, cushion, 20% stop,
+after-2 trend skip), 11 days 09-23..10-03, quiet judged LIVE at each alert (Kalshi BRTI);
+when quiet, take the signal at its alert price (no cushion, no trend skip):
+  live                          +666.56   Sat 09-26 -0.35   Sat 10-03 +6.54
+  quiet = 60-min range <= 15 bp  -85.92   | <= 20 bp -41.56 | <= 30 bp +3.90 (days 6/5 - noise)
+  quiet = day range so far <= 50 bp -11.65 | <= 80 bp -46.09
+  Saturdays: take all           -47.49   (09-26 -56.21, 10-03 +14.91)
+  always take all               -213.50
+The cushion's skips: 09-26 28 skipped, 17 won (61% vs 72% for the day) - skipping them was
+worth +55.86; 10-03 27 skipped, 18 won (67% vs 74%) - taking them would have added +8.37.
+Quiet signals win as often as the rest (215: 75.8% at 0.718 vs 798: 75.6% at 0.735).
+VERDICT: no - the cushion helps on quiet days too; no quiet-day exception. Nothing changed.
+
+## 148. Telegram: the Kalshi target on every $ signal message (2026-10-03)
+
+OPERATOR: "Can we have the signal in telegram show the Kalshi target price for clarity."
+Display only (no LOCKED function touched; locks pass). messages.target_lines + optional
+target/ref/final on the entry, result and skipped/not-filled messages; main._window_prices
+reads what the service already records: the alert's observation (target = the window's
+strike, equal to Kalshi's official strike; btc = the Kalshi BRTI reference at the signal)
+and the synced settlement (strike, expiration_value). Entry/skip: "📍 Kalshi target
+$84,787.45 · UP wins at or above it" + "💲 BTC at the signal $84,810.91 (+2.8 bps above)".
+Result: "📍 Kalshi target $84,787.45 → settled $84,862.28 (+8.8 bps above)". Unknown
+values leave the line out; never raises. Tests: tests/test_signal_target_line.py (6).
+REVIEW (wf_4f5bb4c7-9fe): nothing blocking; numbers verified on live windows (target =
+settlements.strike in every window; Kalshi YES at or above the strike). Two fixes applied
+before deploy: (1) the settlement sync lands ~60-70 s AFTER the result message (24 of 25
+results would have had no settled value) - the result now falls back to the NEXT window's
+strike, which Kalshi opens at this window's settled value (matched 8/8); the official
+value wins when present; (2) "BTC at the signal" now names the instrument. 8 tests.
+LIVE 2026-10-04 00:30:09 (suite 1955 passed on code 1b85934543f7775f; BTC 4848 -> 19744, started 00:30:24 clean).
+
+## 149. Avoid weekends? No - weekend signals do as well as weekday ones (2026-10-04 13:45)
+
+OPERATOR: "Should we avoid weekend?" Kalshi-only BTC signals at the alert price, net of fee:
+  weekday 744 signals, won 75.4% at 0.730, +1.03c per contract [-2.0, +4.1]
+  weekend 343 signals, won 75.5% at 0.733, +0.90c per contract [-3.6, +5.4]
+Per weekend day: Sat 09-26 -1.36c, Sun 09-27 +5.64c (the best day per contract on record),
+Sat 10-03 -0.75c, Sun 10-04 -0.54c (to ~13:30). Weak weekdays are just as common (Mon 09-28
+-2.92c, Fri 10-02 -1.39c). Skipping weekends would have cut 09-27 (+109.35 at $25 under the
+live rules). Four weekend days: no basis to avoid them; weekend vs weekday stays a report
+line for the 2,000-signal review. Nothing changed.
+
+## 150. The rule-based (main) strategy in shadow vs the all-signal (2026-10-05 09:35)
+
+OPERATOR: "How is the rule-based system doing in the shadow?" NOTE: trade_proposals
+'primary' status 'pending' (1,073 since 09-23) are NOT the gated rule - they are created for
+every signal, same time (285 s in) and side as the all-signal alert, at 0.65-0.96 (434 below
+the 0.70 floor). The gated rule is observations.rule_match = 1; its trade = the first such
+poll per window (at its our_ask), graded by the window's settlement for that side:
+  RULE-BASED  440 trades / 14 days (~31/day), won 82.0% at 0.805, +0.45c per contract
+              [-3.1, +4.0]; $25 each +70.86; 6 of 14 days losing (10-04 -175, 09-26 -111;
+              09-27 +125, 10-03 +104).
+  ALL-SIGNAL  1,154 signals 09-23..10-05, won 75.3% at 0.732, +0.75c [-1.7, +3.2]; $25 each
+              +295.80 (the live rules - cushion, target - did better still).
+  BRAIN-approved alerts: 1,149 of the 1,154 - effectively the all-signal (+0.68c).
+The rule wins more often but pays ~7c more per contract and trades a third as often:
+less per contract and far less in total. The all-signal stays the right live strategy.
+
+## 151. What Sat 10-03, Sun 10-04 and Mon 10-05 (to 09:40) teach (2026-10-05)
+
+KALSHI (net): primary -4.29 / -26.92 / -41.44 (to 09:40) = -72.65 (-7.3% of ~$996); Wife
++0.24 / -4.42 (-10.4%) / -5.50 (-14.5%), opening 42.35 -> 37.93; George and Affoue small.
+1. THE SIGNAL HAD NO EDGE these days: won vs break-even -0.7 / +0.4 / -2.0 points (73% at
+   0.723; 75% at 0.733; 76% at 0.771). With ~zero edge the costs make every day negative.
+2. THE COSTS NOW MATTER IN DOLLARS at $25: entries paid +2.4c / +1.5c / -1.0c vs the signal
+   price (cushion waits buy dearer); cash-out since 10-03: 93 of 165 trades sold early, all
+   winners, -31.63 (-34c per cash-out), no loser saved.
+3. THE CUSHION was mixed: skipping saved 92.93 (Sat, skipped won 61%), cost 37.19 (Sun,
+   skipped won 76%), saved 13.59 (Mon) - net ~+69 over the three days.
+4. UNFILLED SIGNALS ALL WON: 3 + 4 + 3 = 10 of 10 - the ask ran past the cap because the
+   market moved the signal's way. A missed fill is systematically a winner. LEAD: test a
+   wider entry cap / a later retry at the moving price on the record before changing it.
+5. The after-2 trend rule never acted (no two-loss run against the trend).
+6. Wife's $3 is ~8% of her balance per signal: -10% and -14.5% days. Her stake is the
+   operator's floor; the 2% scale would put her at $1.
+Three days (~230 signals) of ~zero edge sit inside the noise of a +0.75c edge; nothing
+changed.
+
+## 152. Cash-out OFF; chasing the unfilled signals (2026-10-05)
+
+OPERATOR: "Disable cash out for now and also test [the] new finding - it's best to make a
+few profit than to let it go completely."
+CASH-OUT: CASH_OUT_ENABLED=false in the live .env (its own switch; no code change, the
+LOCKED cash-out returns at its first line); every $ trade held to settlement. Since 10-03
+the cash-out had sold 93 winners early for -31.63 and saved no loser. tests/conftest.py
+sets CASH_OUT_ENABLED=true for the suite (as for the recoveries) so its mechanics stay
+tested; tests/test_allsignal.py pins the OFF behaviour (no sale, no mirror exit).
+UNFILLED (scratchpad/unfilled_chase.py): 30 live unfilled $ signals 09-28..10-05, 25 won
+(83%) - the earlier "10 of 10" was only 10-03..10-05. The recorded quotes LAG the book: at
+the alert they still show the signal price although the order failed at signal + 5c, so
+they cannot price a chase. At the MOVED price (first recorded ask above the cap after the
+failed order; known for 29): buy up to 0.85 -> 24 fills, -2.74; up to 0.90 -> 27, +6.46;
+up to 0.93+ -> 29 fills (24 won, 5 lost) at 0.801 avg, +11.13 at $25 over 8 days. A win at
+~0.80 pays ~$5, a loss costs ~$25: break-even ~83% won, and they won 83%. VERDICT: about
+break-even - not worth changing the order path now. Nothing changed for unfilled signals.
+
+## 153. Early exits on the Kalshi lifecycle: keep them OFF (2026-10-05)
+
+OPERATOR: "the trade exit we disabled ... because we were exiting trades that eventually
+turned out to win - I believe we have enough data now to test the exit using the trades'
+life cycle." Workflow wf_5be1ad8a-9c4 (scratchpad/exitstudy): 1,069 live-rule entries
+09-22..10-05 (Kalshi only), hold to settlement +425.71 at $25; 15 pre-registered rules,
+selling all at the first qualifying poll with >= 60 s left:
+- BID STOPS (bid <= 0.15..0.55): lose in every version, both halves (-177 .. -646); the
+  trades they sell won 1-2c MORE often than the bid implied - the operator's "exits that
+  turned out to win".
+- CROSS / DEEP-CROSS STOPS: looked slightly positive at the recorded quote (best C 0 bps
+  <= 4 min +166.68, t 1.25, family-wise p 0.23-0.47) - but THE RECORDED QUOTE LAGS THE
+  ORDER BOOK 20-30 s (observations come from the /markets list endpoint; book recorder
+  snapshots match the quote 2-3 snapshots later; book top changes on 87% of snapshots, the
+  quote on 28%). BRTI is fresh, so a cross stop fires before the quote prices the cross.
+  At the real book price ALL 15 rules lose (C 0 <= 4 min -234.61 / -112.42; D -10.27 / -20.30).
+- 10% of losses stay on the held side until the last minute; no rule can catch them.
+VERDICT: the market prices an adverse move correctly (FINDINGS 40, now on Kalshi's own
+book); exits sell at or below fair value. KEEP OFF. Any future exit or entry-price work
+must price from the order book (/orderbook), not the lagged /markets quote - this lag also
+explains why recorded asks looked "fillable" for orders that missed (152) and the open
+"book vs quote" item of FINDINGS 7.
+
+## 154. What the losses since Saturday share: cheap prices - but a floor still costs (2026-10-05)
+
+OPERATOR: "What do these new losses since Saturday have in common when it comes to signal
+quality and price?" Live $ trades, at the alert (Kalshi BRTI for trends):
+                      losses since Sat  wins since Sat  losses before  wins before
+  price paid          0.727             0.781           0.697          0.746
+  bps from target     5.2               6.4             6.3            8.4
+  5m volatility       0.71              0.73            1.13           1.08
+  15m / 60m trend to side +4.9/+4.2     +6.3/+6.5       +4.1/-0.1      +7.7/+7.2
+  bought under 70c    46%               21%             45%            32%
+  against 15m trend   8%                7%              12%            4%
+  UP share            54%               55%             63%            48%
+Win rate under 70c: before Sat 82/119 (69%, avg 0.641 - above break-even); since Sat 27/45
+(60%, avg 0.651 - below ~66% break-even). 0.70-0.80: 72% -> 81%; 0.80+: 89% -> 84%. Side,
+momentum, distance/volatility, the 15-min trend: no difference. The regime is quieter
+since Saturday (5m vol 0.71 vs ~1.1) for wins and losses alike.
+A FLOOR under the CURRENT live rules (scratchpad/trendfix/floor_now.py, 13 days, $25/$10):
+live +617.12; floor 0.65 -112.57; 0.68 -490.82; 0.70 -381.07 (since Sat +31.23, before
+-412.31; worse on 9 days, better on 4). The cheap entries carried the earlier days; the
+floor costs far more than it saves (also 130). Not adopted.
+
+## 155. The chase: a missed $ order is bought at the moved price (2026-10-05)
+
+OPERATOR: "You miss the point - whether we take small wins or not it changes nothing, it's
+better to take it than just letting it go." Decision logged with the evidence beside it
+(152: 30 live misses, 25 won; at the moved price +11.13 over 8 days - break-even-ish, positive).
+BUILT in main.allsignal_retry_poll (RETRY_CODE re-pinned ea7e1e26df10b098 on the operator's
+word): when an order went unfilled and the ask on its side is now ABOVE its cap but <= 93c
+(ALLSIGNAL_CHASE_MAX=0.93), from 10 s after the last attempt (allsignal_chase_after_s), at
+most 3 retries (allsignal_chase_attempts), while >= 2 min left and the price is on the
+signal's side (after a loss: >= 5 bps): new cap = min(93c, ask + 5c), the same dollar stake
+at the moved price, the row's stake/count/limit updated. A price back under the old cap keeps
+the 60 s same-cap retry. Default 0 = off; tests/conftest.py keeps it off for the suite and
+tests/test_allsignal_chase.py (8) switches it on; mutation-checked (the ceiling is guarded
+twice). Live after the full suite + review + fingerprint-guarded restart.
+
+## 156. $10 base, $25 twice after a loss (2026-10-05 10:51)
+
+OPERATOR: "base at $10 and after a loss go $25 twice then back to $10 - test that."
+scratchpad/trendfix/boost_after_loss.py (audited engine; cushion, after-2 trend skip, 20%
+stop, held to the result; opening 995.93; 13 days 09-23..10-05):
+                                   total     vs live  worst day  lowest in a day  avg stake
+  LIVE ($25 -> $10 at 8%)          +617.91   -        -44.36     -142.81          $20.74
+  BOOST $10, $25 x2 after a loss   +530.92   -87.00   -29.40     -140.26          $16.23
+  BOOST only below the 8% target   +621.67   +3.76    -29.40     -140.26          $15.50
+  BOOST x1 after a loss            +423.18   -194.74  -15.95     -75.82           $13.38
+  flat $10 / flat $25              +170.44 / +491.61
+BOOST vs live: better on 6 days, worse on 7; the last three (weak) days +115.31 better
+(10-03 +81.23 vs +32.54, 10-04 -7.74 vs -30.28, 10-05 -0.28 vs -44.36), the ten before
+-202.31. Why it can work: after a loss the cushioned entries win more often (137: lost 17%
+vs 23% priced), so the $25 lands on the better trades. "Only below 8%" keeps live's money
+with ~25% less staked per trade and a smaller worst day. In-sample; operator's decision.
+REVIEW (wf_9227437b-524) - the first chase deploy was STOPPED before its restart: a retry
+sent the order at the signal's OLD ask, and every mirror sizes its copy by the order's entry
+price - on a chased order the mirrors would have over-spent their stakes by up to ~50%
+(Wife's $3 -> 5 contracts at ~$4.30). FIXED: a retry is sized and sent at the CURRENT price
+(the record and messages keep the signal price); and a chase-due poll is urgent from the
+miss (it read the price after the poll's chores, 1-2 s late). RETRY_CODE re-pinned
+8ad21fa8451f4823; tests 10; the after-target retry pin updated to the new line (still sized
+at the stake now). Redeployed 10:59 (suite + fingerprint-guarded restart).
+TODAY vs THE WEEKEND (operator: "is today a quiet day like Saturday and Sunday?"), the first
+11 hours of each day: Mon 10-05 range 146 bp, 12-s vol 1.05, net -52 bp - a normal weekday
+(Mon 09-28: 143 bp / 1.13). Sat 10-03 50 bp / 0.27, Sun 10-04 71 bp / 0.34, Sat 09-26
+51 / 0.34, Sun 09-27 95 / 0.55: every weekend so far was 3-4x quieter than any weekday.
+
+## 157. A Binance call was still running: the microstructure recorder (2026-10-05)
+
+While checking which "buying/selling pressure" data exists, found that the separate
+scheduled task BTC15Recorder (pythonw -m btc15_signal.recorder --every 10, elevated, boot +
+logon triggers, running since the 09-25 reboot) still calls Binance's public API every 10 s
+(bookTicker, depth, aggTrades) - an ESTABLISHED connection to data-api.binance.vision
+(52.196.191.78) from PID 7384 at 11:0x - against the operator's rule ("Never use anything
+related to Binance", "Kalshi only"). The trading service never traded on it, but
+main.book_metrics copied its depth_*_qty / trade_count / buy_volume / sell_volume / vwap into
+every observation. The model's two pressure terms (bid_imbalance, taker_imbalance) were
+already zeroed under Kalshi-only. FIX (applied after the chase deploy, to keep that deploy's
+fingerprint): recorder.py writes NULL for every Binance column and makes no Binance request;
+the Kalshi quote and order book are recorded as before; tests/test_recorder_kalshi_only.py.
+
+## 158. Kalshi buying/selling pressure does not validate the direction (2026-10-05)
+
+OPERATOR: "Can we add a read for buying and selling pressure to validate the direction?"
+Workflow wf_97e2bf4f-d7a (scratchpad/pressure; KALSHI ONLY - book_yes/book_no levels,
+volume; no Binance column read, audited): 1,172 signals, book at the alert median 4.8 s old.
+  P1 book lean to the side within 5c: with - against +1.2c (p 0.69)
+  P2 whole-book depth to the side: +2.7c (p 0.14)
+  P3 the side's best bid over 60 s / 120 s: +2.4c (p 0.28) / +5.2c (p 0.21; +2.0c at the
+     fresh book price, p 0.63);  P4 (mid, 60 s) = P3_60;  P5 volume: activity only, nothing.
+Filters: skip when the book leans hard against the side (P1 < -0.4): those signals WON MORE
+(91.7% at 0.814; -130.93 under the live rules) - the wrong way, fragile to the cut-off;
+skip when the side's bid fell >2c in a minute: +6.36 under the live rules, a lagging-quote
+artifact (at the fresh book price the skipped make +1.0c like the rest; halves -45.80 /
++52.16). With the price held fixed, no pressure measure adds to the win rate (all p >= 0.26).
+0 of 19 tests survive BH (best q 0.24); FINDINGS 68 and 137 again. NOT ADDED. The price
+already carries the pressure. (If ever used live, key on book_ms, not captured_ms.)
+DONE 2026-10-05 11:32: recorder.py patched (no Binance request, the BINANCE URL constant
+removed, Binance columns written NULL), tests/test_recorder_kalshi_only.py; task
+BTC15Recorder restarted (old PID 7384 gone; new 11:32:06). Verified: 0 established
+connections to Binance hosts; new book_snapshots every 10 s with the Kalshi quote and book,
+every Binance field NULL. THE CHASE went live at 11:30:08 (suite 1966; BTC 11308 -> 19556;
+ALLSIGNAL_CHASE_MAX=0.93, after 10 s, 3 tries).
+
+## 159. No rule-based gate helps the all-signal - as a filter or a size booster (2026-10-05)
+
+OPERATOR: "can any of the rules in the rule-based system help the all-signal at all?"
+Workflow wf_7141325c-5da (scratchpad/gates; tester + skeptic who rebuilt the engine to the
+cent): live rules ($25/$10, cushion, after-2 trend skip, 20% stop, held), 13 days, LIVE
++637.26 (1,172 signals). The rule that RUNS under Kalshi-only is strategy_kalshi.json
+(kalshi_signal.evaluate): price 0.70-0.93, BRTI distance 10x/15x, move still working, level
+held >= 120 s, level tested >= 2, BRTI stability, fresh reference, 360-660 s window.
+  filter (skip if it fails) / boost (fails -> $10) vs live:
+  price band -344 / -260; distance floor -638 / -434; move working -176 / -79; level held
+  -279 / -181; level tested -384 / -158; stability -59 / -55; the whole deployed rule -687 /
+  -535; retired strategy.json gates (1.5x distance -174/-98, raw prob -220/-133, "7 min"
+  -393/-337); momentum aligned -327/-254 and the 2-4x band -984/-575 (both Binance-era
+  "confirmations" now point the WRONG way: momentum-against signals +12.4c, aligned +0.3c).
+  None beats live in total or in both halves; nothing survives correction. A real booster
+  (2x stake when passing) "beats" live only by staking more (doubling everything +535); vs
+  200 random gates with the same daily pass counts, no gate beats chance (best: price band,
+  21.5% of random gates did as well) and the whole deployed rule did worse than 97.5%.
+WATCH (not a rule): since 10-02 the deployed rule as a filter did better on all 4 days
+(+127.37) after 9 worse days (-808.73); 29 passing signals - judge at the 2,000 review.
+The archive's rule_match on 09-23 recorded the retired strategy.json verdict for 64 alerts.
+
+## 160. The size increase after a loss - variants on all days (2026-10-05 12:29)
+
+OPERATOR: "test that size increase on all the days with variant." scratchpad/trendfix/
+boost_variants.py (audited engine; cushion, after-2 trend skip, 20% stop, held; 995.93;
+13 days 09-23..10-05 12:15; halves split at 09-29; "boost" = the next N TAKEN trades after a
+loss at the high stake, a loss inside restarts it):
+                                       total    vs live  1st/2nd half   Sat-Mon  worst  lowest  avg $
+  LIVE $25, $10 once at 8%             +642.58  -        -              -        -30.28 -142.81 20.77
+  A $10, $25 x2                        +546.12  -96.45   -55 / -41      +105.87  -29.40 -140.26 16.21
+  B as A, only below 8%                +636.88  -5.69    -3 / -3        +105.87  -29.40 -140.26 15.48
+  C $10, $25 x1                        +438.38  -204.19  -146 / -58     +92.62   -15.95  -75.82 13.38
+  D $10, $25 x3                        +628.31  -14.26   -30 / +16      +109.76   -6.89 -126.06 18.36
+  E $15, $25 x2                        +515.33  -127.25  -64 / -63      +70.65   -19.89 -144.53 19.14
+  F $10, $30 x2                        +671.43  +28.85   +18 / +11      +138.85  -37.30 -166.79 18.28
+  G $15, $30 x2                        +640.63  -1.94    +9 / -11       +103.63  -27.79 -171.05 21.21
+  H live + $25 x2 after a loss past 8% +622.14  -20.44   +6 / -26       +0.00    -30.28 -142.81 22.71
+  I live + $30 x2 after a loss         +705.69  +63.12   +46 / +17      +32.99   -28.40 -169.34 24.57
+Mechanism: the trades after a loss are the best ones (Sat-Mon the next trade after a loss
+won 36 of 39; 137: lost 17% vs 23% priced), so stake follows them. Per dollar staked: live
+30.9, F 36.7, B 41.1, D 34.2, I 28.7. F beats live in both halves with a LOWER average stake;
+I makes the most but by staking more. Best of 10 variants on the same 13 days - in-sample.
+VERIFIED (wf_93e6a6dc-66b, independent replay): LIVE +642.58, F +671.43, B +636.88, I +705.69 -
+to the cent. The 20% stop never fired, so all variants take the same 1,070 trades and differ
+only in stake. F vs LIVE: ahead on 7 of 13 days; the daily gap's SD ~$37 -> a 13-day noise
+band of about +/-$134: F's +28.85 (and its +138.85 on 10-03..10-05, after -110.00 on
+09-23..10-02) is inside the noise. F risks ~12% less per trade; B ~26% less for the same money;
+I's lead is from bigger stakes. Winning days: LIVE 10/13, F 11/13, B 11/13, I 10/13.
+OPERATOR: "I want I, but test it on a $20 base, then after a loss $30 - and test after 1
+loss and after 2 losses." scratchpad/trendfix/boost_i20.py, same engine, 13 days to 12:4x
+(LIVE now +651.62 with today's later windows); $30 for the next 2 taken trades:
+  I   $25/$10 + $30 x2 after 1 loss      +716.59  +64.98  halves +46 / +19  Sat-Mon +34.85  worst -28.40  avg $24.58  7-8/5
+  I20 $20/$10 + $30 x2 after 1 loss      +661.62  +10.00  halves +21 / -11  Sat-Mon +69.86  worst -20.30  avg $22.68  7/6
+  I20 $20/$10 + $30 x2 after 2 losses    +553.92  -97.69  halves  +3 / -100 Sat-Mon  +4.72  worst -14.63  avg $18.67  4/9
+  I   $25/$10 + $30 x2 after 2 losses    +674.79  +23.17  halves +49 / -26  Sat-Mon  +2.20  worst -26.08  avg $21.19  6/5
+  $20/$10 with no boost                  +484.17  -167.45                                   worst -22.92  avg $18.04  2/11
+  F   $10 + $30 x2 after 1 loss          +682.33  +30.71  halves +18 / +13  Sat-Mon +140.71 worst -37.30  avg $18.29  7/6
+The boost belongs right AFTER THE FIRST LOSS (that trade is the cushioned one): waiting for two
+losses gives most of it away. At a $20 base the after-1-loss boost is worth ~+177 over no boost
+and lands level with live (+10, inside the ~+/-$134 noise) with a smaller worst day.
+OPERATOR: "Now test I on $25 and $30 after 1 loss twice, but only ..." (message cut off;
+three readings tested - scratchpad/trendfix/boost_i_only.py; 13 days, LIVE +663.61):
+  I $25/$10 + $30 x2 after 1 loss          +728.59  +64.98   halves +46 / +19   days 8/5   avg $24.58
+  ... only BELOW THE 8% TARGET             +788.66  +125.05  halves +113 / +12  days 11/2  avg $21.52
+  ... only while the day is red            +753.67  +90.06   halves +68 / +22   days 10/2  avg $20.94
+  ... only after the day's first loss      +671.88  +8.27    halves +12 / -3    days 7/6   avg $20.63
+Best so far: the $30 pair only below the 8% target - +125 on 11 of 13 days with ~4% more
+staked per trade than live (worst day -28.40). Chosen after ~20 variants today on the same
+days: independent recompute running (wf_7b4cc7d9-5f7) before any recommendation.
+VERIFIED (wf_7b4cc7d9-5f7, independent replay to 12:30): differences vs LIVE identical -
+I +64.98 (8/5), I_BELOW +125.05 (11/2; halves +112.96 / +12.09), I_RED +90.06 (10/2). All
+take the same 1,071 trades. The $30 trades under I_BELOW: 306, won 83.3% at 75.7c (+7.6 points
+over price) vs all trades 77.0% at 74.5c (+2.5) - the after-a-loss trades are the best ones.
+Daily gap +9.62 mean, SD 16.6, SE 4.6 (~2.1 SE) - but chosen after ~20 variants on these days;
+09-24 and 09-28 give 79.47 of the 125.05; second half only +12.09 (5/2), where I_RED (+22.16)
+leads. Promising, not proven; the operator's decision.
+
+## 161. The mirrors under the after-a-loss boost (2026-10-05 12:53)
+
+OPERATOR: "Before that, how will the mirrors follow this - find their own mirror setup as
+well." The mirrors copy the primary's taken trades (the same trades whatever the primary's
+stake) at their own stake and pause at their own target; WITHOUT a mirror rule they would
+copy the boosted trades at their normal stake. scratchpad/trendfix/mirror_boost.py, 13 days,
+openings of 10-05, boost = the 2 copied trades after the mirror's own copied loss:
+                           total   vs now  targets hit  worst day  deepest in a day (of balance)
+  Wife $3 on 37.93   now   +54.57  -       9/13         -4.54      -12.02 (-32%)
+                     $4 x2 +60.96  +6.39   10/13        -4.55      -14.38 (-38%)
+                     $6 x2 +70.87  +16.30  11/13        -4.16      -19.85 (-52%)
+  George $2 on 29.39 now   +34.47  -       9/13         -1.84       -7.17 (-24%)
+                     $3 x2 +40.53  +6.06   11/13        -1.04       -9.63 (-33%)
+                     $4 x2 +43.72  +9.25   11/13        -1.04      -11.98 (-41%)
+  Affoue $2 on 119.51 same money as George; deepest -6% now, -8% at $3 x2, -10% at $4 x2.
+A mirror pauses at its target, so "only below the target" holds by itself. The boost adds
+~+$6 per mirror over 13 days and lifts target hits 9 -> 10-11 of 13, but deepens the intraday
+dip - heavy for the small accounts (Wife -38%, George -33% at +$1), light for Affoue (-8%).
+Primary boost patch written (scratchpad/patch_after_loss_boost.py), NOT applied - awaiting the
+operator's mirror choice.
+
+## 162. What the $10 above the 8% target looks like (2026-10-05)
+
+OPERATOR: "You need to show me what $10 above our target looks like first" (before the
+after-a-loss boost goes live). scratchpad/trendfix/above_target.py, audited engine, 13 days
+09-23..10-05, opening 995.93, the rules being implemented: below 8% $25 ($30 for the 2 trades
+after a loss), at/above 8% $10; a $10 loss can drop the day back under 8% -> $25 again.
+9 of 13 days reached 8% (+79.67), between 03:15 and 18:00. AFTER the first hit:
+  538 more trades: 351 at $10 won 258 (73.5%) at 74.1c -> -102.12 (-0.29 per trade);
+  187 at $25/$30 after slipping back under 8% -> +97.00.  The after-hit part: -5.12 in all,
+  per day from +43.61 (09-25) to -82.66 (10-02); no day reached the 20% stop (best +142.59).
+Choices once the day reaches 8%:  $10 (being implemented) +788.66, 2 losing days;
+  $10 + the $30 boost above 8% too -60.07; $25 -134.30; STOP at 8% +5.12 (1 losing day:
+  10-02 +82.64 instead of -0.02; worst day the same -28.40, 10-04, which never reached 8%).
+Reading: on this record the $10 part of the day is break-even - it neither adds nor costs
+money, it adds swing. STOP-at-8% = same money, steadier (+5 is noise, 9 days). The pre-hit
+win rate (79.8%) is inflated by selection (days reach 8% by winning) - not evidence the
+signals get worse after the target. Earlier pause-at-target rejection (less money) was under
+the old stakes; with the boost it is now a tie. Already on the 2,000-signal review list.
+
+## 163. The operator's new setup: primary done at 8%, mirrors +$1 after a loss, Affoue trades on (2026-10-05)
+
+OPERATOR (after FINDINGS 162): "Mirrors: boost all three by $1 // and stop for the day at
+8% while we make one more change to Affoue mirror account that account become the account
+that keep trading after target hit, and for that account set it to $6 base and $8 after 1
+loss and the after target hit $3." With the earlier "implement I $30 boost only below 8%".
+THE RULES:
+  PRIMARY  $25; $30 for the 2 taken trades after a known loss; DONE for the day at 8%
+           (DAILY_PROFIT_STOP_RATE=0.08 = its target; the $10 phase is gone).
+  WIFE     $3 (scaled stake), $4 for the 2 after a loss; pauses at her own target as before.
+  GEORGE   $2, $3 for the 2 after a loss; pauses at his own target as before.
+  AFFOUE   $6, $8 for the 2 after a loss; at/above ITS OWN target (min(15%, 7 wins at $6)
+           = $14.00 on 119.51) $3, and NOT paused there - it trades on to midnight.
+  Once the primary is done for the day, its $ signals still go to every mirror whose own
+  day takes an entry (below its target, or past it at a lower stake); the primary's row
+  is booked 'copied' (no fill, never graded, in no money report) and the cushion, the
+  after-2-losses trend skip and the after-a-loss stakes read it - its result from the
+  alert's prediction on the same side - so the rules run on exactly as if the primary
+  were still trading. A primary blocked for anything other than its cap copies nothing.
+INTERPRETATION (said to the operator): Affoue's "$3 after target hit" is at ITS OWN target,
+as the primary's $10 was at its own; "$8 after 1 loss" is for the 2 trades after it, as the
+primary's $30. Wife and George would also copy past the primary's stop until their own
+target - on the record they always reached it first (0 such trades in 13 days).
+THE RECORD (scratchpad/trendfix/new_setup.py; 13 days 09-23..10-05, 1,073 taken trades):
+  primary  +802.82, 9/13 days at 8%, worst day -28.40
+  Wife     +62.02 (vs +55.63 now), targets 10/13 (9), deepest -14.38 (-38%; -32% now)
+  George   +40.53 (vs +35.00), targets 11/13 (9), deepest -9.63 (-33%; -24% now)
+  Affoue   +165.57 (vs +35.00 at $2 pausing), worst day -6.62, deepest -30.41 (-25% of 119.51)
+           of which the trades after the primary was done: -19.27 over 9 days (538 trades,
+           mostly at $3) - the same break-even-to-negative tail as the primary's $10 (FINDINGS 162).
+  Other reading ($3 once the PRIMARY is done): Affoue +181.21, same worst day and dip.
+REVIEW (wf_83445e67-f9f: 4 reviewers by lens + 5 adversarial verifiers; all 5 checked
+findings REAL, medium; none could lose money directly). Fixed before deploy:
+  1. The trade message's "Mirrors enabled" dropped Affoue once its target latched though it
+     trades on at $3 -> mirror_label keeps an account with an after-target stake.
+  2. A signal was booked 'copied' before any mirror answered: a missed copy counted as a
+     taken trade (wrong boost / cushion / streak) and was never retried or chased. Now each
+     copy answers back (a future per mirror, 30 s): 'copied' only if a mirror bought; else
+     'unfilled' under order id COPY_MISSED_ID, which the 60 s retry and the 93c chase
+     re-send through the same copy path at the moved price, as for the primary's own miss.
+  3. Copied windows said nothing on Telegram: now COPIED TO THE MIRRORS (accounts, contracts,
+     stakes), COPY WON/LOST (the market's result) and COPY NOT FILLED - never a $ figure (a
+     mirror's money is its broker balance in the session summary).
+  4. The DAILY CAP note was fixed at startup: now built when said, from who still trades.
+  5. Pre-funding covered the day's stake only: now the after-a-loss stake ($30, +$1, $8).
+  Known and accepted: the cash-out (OFF since 10-05) would not reach positions the mirrors
+  open after the primary is done - fix before ever switching it back on.
+  Verified: filled rows read EXACTLY as before (658 window probes on a copy of the live db
+  + 4 altered copies: 0 differences); every live $ row has a prediction on the same side.
+Tests: tests/test_new_setup_1005.py (real Store / DailyProfitGuard / MirrorTarget / _Mirror /
+MirroringExecutionClient; mirror order checks run the real guard); mutation check below.
+
+## 164. Study vs live on 10-03, and every day under the new live rules (2026-10-05)
+
+10-03 AT $25: the study said +32.54, live -4.29 (scratchpad/trendfix/gap_1003.py). Window by
+window: 25 trades both held agree within $0.64; 32 trades live CASHED OUT early made $21.76
+less than holding; 3 live MISSES the study counted as bought were worth +$15.62. Both causes
+were changed on 10-05 (cash-out OFF, the chase ON), so the study now models live closely -
+but it still assumes every miss is bought and every price is the signal's ask.
+Every day under the rules live since 10-05 14:30 (daily_new_live.py, openings of 10-05):
+primary +775.12 over 13 days (9/13 done at 8%, 2 losing days: 10-04 -28.40, 10-05 so far),
+Wife +59.12 (10/13 targets), George +40.53 (11/13), Affoue +158.63, all four +1,033.40.
+Deepest intraday dips: primary -126.20 (09-28, still finished +84.74), Affoue -30.41.
+
+## 165. Is the learning learning anything? (audit, 2026-10-05, wf_5b46f1ef-0ab)
+
+NO ACTIONABLE LEARNING. BTC: 54 training runs 09-23..10-05, all ok, 0 promoted, 0 changed a
+single decision (new_changes = 0, holdout delta +0.0000 every run); all 31,165 intelligence
+verdicts 'neutral'; active policy 29 arms, vetoes and admissions OFF. Why: training and
+validation are 100% the old historical corpus (cutoff 08-26, 40 days old; 6,429 corpus vs
+944 live markets, live only in the newest 20% slice); the corpus no longer grows, so the
+cutoff creeps ~3 h per run - live data reaches validation ~10-12, training ~mid-November. The
+2 candidates examined each run flip sign train -> validation (bd10-15/bd15+, px70-85, mom5+).
+Its confidence label (not used for size) forecasts WORSE than the ask (Brier 0.2205 vs 0.2162,
+n=8,054); its strongest claim failed live (predicted -9.6c, live +2.4c +-4.4c, n=470 windows).
+The similar-markets shadow: following ENTER NOW only would have given up 12.79/contract vs
+taking every signal (1,249 windows); its PASS windows made money. Candidates vs all-signal
+since 09-28: 2 of 3 would have lost money; c80b34f84 points right on 2 days only.
+Other instances: same; ETH promoted 09-25..27 and SOL vetoed 09-26..10-02 (114 windows blocked,
+64% of them winners) - all neutral now; BNB has no learning. Nothing here touches live money:
+the all-signal order path never consults it and the main strategy it could gate is paused.
+
+## 166. Every crypto under the live rules (2026-10-05, scratchpad/trendfix/crypto_live_rule.py)
+
+Each instrument's own recorded primary signals and Kalshi reference, the BTC live rules ($25,
+$30 x2 after a loss, cushion, after-2 trend skip, held, done at 8% of 995.93):
+  BTC  14 d  1,295 sig  75.6% at 73.2c  edge +2.4c   +810.18  10/14 at 8%, 2 losing days, worst -55.05
+  ETH  12 d  1,061      74.6% at 74.4c       +0.2c     -2.76   7/12, 5 losing, worst -135.54, low -327.61
+  SOL  11 d    970      74.6% at 73.6c       +1.0c   -293.55   6/11, 4 losing, worst -331.25
+  XRP  10 d    890      70.8% at 73.5c       -2.7c  -1010.88   4/10, 5 losing, worst -434.74
+  NEAR 10 d    878      71.9% at 74.6c       -2.7c   -996.44   3/10, 7 losing, worst -442.56
+  BNB   5 d    402      68.9% at 71.9c       -3.0c   -717.12   1/5,  4 losing, worst -566.35
+Only BTC wins more often than its price. The others reach 8% on half their days but their bad
+days are 3-10x BTC's. Without the cushion and trend skip every one is worse (BTC +659.91).
+
+## 167. The hourly edge search, all parameters (2026-10-05, wf_d65ca6f7-31a) - NO EDGE
+
+Operator: "find the edge on the hourly, run all parameters optimization, even if it implies a
+combo". Five families, ~487,600 configurations, search on the oldest 60% of hours, best tested
+once on the newest 40%, best-of-N luck checks, net of fees at the ask, one entry per hour,
+Kalshi only (scripts + outputs: scratchpad/hourly_edge/<family>/).
+  A history grid (217,800 cfg; 1,517 hours 07-15..09-21 + 303 live): best +10.7c -> holdout
+    +2.45c [-5.6, +10.3], live +1.8c (n=21); luck p 0.985 (weaker than noise).
+  B live quotes + BRTI (245,970): best (Europe longshots vs momentum) +16.8c -> holdout 0/27 won,
+    -5.2c. Lead only: "Z15 pullback" holdout +14.3c n=32 but fails the luck check.
+  C our 15-min signal -> hourly (336): S1 = xx:15 signal, rung 3 steps in the money (~93c):
+    search +4.8c, holdout +3.66c [-0.2, +6.4] n=73 / 6 days, luck p 0.14. Lead for a forward test.
+  D cross-market 15m vs hourly (1,620): best +20.1c -> holdout +13.3c [-4.1, +31.3] n=32, luck p 0.585.
+  E ladder shape / momentum / late certainty (21,861): longshots overpriced 1-4c both sides;
+    favourites fair after fees; momentum/reversal nothing; 97-99c late = 0-loss streak, binomial p 0.14.
+STRUCTURE (verified): KXBTCD and the KXBTC15M window closing at the same instant settle on the
+IDENTICAL value (1,782/1,782 hours), so 15m + opposite hourly rung pairs pay >= $1 in every state.
+On history candles the pair costs < $1 all-in in only ~3.6% of hours (~1.5c); the live "arbitrage"
+(55-82 of 303 hours, ~5c) is a stale /markets-quote artifact - gone at the next poll 81-91% of the
+time. Executability needs an hourly ORDER-BOOK recording in the last 15 minutes (not built).
+METHOD: day sign-flip / day bootstrap overstate certainty on 0-loss favourites; use a binomial test.

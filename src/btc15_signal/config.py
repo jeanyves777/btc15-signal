@@ -127,6 +127,46 @@ class Settings(BaseSettings):
     # for TWO HOURS and the only symptom was Telegram going quiet, which is
     # the silent stop this system is most exposed to.
     market_gap_alert_s: int = 600
+    # SESSION HOURS, TAKEN FROM THE VENUE. Gold and silver keep New York hours:
+    # they close at the New York close and reopen at the New York open, so they
+    # are shut every weekend for about two days. On 2026-09-25 both went quiet
+    # at 21:00 UTC and the next market Kalshi listed opened 53 hours later.
+    #
+    # A closure is NOT the outage `market_gap_alert_s` exists to catch, and
+    # must not be reported as one - a false alarm on a Friday night teaches the
+    # operator to ignore the alert that matters. It is told apart by asking
+    # Kalshi when the series next lists a market: far away means closed, soon
+    # or unknown means keep worrying.
+    #
+    # WHICH INSTRUMENTS OBSERVE SESSIONS AT ALL, declared rather than guessed.
+    # Off by default, and set only on the metals. "The next unopened market is
+    # far away" looked like sufficient evidence of a closure and is NOT: Kalshi
+    # creates markets in daily batches, so on 2026-09-25 BTC and SOL both
+    # reported their next UNOPENED market 5.1 hours out while trading normally,
+    # because the near-term ones were already OPEN and an `unopened` listing
+    # excludes those. Inferring a closure from that would have backed off a
+    # 24/7 instrument during an outage and silenced the alert built for it -
+    # the exact failure the two-hour gap of 2026-09-24 exists to catch.
+    #
+    # So the instrument declares that it has sessions and the EXCHANGE supplies
+    # the reopen time. No hardcoded New York calendar, and nothing to misfire
+    # on BTC, ETH or SOL.
+    venue_has_sessions: bool = False
+    # `venue_closed_after_s` is how long no open market may last before that
+    # question is asked at all. A window boundary is seconds, so ten minutes
+    # never triggers on a 24/7 instrument.
+    venue_closed_after_s: int = 600
+    # How far ahead the next market must be to count as a closure rather than
+    # a boundary. Kalshi creates markets in daily batches, so on a 24/7 series
+    # the next UNOPENED market can legitimately be a day out while trading is
+    # continuous - which is why this is only consulted once there has already
+    # been no open market for `venue_closed_after_s`.
+    venue_closed_gap_s: int = 1800
+    # The poll interval while closed. Not the whole closure: sleeping 53 hours
+    # would miss an early reopen, a config change and the settlement sweep.
+    # Ten minutes cuts a weekend from ~19,000 requests to ~320 and still
+    # notices a reopen within ten minutes.
+    venue_closed_poll_seconds: int = 600
     # THE REVERSAL GATE. Refuse an entry standing on a move that has already
     # turned over. Shipped as a BLOCKING gate on the operator's explicit
     # instruction, with the evidence recorded beside it in FINDINGS 58:
@@ -220,6 +260,24 @@ class Settings(BaseSettings):
     cash_out_enabled: bool = True
     cash_out_capture: float = 0.90  # fraction of the available profit to bank
     cash_out_min_bid: float = 0.90  # and never sell into a thin, low bid
+    # THE ABSOLUTE TRIGGER, operator 2026-09-24: "that's already at max profit
+    # ... no need to wait for expiry". Compared against the DISCOUNTED bid, so
+    # 0.98 here means a quoted 0.99.
+    #
+    # It exists because `cash_out_capture` alone is unreachable on an
+    # expensive entry: banking 90% of the profit above `paid` needs a quoted
+    # bid of 0.10*paid + 0.91, which passes 0.999 once paid exceeds 0.89. The
+    # live record shows the consequence - entries under 0.89 exit 33-58% of
+    # the time, entries above it 4.2% (1 of 24), and a position quoted 99.9%
+    # on a 0.895 entry needed a 0.9995 bid that does not exist.
+    #
+    # Measured over 146 cases that reached a 0.99 quoted bid: selling returns
+    # 0.9938/contract against 0.9932 for holding. That is noise, the same as
+    # the proportional rule's -$0.0006, and it is shipped for the same reason
+    # - it buys certainty rather than money. At a 0.995 bid holding is very
+    # slightly ahead (1.0000 vs 0.9968 over 140 cases, no losses), so this is
+    # deliberately NOT set higher.
+    cash_out_at_bid: float = 0.98
     # How far BELOW the quoted bid a cash-out is priced and judged. Entries
     # have `entry_slippage` because an immediate-or-cancel order at exactly the
     # touch only fills if that quote is real and still there - on 2026-09-21
@@ -334,9 +392,231 @@ class Settings(BaseSettings):
     telegram_bot_token: str = ""
     telegram_chat_id: str = ""
     telegram_authorized_user_id: int = 0
+    # WHO LISTENS FOR COMMANDS. Telegram's getUpdates is DESTRUCTIVE: it
+    # acknowledges with an offset, so whichever process polls first consumes
+    # the update and every other process never sees it. Two instances sharing
+    # one bot token therefore race for every command - including the kill
+    # switch, which is the one message that must never be lost.
+    #
+    # So exactly one instance listens. The BTC service keeps the default and
+    # is unchanged; a second instance sets this false and still SENDS its
+    # alerts, it just does not consume the command stream. Controlling that
+    # instance is then a deliberate act rather than a coin toss - see ETH.md.
+    telegram_commands_enabled: bool = True
+    # WHO SENDS ALERTS (operator, 2026-09-28: "on telegram send just the alerts
+    # for Gold and Btc. All the other should just come in as summary while in
+    # shadow"). An instance whose instrument is listed here, OR which is
+    # auto-trading, sends everything as before. Any other instance is a
+    # shadow: it records everything and sends only money that actually moved
+    # (fills, exits, a settled trade); its signals reach Telegram once a
+    # session, in the combined SHADOW SUMMARY the command-listening instance
+    # sends. Empty = every instance alerts, as before.
+    telegram_alert_instruments: str = "BTC,GOLD"
+    # THE ALL-SIGNAL STRATEGY (operator, 2026-09-28: "running alongside the
+    # main strategy... trade at a pace one dollar... execute all their
+    # generated signal every 15 minutes... two strategies in parallel"). On
+    # every signal (the alert) of a listed instrument it buys that side for
+    # `allsignal_stake` dollars, with no strategy gate. It keeps its own book
+    # (store.allsignal_trades), is never mirrored, and stops with /auto off or
+    # scripts/allsignal_switch.py. The main strategy is untouched.
+    allsignal_instruments: str = "BTC,GOLD"
+    allsignal_stake: float = 1.00
+    # AFTER THE PRIMARY'S DAILY TARGET, A LOWER STAKE INSTEAD OF A PAUSE
+    # (operator, 2026-09-30: "make primary account base size 6 and apply $3
+    # after the 8% target hit only to mine the primary; the mirrors stay at the
+    # pause when they hit target"). Once the primary has reached its daily
+    # target it keeps trading at this stake while the day stays AT OR ABOVE the
+    # target, and at `allsignal_stake` whenever losses bring it back below
+    # (operator, 17:5x: "invalidate the daily target hit and trade size back to
+    # the $6"); the day resets at 00:00 New York. Mirrors are untouched: their
+    # own targets still pause them. 0 = pause at the target. FINDINGS 116-120.
+    allsignal_after_target_stake: float = 0.0
+    # AFTER A LOSS (operator, 2026-10-05: "Let implement I $30 boost only below 8%";
+    # FINDINGS 160, 163): below the daily target, the next
+    # `allsignal_after_loss_trades` taken $ trades after a known loss go at this
+    # stake. The primary (the mirrors' own below). 0 = off.
+    allsignal_after_loss_stake: float = 0.0
+    allsignal_after_loss_trades: int = 2
+    # AFTER A LOSS, WAIT FOR A CUSHION (operator, 2026-09-29: "adopt 5 and ship
+    # it live"; FINDINGS 112). The signal after a losing trade (today) enters
+    # only once the reference price is this far clear of the target line on
+    # its side - at the alert if it already is, else at the first poll where
+    # it gets there - and is skipped if that has not happened with
+    # `allsignal_cushion_min_left_s` left. On the recorded signals 4-8 bps all
+    # beat entering at once (+$56-67 vs +$43 over 7 days, no losing day);
+    # 5 is the middle of that range, 10+ falls off. 0 turns it off.
+    allsignal_after_loss_cushion_bps: float = 5.0
+    allsignal_cushion_min_left_s: int = 120
+    # Copied to the mirror accounts too, each sized $1 by its own
+    # `allsignal_budget` (operator, 2026-09-28: "run on both my wife and mine
+    # with the $1 trading all signals").
+    allsignal_mirror: bool = True
+    # THE LEARNING CORPUS, per instrument. These were function defaults inside
+    # `learning_data` - not settings at all - so every instance fitted on BTC
+    # whatever it traded. An arm is a statement about one instrument's
+    # distribution, the same as a threshold (FINDINGS 43, 63), and
+    # `_corpus_mismatch` now refuses a fit whose rows disagree with the series.
+    # These are what let a second instance satisfy that guard rather than
+    # simply being blocked by it.
+    corpus_brti_path: str = "data/brti_history.db"
+    corpus_market_path: str = "data/market_data.db"
     kalshi_api_key_id: str = ""
     kalshi_private_key_path: str = ""
     execution_enabled: bool = False
+    execution_entry_series: str = ""
+    daily_profit_target_enabled: bool = False
+    # THE DAILY TARGETS, per account (operator, 2026-09-29: "let's move to 8%
+    # and 15%"). On the 650 recorded BTC signals to 09-29 a 3% target kept 28%
+    # of the no-target profit on the primary; 8% kept 82% and still stopped the
+    # bad afternoons. A mirror's $2 trade is a far bigger share of a ~$20-25
+    # account, so it hit small targets after one trade; 15% kept all of it.
+    # Re-evaluate at 2,000 recorded signals (scripts/target_study.py).
+    daily_profit_target_rate: float = 0.08            # the primary
+    # THE PRIMARY'S DAILY CAP (operator, 2026-10-02: "I authorize implement the
+    # 20% daily stop on the primary"; FINDINGS 135): once the day's realised P&L
+    # reaches this fraction of the opening, no new entry until 00:00 New York
+    # (latched; exits and recording continue). Primary only. 0 = off.
+    daily_profit_stop_rate: float = 0.0
+    # AFTER TWO LOSSES, NEVER AGAINST THE 15-MIN TREND (operator, 2026-10-02:
+    # "the 15 minutes after 2 losses is the one I want live"; FINDINGS 139-142):
+    # once the day's last N taken $ trades all lost, a BTC signal against the
+    # Kalshi BRTI move of the last `minutes` by more than `bps` is skipped.
+    # 0 = off.
+    # THE CHASE (operator, 2026-10-05: "it's better to take it than just letting it
+    # go"; FINDINGS 153): a $ order that missed because the price ran past its cap
+    # is bought at the moved price - from `allsignal_chase_after_s` after the miss,
+    # up to `allsignal_chase_max`, at most `allsignal_chase_attempts` times, while
+    # the price is still on the signal's side with >= 2 min left. 0 = off.
+    allsignal_chase_max: float = 0.0
+    allsignal_chase_after_s: int = 10
+    allsignal_chase_attempts: int = 3
+    allsignal_trend_skip_after_losses: int = 0
+    allsignal_trend_skip_minutes: int = 15
+    allsignal_trend_skip_bps: float = 10.0
+    mirror_daily_profit_target_rate: float = 0.15     # each mirror
+    # THE MIRRORS AFTER A LOSS, PAST A TARGET, AND ONCE THE PRIMARY IS DONE
+    # (operator, 2026-10-05: "Mirrors: boost all three by $1 ... Affoue ... $6 base
+    # and $8 after 1 loss and the after target hit $3"; FINDINGS 163). Inside the
+    # after-a-loss boost (the primary's taken sequence) a copy goes at
+    # `mirror_n_allsignal_after_loss_stake` if set, else the day's stake + this.
+    # `mirror_n_allsignal_after_target_stake` > 0: that mirror is NOT paused at its
+    # own target - it trades on at this stake while at or above it.
+    # `mirror_after_primary_done`: once the primary is DONE for the day at its cap,
+    # its $ signals still go to the mirrors still trading by their own day.
+    mirror_allsignal_after_loss_add: float = 0.0
+    mirror_after_primary_done: bool = False
+    # THE TARGET SCALES WITH THE ACCOUNT (operator, 2026-10-01: "design a scale
+    # mechanic that auto adjusts the % based on account growth"). A mirror's day
+    # target is its rate x the opening, but never more than this many WINS at
+    # its own stake - a win being what that stake makes at a typical 75c entry
+    # (contracts_for_budget(stake, 0.75) x 0.25: $0.50 at $2, $1.00 at $3). So
+    # as an account grows the % falls and the target stays reachable at the same
+    # stake. Measured on the recorded copies 09-23..10-01: up to ~7 wins the
+    # target was reached on 8 of 9 days at both $2 and $3; past ~8-9 the hit rate
+    # fell (Wife missed 10-01 by 13c at $2 needing ~9 wins). 0 = off. FINDINGS 123.
+    mirror_target_max_wins: float = 7.0
+    target_win_price: float = 0.75
+    # THE MIRRORS' STAKE SCALES WITH THE ACCOUNT (operator, 2026-10-01: "auto
+    # scale for the mirrored account as the account balance changes every day at
+    # midnight, but a nice safe scale. Only my primary is controlled manually on
+    # aggressive"). At each 00:00:30 opening a mirror's $ stake for the day is
+    # this fraction of its opening in whole dollars - never below its own
+    # MIRROR_n_ALLSIGNAL_BUDGET (the operator's stake stays the floor) and never
+    # above `mirror_stake_scale_max` (the primary's base). Its 7-win target cap
+    # follows the same stake. The primary is untouched. 0 = off. FINDINGS 129.
+    mirror_stake_scale_rate: float = 0.0
+    mirror_stake_scale_max: float = 6.0
+    # THE PRIMARY FUNDS ITS MARKET'S SHARD before each order, as the mirrors
+    # and the Kalshi app do (operator, 2026-09-29: "the trades are failing").
+    # At $5 a signal BTC's shard 2 held $4.38 while $98 sat on shard 0, and
+    # every order was refused "insufficient balance".
+    kalshi_auto_fund: bool = True
+    # --- copy trading to other accounts ---------------------------------
+    # Every order this system places on the primary account is forwarded to up
+    # to two other Kalshi accounts, each with its own API key and ITS OWN
+    # SIZING. The mirrors are write-only: no balance, fill, settlement or P&L is
+    # ever read from them, so nothing here can reach the ledger.
+    #
+    # OFF BY DEFAULT, and off unless `mirror_enabled` is true AND a key pair is
+    # configured AND execution itself is live. Dry run never mirrors.
+    #
+    # Sizing per account is base-through-upsize, in the same units as the
+    # primary: `base_budget` is dollars PER CONTRACT (like `auto_budget`) and 0
+    # means "ignore the budget, buy `base_contracts`"; `add_contracts` is the
+    # upsize and 0 means "use whatever count the primary's add used";
+    # `max_contracts` is a hard ceiling on every order and 0 means none.
+    # A mirror does NOT inherit the primary's tier, so the growth controller
+    # raising the primary's size leaves a small mirror account alone.
+    # WHICH INSTANCES MAY MIRROR. Every instance reads this ONE .env file - the
+    # per-instance launchers override only instrument values and deliberately
+    # keep shared secrets here (see scripts/run_gold.ps1) - so `mirror_enabled`
+    # alone would turn copy trading on for BTC, ETH, GOLD, SILVER and SOL at
+    # once, and for every instrument added afterwards. Five instances forwarding
+    # a base contract each is five times the exposure the operator configured on
+    # the destination account.
+    #
+    # So mirroring is scoped by name and FAILS CLOSED: an instance not listed
+    # here does not mirror, and a new instrument inherits nothing. Comma
+    # separated, matched against BTC15_INSTANCE, where an empty instance - the
+    # original BTC service - is named `btc`.
+    mirror_instances: str = ""
+    mirror_enabled: bool = False
+    mirror_1_api_key_id: str = ""
+    mirror_1_private_key_path: str = ""
+    mirror_1_base_budget: float = 0.0
+    mirror_1_base_contracts: int = 1
+    mirror_1_allsignal_budget: float = 1.0
+    mirror_1_allsignal_after_loss_stake: float = 0.0
+    mirror_1_allsignal_after_target_stake: float = 0.0
+    mirror_1_add_contracts: int = 0
+    mirror_1_max_contracts: int = 0
+    mirror_2_api_key_id: str = ""
+    mirror_2_private_key_path: str = ""
+    mirror_2_base_budget: float = 0.0
+    mirror_2_base_contracts: int = 1
+    mirror_2_allsignal_budget: float = 1.0
+    mirror_2_allsignal_after_loss_stake: float = 0.0
+    mirror_2_allsignal_after_target_stake: float = 0.0
+    mirror_2_add_contracts: int = 0
+    mirror_2_max_contracts: int = 0
+    # A THIRD mirror (operator, 2026-09-30: "I added MIRROR 3 enable it to trade
+    # same as the other MIRRORs"): the same fields, used only when both its key
+    # id and key path are set.
+    mirror_3_api_key_id: str = ""
+    mirror_3_private_key_path: str = ""
+    mirror_3_base_budget: float = 0.0
+    mirror_3_base_contracts: int = 1
+    mirror_3_allsignal_budget: float = 1.0
+    mirror_3_allsignal_after_loss_stake: float = 0.0
+    mirror_3_allsignal_after_target_stake: float = 0.0
+    mirror_3_add_contracts: int = 0
+    mirror_3_max_contracts: int = 0
+    # FUND THE MARKET'S EXCHANGE SHARD BEFORE EACH MIRROR ORDER, as the Kalshi
+    # app does for a manual trade. The account's cash is split by
+    # `exchange_index` and an API order can spend only its market's shard (the
+    # 15-minute crypto markets are shard 2). Without this the wife's mirror ran
+    # shard 2 to $0.09 on 2026-09-26 and was refused every entry for ~15 hours
+    # while $30 sat in shard 0. Only the shortfall is moved, never a float.
+    mirror_1_auto_fund: bool = True
+    mirror_2_auto_fund: bool = True
+    mirror_3_auto_fund: bool = True
+    mirror_1_fund_source_shard: int = 0
+    mirror_2_fund_source_shard: int = 0
+    mirror_3_fund_source_shard: int = 0
+    # RECOVERY SIZE ON THE MIRROR, operator 2026-09-27: "$2 as well". The same
+    # dollar budget as the primary's `loss_step_budget`, applied only to an
+    # entry the primary's loss step upsized. At 0.70-0.79 that is 2 contracts,
+    # and `mirror_1_max_contracts` still caps it. Mirror 2 has no instruction
+    # and no account, so it stays off.
+    mirror_1_recovery_budget: float = 2.00
+    mirror_2_recovery_budget: float = 0.0
+    mirror_3_recovery_budget: float = 0.0
+    # WHO each mirror account is, in every message that names it (operator,
+    # 2026-09-28: m2 is Uncle George's account). Display only; nothing keys
+    # on it except the balance baseline, which is stored under this name.
+    mirror_1_label: str = "Wife"
+    mirror_2_label: str = "Uncle George"
+    mirror_3_label: str = "Mirror 3"      # MIRROR_3_LABEL in .env names it
     # Dollar budget per order, not a contract count. These are only the
     # defaults: /size and /autosize change them from Telegram at runtime and
     # the stored value wins, so sizing never needs a restart.
@@ -356,6 +636,12 @@ class Settings(BaseSettings):
     # four hours once. The measured max drawdown at 2 contracts is -37.05 over
     # 68 days, so this is a day limit, not a strategy limit.
     auto_daily_loss_limit: float = 20.0
+    # THE FLOOR SCALES WITH THE BASE (operator, 2026-09-27: "loss limit must
+    # scale"). `auto_daily_loss_limit` is the floor for this many base
+    # contracts - 2, the base it was set for - and the day's floor is
+    # limit x today's base / this. See main.scaled_loss_limit.
+    loss_limit_scales_with_base: bool = True
+    loss_limit_reference_base: int = 2
     auto_max_trades_per_day: int = 40
     auto_max_trades_per_hour: int = 6
     auto_min_seconds_between: int = 120
@@ -426,6 +712,136 @@ class Settings(BaseSettings):
     # deficit is outstanding.
     recovery_upfront_upsize_enabled: bool = False
 
+    # THE LOSS STEP. Operator's rule, 2026-09-24: after a market that lost,
+    # the next trade is sized to a fixed DOLLAR budget; a win resets it to
+    # base. Consecutive losses stay at the same budget, so it is a step and
+    # not a martingale - exposure is bounded by `loss_step_max_contracts`
+    # whatever the streak.
+    #
+    # This is keyed on the LAST MARKET'S RESULT, not on the deficit. It is a
+    # different rule from `recovery_upfront_upsize_enabled` above, which sizes
+    # while money is still outstanding; this one asks only whether the
+    # previous market lost. Both may not run - see `loss_step_size`.
+    #
+    # THE EVIDENCE, recorded beside the decision because it does not support
+    # the rule on its own (FINDINGS 61). On 146 reconciled live lifecycles the
+    # $5 step returned +8.85 against -0.26 flat. But the whole gain comes from
+    # the 25 trades that happened to follow a loss winning 92.0% against 82.9%
+    # overall, which a permutation test could not separate from chance
+    # (p=0.249); shuffling the SAME trades into a different order reproduces a
+    # gain that large 12.9% of the time. The sample contains two 2-loss runs
+    # and NO 3-loss run, so the shallow drawdown it shows has never been
+    # tested by the thing that would move it: across shuffles the median max
+    # drawdown is -6.84 and the worst -22.42, against the -5.80 observed.
+    #
+    # The operator has decided with that measurement in view. It is their
+    # call - sizing always is - and it is implemented in full.
+    #
+    # REDUCED $5 -> $2 BY THE OPERATOR, 2026-09-24 the same day: "5 is too
+    # risky just to make 50". That judgement is about the ratio the measurement
+    # never addressed. The $5 step risks $5 per post-loss trade to chase a
+    # total upside the backtest put at +8.85, and the permutation test could
+    # not distinguish that gain from ordering luck (p=0.249) on a sample with
+    # two 2-loss runs and NO 3-loss run. The drawdown it reported had never
+    # been tested by the thing that would move it - across shuffles the median
+    # worst drawdown was -6.84 against the -5.80 observed - so the downside was
+    # the least-evidenced number in the whole result. Sizing down when the
+    # evidence is weakest is the conservative reading of exactly that.
+    #
+    # $2 is also the size the two other upsize triggers use, so the three no
+    # longer disagree about what "one step up" means.
+    # NO RECOVERY AT ALL (operator, 2026-09-28: "does the system even need
+    # recovery ... we need no recovery at all ... Gold and BTC can actually run
+    # without recovery based on the report we have already seen"; FINDINGS
+    # 108). The master switch: OFF, there is no loss step, no recovery
+    # message (ARMED / SIZE ENDED) and no recovery line on any message. Every
+    # entry is base size. The deficit is still folded each poll - that is
+    # bookkeeping, not trading - and nothing reads it to size an order.
+    recovery_enabled: bool = False
+    loss_step_enabled: bool = True
+    loss_step_budget: float = 2.00
+    # IT WAITS FOR THE PRICE WHERE IT MATTERS. Operator instruction,
+    # 2026-09-25: "the recovery after a loss does not need to be triggered
+    # automatically, as we will make it wait for the best opportunity ...
+    # around the 70 to 79 range ... so that we are not making 20 cent profit
+    # on a recovery trade where normal sizing can offer the same on a better
+    # opportunity."
+    #
+    # The arithmetic behind it: the extra contract wins `1 - ask` and loses
+    # `ask`, so at 0.90 it risks 90c to make 10c and at 0.75 it risks 75c to
+    # make 25c. Firing the step at the top of the band spends the whole upsize
+    # for about 10c, which is the complaint.
+    #
+    # THE EVIDENCE, recorded beside the decision because it does NOT support the
+    # band on its own. Expected value per extra contract is `p - ask`, which is
+    # the calibration residual - so the payoff ratio cancels and the question
+    # becomes where the market is most mispriced, not where the win pays most.
+    # On BTC's 7,139 priced brti-4 points over 64 days, ungated:
+    #
+    #     0.70-0.75   73.1%   +0.0104 per contract   +0.0138 per dollar
+    #     0.75-0.80   76.5%   -0.0053               -0.0067
+    #     0.85-0.90   89.4%   +0.0242               +0.0284
+    #     0.90-0.93   94.1%   +0.0240 [+0.0009]     +0.0261
+    #
+    #     in 0.70-0.79  +0.0026 per contract, 21.7% of setups
+    #     outside       +0.0159 [+0.0004]
+    #
+    # So on that population the band the operator chose is where the extra
+    # contract earns LEAST, and the top of the price band is where it earns
+    # most. The measurement could not be repeated on the population that
+    # actually matters - the setups the gates admit, which is all the step ever
+    # sizes - because BTC's brti-2-era floors admit too few brti-4 points to
+    # score. So the ungated table is suggestive, not decisive.
+    #
+    # The operator has decided with that in view and instructed it be shipped.
+    # Sizing is theirs; it is implemented in full, and the interval above is
+    # here so the decision can be revisited against live results rather than
+    # re-argued.
+    loss_step_band_lo: float = 0.70
+    loss_step_band_hi: float = 0.79
+    # HOW LONG IT MAY WAIT. The operator's "3 to 5 trades later" as a bound:
+    # after this many settled bot markets the armed step expires unspent. A
+    # wait with no bound is not a wait, it is a permanent upsize waiting for a
+    # cheap ask - and the further from the loss it fires, the less it is a
+    # recovery of anything.
+    loss_step_wait_markets: int = 5
+    # A HARD CEILING, not the rule. At the 0.70 floor of the price band $2
+    # buys 2, so this is headroom against a cheap fill, and the guard that
+    # stops a mispriced ask from turning a $2 budget into a large position.
+    # Left at 8 deliberately: it bounds the OTHER upsize paths too, and
+    # lowering a ceiling that is no longer reachable by this rule would only
+    # look like it had been tightened.
+    loss_step_max_contracts: int = 8
+    # THE RECOVERY IS A COMBO AT BASE SIZE (operator, 2026-09-27: "replace the
+    # single recover into a Combo with same base size, no more up scaling").
+    # The loss step above still decides WHEN - armed by a loss, ask 0.70-0.79,
+    # 5 markets, once per episode, never back to back - but its trade is no
+    # longer the same market at 2x base: it is this entry plus a partner (SOL
+    # for BTC/ETH, BTC for SOL) as one combo, sized at the BASE count. No
+    # partner, no quote at or below the legs' product, or no fill: the entry
+    # goes out as usual at base size. Nothing is upsized either way. See
+    # combo_recovery.py and FINDINGS 105.
+    recovery_combo_enabled: bool = True
+    combo_partner_band_lo: float = 0.70
+    combo_partner_band_hi: float = 0.85
+    combo_partner_stale_s: float = 120.0
+    # How long to wait for a maker's quote before falling back to the
+    # single-leg base entry. The entry window is minutes; quotes arrive in
+    # seconds or not at all.
+    combo_quote_wait_s: float = 25.0
+    # Accept the cheapest quote at or below the CHEAPER LEG's ask x this, same
+    # or opposite direction (operator, 2026-09-27). A combo pays only if both
+    # legs win, so it is never worth more than its cheaper leg. NOT the legs'
+    # product: Kalshi prices correlation in, and a product cap refused every
+    # same-direction pair it was offered (FINDINGS 105).
+    combo_max_price_ratio: float = 1.00
+    # FUND THE COMBO SHARD on the operator's own account (operator,
+    # 2026-09-27: "auto-fund combos"). Combo markets settle in exchange shard
+    # 1, which held $0.28 while shard 0 held $103; the app moves the cost
+    # itself, the API does not. Only the recovery combo is funded this way -
+    # the 15-minute orders are untouched.
+    combo_auto_fund: bool = True
+
     # THE CONDITIONAL RECOVERY ADD-ON (recovery_add.py).
     #
     # Live-test authorisation: $30 total, and `recovery_test_budget` is a
@@ -441,7 +857,7 @@ class Settings(BaseSettings):
     recovery_add_dip: float = 0.02  # rest this far below the ACTUAL fill
     recovery_add_min_seconds: int = 120  # add-entry deadline before close
     recovery_add_distance_floor: float = 10.0  # BRTI normalized distance
-    recovery_add_max_contracts: int = 1  # per position, on top of the base
+    recovery_add_max_contracts: int = 1  # PER BASE CONTRACT, on top of the base (+2 at base 2)
     # HOW OLD THE BROKER'S POSITION MARK MAY BE when the add-on checks
     # exposure. Not an exposure limit - the cap and the arithmetic are
     # unchanged - but a bound on the FRESHNESS of one of its inputs.
@@ -456,9 +872,10 @@ class Settings(BaseSettings):
     # The base tier changes ONLY at the daily review, from reconciled settled
     # cash - never from an open position's mark, because sizing on unrealised
     # gains compounds exposure exactly when a position is most likely to give
-    # them back. $30 of capital per contract matches the authorised test
-    # account: one contract now, two if the account doubles, and never more
-    # than `max_base_contracts` whatever the balance says.
+    # them back. $30 of capital per contract: one base contract per $30 of
+    # reconciled capital. UNCAPPED since 2026-09-27 (operator: "contracts
+    # should not be capped, it should scale as capital grows"):
+    # `max_base_contracts` 0 means no ceiling; set a number to restore one.
     #
     # The day is NEW YORK because that is the exchange's own reset - Kalshi
     # documents its utilisation caps resetting at midnight New York time - and
@@ -513,7 +930,13 @@ class Settings(BaseSettings):
     # Evidence floor for an arm to be consulted at all, live. Matches the
     # promotion bar in `learning.MIN_PROMOTION_N`; stated here too because it
     # is the number the running policy is written with.
-    learning_min_evidence: int = 120
+    #
+    # 100 BY OPERATOR DECISION, 2026-09-26: learning and identifying start at
+    # 100 signals for an instrument. Measured that day, BTC held a cell at
+    # n=103 refused 213 times and ETH one at n=115 refused 126 times, so the
+    # previous 120 was costing real evidence for the sake of a number that was
+    # chosen rather than measured. The statistical tests are unchanged.
+    learning_min_evidence: int = 100
     # How much worse, in dollars per contract over the validation slice, a new
     # fit may score than the running one and still activate. Zero: a fresher
     # fit is not automatically a better one.
@@ -521,10 +944,20 @@ class Settings(BaseSettings):
     # Forward changes an ACTIVE execution arm must have made before its record
     # can withdraw it. Below this a bad run is indistinguishable from bad luck.
     learning_min_withdrawal_n: int = 20
+    # THE LOCAL MODEL, INSIDE EVERY LEARNING RUN (operator, 2026-09-28: "do so
+    # the system learns and adapts"). After each completed run the instance's
+    # recorded lifecycles go to the local model for hypotheses, and every one
+    # is tested (hypotheses.py). Survivors are reported as candidates; nothing
+    # the model says changes an order.
+    learning_hypotheses_enabled: bool = True
+    learning_hypotheses_url: str = "http://127.0.0.1:8080/v1"
+    learning_hypotheses_model: str = "local"
+    # Inside the quiet slot: a call must end before entries open (+240s).
+    learning_hypotheses_timeout_s: float = 200.0
 
     capital_sizing_enabled: bool = True
     capital_per_contract: float = 30.0
-    max_base_contracts: int = 2
+    max_base_contracts: int = 0      # 0 = no ceiling (operator, 2026-09-27)
 
     high_confidence_distance_min: float = 2.0
     high_confidence_distance_max: float = 4.0

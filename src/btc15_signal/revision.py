@@ -32,10 +32,15 @@ PROJECT = PACKAGE.parents[1]
 
 
 def _git(*args: str) -> str:
+    # NO CONSOLE WINDOW. git is a console program; started from pythonw.exe
+    # (the service, and every watchdog's once-a-minute check) Windows gives it
+    # a window of its own, so seven watchdogs flashed a black window every few
+    # seconds (operator, 2026-09-29: "a cmd that keeps opening and closing").
+    hide = getattr(subprocess, "CREATE_NO_WINDOW", 0)
     try:
         out = subprocess.run(
             ["git", *args], cwd=PROJECT, capture_output=True, text=True,
-            timeout=10,
+            timeout=10, creationflags=hide,
         )
     except (OSError, subprocess.SubprocessError):
         return ""

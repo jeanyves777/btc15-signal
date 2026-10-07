@@ -122,21 +122,22 @@ def test_realised_record_prefers_the_exchange_over_the_local_rebuild(tmp_path):
 # --------------------------------------------------- the market's own clock
 
 def test_the_ticker_carries_the_market_time_not_the_settlement_time():
-    """Kalshi settles in batches hours late, so `settled_time` files a trade
-    under the wrong day. KXBTC15M-26SEP220445-45 settled at 08:45 UTC - four
-    hours after its own window - and grouping by settlement read 2026-09-21 as
-    -3.3256 where the market's own clock reads +0.0022."""
+    """The ticker's time is the market's CLOSE on the New York clock.
+    KXBTC15M-26SEP220445-45 closes 04:45 ET (08:45 UTC) and settled seconds
+    later - not "four hours after its window", which was this test's own
+    misreading until 2026-09-28 (FINDINGS 108). Its window opens 08:30 UTC."""
     from datetime import UTC, datetime
 
     got = KalshiExecutionClient.market_open_ms("KXBTC15M-26SEP220445-45")
-    assert got == int(datetime(2026, 9, 22, 4, 45, tzinfo=UTC).timestamp() * 1000)
+    assert got == int(datetime(2026, 9, 22, 8, 30, tzinfo=UTC).timestamp() * 1000)
 
 
 def test_the_hourly_ladder_ticker_parses_too():
     from datetime import UTC, datetime
 
     got = KalshiExecutionClient.market_open_ms("KXBTCD-26SEP2207-T80099.99")
-    assert got == int(datetime(2026, 9, 22, 7, 0, tzinfo=UTC).timestamp() * 1000)
+    # closes 07:00 ET, an hour long: opens 06:00 ET = 10:00 UTC
+    assert got == int(datetime(2026, 9, 22, 10, 0, tzinfo=UTC).timestamp() * 1000)
 
 
 def test_an_unparseable_ticker_returns_none_rather_than_a_wrong_day():

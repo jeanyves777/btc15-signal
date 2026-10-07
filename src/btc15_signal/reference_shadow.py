@@ -49,6 +49,8 @@ from .reference import (
 )
 from .reference_store import ReferenceStore
 
+RECONCILE_PAGES = 4
+
 
 def new_session_id() -> str:
     return f"ref-{int(time.time())}"
@@ -428,8 +430,19 @@ class ReferenceShadow:
                 traceback.print_exc()
 
     async def _reconcile(self, now_ms: int) -> None:
-        markets, _ = await self._kalshi.settled(limit=50)
         done = self._store.reconciled_tickers()
+        # PAGE BACK TO WHAT IS ALREADY RECONCILED. One page of 50 was the whole
+        # horizon, so an outage longer than ~12.5 h (50 windows) left every
+        # market before it without a row, for good (2026-09-30 audit). Newest
+        # first: stop at the first page that reaches a reconciled market, or
+        # after RECONCILE_PAGES pages (~8 days of 15-minute markets).
+        markets: list[dict] = []
+        cursor = None
+        for _ in range(RECONCILE_PAGES):
+            page, cursor = await self._kalshi.settled(limit=200, cursor=cursor)
+            markets.extend(page)
+            if not cursor or not page or any(m.get("ticker") in done for m in page):
+                break
         for market in markets:
             ticker = market.get("ticker")
             if not ticker or ticker in done:

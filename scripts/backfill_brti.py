@@ -30,7 +30,12 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from btc15_signal.brti import KalshiBRTI, features_from_series  # noqa: E402
 from btc15_signal.config import Settings  # noqa: E402
 
-OUT = "data/brti_history.db"
+# PER-INSTRUMENT. Both of these were hardcoded to BTC, which is how the ETH
+# instance came to have no corpus of its own at all - and why a fit there
+# would have been built from BTC rows. A threshold, and an arm, is a
+# statement about ONE instrument's distribution (FINDINGS 43, 63).
+DEFAULT_OUT = "data/brti_history.db"
+DEFAULT_MARKETS = "data/market_data.db"
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS brti_decision_points (
@@ -48,6 +53,12 @@ CREATE TABLE IF NOT EXISTS brti_decision_points (
     brti_normalized_distance REAL,
     brti_side TEXT,
     samples INTEGER,
+    brti_rsi REAL,
+    brti_accel REAL,
+    brti_held_s REAL,
+    brti_rejections INTEGER,
+    brti_retrace REAL,
+    brti_choppiness REAL,
     PRIMARY KEY (ticker, remaining_s)
 );
 CREATE TABLE IF NOT EXISTS brti_fetched (
@@ -59,8 +70,9 @@ CREATE TABLE IF NOT EXISTS brti_fetched (
 DECISION_SECONDS = (660, 600, 540, 480, 420, 360)
 
 
-def markets(limit: int, stride: int, done: set[str]) -> list[dict]:
-    db = sqlite3.connect("file:data/market_data.db?mode=ro", uri=True)
+def markets(limit: int, stride: int, done: set[str],
+            market_db: str = DEFAULT_MARKETS) -> list[dict]:
+    db = sqlite3.connect(f"file:{market_db}?mode=ro", uri=True)
     db.row_factory = sqlite3.Row
     rows = [
         dict(r) for r in db.execute(
@@ -77,12 +89,31 @@ def markets(limit: int, stride: int, done: set[str]) -> list[dict]:
 async def run(args) -> None:
     settings = Settings()
     Path("data").mkdir(exist_ok=True)
-    out = sqlite3.connect(OUT)
+    out = sqlite3.connect(args.out)
     out.executescript(SCHEMA)
+    # A bare CREATE TABLE IF NOT EXISTS adds nothing to a table that already
+    # exists, which is how every column has reached a fresh install and no
+    # live database before.
+    have = {r[1] for r in out.execute("PRAGMA table_info(brti_decision_points)")}
+    for column, kind in (("brti_rsi", "REAL"), ("brti_accel", "REAL"),
+                         ("brti_held_s", "REAL"),
+                         ("brti_rejections", "INTEGER"),
+                         # Added 2026-09-25. The live rule gates on both and no
+                         # corpus held either, so every fit to date treated two
+                         # live gates as absent.
+                         ("brti_retrace", "REAL"),
+                         ("brti_choppiness", "REAL")):
+        if column not in have:
+            out.execute(
+                f"ALTER TABLE brti_decision_points ADD COLUMN {column} {kind}")
+            out.commit()
+            print(f"  migrated: {column} added")
     done = {r[0] for r in out.execute("SELECT ticker FROM brti_fetched")}
 
-    todo = markets(args.limit, args.stride, done)
-    print(f"{len(todo)} markets to fetch ({len(done)} already stored) -> {OUT}")
+    todo = markets(args.limit, args.stride, done, args.market_db)
+    print(f"{len(todo)} markets to fetch ({len(done)} already stored)")
+    print(f"  from {args.market_db}")
+    print(f"  ->   {args.out}")
 
     client = KalshiBRTI(settings.kalshi_base_url, timeout=25)
     written = failed = 0
@@ -123,8 +154,14 @@ async def run(args) -> None:
                     "brti_momentum_bps": f.brti_momentum_bps,
                     "brti_volatility_bps": f.brti_volatility_bps,
                     "brti_normalized_distance": f.brti_normalized_distance,
+                    "brti_retrace": f.brti_retrace,
+                    "brti_choppiness": f.brti_choppiness,
                     "brti_side": f.side,
                     "samples": f.samples,
+                    "brti_rsi": f.brti_rsi,
+                    "brti_accel": f.brti_accel,
+                    "brti_held_s": f.brti_held_s,
+                    "brti_rejections": f.brti_rejections,
                 })
             if rows:
                 out.executemany(
@@ -132,11 +169,11 @@ async def run(args) -> None:
                     "(ticker, remaining_s, open_ms, close_ms, target, "
                     " expiration_value, result, brti_value, signed_distance_bps, "
                     " brti_momentum_bps, brti_volatility_bps, "
-                    " brti_normalized_distance, brti_side, samples) "
+                    " brti_normalized_distance, brti_side, samples, brti_rsi, brti_accel, brti_held_s, brti_rejections, brti_retrace, brti_choppiness) "
                     "VALUES (:ticker, :remaining_s, :open_ms, :close_ms, :target, "
                     " :expiration_value, :result, :brti_value, :signed_distance_bps, "
                     " :brti_momentum_bps, :brti_volatility_bps, "
-                    " :brti_normalized_distance, :brti_side, :samples)",
+                    " :brti_normalized_distance, :brti_side, :samples, :brti_rsi, :brti_accel, :brti_held_s, :brti_rejections, :brti_retrace, :brti_choppiness)",
                     rows,
                 )
             out.execute(
@@ -160,6 +197,10 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--limit", type=int, default=1200)
     parser.add_argument("--stride", type=int, default=5)
+    parser.add_argument("--market-db", default=DEFAULT_MARKETS,
+                        help="settled markets to backfill against")
+    parser.add_argument("--out", default=DEFAULT_OUT,
+                        help="BRTI decision points database to write")
     asyncio.run(run(parser.parse_args()))
 
 

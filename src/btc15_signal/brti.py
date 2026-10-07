@@ -119,11 +119,94 @@ class BRTIFeatures:
     # it to refuse or admit a setup. It moves the header word; that is all the
     # authority it has.
     brti_choppiness: float | None = None
+    # WILDER'S RSI ON THE SETTLEMENT REFERENCE. Operator, 2026-09-24: the
+    # Kalshi price implies a direction, and taking that on trust has cost
+    # validated signals - so direction wants a second opinion from the price
+    # ACTION, not from the price alone.
+    #
+    # Above 50 the recent path has been rising, below 50 falling. Whether that
+    # predicts anything is a MEASUREMENT and not an assumption: it is computed
+    # and archived here, and gates nothing until the archive earns it. The same
+    # discipline the reversal and choppiness indicators were held to, and the
+    # reason both could be judged later instead of argued about.
+    brti_rsi: float | None = None
+    # THREE LEVEL-HOLDING MEASURES. Operator, 2026-09-24, after RSI failed on
+    # the live archive: direction at a 15-minute horizon is already in the
+    # price, so what is worth measuring is whether the STRIKE is being
+    # defended - "we are mostly already in the money; will price stay above
+    # the level we need it to stay".
+    #
+    # Measured on the bot's own 176 in-the-money executed trades:
+    #
+    #   accel     decaying (<0) trades lost -6.93 over 55 trades while
+    #             winning 40 of them: they win often and lose big
+    #   held_s    5-12 min on side won 91.5% at +7.8% residual, against
+    #             79.1% and -3.2% for under 5 minutes
+    #   rejections 2+ tests held won 88.1% at +6.8%, against 78.9% and
+    #             -4.6% for a level tested only once
+    #
+    # brti_accel      momentum over the last 150s MINUS the prior 150s,
+    #                 signed toward the winning side. Positive = the move
+    #                 that built the cushion is still building.
+    # brti_held_s     seconds price has been continuously on the winning side.
+    # brti_rejections times price came inside 40% of the current gap and was
+    #                 turned back without crossing.
+    brti_accel: float | None = None
+    brti_held_s: float | None = None
+    brti_rejections: int | None = None
+    # THE SAME QUANTITIES OVER 45 MINUTES, recorded as CONTEXT beside the
+    # 300-second ones rather than instead of them.
+    #
+    # The operator's instruction, 2026-09-25: every feature should see 45
+    # minutes "for insight", while the current window "still matters more".
+    # So the gates keep reading `brti_momentum_bps` and `brti_volatility_bps`
+    # exactly as before - nothing about what qualifies changes - and these
+    # answer a different question: is the last five minutes typical of the
+    # last forty-five, or is it the exception?
+    #
+    # A 300-second window cannot tell a market that has been drifting all hour
+    # from one that just turned. Both read the same momentum; only the wider
+    # view separates them.
+    brti_momentum_45m_bps: float | None = None
+    brti_volatility_45m_bps: float | None = None
 
     @property
     def side(self) -> str:
         """Which side is winning, decided on the official reference alone."""
         return "UP" if self.signed_distance_bps >= 0 else "DOWN"
+
+
+def wilder_rsi(values: list[float], period: int = 14) -> float | None:
+    """Wilder's RSI over a price series, or None if it cannot be computed.
+
+    The standard definition, smoothed the way Wilder specified rather than
+    with a simple mean: the first average is a simple one over `period`
+    changes and every later one carries (period-1)/period of the previous.
+    A simple rolling mean is a DIFFERENT indicator that shares the name, and
+    the difference is largest exactly where the series turns.
+
+    Returns None below `period + 1` samples rather than a half-formed number.
+    A flat series has no losses and no gains; it is 50, not 100, because
+    "nothing moved" is neither strength nor weakness.
+    """
+    if len(values) < period + 1:
+        return None
+    gains, losses = [], []
+    for earlier, later in zip(values, values[1:]):
+        change = later - earlier
+        gains.append(max(0.0, change))
+        losses.append(max(0.0, -change))
+    avg_gain = sum(gains[:period]) / period
+    avg_loss = sum(losses[:period]) / period
+    for gain, loss in zip(gains[period:], losses[period:]):
+        avg_gain = (avg_gain * (period - 1) + gain) / period
+        avg_loss = (avg_loss * (period - 1) + loss) / period
+    if avg_loss == 0 and avg_gain == 0:
+        return 50.0
+    if avg_loss == 0:
+        return 100.0
+    rs = avg_gain / avg_loss
+    return 100.0 - (100.0 / (1.0 + rs))
 
 
 def features_from_series(
@@ -136,6 +219,31 @@ def features_from_series(
     stale_limit_ms: int = 15_000,
     retrace_window_s: int = 120,
     choppiness_window_s: int = 900,
+    rsi_window_s: int = 900,
+    # THE LEVEL LOOKBACK. 2,700s of price action ending at the decision, which
+    # takes in the current running window AND the 30-45 minutes before it.
+    #
+    # It was 900s - the market's OWN window - and the strike IS that window's
+    # opening price, so every window began with price sitting on the strike,
+    # inside the rejection threshold. A clean one-way move therefore scored
+    # exactly 1 rejection: its own departure. Reaching 2 required the move to
+    # have wobbled back toward the strike.
+    #
+    # The deployed gate asks for >= 2, so it refused the cleanest setups. Over
+    # 19,305 corpus points the refused bucket led on every measure - distance
+    # 8.33 against 4.58, held 241s against 212s, momentum 6.3 against 3.2, and
+    # 75.6% wins against 66.9% - with corr(rejections, distance) = -0.319. The
+    # metric measured the opposite of its own name.
+    #
+    # The feed already carried the fix: every market's series is the hour
+    # ending at its close, so 45 minutes of price BEFORE the window opens was
+    # being fetched and discarded. Widening the lookback lets a rejection mean
+    # what it says - price approached this level and was turned back - instead
+    # of counting the move leaving its own starting point. Measured over the
+    # same markets the median goes 1 -> 2, so the gate becomes satisfiable by
+    # an ordinary clean setup rather than refusing it by construction.
+    level_window_s: int = 2700,
+    rsi_bucket_s: int = 60,
 ) -> BRTIFeatures | None:
     """Gate inputs from a BRTI series. Returns None rather than guessing.
 
@@ -200,6 +308,83 @@ def features_from_series(
             # 0.0 straight line, 1.0 ended where it started having moved a lot.
             choppiness = max(0.0, min(1.0, 1.0 - net / travelled))
 
+    # RSI ON BUCKETED SAMPLES, not on the raw per-second series. BRTI arrives
+    # roughly once a second, so 14 raw changes span 14 SECONDS - an indicator
+    # of noise, not of the move. Bucketing to one close per minute over the
+    # window makes the 14 periods 14 minutes, which is what RSI means
+    # everywhere else and what the operator is reading off a chart.
+    rsi = None
+    rsi_points = [(t, v) for t, v in ordered
+                  if t >= ts_ms - rsi_window_s * 1000]
+    if rsi_points:
+        buckets: dict[int, float] = {}
+        for t, v in rsi_points:
+            buckets[t // (rsi_bucket_s * 1000)] = v      # last in each bucket
+        closes = [buckets[k] for k in sorted(buckets)]
+        rsi = wilder_rsi(closes)
+
+    # ---- THE THREE LEVEL-HOLDING MEASURES -------------------------------
+    # All computed on the winning side's sign, so UP and DOWN read the same
+    # way: positive `accel` means the move is still working FOR the position.
+    sign = 1.0 if side_up else -1.0
+    level_pts = [(t, v) for t, v in ordered
+                 if t >= ts_ms - level_window_s * 1000]
+
+    def _drift(lo_ms: int, hi_ms: int) -> float | None:
+        seg2 = [v for t, v in level_pts if ts_ms - hi_ms <= t <= ts_ms - lo_ms]
+        if len(seg2) < 10 or not seg2[0]:
+            return None
+        return (seg2[-1] / seg2[0] - 1) * 10_000
+
+    recent, prior = _drift(0, 150_000), _drift(150_000, 300_000)
+    accel = None if recent is None or prior is None else (recent - prior) * sign
+
+    held_s = None
+    rejections = None
+    if len(level_pts) >= 60:
+        # Distance from the strike, signed so positive is the winning side.
+        edge = [(t, (v - target) * sign) for t, v in level_pts]
+        gap = edge[-1][1]
+        if gap > 0:
+            held_s = 0.0
+            for t, v in reversed(edge):
+                if v <= 0:
+                    break
+                held_s = (ts_ms - t) / 1000.0
+            # A level TESTED AND HELD is stronger evidence than one never
+            # approached. Inside 40% of the current gap counts as a test; it
+            # only counts as a rejection once price recovers back past it.
+            threshold = gap * 0.4
+            rejections, inside = 0, False
+            for _t, v in edge:
+                if not inside and 0 < v <= threshold:
+                    inside = True
+                elif inside and v > threshold:
+                    rejections += 1
+                    inside = False
+
+    # The 45-minute context. Same arithmetic as the 300s pair, wider window -
+    # so the two are directly comparable and their RATIO is the insight: a
+    # momentum well above its own 45-minute reading is a turn, not a trend.
+    wide = [v for t, v in ordered if ts_ms - level_window_s * 1000 <= t <= ts_ms]
+    momentum_45m = volatility_45m = None
+    if len(wide) > 2:
+        # EXACTLY the formulae used for the 300s pair, only the window differs.
+        # Anything else and the two are not comparable, which is the single
+        # thing this context is for: the 45-minute reading is only meaningful
+        # against the short one it sits beside.
+        if wide[0]:
+            momentum_45m = (wide[-1] / wide[0] - 1) * 10_000
+        wide_returns = [
+            (wide[i + 1] / wide[i] - 1) * 10_000
+            for i in range(len(wide) - 1)
+            if wide[i]
+        ]
+        volatility_45m = (
+            st.pstdev(wide_returns) * (len(wide_returns) ** 0.5)
+            if wide_returns else 0.0
+        )
+
     return BRTIFeatures(
         event_ticker=event_ticker,
         ts_ms=ts_ms,
@@ -213,6 +398,12 @@ def features_from_series(
         span_ms=ordered[-1][0] - ordered[0][0],
         brti_retrace=retrace,
         brti_choppiness=choppiness,
+        brti_rsi=rsi,
+        brti_accel=accel,
+        brti_held_s=held_s,
+        brti_rejections=rejections,
+        brti_momentum_45m_bps=momentum_45m,
+        brti_volatility_45m_bps=volatility_45m,
         stale=(now_ms - ts_ms) > stale_limit_ms,
         settlement_projection=value,
     )

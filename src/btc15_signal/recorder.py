@@ -1,4 +1,11 @@
-"""Microstructure recorder: Kalshi order book and Binance book/flow.
+"""Microstructure recorder: the Kalshi quote and order book - KALSHI ONLY.
+
+KALSHI ONLY since 2026-10-05 (operator: "Never use anything related to Binance",
+"Kalshi only"). Until then this separate process (scheduled task BTC15Recorder)
+also called Binance's bookTicker, depth and aggTrades every 10 s, and the service
+copied those numbers into observations (depth_*_qty, trade_count, buy/sell
+volume, vwap). The Binance columns stay in the table for the old rows and are
+written NULL from now on; nothing here may contact Binance again.
 
 Nothing in the cached history has depth. Kalshi's candlesticks carry only OHLC
 of the bid and ask, Binance klines carry no book at all, and both backtests
@@ -27,7 +34,6 @@ import httpx
 
 from .datasource import KALSHI_URL, SERIES, RateLimiter
 
-BINANCE = "https://data-api.binance.vision"
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS book_snapshots (
@@ -126,24 +132,8 @@ class Recorder:
         yes_levels = _levels(book.get("yes_dollars"))
         no_levels = _levels(book.get("no_dollars"))
 
-        binance_ms = int(time.time() * 1000)
-        ticker_data = client.get(
-            BINANCE + "/api/v3/ticker/bookTicker", params={"symbol": "BTCUSDT"}
-        ).json()
-        depth = client.get(
-            BINANCE + "/api/v3/depth", params={"symbol": "BTCUSDT", "limit": 100}
-        ).json()
-        trades = client.get(
-            BINANCE + "/api/v3/aggTrades", params={"symbol": "BTCUSDT", "limit": 500}
-        ).json()
-
-        fresh = [t for t in trades if self.last_trade_id is None or t["a"] > self.last_trade_id]
-        if trades:
-            self.last_trade_id = max(t["a"] for t in trades)
-        buy = sum(float(t["q"]) for t in fresh if not t["m"])
-        sell = sum(float(t["q"]) for t in fresh if t["m"])
-        notional = sum(float(t["q"]) * float(t["p"]) for t in fresh)
-        quantity = buy + sell
+        # KALSHI ONLY (2026-10-05): no Binance request of any kind - its columns
+        # are written NULL.
 
         self.db.execute(
             "INSERT OR REPLACE INTO book_snapshots VALUES "
@@ -163,20 +153,12 @@ class Recorder:
                 _num(market.get("open_interest_fp")),
                 json.dumps(yes_levels),
                 json.dumps(no_levels),
-                _num(ticker_data.get("bidPrice")),
-                _num(ticker_data.get("askPrice")),
-                _num(ticker_data.get("bidQty")),
-                _num(ticker_data.get("askQty")),
-                sum(float(q) for _, q in depth.get("bids", [])),
-                sum(float(q) for _, q in depth.get("asks", [])),
-                len(depth.get("bids", [])),
-                len(fresh),
-                buy,
-                sell,
-                (notional / quantity) if quantity else None,
+                None, None, None, None,      # btc_bid, btc_ask, btc_bid_qty, btc_ask_qty
+                None, None, None,            # depth_bid_qty, depth_ask_qty, depth_levels
+                None, None, None, None,      # trade_count, buy_volume, sell_volume, vwap
                 quote_ms,
                 book_ms,
-                binance_ms,
+                None,                        # binance_ms
             ),
         )
         self.db.commit()

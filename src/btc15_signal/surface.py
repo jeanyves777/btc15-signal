@@ -71,6 +71,10 @@ RECOVERY = "\U0001f527"                # 🔧
 
 PASS = "✅"
 FAIL = "❌"
+# A gate whose threshold no value can fail. Not a tick - a tick claims a
+# protection was tested and held - and not a cross, because nothing failed.
+# The value is still shown; the mark says the gate is off.
+DISABLED = "⚪"
 PRICE = "\U0001f4b5"
 CLOCK = "⏱"
 TARGET = "\U0001f3af"
@@ -79,6 +83,7 @@ MONEY = "\U0001f4b0"
 TODAY = "\U0001f4c5"
 PACKAGE = "\U0001f4e6"
 WARN = "⚠️"
+CHOP = "\U0001f30a"                # 🌊 choppiness - a confidence note, never a check
 # THE EXIT EVENT, which is not a direction. `auto_exit` used the DOWN
 # chip as its headline while the body said "Held UP", so one message
 # carried two contradictory direction chips - the exact collapse of the
@@ -172,6 +177,16 @@ def check_line(fact: dict) -> str:
     and adds nothing, so the word in the header and the ticks beneath it cannot
     disagree.
     """
+    # A GATE NO VALUE CAN FAIL IS NOT A PASSED CHECK. On 2026-09-25 a gold
+    # alert read "Entry checks 8/8" with five green ticks whose thresholds were
+    # `accel >= -1e9`, `held >= 0s`, `rejections >= 0`, `momentum >= 0.0` and
+    # `retrace <= 1.0`. Three checks could fail; the operator was shown eight
+    # protections. The value is still worth seeing - it is real - so it is
+    # printed, but under a mark that says the gate is off.
+    if fact.get("enabled") is False:
+        text = fact.get("pass_text") or fact.get("fail_text") or ""
+        return (f"{DISABLED} {escape(display_name(fact.get('name')))}: "
+                f"{escape(_typography(str(text)))} <i>(gate disabled)</i>")
     tick = PASS if fact.get("passed") else FAIL
     text = fact.get("pass_text") if fact.get("passed") else fact.get("fail_text")
     return (f"{tick} {escape(display_name(fact.get('name')))}: "
@@ -230,8 +245,18 @@ def clipped(text: str, limit: int = 100) -> str:
 
 
 def checks_summary(facts: list[dict]) -> str:
-    passed = sum(1 for f in facts or [] if f.get("passed"))
-    return f"{passed}/{len(facts or [])}"
+    """Passed over the number of gates that COULD have failed.
+
+    A disabled gate counts in neither half. Including it inflated gold's
+    count to 8/8 when only three checks were live - and the inflation is
+    worse than cosmetic, because the operator reads that number as the
+    strength of the evidence behind an entry.
+    """
+    live = [f for f in facts or [] if f.get("enabled") is not False]
+    passed = sum(1 for f in live if f.get("passed"))
+    summary = f"{passed}/{len(live)}"
+    off = len(facts or []) - len(live)
+    return f"{summary} ({off} off)" if off else summary
 
 
 # ------------------------------------------------------------- money footer
@@ -283,16 +308,55 @@ def money_footer(snapshot) -> list[str]:
     lifetime = getattr(snapshot, "lifetime", None)
     lines = []
     if lifetime is not None and getattr(lifetime, "markets", 0):
+        # NAME THE INSTRUMENT. Both instances reconcile the whole account, so an
+        # unlabelled total invites reading ETH's trades and hand-placed markets
+        # as this strategy's record - which is exactly what happened on
+        # 2026-09-24, when BTC showed -$8.20 against its own +$0.11.
+        scope = getattr(lifetime, "series", None)
+        label = escape(lifetime.label())
+        if scope:
+            label = f"{label} ({escape(str(scope))})"
         lines.append(
-            f"{MONEY} <b>{escape(lifetime.label())}: "
-            f"{_signed_dollars(lifetime.dollars)}</b>"
+            f"{MONEY} <b>{label}: {_signed_dollars(lifetime.dollars)}</b>"
         )
         lines.append(
             f"   {lifetime.markets} closed · "
             f"{lifetime.winners}W–{lifetime.markets - lifetime.winners}L"
         )
+        # The rest of the account, shown rather than absorbed. It is real money
+        # and it moves the balance, but it is not this strategy's result.
+        foreign = getattr(lifetime, "foreign_markets", 0)
+        if scope and foreign:
+            lines.append(
+                f"   <i>account also holds "
+                f"{_signed_dollars(getattr(lifetime, 'foreign_dollars', 0.0))}"
+                f" in {foreign} market(s) this strategy did not place</i>"
+            )
     else:
         lines.append(f"{MONEY} <b>Live: nothing settled yet</b>")
+
+    # THE SIGNAL RECORD, ALWAYS, not only when the rotation happens to pick it.
+    #
+    # It was one of the rotating insights, so whether a reader could see how
+    # this instrument's CALLS are doing depended on which variant came up. The
+    # money lines answer "what did the account do"; this answers "is the
+    # strategy right about direction", and with five instruments running it is
+    # the number that says whether a new one is working at all.
+    #
+    # Separate from money on purpose: a signal record counts calls, including
+    # every one that was never traded, and presenting it beside dollars would
+    # invite reading it as P&L.
+    record = getattr(snapshot, "signal_record", None)
+    if record:
+        settled = int(record.get("settled") or 0)
+        wins = int(record.get("wins") or 0)
+        if settled:
+            scope = getattr(lifetime, "series", None) if lifetime else None
+            label = f" ({escape(str(scope))})" if scope else ""
+            lines.append(
+                f"{TARGET} <b>Signals{label}: {wins / settled:.0%}</b> · "
+                f"{wins}W–{settled - wins}L over {settled} settled"
+            )
     lines.append(
         f"{TODAY} <b>Today: {_signed_dollars(snapshot.realised)}</b> · "
         f"{snapshot.markets} closed · "
@@ -390,7 +454,7 @@ def recovery_line(state) -> str:
     Two facts, because either alone misleads. A deficit with no word on sizing
     reads as "still broken"; a sizing note with no deficit reads as "fixed".
     """
-    if state is None or not getattr(state, "owes", False):
+    if state is None or not getattr(state, "owes", False) or not _RECOVERY:
         return ""
     if getattr(state, "base_only", False):
         # THE SAME WORDS THE TRANSITION USED. "Recovery: $0.16 outstanding"
@@ -400,11 +464,127 @@ def recovery_line(state) -> str:
         # standing line the continuation of the announcement it follows.
         return (f"{RECOVERY} Recovery size ended · "
                 f"${state.deficit:,.2f} still outstanding · base size only")
+    # Since 2026-09-27 nothing upsizes: a recovery is a combo at base size -
+    # for an instrument that HAS a combo partner. BTC has none since 09-28 and
+    # gold never had one, so for them it says what runs (FINDINGS 108). Told
+    # once at startup (`set_recovery`), so this never reads the instrument.
+    if not _RECOVERY_COMBO:
+        return (f"{RECOVERY} Recovery: ${state.deficit:,.2f} outstanding · "
+                f"every entry at base size, no combo")
     return (f"{RECOVERY} Recovery: ${state.deficit:,.2f} outstanding · "
-            f"extra sizing allowed")
+            f"recovery by combo at base size")
 
 
 # ------------------------------------------------------------ the assembler
+
+
+# WHICH INSTRUMENT THIS PROCESS IS. Two instances now send to one Telegram
+# chat, so a message that does not say what it is about is ambiguous - and
+# the ambiguous ones are the dangerous ones: RECOVERY ARMED and the money
+# summaries carry no ticker at all. Set once at startup from the configured
+# series; the empty default keeps a single-instance deployment unchanged.
+_INSTRUMENT = ""
+
+
+def set_instrument(series: str) -> None:
+    """Called once at service startup with `settings.kalshi_series`."""
+    global _INSTRUMENT
+    _INSTRUMENT = asset(series)
+
+
+# WHETHER THERE IS A RECOVERY AT ALL. Off since 2026-09-28 (operator: "we need
+# no recovery at all"), and then no message carries a recovery line - a
+# standing "Recovery: $36.63 outstanding" for a subsystem that does nothing is
+# the noise that hides a real line. Set once at startup.
+_RECOVERY = True
+# Whether this process's recovery can be a combo - it has a partner and combos
+# are on. Without one the standing line says every entry is base size.
+_RECOVERY_COMBO = True
+
+
+def set_recovery(enabled: bool, combo: bool = True) -> None:
+    global _RECOVERY, _RECOVERY_COMBO
+    _RECOVERY = bool(enabled)
+    _RECOVERY_COMBO = bool(combo)
+
+
+def recovery_on() -> bool:
+    return _RECOVERY
+
+
+# WHETHER THE LEARNED LAYER CAN ACTUALLY ACT. The operator's standing
+# instruction is that the intelligence is on and affecting trades, never off.
+# That is only enforceable if OFF IS VISIBLE: five conditions reduce every
+# decision to NEUTRAL while `intelligence_enabled` still reads True - a missing
+# or empty artefact, a feature-fingerprint mismatch, evidence older than the
+# staleness limit, a mode other than "live", and every arm withdrawn. None of
+# them announce themselves, and a layer contributing +0 looks identical to a
+# layer that is gone. Set from `intelligence_policy.health()` at startup and on
+# every policy reload; rendered by `compose` so no builder can omit it.
+_INTELLIGENCE: dict = {}
+
+
+def set_intelligence_state(state: dict | None) -> None:
+    """Called at startup and after every policy reload."""
+    global _INTELLIGENCE
+    _INTELLIGENCE = dict(state or {})
+
+
+def intelligence_alert() -> str:
+    """One line, and ONLY when the layer cannot act.
+
+    Silent while healthy on purpose: a reassurance printed on every message
+    stops being read, and the thing worth interrupting for is the exception.
+    The healthy state is still observable - it shows as `learned +N` in the
+    score whenever an arm moves a decision, and `/learning` reports it in full.
+    """
+    if not _INTELLIGENCE or _INTELLIGENCE.get("ok"):
+        return ""
+    reason = str(_INTELLIGENCE.get("reason") or "unknown")
+    return (f"⚠️ <b>Intelligence NOT acting</b> · {escape(reason)} · "
+            f"decisions are running on the fixed rules alone")
+
+
+def asset(ticker: str) -> str:
+    """BTC / ETH / SOL from a Kalshi ticker or series, or "" if unknown.
+
+    Derived rather than configured, so a third instrument needs no change
+    here. `KXBTC15M-26SEP241015-15` and `KXBTCD-26SEP2412` both give BTC.
+    """
+    if not ticker:
+        return ""
+    head = ticker.split("-", 1)[0].upper()
+    if not head.startswith("KX"):
+        return ""
+    body = head[2:]
+    # GOLD AND SILVER ARE NOT OPTIONAL ENTRIES HERE. This function is not only
+    # a message label: `learning_runner._corpus_mismatch` compares
+    # `asset(kalshi_series)` against the assets in the corpus rows, and treats
+    # an UNRECOGNISED series as "no opinion" so a synthetic or fresh corpus is
+    # not refused. An instrument missing from this list therefore has its
+    # corpus guard silently switched off - which for gold would have allowed a
+    # fit on BTC rows, the exact failure that guard exists to prevent. Any new
+    # instrument must be added here before it is run.
+    for name in ("BTC", "ETH", "SOL", "XRP", "DOGE", "NEAR", "BNB",
+                 "GOLD", "SILVER", "PLATINUM", "PALLADIUM"):
+        if body.startswith(name):
+            return name
+    return ""
+
+
+def labelled(header: str, ticker: str = "") -> str:
+    """`header` with its instrument in front - `<b>SOL</b> · ...` - or unchanged
+    when none is known. `ticker` may be a market ticker or a series.
+
+    THE ONE PLACE THE LABEL IS WRITTEN. `compose` uses it, and so does every
+    message that is NOT a trading message and so is not assembled by
+    `compose` - the learning update and the market-gap notices. Those were
+    sent bare: seven instances write to one chat, and "LEARNING UPDATE" or "NO
+    MARKET AT THE EXCHANGE" arrived with nothing to say whose it was (gold and
+    silver both send the latter every weekend).
+    """
+    label = asset(ticker) or _INSTRUMENT
+    return f"<b>{label}</b> · {header}" if label else header
 
 
 def compose(*, header: str, ticker: str, essentials: list[str],
@@ -413,8 +593,13 @@ def compose(*, header: str, ticker: str, essentials: list[str],
     """Assemble one message in the fixed order. The only assembler.
 
     Every trading message goes through here so the order, the spacing and the
-    single divider cannot drift apart between builders.
+    single divider cannot drift apart between builders - which is why the
+    instrument label is applied HERE and not in each builder. Two instances
+    write to one chat, and a label that only some messages carried would be
+    worse than none: the reader would learn to assume the unlabelled ones
+    were the other instrument.
     """
+    header = labelled(header, ticker)
     lines = [header]
     if ticker:
         lines.append(f"<code>{escape(ticker)}</code>")
@@ -423,6 +608,12 @@ def compose(*, header: str, ticker: str, essentials: list[str],
     lines.extend(line for line in (priority or []) if line)
     if status:
         lines.append(status)
+    # Above the divider, with the decision it affected - not in the money
+    # block, because a layer that has stopped acting is a fact about the CALL,
+    # not about the balance.
+    alert = intelligence_alert()
+    if alert:
+        lines.append(alert)
     lines.append(DIVIDER)
     lines.extend(money_footer(snapshot))
     if insight:
@@ -543,6 +734,46 @@ def max_net_profit(contracts: float, paid: float, fee: float | None) -> str:
 
 NO_TRADE = f"{PRICE} Not traded \u00b7 realised P&amp;L $0.00"
 ALREADY_COUNTED = "\U0001f9fe <i>Already counted at the sale.</i>"
+
+
+def confidence_note(*, points: int, high_at: int, checks: int, clock: int,
+                    shield: int, intelligence: int = 0,
+                    choppiness: float | None = None,
+                    choppiness_points: int = 0, failed: int = 0) -> str:
+    """The confidence word as arithmetic, on the line under the word.
+
+    WHY THIS EXISTS. KXBTC15M-26SEP240915-15 alerted "Confidence MEDIUM ·
+    Entry checks 5/5". Every check green and the word still not HIGH, with
+    nothing on screen accounting for it. The operator read the missing
+    choppiness line as the cause; it was not. The real sum was
+
+        checks 100 · shield -6 · clock -11 = 83, and HIGH starts at 85
+
+    with choppiness (-7) taking it to 76 without changing the label. Three
+    separate terms move this word and none of them was visible, so the only
+    way to check the header was to read the source.
+
+    CHOPPINESS IS SHOWN HERE AND NOT AS A CHECK, deliberately. The operator's
+    instruction was that it influences confidence only, so it appears in no
+    `check_facts` list and no rule carries a threshold for it. Printing it
+    beside the other adjustments says what it did without implying a gate.
+    """
+    parts = [f"checks {checks:+d}", f"shield {shield:+d}",
+             f"clock {clock:+d}"]
+    if intelligence:
+        parts.append(f"learned {intelligence:+d}")
+    if choppiness is None:
+        parts.append("chop n/a")
+    else:
+        parts.append(f"chop {choppiness_points:+d} ({choppiness * 100:.0f}%)")
+    if failed:
+        # The cap, said out loud. A score of 75 printed beside the word LOW
+        # is a contradiction unless the reason is on the same line.
+        return (f"{CHOP} Score {points}/100 · <b>capped LOW</b>: "
+                f"{failed} gate{'s' if failed != 1 else ''} failed · "
+                f"<i>{' · '.join(parts)}</i>")
+    return (f"{CHOP} Score {points}/100 · HIGH at {high_at} · "
+            f"<i>{' · '.join(parts)}</i>")
 # A PARTIAL EXIT IS NOT counted at the sale. Two of three
 # contracts were sold here and the third ran to settlement, so
 # part of the money arrived hours after the sale this line says

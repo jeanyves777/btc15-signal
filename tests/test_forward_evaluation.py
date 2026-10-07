@@ -18,10 +18,10 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from btc15_signal import feature_contract  # noqa: E402
 from btc15_signal.candidates import Candidate, CandidateSet, grade  # noqa: E402
 from btc15_signal.intelligence_policy import ADMIT, VETO  # noqa: E402
 from btc15_signal.store import Store  # noqa: E402
+from btc15_signal import feature_contract  # noqa: E402
 
 NOW = int(time.time() * 1000)
 CTX = "asia · mid · bd10-15 · px70-85"

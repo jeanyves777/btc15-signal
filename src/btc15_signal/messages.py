@@ -168,16 +168,38 @@ def _money_block(snapshot) -> str:
     # subsystem that is off is noise, and noise is what hides the real one.
     recovery = recovery_line(
         getattr(snapshot, "recovery", None), getattr(snapshot, "last_add", None)
-    )
+    ) if surface.recovery_on() else ""
     if recovery:
         lines.append(recovery)
     return "\n".join(lines)
 
 
-def recovery_armed(state, trigger: str = "") -> str:
-    """Announced when a realised loss opens a deficit."""
+def recovery_armed(state, trigger: str = "", loss_step: float = 0.0,
+                   band: tuple[float, float] = (0.70, 0.79),
+                   wait: int = 5) -> str:
+    """Announced when a realised loss opens a deficit.
+
+    THE SIZING LINE HAS TO MATCH WHAT RUNS. It said "base entries stay at one
+    contract" for as long as that was true. Since 2026-09-24 the loss step
+    sizes the next trade after a losing market to a fixed dollar budget, so a
+    message still promising one contract would describe a system that is
+    about to buy six - and this whole thread began with recovery messages
+    that contradicted each other.
+    """
     head = (
         f"\U0001f527 <b>RECOVERY ARMED</b> · ${state.deficit:,.2f} outstanding"
+    )
+    sizing = (
+        f"After a losing market ONE later entry is sized to "
+        f"${loss_step:,.2f} - but it waits for an ask between "
+        f"{band[0]:.2f} and {band[1]:.2f}, where the extra contract is worth "
+        f"having, so it may be several markets later. It expires unspent after "
+        f"{wait} settled markets, fires once, and never escalates; the "
+        f"conditional add-on stands down only on the entry it actually sizes."
+        if loss_step > 0 else
+        "Base entries stay at one contract. Recovery may add ONE extra "
+        "contract, resting 2¢ below a fill, and only while the BRTI "
+        "evidence still holds."
     )
     body = [
         head,
@@ -185,9 +207,7 @@ def recovery_armed(state, trigger: str = "") -> str:
         "",
         f"Plan: {max(1, state.steps)} step(s), "
         f"${state.required_per_trade():,.2f} a trade.",
-        "Base entries stay at one contract. Recovery may add ONE extra "
-        "contract, resting 2¢ below a fill, and only while the BRTI evidence "
-        "still holds.",
+        sizing,
     ]
     return "\n".join(x for x in body if x != "")
 
@@ -754,6 +774,36 @@ def _cents(price: float) -> str:
             else f"{value:.1f}¢")
 
 
+
+def _margin_lines(margin: dict | None) -> list[str]:
+    """How far past the target the market finished, in bps and in dollars.
+
+    BPS LEADS because the dollar figure is not comparable between instruments
+    and the bps figure demonstrably is: measured over 143 BTC and 14 ETH
+    executed trades, winners finished a mean 18.3 bps past the target on BOTH,
+    and losers fell 6.4 / 6.5 bps short. A $128 move on BTC and a $4.37 move on
+    ETH are the same event, and only one of those units says so.
+
+    The wording distinguishes three outcomes rather than signing a number:
+    "past" for a favourable finish, "short of" for an adverse one, and a
+    settlement exactly on the strike is named as such - that is the case a
+    reader would otherwise take for a rounding artefact.
+
+    Returns a LIST so an absent margin contributes no line at all. Kalshi
+    publishes the two numbers on the market object and the enrichment pass may
+    not have run yet; "not fetched" and "finished level with the target" are
+    different facts and must not render the same.
+    """
+    if not margin:
+        return []
+    favourable = float(margin.get("favourable") or 0.0)
+    bps = float(margin.get("bps") or 0.0)
+    if abs(favourable) < 0.005:
+        return ["\U0001f4cf Settled exactly ON the target"]
+    word = "past" if favourable > 0 else "short of"
+    return [f"\U0001f4cf Settled ${abs(favourable):,.2f} {word} "
+            f"the target \u00b7 {bps:.1f} bps"]
+
 def settlement(
     *,
     head: str,
@@ -776,6 +826,14 @@ def settlement(
     paper: bool = False,
     exact: bool = True,
     record: str = "",
+    # BY HOW MUCH the market finished past the target, from `Store
+    # .settlement_margin` - Kalshi's own `floor_strike` and
+    # `expiration_value`. The lifecycle recorded whether a trade won and what
+    # it paid but never the MARGIN, which is what says an 83c favourite
+    # settled comfortably rather than by a hair. None when Kalshi has not
+    # published both numbers yet, which is different from a margin of zero:
+    # finishing exactly on the strike is a real and reportable outcome.
+    margin: dict | None = None,
 ) -> str:
     """How a window closed, and what it did to the account.
 
@@ -828,6 +886,7 @@ def settlement(
             "",
             f"{chip_side} Signal: <b>{side}</b>{priced}",
             f"\U0001f3c1 Market settled <b>{winner}</b>",
+            *_margin_lines(margin),
             # WHY it was not traded, not just that it was not. A signal the
             # rule approved and nobody pressed is a different miss from one the
             # rule refused, and only the first is a trade that got away.
@@ -858,6 +917,7 @@ def settlement(
             "",
             f"{chip_side} Bought <b>{side}</b>{priced}",
             f"\U0001f3c1 Market settled <b>{winner}</b>",
+            *_margin_lines(margin),
             "\U0001f9fe <i>The money for this one is not settled yet.</i>",
         ]
         if record:
@@ -906,6 +966,7 @@ def settlement(
             "",
             f"{chip_side} Bought <b>{side}</b>{priced}",
             f"\U0001f3c1 Market settled <b>{winner}</b>",
+            *_margin_lines(margin),
         ]
         # THE CALL, on its own line, every time. It is a different fact from
         # the money and it is the one that was silently inverted: the 12:15
@@ -1672,7 +1733,9 @@ def signal_message(*, side: str, ticker: str, ask: float, remaining: int,
                    status_line: str, snapshot=None, insight: str = "",
                    band_hold: tuple[int, int] | None = None,
                    distance_text: str = "", priority=None,
-                   verdict: str = "") -> str:
+                   verdict: str = "",
+                   confidence_note: str = "",
+                   policy_note: str = "") -> str:
     """A signal, executed or not. The checks are always visible.
 
     `confidence` is the ONE Kalshi-native confidence result, computed once by
@@ -1692,6 +1755,15 @@ def signal_message(*, side: str, ticker: str, ask: float, remaining: int,
         f"{surface.LEARNING} Confidence {escape(confidence)} · "
         f"Entry checks {surface.checks_summary(facts)}"
     )
+    # Directly under the word it explains. Without it a 5/5 setup reading
+    # MEDIUM has nothing on screen to account for the gap.
+    if confidence_note:
+        essentials.append(confidence_note)
+    # A VETO or an ADMIT belongs in the message, not behind the DETAILS
+    # button: one refuses a setup every gate accepted, the other overrules a
+    # gate and lets an order through.
+    if policy_note:
+        essentials.append(policy_note)
     return surface.compose(
         header=f"{surface.side_icon(side)} <b>{escape(side)} SIGNAL · "
                f"{escape(label)}</b>",
@@ -1710,7 +1782,9 @@ def fill_message(*, side: str, ticker: str, contracts: float, paid: float,
                  facts: list[dict], snapshot=None, insight: str = "",
                  band_hold: tuple[int, int] | None = None,
                  decision_ask: float | None = None, priority=None,
-                 size_reason: str = "") -> str:
+                 size_reason: str = "",
+                 confidence_note: str = "",
+                 policy_note: str = "") -> str:
     """An executed entry. Cost and maximum profit are both NET.
 
     The old fill report printed `Maximum profit contracts - cost` with no fee
@@ -1740,6 +1814,13 @@ def fill_message(*, side: str, ticker: str, contracts: float, paid: float,
         f"{surface.LEARNING} Confidence {escape(confidence)} · "
         f"Entry checks {surface.checks_summary(facts)}"
     )
+    if confidence_note:
+        essentials.append(confidence_note)
+    # A VETO or an ADMIT belongs in the message, not behind the DETAILS
+    # button: one refuses a setup every gate accepted, the other overrules a
+    # gate and lets an order through.
+    if policy_note:
+        essentials.append(policy_note)
     return surface.compose(
         header=f"{surface.side_icon(side)} <b>{escape(side)} FILLED</b>",
         ticker=ticker,
@@ -1931,13 +2012,81 @@ def exit_warning_message(*, ticker: str, side: str, price: float,
 
 
 def recovery_armed_message(state, trigger: str = "", *, snapshot=None,
-                           insight: str = "") -> str:
-    """A realised loss opened a deficit, and sizing may now rise.
+                           insight: str = "", loss_step: float = 0.0,
+                           band: tuple[float, float] = (0.70, 0.79),
+                           wait: int = 5, base: int = 1,
+                           add_per_base: int = 1, combo: bool = False,
+                           partner: str = "",
+                           partner_band: tuple[float, float] = (0.70, 0.85)
+                           ) -> str:
+    """A realised loss opened a deficit, and a recovery may now follow.
 
-    What it may rise BY is stated here rather than left to the reader: the
-    shipped rule adds ONE extra contract, resting 2c below a fill. It is not
-    a martingale and the message must not read like one.
+    WHAT IT MAY RISE BY IS STATED HERE rather than left to the reader, and it
+    has to be the rule that is actually running. Until 2026-09-24 that was
+    one extra contract rested 2c below a fill. Since the loss step shipped,
+    the next entry after a losing market is sized to a fixed dollar budget -
+    six or seven contracts at band prices - so the old sentence would now
+    understate the position by a factor of six. Neither rule is a martingale
+    and the message must not read like one.
+
+    `base` is today's base tier. Both recoveries are PER BASE CONTRACT since
+    2026-09-27 - the step is `loss_step` per base contract and the resting
+    add-on is `add_per_base` per base contract (0 = the add-on is off) - so
+    the message leads with the RULE ("2x the base") and gives today's
+    contracts beside it. The step can fire several markets later, possibly
+    after the base has moved; the rule is what stays true. A message saying
+    "$2" while the service buys 4 is the contradiction this began with.
     """
+    base = max(1, int(base))
+    at_hi = int(loss_step / band[1]) * base if band[1] > 0 else 0
+    at_lo = int(loss_step / band[0]) * base if band[0] > 0 else 0
+    contracts = f"{at_hi}" if at_hi == at_lo else f"{at_hi}-{at_lo}"
+    per_base = at_hi // base if at_hi == at_lo else None
+    rule = f"{per_base}x the base" if per_base else "the step"
+    add = max(0, int(add_per_base)) * base
+    add_line = (
+        f" The resting add-on is +{add} ({add_per_base} per base contract), "
+        f"2\u00a2 below a fill, and stands down on the entry the step sizes."
+        if add > 0 else ""
+    )
+    if combo:
+        # SINCE 2026-09-27 THE RECOVERY IS A COMBO AT BASE SIZE. Said exactly,
+        # because the message is the operator's only view of what will run.
+        sizing = (
+            f"<i>After a losing market ONE later entry goes out as a "
+            f"<b>recovery combo at base size ({base})</b> - this market plus "
+            f"{escape(partner or 'its partner')} on its own signal side, priced "
+            f"{partner_band[0]:.2f}-{partner_band[1]:.2f}, same or opposite "
+            f"direction, bought at the cheapest quote at or below the cheaper "
+            f"leg's price. It "
+            f"waits for an ask between {band[0]:.2f} and {band[1]:.2f}, may "
+            f"fire several markets later, expires unspent after {wait} "
+            f"settled markets, fires once, and never back to back. No partner "
+            f"or no quote: the entry goes out as usual at base size. Nothing "
+            f"is upsized.</i>"
+        )
+    elif loss_step > 0:
+        sizing = ("<i>Recovery combos are off - every entry stays at base "
+                  "size.</i>")
+    else:
+        sizing = (
+            f"<i>After a losing market ONE later entry is sized to {rule} - "
+            f"${loss_step:,.2f} per base contract, {contracts} contracts at "
+            f"today's base of {base} - and it WAITS for an ask between "
+            f"{band[0]:.2f} and "
+            f"{band[1]:.2f} - at 0.90 an extra contract makes about 10¢, which "
+            f"base size earns anyway at a better price. So it may fire several "
+            f"markets later; it expires unspent after {wait} settled markets, fires "
+            f"once, never escalates, and a recovery trade that loses does not "
+            f"arm another.{add_line}</i>"
+            if loss_step > 0 else
+            (f"<i>Base entries stay at {base} contracts. Recovery may add "
+             f"{add} extra, resting 2\u00a2 below a fill, and only while "
+             f"the BRTI evidence still holds.</i>" if base > 1 else
+             "<i>Base entries stay at one contract. Recovery may add ONE "
+             "extra contract, resting 2\u00a2 below a fill, and only while "
+             "the BRTI evidence still holds.</i>")
+        )
     return surface.compose(
         header=f"{surface.RECOVERY} <b>RECOVERY ARMED</b>",
         ticker="",
@@ -1947,9 +2096,7 @@ def recovery_armed_message(state, trigger: str = "", *, snapshot=None,
             f"{surface.TARGET} Plan: {max(1, state.steps)} step"
             f"{'s' if max(1, state.steps) != 1 else ''} \u00b7 "
             f"${state.required_per_trade():,.2f} a trade",
-            "<i>Base entries stay at one contract. Recovery may add ONE "
-            "extra contract, resting 2\u00a2 below a fill, and only while "
-            "the BRTI evidence still holds.</i>",
+            sizing,
         ],
         checks=[],
         status="",
@@ -2011,6 +2158,327 @@ def recovery_cleared_message(snapshot=None, *, insight: str = "") -> str:
     )
 
 
+def _record(r: dict) -> str:
+    """'11W\u20131L 92% +$2.04' - a record, compact. Its P&L is already NET of
+    fees (shadow_summary.allsignal_record), under a "(net)" heading."""
+    if not r["n"]:
+        return "no settled trades yet"
+    return (f"{r['wins']}W\u2013{r['n'] - r['wins']}L "
+            f"<b>{r['wins'] / r['n']:.0%}</b> {surface._signed_dollars(r['pnl'])}")
+
+
+def _book_lines(book: list, asset: str | None = None) -> list[str]:
+    """Today and overall, one line each: this instrument, then the combined
+    book (the last row when there is more than one instrument)."""
+    if not book:
+        return []
+    own = next((r for r in book if r[0] == asset), None) if asset else None
+    combined = book[-1] if len(book) > 1 else None
+    scopes = [r for r in (own, combined) if r is not None] or book
+    lines = []
+    for i, when in ((1, "\U0001f4c5 Today (net)"), (2, "\U0001f4c8 Since start (net)")):
+        parts = [f"{escape(r[0])} {_record(r[i])}" for r in scopes]
+        lines.append(f"{when}: " + " \u00b7 ".join(parts))
+    return lines
+
+
+def _exit_part(window_open: int, fill_price: float, count: float,
+               exit_price, exit_count, exited_ms) -> str:
+    """'sold 98\u00a2 with 4m12s left' - or '' if nothing was sold."""
+    if not exit_count:
+        return ""
+    left = max(0, int((window_open + 900_000 - int(exited_ms or 0)) / 1000))
+    some = "" if float(exit_count) >= float(count) - 1e-9 else f"{float(exit_count):g} "
+    return (f"sold {some}{float(exit_price) * 100:.0f}\u00a2 "
+            f"with {left // 60}m{left % 60:02d}s left")
+
+
+def _px(value) -> str:
+    """$84,787.45 - cents for a coin above $100, four places below it."""
+    v = float(value)
+    return f"${v:,.2f}" if v >= 100 else f"${v:,.4f}"
+
+
+def _vs_target(value, target) -> str:
+    bps = (float(value) / float(target) - 1) * 10_000
+    return f"{bps:+.1f} bps {'above' if bps >= 0 else 'below'}"
+
+
+def target_lines(side: str, target=None, ref=None, final=None, asset: str = "BTC") -> list[str]:
+    """THE KALSHI TARGET (operator, 2026-10-03: "show the Kalshi target price for
+    clarity"): the window's strike and what the side needs - Kalshi settles YES
+    (UP) at or above it - plus BTC at the signal, or where it settled. Empty when
+    the target is not known; never raises."""
+    try:
+        if not target or float(target) <= 0:
+            return []
+        need = "UP wins at or above it" if side == "UP" else "DOWN wins below it"
+        if final:
+            return [f"\U0001f4cd Kalshi target <b>{_px(target)}</b> \u2192 settled "
+                    f"<b>{_px(final)}</b> ({_vs_target(final, target)})"]
+        lines = [f"\U0001f4cd Kalshi target <b>{_px(target)}</b> \u00b7 {need}"]
+        if ref:
+            lines.append(f"\U0001f4b2 {escape(asset)} at the signal {_px(ref)} "
+                         f"({_vs_target(ref, target)})")
+        return lines
+    except (TypeError, ValueError, ZeroDivisionError):
+        return []
+
+
+def allsignal_trade_message(*, asset: str, window_open: int, side: str,
+                            signal_ask: float, fill_price: float, count: float,
+                            mirrored: bool, won=None, pnl=None,
+                            book: list | None = None, exit_price=None,
+                            exit_count=None, exited_ms=None, budget: float = 1.0,
+                            cushion_note: str = "", target=None, ref=None) -> str:
+    """The ENTRY: the trade and nothing else (operator, 2026-09-29: "the
+    signal should only be the trade; the result should be the one containing
+    account summary and stats"). A trade that never got an entry message is
+    reported through this too, with its result and record.
+    """
+    import datetime as dt
+    from zoneinfo import ZoneInfo
+
+    ny = ZoneInfo("America/New_York")
+    start = dt.datetime.fromtimestamp(window_open / 1000, ny)
+    end = start + dt.timedelta(minutes=15)
+    arrow = "\u2b06\ufe0f UP" if side == "UP" else "\u2b07\ufe0f DOWN"
+    cashed = bool(exit_count) and float(exit_count) >= float(count) - 1e-9
+    sold = _exit_part(window_open, fill_price, count, exit_price, exit_count, exited_ms)
+    name = f"{escape(asset)} ${budget:g}"
+    if won is None:
+        head = f"\U0001f7e2 <b>{name} \u00b7 NEW TRADE</b>"
+    elif cashed:
+        head = f"\U0001f4b0 <b>{name} \u00b7 CASHED OUT {surface._signed_dollars(pnl or 0)}</b>"
+    elif won:
+        head = f"\u2705 <b>{name} \u00b7 WON {surface._signed_dollars(pnl or 0)}</b>"
+    else:
+        head = f"\u274c <b>{name} \u00b7 LOST {surface._signed_dollars(pnl or 0)}</b>"
+    who = mirrored if isinstance(mirrored, str) else ("wife's account" if mirrored else "")
+    lines = [
+        head,
+        f"<b>{arrow}</b> \u00b7 \U0001f552 {start:%H:%M}\u2013{end:%H:%M} ET"
+        + ("" if won is not None else f" \u00b7 open until {end:%H:%M}"),
+        f"\U0001f3af Signal {signal_ask * 100:.0f}\u00a2 \u2192 \u2705 filled "
+        f"<b>{fill_price * 100:.0f}\u00a2 \u00d7 {count:g}</b>",
+        f"\U0001f4b5 Cost <b>${fill_price * count:.2f}</b> <i>(before fees)</i>",
+    ]
+    lines[3:3] = target_lines(side, target, ref, asset=asset)
+    if who:
+        lines.append(f"\U0001f465 Mirrors enabled: {escape(who, quote=False)}")
+    if cushion_note:
+        lines.append(f"\U0001f6e1 {escape(cushion_note, quote=False)}")
+    if sold:
+        lines.append(f"\U0001f4e4 Cash-out: {sold}"
+                     + ("" if cashed else " \u00b7 rest held to settlement"))
+    if book:
+        lines += ["", "\U0001f4ca <b>Stats</b>"] + _book_lines(book, asset)
+    return "\n".join(lines)
+
+
+def allsignal_cashout_notice(*, asset: str, window_open: int, side: str,
+                             fill_price: float, count: float, sold: float,
+                             sold_at: float, bid: float, remaining: int,
+                             budget: float = 1.0) -> str:
+    """A cash-out that did NOT close the whole position: a miss, or part of
+    it. (A full one is announced by `allsignal_settled_message` at the sale.)"""
+    left = f"{max(0, remaining) // 60}m{max(0, remaining) % 60:02d}s left"
+    if sold <= 0:
+        return (f"{surface.WARN} <b>{escape(asset)} ${budget:g} CASH-OUT MISSED</b> \u00b7 "
+                f"{side} {fill_price * 100:.0f}\u00a2, bid {bid * 100:.0f}\u00a2, "
+                f"no fill \u00b7 {left} \u00b7 <i>holding to settlement</i>")
+    return (f"\U0001f4b0 <b>{escape(asset)} ${budget:g} CASHED OUT {sold:g} of {count:g}</b> "
+            f"\u00b7 {side} {fill_price * 100:.0f}\u00a2 \u2192 {sold_at * 100:.0f}\u00a2 "
+            f"\u00b7 {left} \u00b7 <i>{count - sold:g} held to settlement</i>")
+
+
+def _balance_lines(balances: list) -> list[str]:
+    """'🏦 You: $112.12 → $113.45 (+$1.33) since 15:45' per account.
+
+    The operator's request, 2026-09-28: track each account's starting and
+    current balance. Current = cash plus open positions at cost."""
+    import datetime as dt
+    from zoneinfo import ZoneInfo
+
+    lines = []
+    for label, start, at_ms, now in balances or []:
+        since = dt.datetime.fromtimestamp(at_ms / 1000, ZoneInfo("America/New_York"))
+        if now is None:
+            lines.append(f"\U0001f3e6 {escape(label)}: started ${start:,.2f} "
+                         f"({since:%m-%d %H:%M}) \u00b7 now unreadable")
+            continue
+        lines.append(
+            f"\U0001f3e6 {escape(label)}: ${start:,.2f} \u2192 <b>${now:,.2f}</b> "
+            f"({surface._signed_dollars(now - start)}) since {since:%m-%d %H:%M}")
+    return lines
+
+
+def allsignal_settled_message(*, asset: str, window_open: int, side: str,
+                              fill_price: float, won: bool, pnl: float,
+                              book: list | None = None, count: float = 0.0,
+                              exit_price=None, exit_count=None,
+                              exited_ms=None, budget: float = 1.0,
+                              target=None, final=None) -> str:
+    """The RESULT, sent as a reply to the trade's entry: the outcome, then the
+    stats (today and since start, net), then - appended by the caller - the
+    account table. An edit alone is silent in Telegram, so this is always a
+    new message (2026-09-28 18:00)."""
+    import datetime as dt
+    from zoneinfo import ZoneInfo
+
+    start = dt.datetime.fromtimestamp(window_open / 1000, ZoneInfo("America/New_York"))
+    end = start + dt.timedelta(minutes=15)
+    arrow = "\u2b06\ufe0f UP" if side == "UP" else "\u2b07\ufe0f DOWN"
+    mark = "\u2705" if won else "\u274c"
+    verb = "WON" if won else "LOST"
+    # CASHED OUT is said as such (operator: "if that is the case the message
+    # needs to better say it") - never dressed up as a settlement win.
+    cashed = bool(exit_count) and float(exit_count) >= float(count or 0) - 1e-9
+    if cashed:
+        mark, verb = "\U0001f4b0", "CASHED OUT"
+    sold = _exit_part(window_open, fill_price, count or float(exit_count or 0),
+                      exit_price, exit_count, exited_ms)
+    outcome = (f"\U0001f4e4 {sold}" + ("" if cashed else " \u00b7 rest held to settlement")
+               if sold else f"\U0001f3c1 held to settlement \u00b7 {'won' if won else 'lost'}")
+    lines = [
+        f"{mark} <b>{escape(asset)} ${budget:g} \u00b7 {verb} "
+        f"{surface._signed_dollars(pnl)}</b> <i>net of fees</i>",
+        f"<b>{arrow}</b> \u00b7 \U0001f552 {start:%H:%M}\u2013{end:%H:%M} ET",
+        f"\U0001f4e5 Entry <b>{fill_price * 100:.0f}\u00a2 \u00d7 {count:g}</b> \u2192 {outcome}",
+    ]
+    lines += target_lines(side, target, final=final, asset=asset)
+    if book:
+        lines += ["\u2501" * 14, "\U0001f4ca <b>Stats</b>"] + _book_lines(book, asset)
+    return "\n".join(lines)
+
+
+def allsignal_missed_message(*, asset: str, window_open: int, side: str,
+                             signal_ask: float, limit: float,
+                             failed: bool = False, budget: float = 1.0,
+                             reason: str = "", skipped: bool = False,
+                             target=None, ref=None) -> str:
+    """A signal whose order bought nothing - said, so no window looks skipped,
+    with the broker's reason when there is one."""
+    import datetime as dt
+    from zoneinfo import ZoneInfo
+
+    start = dt.datetime.fromtimestamp(window_open / 1000, ZoneInfo("America/New_York"))
+    end = start + dt.timedelta(minutes=15)
+    arrow = "\u2b06\ufe0f UP" if side == "UP" else "\u2b07\ufe0f DOWN"
+    what = "SKIPPED" if skipped else ("ORDER FAILED" if failed else "NOT FILLED")
+    lines = [
+        f"\u26aa <b>{escape(asset)} ${budget:g} \u00b7 {what}</b>",
+        f"<b>{arrow}</b> \u00b7 \U0001f552 {start:%H:%M}\u2013{end:%H:%M} ET",
+        f"\U0001f3af Signal {signal_ask * 100:.0f}\u00a2"
+        + ("" if skipped else f" \u00b7 limit {limit * 100:.0f}\u00a2"),
+        *target_lines(side, target, ref, asset=asset),
+        f"{surface.WARN} <i>No trade this window"
+        + (f": {escape(reason, quote=False)}" if reason else "") + "</i>",
+    ]
+    return "\n".join(lines)
+
+
+def allsignal_copy_message(*, asset: str, window_open: int, side: str,
+                           signal_ask: float, accounts: str, won=None,
+                           missed: bool = False, target=None, ref=None,
+                           final=None) -> str:
+    """A $ signal the MIRRORS took once the primary was done for the day
+    (operator, 2026-10-05; FINDINGS 163): which accounts, at what stake - then
+    the market's result on its side, or that the copy missed. No dollar figure:
+    a mirror's money is its own broker balance (the session summary)."""
+    import datetime as dt
+    from zoneinfo import ZoneInfo
+
+    start = dt.datetime.fromtimestamp(window_open / 1000, ZoneInfo("America/New_York"))
+    end = start + dt.timedelta(minutes=15)
+    arrow = "\u2b06\ufe0f UP" if side == "UP" else "\u2b07\ufe0f DOWN"
+    if missed:
+        head = f"\u26aa <b>{escape(asset)} \u00b7 COPY NOT FILLED</b>"
+    elif won is None:
+        head = f"\U0001f501 <b>{escape(asset)} \u00b7 COPIED TO THE MIRRORS</b>"
+    else:
+        icon = "\u2705" if won else "\u274c"
+        head = f"{icon} <b>{escape(asset)} \u00b7 COPY {'WON' if won else 'LOST'}</b>"
+    lines = [
+        head,
+        f"<b>{arrow}</b> \u00b7 \U0001f552 {start:%H:%M}\u2013{end:%H:%M} ET",
+        f"\U0001f3af Signal {signal_ask * 100:.0f}\u00a2",
+        *target_lines(side, target, ref, final, asset=asset),
+        f"\U0001f465 {escape(accounts, quote=False)}",
+        "<i>The primary is done for the day; the mirrors trade on.</i>",
+    ]
+    return "\n".join(lines)
+
+
+def shadow_summary_message(*, session: str, rows: list, ny_day: str,
+                           allsignal: list | None = None,
+                           book: list | None = None,
+                           balances: list | None = None,
+                           copies: dict | None = None, budget: float = 1.0,
+                           after_target: float = 0.0, after_loss: float = 0.0,
+                           after_loss_trades: int = 2) -> str:
+    """The shadow instruments' session, in one message.
+
+    Operator, 2026-09-28: only BTC and gold send alerts; the rest "come in as
+    summary while in shadow". Per instrument: the alerts as sent, and the
+    trades its own rule would have placed, each graded on the settled outcome
+    at one contract, fee-free. Nothing here moved money.
+    """
+    from .sessions import LABELS
+
+    def line(g):
+        if not g["n"]:
+            return "none"
+        return (f"{g['n']} \u00b7 {g['wins']}W\u2013{g['n'] - g['wins']}L "
+                f"({g['wins'] / g['n']:.0%}) \u00b7 "
+                f"{g['pnl']:+.2f} at 1 contract")
+
+    title = escape(LABELS.get(session, session))
+    # The primary's stake drops after its daily target (2026-09-30): say both.
+    stake = f"${budget:g}" + (f" (${after_target:g} while at the target)" if after_target else "")
+    if after_loss:
+        stake += f" \u00b7 ${after_loss:g} for {int(after_loss_trades)} after a loss"
+    out = [f"\U0001f4b5 <b>ALL-SIGNAL {stake} \u00b7 {title} session</b>" if allsignal
+           else f"\U0001f441 <b>SESSION SUMMARY \u00b7 {title} session</b>"]
+    # THE ALL-SIGNAL STRATEGY: real money, $1 a signal (operator, 2026-09-28).
+    for asset, a in allsignal or []:
+        text = f"<b>{escape(asset)}</b> this session: " + (
+            f"{_record(a)} (fees ${a['fee']:.2f})" if a["n"] else "no settled trades")
+        if a.get("open"):
+            text += f" \u00b7 {a['open']} open"
+        if a.get("missed"):
+            text += f" \u00b7 {a['missed']} not filled"
+        out.append(text)
+    out.extend(_book_lines(book or []))
+    out.extend(_balance_lines(balances or []))
+    if rows:
+        out.append("\U0001f441 <b>SHADOW</b> (no money):")
+    for asset, s in rows:
+        if "error" in s:
+            out.append(f"<b>{escape(asset)}</b>: store unreadable ({escape(s['error'])})")
+            continue
+        a, r = s["alerts"], s["rule"]
+        head = f"<b>{escape(asset)}</b> alerts: {line(a)}"
+        if a["n"]:
+            head += f" \u00b7 avg {a['avg_ask'] * 100:.0f}\u00a2"
+        if a.get("open"):
+            head += f" \u00b7 {a['open']} unsettled"
+        out.append(head)
+        out.append(f"   rule would have traded: {line(r)}")
+    if not allsignal:
+        tail = "Shadow only - no money moved"
+    elif copies is None:
+        tail = f"{stake} per primary signal; mirrors use their own budgets \u00b7 after fees"
+    else:
+        # What each mirror account really copies, per its switch
+        # (scripts/mirror_switch.py).
+        parts = [f"{escape(who, quote=False)} copies {', '.join(assets) if assets else 'nothing'}"
+                 for who, assets in copies.items()] or ["no mirror account"]
+        tail = f"{stake} per primary signal \u00b7 " + " \u00b7 ".join(parts) + " \u00b7 after fees"
+    out.append(f"<i>{escape(ny_day)} \u00b7 {tail}</i>")
+    return "\n".join(out)
+
+
 def session_close_message(*, session, day_snapshot, ny_day: str,
                           insight: str = "") -> str:
     """How that session went, then where the day stands.
@@ -2062,7 +2530,8 @@ def result_message(*, side: str, ticker: str, winner: str, won: bool,
                    exited_at: float | None = None,
                    called_side: str = "", qualified: bool | None = None,
                    position: dict | None = None,
-                   snapshot=None, insight: str = "", priority=None) -> str:
+                   snapshot=None, insight: str = "", priority=None,
+                   margin: dict | None = None) -> str:
     """How a window closed. Three facts, never collapsed into one verdict.
 
         WIN / LOSS / CLOSED       the broker's realised P&L after fees
@@ -2137,6 +2606,10 @@ def result_message(*, side: str, ticker: str, winner: str, won: bool,
         f"\U0001f3c1 Market{' later' if exited_at is not None else ''} "
         f"settled <b>{escape(winner)}</b>"
     )
+    # BY HOW MUCH, beside the fact that it settled. Whether a trade won was
+    # always here; the MARGIN never was, and it is what distinguishes an 83c
+    # favourite finishing comfortably from one that finished by a hair.
+    essentials.extend(_margin_lines(margin))
     # THE CALL, always, on its own line and in its own words.
     essentials.append(
         f"{surface.PASS if call_right else surface.FAIL} {escape(call)} "
@@ -2211,8 +2684,12 @@ def result_message(*, side: str, ticker: str, winner: str, won: bool,
 
 
 def learning_update(*, markets: int, confidence_changes: int,
-                    entry_changes: int, detail: str = "") -> str:
+                    entry_changes: int, detail: str = "",
+                    series: str = "") -> str:
     """The learning notification. Plain language, no policy identifiers.
+
+    `series` names the instrument that learned, for the label - every instance
+    learns separately and all of them post here.
 
     Policy ids, fingerprints, retired methods and training splits stay in the
     log and in `/learning` details. This message answers one question: did the
@@ -2226,7 +2703,7 @@ def learning_update(*, markets: int, confidence_changes: int,
     to how money is spent.
     """
     lines = [
-        f"{surface.LEARNING} <b>LEARNING UPDATE</b>",
+        surface.labelled(f"{surface.LEARNING} <b>LEARNING UPDATE</b>", series),
         f"\U0001f4da Reviewed: {markets:,} historical markets",
         f"{surface.TARGET} Confidence: "
         + (f"{confidence_changes} setup adjustment"
@@ -2250,7 +2727,7 @@ def _duration(seconds: float) -> str:
     return f"{hours}h {minutes:02d}m" if hours else f"{minutes}m"
 
 
-def market_gap_message(gap_s: float) -> str:
+def market_gap_message(gap_s: float, series: str = "") -> str:
     """The exchange is listing no market, and has not been for a while.
 
     THE SILENT STOP, NAMED. A window boundary is seconds. On 2026-09-24 Kalshi
@@ -2263,7 +2740,8 @@ def market_gap_message(gap_s: float) -> str:
     read on a phone at 3am looks exactly like the bot having died.
     """
     return "\n".join([
-        f"{surface.WARN} <b>NO MARKET AT THE EXCHANGE</b>",
+        surface.labelled(f"{surface.WARN} <b>NO MARKET AT THE EXCHANGE</b>",
+                         series),
         f"{surface.WAITING} Kalshi has listed no 15-minute market for "
         f"<b>{_duration(gap_s)}</b>",
         "",
@@ -2278,7 +2756,106 @@ def market_gap_message(gap_s: float) -> str:
 def market_back_message(gap_s: float, ticker: str) -> str:
     """The all-clear. A gap that gets reported must also get closed."""
     return "\n".join([
-        f"{surface.PASS} <b>MARKETS ARE BACK</b>",
+        surface.labelled(f"{surface.PASS} <b>MARKETS ARE BACK</b>", ticker),
         f"{surface.TARGET} Trading resumed on <code>{escape(ticker)}</code>",
         f"<i>The exchange listed nothing for {_duration(gap_s)}.</i>",
     ])
+
+
+def combo_recovery_message(*, legs, market: str, result, contracts: float,
+                           remaining: int, snapshot=None) -> str:
+    """The recovery, placed as a combo at base size (operator, 2026-09-27).
+
+    Says what was bought, both legs and the price check - the quote against
+    the legs' product it had to beat - and what it pays or loses. When the
+    outcome is unknown it says so first: the money may have moved, nothing
+    else was sent, and the broker is the place to look.
+    """
+    trigger, partner = legs[0], legs[1]
+
+    def leg_line(leg):
+        arrow = surface.UP if leg.side == "UP" else surface.DOWN
+        return (f"{arrow} <b>{escape(leg.asset)} {leg.side}</b> at "
+                f"{leg.ask:.2f} · <code>{escape(leg.ticker)}</code>")
+
+    price = result.price or result.product
+    cost = contracts * price
+    if result.bought:
+        header = (f"{surface.RECOVERY} <b>RECOVERY COMBO BOUGHT</b> · "
+                  f"{contracts:g} at {price:.2f}")
+        status = (f"{surface.PACKAGE} Held to settlement · wins "
+                  f"<b>${contracts * (1 - price) - (result.fee or 0):,.2f}</b> "
+                  f"if BOTH legs win, loses <b>${cost + (result.fee or 0):,.2f}</b> "
+                  f"otherwise <i>(net of fees)</i>")
+    else:
+        header = (f"{surface.WARN} <b>RECOVERY COMBO - OUTCOME UNKNOWN</b>")
+        status = (f"{surface.WARN} {escape(result.reason or 'Outcome not confirmed')}. "
+                  f"Treated as held at {price:.2f} so nothing else is bought "
+                  f"this window; the broker's fills settle it within minutes "
+                  f"- <b>{escape(market)}</b>.")
+    essentials = [
+        leg_line(trigger),
+        leg_line(partner),
+        f"{surface.PRICE} {'Bought' if result.bought else 'Quoted'} at "
+        f"{price:.4f} · cap {result.limit or 0:.4f} "
+        f"(the cheaper leg) · legs multiplied {result.product:.4f} · base "
+        f"size, nothing upsized",
+        f"{surface.CLOCK} {remaining // 60}m {remaining % 60:02d}s to settle",
+    ]
+    return surface.compose(
+        header=header, ticker=trigger.ticker, essentials=essentials,
+        checks=[], status=status, snapshot=snapshot,
+    )
+
+
+def combo_result_message(*, market: str, legs: list, contracts: float,
+                         price: float, pnl: float | None,
+                         snapshot=None) -> str:
+    """A recovery combo settled. The money is the broker's own figure."""
+    trigger = legs[0] if legs else {}
+    names = " + ".join(f"{l.get('asset')} {l.get('side')}" for l in legs) or market
+    if pnl is None:
+        head = f"{surface.WAITING} <b>RECOVERY COMBO SETTLED</b> · {escape(names)}"
+        money = "Result not reconciled yet - it will show in the money line."
+    elif pnl > 0:
+        head = f"{surface.WON_MONEY} <b>RECOVERY COMBO WON</b> · {escape(names)}"
+        money = f"Realised <b>{surface._signed_dollars(pnl)}</b> <i>(net of fees)</i>"
+    else:
+        head = f"{surface.LOST_MONEY} <b>RECOVERY COMBO LOST</b> · {escape(names)}"
+        money = f"Realised <b>{surface._signed_dollars(pnl)}</b> <i>(net of fees)</i>"
+    return surface.compose(
+        header=head, ticker=str(trigger.get("ticker") or ""),
+        essentials=[f"{surface.PRICE} {contracts:g} at {price:.2f} · "
+                    f"<code>{escape(market)}</code>", money],
+        checks=[], status="", snapshot=snapshot,
+    )
+
+
+def hypotheses_message(*, asset: str, result: dict, series: str = "") -> str:
+    """The local model's ideas that SURVIVED testing - candidates, not rules.
+
+    Sent only when at least one survived. Every number is the statistics',
+    never the model's: the slice's advantage over the rest, day-clustered,
+    Benjamini-Hochberg across the batch.
+    """
+    lines = [surface.labelled(
+        f"{surface.LEARNING} <b>LOCAL MODEL IDEAS</b>", series)]
+    lines.append(
+        f"{len(result.get('survivors') or [])} of {result.get('proposed', 0)} "
+        f"proposal(s) survived testing over {result.get('windows', 0)} windows "
+        f"and {result.get('days', 0)} days:")
+    for s in (result.get("survivors") or [])[:5]:
+        where = " and ".join(f"{c} {o} {v}" for c, o, v in s.get("terms") or [])
+        diff = float(s.get("diff") or 0.0)
+        # A two-sided test: a slice can survive for doing WORSE than the rest,
+        # which is a condition to avoid, and it is said that way round.
+        verb = (f"beats the rest by {diff:.3f}/contract" if diff >= 0 else
+                f"trails the rest by {-diff:.3f}/contract - one to avoid")
+        lines.append(
+            f"• <b>{escape(str(s.get('name')))}</b>: {escape(where)} - "
+            f"{verb} (n={s.get('n')}, {s.get('days')} days, "
+            f"p={float(s.get('p') or 0):.3f})")
+    lines.append("<i>Candidates only: nothing changes an order until one "
+                 "clears the promotion bar. The model saw a summary of the "
+                 "same data, so treat these as leads.</i>")
+    return "\n".join(lines)

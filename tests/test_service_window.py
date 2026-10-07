@@ -202,7 +202,8 @@ def test_default_order_size_is_one_dollar(tmp_path):
     """Live money: the default must be the smallest thing that can trade."""
     from btc15_signal.main import budget_for
 
-    settings = Settings()
+    # The CODE default, not the operator's live .env (AUTO_BUDGET=5.00 there).
+    settings = Settings(_env_file=None)
     assert settings.manual_budget == 1.0
     assert settings.auto_budget == 1.0
     store = size_store(tmp_path)

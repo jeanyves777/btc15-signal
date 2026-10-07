@@ -138,8 +138,13 @@ def test_a_reversal_alone_is_enough_to_disqualify():
 
 
 def test_the_same_setup_passes_once_the_move_holds():
+    # The three level-holding gates are neutralised HERE because this test is
+    # about the REVERSAL gate: it must fail if retrace refuses a held move,
+    # not because a synthetic climbing series never tested its strike twice.
     rule = KalshiBRTIRule(min_brti_normalized_distance=0.0,
-                          require_momentum_alignment=False)
+                          require_momentum_alignment=False,
+                          min_brti_accel=-1e9, min_brti_held_s=0,
+                          min_brti_rejections=0)
     ok, _facts, failed = kalshi_signal.evaluate(rule, feats(climbing()), 0.80, 600)
     assert ok, failed
 

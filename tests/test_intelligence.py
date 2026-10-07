@@ -835,7 +835,14 @@ def test_recovery_never_creates_a_trade(tmp_path):
     auto = source.split("---- unattended execution")[1]
     gate = auto.index("blocked = autotrade.auto_block_reason(")
     declined = auto.index("if blocked:")
-    size = auto.index("recovery_size(")
+    # The recovery half of sizing is `recovery_sizing` since 2026-09-27; the
+    # order path calls it, and it calls `recovery_size`.
+    import inspect
+
+    import btc15_signal.main as main
+
+    size = auto.index("recovery_sizing(")
+    assert "recovery_size(" in inspect.getsource(main.recovery_sizing)
     assert gate < declined < size, "the gates decide first, sizing second"
     assert "else:" in auto[declined:size], "sizing is in the not-blocked branch"
     assert "recovery" not in auto[:declined], "no deficit may reach a gate"

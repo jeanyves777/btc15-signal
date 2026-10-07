@@ -68,8 +68,12 @@ class Capital:
 
 
 def tier_for(capital: float, per_contract: float, ceiling: int) -> int:
-    """Contracts the reconciled capital supports. At least one, never above
-    the ceiling.
+    """Contracts the reconciled capital supports. At least one, and never above
+    the ceiling when there is one - `ceiling <= 0` means NO ceiling.
+
+    UNCAPPED BY OPERATOR DECISION, 2026-09-27: "auto scale, and contracts
+    should not be capped, it should scale as capital grows." The cap was 2;
+    at $132.95 the account supports 4.
 
     A step function on purpose: it changes once a day, at the review, so the
     size a trade goes out at is knowable in advance rather than a function of
@@ -77,7 +81,8 @@ def tier_for(capital: float, per_contract: float, ceiling: int) -> int:
     """
     if per_contract <= 0:
         return 1
-    return max(1, min(ceiling, int(capital // per_contract)))
+    tier = max(1, int(capital // per_contract))
+    return min(ceiling, tier) if ceiling and ceiling > 0 else tier
 
 
 class CapitalController:
