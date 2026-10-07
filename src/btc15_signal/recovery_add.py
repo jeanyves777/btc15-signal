@@ -142,13 +142,24 @@ def evaluate(
     open_exposure: float,
     limits: AddLimits,
     fee,
+    base_count: int = 1,
+    add_count: int = 1,
 ) -> AddDecision:
     """Should the add rest right now? Pure, so it is testable without a broker.
 
     Order matters. The cheap, certain refusals come first so a log line names
     the real reason rather than the first expensive thing that happened to
     fail.
+
+    `base_count` and `add_count` are the entry and the add AS THEY ARE. Both
+    were a fixed 1 until the add was made to follow the base (operator,
+    2026-09-27: +1 per base contract), and the arithmetic below was written
+    for exactly one of each - a plain average of two prices, profit on 2
+    contracts, one contract's price against the cap. At 1 and 1 it is the
+    same arithmetic as before.
     """
+    base_count = max(1, int(base_count))
+    add_count = max(1, int(add_count))
     if not recovery_active:
         return AddDecision(False, "recovery is not active")
     if already_added:
@@ -173,7 +184,7 @@ def evaluate(
     # room - `resting_exposure` returns -1 when it could not be read.
     if open_exposure < 0:
         return AddDecision(False, "exposure unknown; refusing to add", limit_price)
-    if open_exposure + limit_price > limits.max_total_funding:
+    if open_exposure + limit_price * add_count > limits.max_total_funding:
         return AddDecision(
             False,
             f"would exceed the ${limits.max_total_funding:.0f} cap "
@@ -183,8 +194,11 @@ def evaluate(
 
     # The combined position has to be able to pay the recovery portion, or the
     # add is buying exposure that cannot do the job it exists for.
-    combined = round((entry_fill + limit_price) / 2, 6)
-    potential = max_net_profit(2, combined, fee)
+    total = base_count + add_count
+    combined = round(
+        (entry_fill * base_count + limit_price * add_count) / total, 6
+    )
+    potential = max_net_profit(total, combined, fee)
     if potential < required_per_trade:
         return AddDecision(
             False,
@@ -194,7 +208,8 @@ def evaluate(
         )
     return AddDecision(
         True,
-        f"resting 1 at {limit_price:.2f} ({limits.dip_cents * 100:.0f}c below "
+        f"resting {add_count} at {limit_price:.2f} "
+        f"({limits.dip_cents * 100:.0f}c below "
         f"the {entry_fill:.2f} fill); combined {combined:.4f} could make "
         f"{potential:+.4f} against {required_per_trade:+.4f} needed",
         limit_price,

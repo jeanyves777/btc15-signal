@@ -12,6 +12,8 @@ each look bounded is how a cap gets exceeded by their sum.
 """
 
 import sys
+
+import pytest
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
@@ -19,6 +21,17 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 import btc15_signal.main as main  # noqa: E402
 from btc15_signal.config import Settings  # noqa: E402
 from btc15_signal.store import Store  # noqa: E402
+
+
+# THE COMBO MECHANICS, tested on the pre-2026-09-28 map. Since then BTC has no
+# partner ("BTC AND GOLD ONLY I SAID"; FINDINGS 108) and its entries carry no
+# recovery label at all - pinned in tests/test_live_instruments.py. The rules
+# for WHEN a recovery is due still run for ETH->SOL and SOL->BTC, on this code.
+@pytest.fixture(autouse=True)
+def _mechanics_map(monkeypatch):
+    from btc15_signal import combo_recovery
+    monkeypatch.setattr(combo_recovery, "PARTNERS",
+                        {"BTC": ("SOL",), "ETH": ("SOL",), "SOL": ("BTC",)})
 
 W = 1_790_193_600_000
 
@@ -30,6 +43,12 @@ def store_with(tmp_path, events, name="s.db"):
     write `realised_events`, which holds one row per TICKER and therefore
     blends every contract the ACCOUNT traded in that market - the operator's
     manual fills included. See the 2026-09-24 case at the bottom of this file.
+
+    AT BASE SIZE - one contract, as an ordinary loss is at base 1. These were
+    written at 2, which at base 1 is exactly what the step itself buys; once a
+    loss on the step's own trade stopped arming another (2026-09-27), every
+    arming loss here read as a recovery trade and the tests stopped testing
+    the ordinary case they were written for.
     """
     store = Store(str(tmp_path / name))
     for i, (ticker, window, amount) in enumerate(events):
@@ -38,7 +57,7 @@ def store_with(tmp_path, events, name="s.db"):
             "INSERT INTO trade_proposals (id, strategy, window_open, ticker,"
             " side, entry_limit, take_profit, count, expires_at, close_ms,"
             " status, created_at, fill_price, fee_paid) "
-            "VALUES (?,'primary',?,?,'UP',0.80,0,2,?,?,'filled',?,0.80,0.02)",
+            "VALUES (?,'primary',?,?,'UP',0.80,0,1,?,?,'filled',?,0.80,0.01)",
             (f"p{i}", window, ticker, window + 60_000, window + 900_000,
              window))
         store.db.execute(
@@ -55,10 +74,10 @@ def store_with(tmp_path, events, name="s.db"):
 def _settle(store, store_id, window, pnl):
     """One further settled BOT market at BASE size.
 
-    count=1 deliberately. `store_with` writes count=2, and the amended rule
-    reads `trade_proposals` for "has the step already been spent" - so an
-    intervening market written at 2 contracts would look like the upsize had
-    already fired and every waiting test would pass for the wrong reason.
+    count=1 deliberately: the amended rule reads `trade_proposals` for "has
+    the step already been spent" - so an intervening market written at 2
+    contracts would look like the upsize had already fired and every waiting
+    test would pass for the wrong reason.
     """
     won = pnl > 0
     store.db.execute(
@@ -219,12 +238,14 @@ def test_consecutive_losses_do_not_escalate(tmp_path):
     st = Settings(loss_step_enabled=True, loss_step_budget=5.0)
     store = store_with(tmp_path, [("A", 1_000_000, -0.80)])
     first = main.loss_step_size(store, st, 1, 0.75)[0]
-    # a SECOND losing bot trade, after the first
+    # a SECOND losing bot trade, after the first - an ORDINARY one, at base
+    # size. A loss on the step's own trade arms nothing (2026-09-27); that
+    # case is pinned in test_recovery_follows_base.py.
     store.db.execute(
         "INSERT INTO trade_proposals (id, strategy, window_open, ticker, side,"
         " entry_limit, take_profit, count, expires_at, close_ms, status,"
         " created_at, fill_price, fee_paid) "
-        "VALUES ('p9','primary',?, 'B','UP',0.80,0,2,?,?,'filled',?,0.80,0.02)",
+        "VALUES ('p9','primary',?, 'B','UP',0.80,0,1,?,?,'filled',?,0.80,0.01)",
         (2_000_000, 2_060_000, 2_900_000, 2_000_000))
     store.db.execute(
         "INSERT INTO settlements (ticker, event_ticker, market_result,"
@@ -265,15 +286,16 @@ def test_a_mispriced_ask_cannot_produce_a_position(tmp_path):
     assert main.loss_step_size(store, s, 1, 0.01)[0] == 1
 
 
-def test_the_cap_still_binds_inside_the_band(tmp_path):
-    """The cap is not decoration just because the band narrowed. Within
-    0.70-0.79 a large budget must still be bounded, because the budget is a
-    dollar figure and the count it buys is not something anyone typed."""
+def test_a_large_budget_never_becomes_an_order_size(tmp_path):
+    """The cap used to bound what the step BOUGHT. Since 2026-09-27 the step
+    buys nothing: its count only says a recovery is due, and the order - a
+    combo, or the single-leg fallback - goes out at BASE size whatever the
+    budget. $20 at 0.70 would be 28 contracts; the order is 1."""
     store = store_with(tmp_path, [("A", 1_000_000, -0.80)])
     s = Settings(loss_step_enabled=True, loss_step_budget=20.0,
                  loss_step_max_contracts=8)
-    count, why = main.loss_step_size(store, s, 1, 0.70)
-    assert count == 8, why           # int(20 / 0.70) = 28, capped
+    count, why, base, _, _, due = main.recovery_sizing(store, s, 1, "", 0.70)
+    assert (count, base, due) == (1, 1, True), why
 
 
 def test_the_cap_holds_across_the_whole_price_band(tmp_path):
@@ -327,8 +349,11 @@ def test_the_add_on_stands_down_when_the_step_fires():
     assert "add_on_stands_down(" in source
     helper = inspect.getsource(main.add_on_stands_down)
     assert "loss_step_enabled" in helper
-    assert "loss_step_size(" in helper
-    assert "position[0]" in helper
+    # It reads the ENTRY ROW (the id is element 4 of the tuple), not a re-run
+    # of the step at the current ask - see test_the_stand_down_runs_on_the_
+    # real_position_tuple for why the re-run was wrong in both directions.
+    assert "entry_was_upsized(" in helper
+    assert "position[4]" in helper
     # and the add-on call is actually guarded by it
     call = source.index("await recovery_add.step(")
     assert "not stood_down" in source[:call][-400:]
@@ -340,9 +365,12 @@ def test_the_step_is_applied_after_every_other_sizing_rule():
     again on top of a budget that was already the whole position."""
     import inspect
 
+    # The recovery half lives in `recovery_sizing` since 2026-09-27, so a test
+    # can run it; `primary_signal` applies the band first and then calls it.
     source = inspect.getsource(main.primary_signal)
-    assert source.index("confidence_size(") < source.index("loss_step_size(")
-    assert source.index("recovery_size(") < source.index("loss_step_size(")
+    assert source.index("confidence_size(") < source.index("recovery_sizing(")
+    helper = inspect.getsource(main.recovery_sizing)
+    assert helper.index("recovery_size(") < helper.index("loss_step_size(")
 
 
 def test_it_cannot_create_a_trade():
@@ -452,26 +480,45 @@ def test_the_stand_down_runs_on_the_real_position_tuple(tmp_path):
     `test_the_add_on_stands_down_when_the_step_fires` passed the whole time,
     because it SCANS THE SOURCE for strings. A source scan cannot catch an
     AttributeError. So this one calls the code with the real tuple shape.
+
+    WHAT IT ASSERTS CHANGED ON 2026-09-27, because what it asserted was the
+    bug. It used to expect a ONE-contract position to stand down when the ask
+    sat in the band - "the step would size this position". But the position
+    already exists at one contract: the step did NOT size it, and standing the
+    add-on down there removes one mechanism without engaging the other. And
+    the real stepped position - two contracts - was cleared to take an add,
+    because the re-run found that very entry and answered "already taken".
+    The question is whether THIS entry went out above its day's base.
     """
     from btc15_signal.kalshi import KalshiMarket
 
     store = store_with(tmp_path, [("A", 1_000_000, -0.80)])
-    s = Settings(loss_step_enabled=True, loss_step_budget=5.0)
+    s = Settings(loss_step_enabled=True, loss_step_budget=2.0)
     market = KalshiMarket(ticker="T", target=64.0, open_ms=0, close_ms=900_000,
                           yes_ask=0.74, no_ask=0.26, yes_bid=0.73, no_bid=0.25)
+    for pid, count in (("p-base", 1), ("p-stepped", 2)):
+        store.db.execute(
+            "INSERT INTO trade_proposals (id, strategy, window_open, ticker,"
+            " side, entry_limit, take_profit, count, expires_at, close_ms,"
+            " status, created_at, fill_price) "
+            "VALUES (?,'primary',?,'T','UP',0.74,0,?,0,0,'filled',0,0.74)",
+            (pid, 2_000_000 + count, count))
+    store.db.commit()
+
     # EXACTLY what the store returns: (side, paid, count, ticker, id)
-    position = ("UP", 0.74, 1, "T", "p9")
+    stepped = ("UP", 0.74, 2, "T", "p-stepped")
+    base = ("UP", 0.74, 1, "T", "p-base")
 
-    # In band after a loss -> the step would size this position, so the add-on
-    # must stand down. This is the call that used to raise.
-    assert main.add_on_stands_down(store, s, market, position) is True
-
-    # Out of band -> the step is waiting, so the add-on must NOT stand down:
-    # standing it down for an upsize that never happens removes one mechanism
-    # without engaging the other.
+    # The step sized this one, so the add-on must stand down - at ANY ask.
+    # This is the call that used to raise, and later the one that said False.
+    assert main.add_on_stands_down(store, s, market, stepped) is True
     high = KalshiMarket(ticker="T", target=64.0, open_ms=0, close_ms=900_000,
                         yes_ask=0.91, no_ask=0.09, yes_bid=0.90, no_bid=0.08)
-    assert main.add_on_stands_down(store, s, high, position) is False
+    assert main.add_on_stands_down(store, s, high, stepped) is True
+
+    # A base-size position is not the step's, whatever the ask is doing.
+    assert main.add_on_stands_down(store, s, market, base) is False
+    assert main.add_on_stands_down(store, s, high, base) is False
 
     # No position at all must be answerable without raising.
     assert main.add_on_stands_down(store, s, market, None) is False

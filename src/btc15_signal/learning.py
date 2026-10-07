@@ -21,11 +21,29 @@ gate allowed, and cannot change size. It moves a label. That is the whole of its
 authority, and keeping it that small is what makes it safe to grant on less
 evidence than an execution change.
 
-THE PROMOTION BAR IS NOT NEGOTIABLE DOWNWARD. It is stated once, here, and a
-training run either clears it or does not. "Nothing qualified" is a result and
-the loop keeps running and keeps measuring; manufacturing an active adjustment
-by relaxing the bar would convert a measurement into a decision that was already
-made. The bar:
+THE BAR IS STATED ONCE, HERE, and a training run either clears it or does not.
+"Nothing qualified" is a result and the loop keeps running and keeps measuring;
+manufacturing an active adjustment by relaxing the STATISTICAL tests would
+convert a measurement into a decision that was already made, and those tests -
+sign agreement, the sqrt(k) widening, Holm-Bonferroni across cells - are
+untouched by the count below.
+
+THE COUNT WAS SET TO 100 BY THE OPERATOR, 2026-09-26, with the evidence beside
+it. It was 120, and 120 was never measured - it was chosen. What 100 buys, read
+from the live stores that day: BTC held a cell at n=103 that was refused 213
+times, ETH one at n=115 refused 126 times, so 17 rows and 5 rows respectively
+were the whole difference. Across BTC decisions, 55% cleared 120 and 64% clear
+100. SOL is unaffected either way; its median cell holds 2 rows.
+
+WHAT 100 CANNOT BUY, stated so nobody re-derives it later: n=100 has the power
+to see a LARGE effect, not a small one. FINDINGS 38 measured meta-labelling as
+needing ~10,700 qualified signals to resolve a veto value of +8.39 with an
+interval of [-7.52, +24.83]. Nothing about this change makes that effect
+visible; it makes cells that already carry a large, consistent signal able to
+speak 20 rows sooner. The multiplicity and out-of-sample tests still decide
+whether they do.
+
+The bar:
 
     train n >= MIN_PROMOTION_N            enough to be worth acting on
     validate n >= MIN_VALIDATE_N          measured out of sample
@@ -44,6 +62,7 @@ not read during fitting at all.
 
 from __future__ import annotations
 
+import copy
 import datetime as dt
 import math
 import random
@@ -56,9 +75,15 @@ from .validation import kalshi_fee_charged
 
 # ---------------------------------------------------------------- the bar
 MIN_CANDIDATE_N = 60       # enough to be worth WATCHING forward
-MIN_PROMOTION_N = 120      # enough to be considered for CONTROLLING an order
+# 100 BY OPERATOR DECISION, 2026-09-26 - see the module docstring for what that
+# buys and what it cannot. Both were 120, and 120 was chosen rather than
+# measured. Learning and identifying start at 100 signals for an instrument.
+MIN_PROMOTION_N = 100      # enough to be considered for CONTROLLING an order
+MIN_CONFIDENCE_N = 100     # enough to re-rate what the operator is shown
+# UNCHANGED, and deliberately. This is the OUT-OF-SAMPLE leg, not the evidence
+# count: lowering it would weaken the test that decides whether a cell's signal
+# replicates, which is the one thing the count above still depends on.
 MIN_VALIDATE_N = 40        # enough for the out-of-sample leg to mean anything
-MIN_CONFIDENCE_N = 120     # enough to re-rate what the operator is shown
 MIN_WITHDRAWAL_N = 20      # enough forward changes to call an active arm bad
 
 # THE METHOD, named and versioned like the features.
@@ -239,6 +264,48 @@ def holm_bonferroni(pvalues: dict, alpha: float = 0.05) -> dict:
             still_rejecting = False
             out[key] = False
     return out
+
+
+def benjamini_hochberg(pvalues: dict, alpha: float = 0.05) -> dict:
+    """Which cells survive, controlling the FALSE DISCOVERY RATE.
+
+    OPERATOR DECISION, 2026-09-26: "learning must be adaptive and continuous
+    based on a few brackets of evidence... mistakes are ok and allow that where
+    the intelligence learns from mistakes and progression."
+
+    That changes the premise `holm_bonferroni` was chosen under. Holm bounds the
+    probability of ANY false positive, which is right when one error is
+    unrecoverable. It is the wrong instrument when several cells are expected to
+    carry real signal, a false one is tolerable, and there is a mechanism that
+    finds and removes it - all three of which now hold:
+
+      * a CONFIDENCE arm moves a displayed label and cannot place, size or
+        cancel an order. Its whole authority is the word on the screen.
+      * `_propose_execution` refuses any arm whose forward evidence contradicts
+        it once `MIN_WITHDRAWAL_N` changes have accumulated, and an arm already
+        active is withdrawn the same way. That is the portfolio across which a
+        false-discovery RATE is exactly the natural thing to bound, and its
+        absence was the stated reason for preferring Holm.
+
+    So this is used for the CONFIDENCE family only. The EXECUTION family - the
+    one that can move an order - keeps Holm, because there the old argument
+    still applies and a false positive spends money before the forward evidence
+    that would withdraw it has had time to accumulate.
+
+    Benjamini-Hochberg: order the p-values, find the largest rank i where
+    p_(i) <= alpha * i / k, and reject everything up to it. Under positive
+    dependence - which cells sharing a corpus have - it controls FDR at alpha.
+    """
+    ordered = sorted(pvalues.items(), key=lambda kv: kv[1])
+    k = len(ordered)
+    if not k:
+        return {}
+    cutoff = 0
+    for rank, (_key, p) in enumerate(ordered, start=1):
+        if p <= alpha * rank / k:
+            cutoff = rank
+    return {key: (rank <= cutoff)
+            for rank, (key, _p) in enumerate(ordered, start=1)}
 
 
 def excludes_zero(low: float, high: float) -> bool:
@@ -834,10 +901,17 @@ def train(
     }
     eligible_cells = len(eligible)
     report.nested_eligible_cells = eligible_cells
-    # HOLM-BONFERRONI across exactly the cells that were testable. This is the
-    # family: every cell with enough nested out-of-sample evidence to have been
-    # a candidate, whether or not it looked promising.
-    survives = holm_bonferroni({key: c["p"] for key, c in eligible.items()})
+    # BENJAMINI-HOCHBERG across exactly the cells that were testable. This is
+    # the family: every cell with enough nested out-of-sample evidence to have
+    # been a candidate, whether or not it looked promising.
+    #
+    # FDR, NOT FWER, BY OPERATOR DECISION 2026-09-26 - see `benjamini_hochberg`
+    # for why the premise changed. A confidence arm moves a label and nothing
+    # else, and the forward-evidence check withdraws one the live record
+    # contradicts, so the cost of a false discovery here is a wrong word on a
+    # screen for as long as it takes 20 forward changes to accumulate. The
+    # EXECUTION family below still uses Holm.
+    survives = benjamini_hochberg({key: c["p"] for key, c in eligible.items()})
     report.nested_survivors = sum(1 for v in survives.values() if v)
     report.nested_folds = nested.get("tested_folds", 0)
     report.nested_rows = nested.get("rows", 0)
@@ -908,8 +982,8 @@ def train(
             f"TWO BARS, TWO QUANTITIES. "
             f"{report.arms_with_confidence} arm(s) pass the CONFIDENCE bar: "
             f"nested out-of-sample CALIBRATION residual (observed win rate "
-            f"minus the probability the price implied), Holm-Bonferroni at "
-            f"FWER 0.05 across {report.nested_eligible_cells} testable cells "
+            f"minus the probability the price implied), Benjamini-Hochberg at "
+            f"FDR 0.05 across {report.nested_eligible_cells} testable cells "
             f"over {report.nested_folds} chronological folds. NONE passes the "
             f"EXECUTION bar: day-clustered P&L on the validation slice, "
             f"Holm-Bonferroni at FWER 0.05 across "
@@ -1033,9 +1107,11 @@ def _calibrate_confidence(arm: ArmFit, validate_arms: dict,
     # guarantee, and in practice about a 99.6% interval, so it suppressed a
     # result a stated method supports.
     #
-    # Holm-Bonferroni at FWER 0.05 across every testable cell. Family-wise
-    # rather than false-discovery, because one false positive is one wrong
-    # number on the operator's screen and there is no portfolio to average over.
+    # Benjamini-Hochberg at FDR 0.05 across every testable cell. False-discovery
+    # rather than family-wise, by operator decision 2026-09-26: a confidence arm
+    # moves a label and cannot move an order, and the forward-evidence check
+    # withdraws one the live record contradicts - so there IS a portfolio to
+    # average over, which is the condition FWER was chosen for the absence of.
     if not (survives or {}).get(arm.key):
         raw = "clears" if excludes_zero(cell["low"], cell["high"]) else "spans"
         arm.delta, arm.delta_reason = 0, (
@@ -1330,6 +1406,152 @@ def policy_is_valid(policy: Policy, *, fingerprint: str,
     return True, "valid"
 
 
+# What a carried rule brings with it: the decision to act and the evidence it
+# was PROMOTED on (`low` is also the floor `deteriorated` withdraws against).
+# Everything else about the cell - its sample, its confidence delta, its
+# probability - is the fresh fit's, because that is newer evidence and the
+# label the operator reads is built from it.
+EXECUTION_FIELDS = (
+    "action", "action_reason", "gate", "promoted", "low", "high",
+    "execution_p", "execution_cells_tested", "execution_correction",
+    "validate_mean", "validate_n", "winners_blocked", "losers_blocked",
+    "winners_admitted", "losers_admitted",
+)
+
+
+@dataclass
+class CarryDecision:
+    """What became of each of the running policy's live execution rules."""
+
+    carried: list = field(default_factory=list)     # kept in the fresh policy
+    condemned: list = field(default_factory=list)   # its live record says it costs money
+    dropped: list = field(default_factory=list)     # no live verdict; newest data did not back it
+    reasons: dict = field(default_factory=dict)
+
+    def summary(self) -> str:
+        parts = []
+        if self.carried:
+            parts.append(f"kept {len(self.carried)} live rule(s): "
+                         f"{', '.join(self.carried)}")
+        if self.condemned:
+            parts.append(f"let go {len(self.condemned)} its live record "
+                         f"condemned: {', '.join(self.condemned)}")
+        if self.dropped:
+            parts.append(f"dropped {len(self.dropped)} with no live verdict "
+                         f"that the newest slice did not back: "
+                         f"{', '.join(self.dropped)}")
+        return "; ".join(parts)
+
+
+def _enable_flags(policy: Policy) -> None:
+    policy.vetoes_enabled = any(
+        a.get("promoted") and a.get("action") == VETO
+        for a in policy.arms.values())
+    policy.admissions_enabled = any(
+        a.get("promoted") and a.get("action") == ADMIT
+        for a in policy.arms.values())
+
+
+def without(policy: Policy, keys) -> Policy:
+    """A copy of `policy` with those execution arms made neutral."""
+    out = copy.deepcopy(policy)
+    for key in keys:
+        if key in out.arms:
+            out.arms[key] = {**out.arms[key], "action": NEUTRAL,
+                             "promoted": False}
+    _enable_flags(out)
+    return out
+
+
+def carry_forward(new: Policy, current: Policy, forward: dict[str, dict] | None,
+                  rows: list[dict] | None = None, *, fingerprint: str,
+                  feature_version: str, slippage: float = 0.0,
+                  min_changes: int = MIN_WITHDRAWAL_N) -> CarryDecision:
+    """Decide, rule by rule, what the running policy's live rules become.
+
+    Mutates `new` (carried arms are copied in). `rows` is the newest slice -
+    the holdout the runner compares on.
+
+    WHY (operator, 2026-09-28: "do so the system learns and adapts"). A rule
+    that changes orders is promoted on the VALIDATION slice, and the running
+    policy used to be compared with every fresh fit on that same slice, so it
+    won by construction: ETH froze on its 09-27 02:17 policy and SOL on 09-26's.
+    The comparison now uses the holdout, and each live rule the fresh fit did
+    not re-promote gets ONE verdict here:
+
+      * the running artefact CANNOT ACT (retired features, a changed feature
+        contract, a superseded method): nothing is carried. Its rules were
+        fitted under definitions this build does not compute, and the service
+        told the operator they were withdrawn on load. Carrying them would
+        resurrect them silently - brti-2 -> brti-3 -> brti-4 each withdrew
+        ETH's veto this way (FINDINGS 107).
+      * its LIVE RECORD CONDEMNS it (>= `min_changes` changed orders, net
+        cost): let go, and the runner leaves it out of both sides of the
+        comparison so dropping it cannot re-freeze adoption.
+      * its LIVE RECORD SUPPORTS it (changed orders, net gain): carried. The
+        live record outranks a re-fit - it is the only evidence gathered on
+        orders the rule actually touched.
+      * NO LIVE VERDICT (no changed orders, or too few to condemn and not
+        positive): judged on the NEWEST slice, the fresh policy with the rule
+        against the fresh policy without it. Carried only if it adds value
+        there; otherwise the fresh fit stands. ETH's veto has had no live
+        opportunity since brti-4 (every such setup fails the distance gate),
+        so it is judged here instead of being kept forever on 0 changes.
+    """
+    out = CarryDecision()
+    ok, _why = policy_is_valid(current, fingerprint=fingerprint,
+                               feature_version=feature_version)
+    if not ok:
+        return out
+    forward = forward or {}
+    for key, arm in sorted((current.arms or {}).items()):
+        if not arm.get("promoted") or arm.get("action") in (None, NEUTRAL):
+            continue
+        fresh = (new.arms or {}).get(key) or {}
+        if fresh.get("promoted") and fresh.get("action") == arm.get("action"):
+            continue  # the fresh fit re-promoted it on its own evidence
+        live = forward.get(key) or {}
+        changes = int(live.get("changes") or 0)
+        incremental = float(live.get("incremental") or 0.0)
+        record = (f"live record {incremental:+.4f} over {changes} changed "
+                  f"order(s)")
+        if changes >= min_changes and incremental < 0:
+            out.condemned.append(key)
+            out.reasons[key] = record
+            continue
+        if changes > 0 and incremental > 0:
+            why = record
+        else:
+            trial = copy.deepcopy(new)
+            trial.arms[key] = dict(arm)
+            _enable_flags(trial)
+            test = compare(trial, new, rows or [], fingerprint=fingerprint,
+                           feature_version=feature_version, slippage=slippage)
+            acted = test.new_changes - test.current_changes
+            if test.delta <= 0:
+                out.dropped.append(key)
+                out.reasons[key] = (
+                    f"no live verdict ({record}); on the newest slice it "
+                    + (f"scored {test.delta:+.4f} over {acted} changed "
+                       f"decision(s)" if acted else "changed nothing")
+                )
+                continue
+            why = (f"no live verdict yet ({record}); {test.delta:+.4f} over "
+                   f"{acted} changed decision(s) on the newest slice")
+        kept = dict(fresh) if fresh else dict(arm)
+        kept.update({f: arm[f] for f in EXECUTION_FIELDS if f in arm})
+        kept["carried"] = True
+        kept["carried_reason"] = f"kept from {current.version}: {why}"
+        new.arms[key] = kept
+        # AT ONCE, not after the loop: the next rule is judged against `new`,
+        # and a carried rule that cannot act there credits its effect to the
+        # rule being judged (a -2.75 veto was reported as +6.50; review N1).
+        _enable_flags(new)
+        out.carried.append(key)
+        out.reasons[key] = why
+    return out
+
+
 def compare(new: Policy, current: Policy, rows: list[dict], *,
             fingerprint: str, feature_version: str,
             slippage: float = 0.0) -> Comparison:
@@ -1414,11 +1636,11 @@ def activation_decision(new: Policy, current: Policy, comparison: Comparison, *,
         )
     if comparison.delta < -abs(tolerance):
         return False, (
-            f"regression on the validation slice: {comparison.delta:+.4f} "
+            f"regression on the newest (holdout) slice: {comparison.delta:+.4f} "
             f"against the running policy"
         )
     return True, (
-        f"no regression on the validation slice ({comparison.delta:+.4f}); "
+        f"no regression on the newest (holdout) slice ({comparison.delta:+.4f}); "
         f"activating the fresher fit"
     )
 
@@ -1428,7 +1650,8 @@ def activation_decision(new: Policy, current: Policy, comparison: Comparison, *,
 
 def candidate_payload(result: TrainingResult, *, fingerprint: str,
                       feature_definitions: dict, feature_version: str,
-                      now_ms: int) -> dict:
+                      now_ms: int, policy: Policy | None = None,
+                      also: Policy | None = None) -> dict:
     """The frozen candidate artefact: cells worth WATCHING, forward.
 
     Refitting the policy without refitting these would leave the forward
@@ -1447,11 +1670,27 @@ def candidate_payload(result: TrainingResult, *, fingerprint: str,
     """
     import hashlib
 
+    arms_of: dict = {}
+    # EVERY RULE THE POLICY ACTS ON IS WATCHED, whatever the fresh fit thinks
+    # of the cell. A carried rule's life is decided by its forward record, and
+    # a rule dropped from the watch list stops accumulating one: SOL's live
+    # veto went unrecorded in 7 windows because three refits had turned
+    # against the cell (FINDINGS 107).
+    # Both policies: the fresh one if it activates, and the running one - which
+    # stays live when activation is refused, with rules the fresh fit dropped
+    # still acting (review N2).
+    acting = {}
+    for source in (also, policy):
+        for key, arm in ((source.arms if source else {}) or {}).items():
+            if arm.get("promoted") and arm.get("action") in (VETO, ADMIT):
+                acting[key] = arm.get("action")
+                if source is policy or key not in arms_of:
+                    arms_of[key] = arm
     candidates = []
     for key, arm in sorted(result.arms.items(), key=lambda kv: -kv[1].n):
-        if arm.n < MIN_CANDIDATE_N:
+        if arm.n < MIN_CANDIDATE_N and key not in acting:
             continue
-        proposed = arm.action
+        proposed = acting.get(key) or arm.action
         if proposed == NEUTRAL:
             # A cell with no proposed change still has nothing to watch: the
             # candidate table measures DISAGREEMENT with the base rule, and a
@@ -1486,8 +1725,32 @@ def candidate_payload(result: TrainingResult, *, fingerprint: str,
         "training_cutoff_ms": result.report.training_cutoff_ms,
         "min_candidate_n": MIN_CANDIDATE_N,
         "min_promotion_n": MIN_PROMOTION_N,
-        "candidates": candidates,
+        "candidates": candidates + _acting_not_listed(acting, arms_of, candidates),
     }
+
+
+def _acting_not_listed(acting: dict, arms_of: dict,
+                       listed: list[dict]) -> list[dict]:
+    """Candidates for acting rules the fresh fit produced no cell for."""
+    import hashlib
+
+    seen = {c["context"] for c in listed}
+    out = []
+    for key, action in sorted(acting.items()):
+        if key in seen:
+            continue
+        arm = arms_of[key]
+        out.append({
+            "candidate_id": f"c{hashlib.sha1(key.encode('utf-8')).hexdigest()[:8]}",
+            "context": key,
+            "proposed_action": action,
+            "train_n": int(arm.get("n") or 0),
+            "train_mean": round(float(arm.get("mean") or 0.0), 6),
+            "promotes": True,
+            "delta": int(arm.get("delta") or 0),
+            "reason": "acting rule; watched so its live record keeps growing",
+        })
+    return out
 
 
 def _direction_only(arm: ArmFit) -> str:

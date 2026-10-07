@@ -77,10 +77,20 @@ async def main() -> None:
               f"across {touched} markets")
 
         print("\n  by MARKET day (window_ms, not settlement time):")
-        for day, count, dollars in store.db.execute(
-            "SELECT DATE(COALESCE(window_ms, settled_ms)/1000,'unixepoch'), "
-            "COUNT(*), SUM(pnl) FROM settlements GROUP BY 1 ORDER BY 1"
+        # The NEW YORK day of the market's own window. A UTC date of the true
+        # open misfiles every 20:00-24:00 ET window (FINDINGS 108).
+        from collections import defaultdict
+
+        from btc15_signal.capital import ny_day
+
+        days = defaultdict(lambda: [0, 0.0])
+        for when, dollars in store.db.execute(
+            "SELECT COALESCE(window_ms, settled_ms), pnl FROM settlements"
         ):
+            days[ny_day(int(when))][0] += 1
+            days[ny_day(int(when))][1] += float(dollars or 0.0)
+        for day in sorted(days):
+            count, dollars = days[day]
             print(f"    {day}   {count:>3} markets   {dollars:+.4f}")
 
         balance = await client.client.get(

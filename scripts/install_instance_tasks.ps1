@@ -29,7 +29,7 @@
 # instance that trades with approval for no gain.
 
 param(
-    [string[]]$Instances = @('eth', 'gold', 'silver', 'sol'),
+    [string[]]$Instances = @('eth', 'gold', 'silver', 'sol', 'xrp'),
     [switch]$WhatIfOnly
 )
 

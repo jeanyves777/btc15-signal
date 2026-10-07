@@ -51,16 +51,30 @@ is usually because one is already running — check `runtime/service.pid` first.
 Start-Process -FilePath ".venv\Scripts\python.exe" -ArgumentList 'scripts\watchdog.py' -WindowStyle Hidden
 ```
 
-It restarts the service if it dies, messages Telegram when it does, and gives up
-after 6 restarts in an hour rather than hiding a real fault behind a loop. It is
-safe to loop because no trading limit lives in memory — see below.
+It restarts the service if it dies and messages Telegram when it does. After 6
+restarts in an hour it says so once ("SERVICE KEEPS FAILING") and slows to one
+attempt every 15 minutes - it never stops for good, because a stopped watchdog
+also stopped every shadow recorder (2026-09-30, FINDINGS 113). It is safe to
+loop because no trading limit lives in memory — see below. A bug inside a poll no
+longer ends the service at all: it is logged, sent to Telegram as SOFTWARE ERROR,
+and the poll carries on recording.
+
+**The watchdogs keep their code in memory.** Restarting the services does not
+load a changed `scripts/watchdog.py`; stop each watchdog pair (venv stub + base
+pythonw running `scripts\watchdog.py`) and relaunch it through its
+`Startup\BTC15Signal-<X>.cmd`. The service keeps running meanwhile: the new
+watchdog finds its lock held and just supervises.
 
 ### Deploying a change, and getting back
 
 **The restart budget is spent silently.** The watchdog counts restarts in
 memory, not in a file, so the count cannot be read back — assume every restart
-in the last hour counts against 6. Batch the work and deploy ONCE; a live
-trading service is not somewhere to iterate.
+in the last hour counts against 6 (a run of 10 minutes, or a probe that finds
+the lock held, starts the count over). Past 6 it does not stop: it says "SERVICE
+KEEPS FAILING" and tries once every 15 minutes - so after fixing the fault,
+start the instance by hand (`scripts\run_X.ps1`, bare) or relaunch its watchdog
+rather than wait. Batch the work and deploy ONCE; a live trading service is not
+somewhere to iterate.
 
 Before touching anything:
 
@@ -95,7 +109,7 @@ holding the lock, and the relaunch then returns immediately against a lock held
 by nothing, which reads as success while old code keeps trading.
 
 ```powershell
-taskkill /PID <parent-pid> /T /F    # the watchdog relaunches within ~5s
+taskkill /PID <parent-pid> /T /F    # the watchdog relaunches within ~5s (not during a backoff)
 ```
 
 Then verify by **timestamp and revision**, never by grepping the log for a

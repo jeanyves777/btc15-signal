@@ -96,6 +96,28 @@ class MirrorTarget:
     add_contracts: int = 0
     # Hard ceiling, applied last to every order on this account. 0 = none.
     max_contracts: int = 0
+    # FUND THE MARKET'S SHARD BEFORE EACH ORDER, as the Kalshi app does for a
+    # manual trade. ON for mirrors: on 2026-09-26 the operator's wife's mirror
+    # spent shard 2 to $0.09 and was refused every entry for ~15 hours with $30
+    # in shard 0 - money the app would have used without a word. See
+    # `KalshiExecutionClient.ensure_funds`.
+    auto_fund: bool = True
+    fund_source_shard: int = 0
+    # THE RECOVERY SIZE, in dollars, for an entry the primary's loss step
+    # upsized. Operator, 2026-09-27: "make sure the recovery size is set to $2
+    # as well" - the same budget the primary's `loss_step_budget` uses. 0 means
+    # a recovery is sized like any other entry on this account.
+    recovery_budget: float = 0.0
+    # THE ALL-SIGNAL $1 STRATEGY on this account: dollars per signal
+    # (operator, 2026-09-28). Keyed on the order's strategy, never on shared
+    # state, so a main-strategy entry in flight at the same moment cannot be
+    # sized by it.
+    allsignal_budget: float = 1.0
+
+    def recovery_count(self, price: float) -> int:
+        """Contracts for a recovery entry: this account's own dollar budget at
+        the real price, then the account's hard ceiling."""
+        return self._cap(contracts_for_budget(self.recovery_budget, price))
 
     def _cap(self, n: int) -> int:
         n = max(1, int(n))
@@ -122,6 +144,15 @@ class MirrorTarget:
         return self._cap(primary_count)
 
 
+def _with_funding(note: str, client) -> str:
+    """Append what funding did to a log note, so a transfer is never silent."""
+    funding = getattr(client, "last_funding_note", "") or ""
+    client.last_funding_note = ""
+    if not funding:
+        return note
+    return f"{note} | funding: {funding}" if note else f"funding: {funding}"
+
+
 class _Mirror:
     """A destination account plus the single worker that keeps its order."""
 
@@ -130,6 +161,8 @@ class _Mirror:
         self.client = KalshiExecutionClient(
             base_url, target.api_key_id, target.private_key_path
         )
+        self.client.auto_fund = target.auto_fund
+        self.client.fund_source_shard = target.fund_source_shard
         self._log = log
         self.queue: asyncio.Queue = asyncio.Queue()
         self.worker: asyncio.Task | None = None
@@ -156,30 +189,65 @@ class _Mirror:
                     return
                 kind, args = job
                 try:
-                    await asyncio.wait_for(self._apply(kind, args), timeout=15.0)
+                    # A combo waits for a maker's quote, so it gets that wait
+                    # plus room to confirm and read the fill.
+                    # 25 s: an entry may top up and resend once (2026-09-30).
+                    limit = (25.0 if kind != "combo"
+                             else float(args.get("wait_s", 25.0)) + 25.0)
+                    await asyncio.wait_for(self._apply(kind, args), timeout=limit)
                 except asyncio.CancelledError:
                     raise
                 except Exception as exc:  # noqa: BLE001 - never raise at a mirror
-                    self._log(self.target.name, kind, "error", args, str(exc))
+                    # str(exc) now carries Kalshi's reason (see
+                    # KalshiExecutionClient._post), and the funding note says
+                    # whether a top-up was tried - together they tell a
+                    # balance problem from a malformed order at a glance.
+                    self._log(self.target.name, kind, "error", args,
+                              _with_funding(str(exc), self.client))
+                    self._answer(args, "error")
             finally:
                 self.queue.task_done()
+
+    def _answer(self, args: dict, status: str, filled: float = 0.0, count: int = 0,
+                stake=None) -> None:
+        """Tell a dispatcher waiting on this copy - the copy path once the primary
+        is done (2026-10-05, FINDINGS 163) - what it did. Never raises."""
+        try:
+            fut = (args.get("answers") or {}).get(self.target.name)
+            if fut is not None and not fut.done():
+                fut.set_result({"status": status, "filled": float(filled or 0),
+                                "count": int(count or 0), "stake": stake})
+        except Exception:  # noqa: BLE001
+            pass
 
     async def _apply(self, kind: str, args: dict) -> None:
         if kind == "entry":
             proposal = args["proposal"]
-            count = self.target.entry_count(proposal.entry_limit)
+            stake = None
+            if getattr(proposal, "strategy", "") == "allsignal":
+                # THIS COPY'S STAKE, decided at the dispatch (after a loss, past
+                # a target - main.mirror_stake_now, 2026-10-05); else the day's.
+                stake = float(args.get("stake") or self.target.allsignal_budget)
+                count = self.target._cap(contracts_for_budget(stake, proposal.entry_limit))
+            elif args.get("recovery") and self.target.recovery_budget > 0:
+                count = self.target.recovery_count(proposal.entry_limit)
+            else:
+                count = self.target.entry_count(proposal.entry_limit)
             result = await self.client.execute_with_take_profit(
                 replace(proposal, count=count), args["slippage"], args["ceiling"]
             )
             if result.status in FILLED_STATUSES and result.filled_count > 0:
                 key = (proposal.ticker, proposal.side)
                 self.held[key] = self.held.get(key, 0) + int(result.filled_count)
+            self._answer(args, result.status,
+                         result.filled_count if result.status in FILLED_STATUSES else 0,
+                         count, stake)
             self._log(
                 self.target.name, kind, result.status,
                 {"ticker": proposal.ticker, "side": proposal.side,
                  "count": count, "limit": proposal.entry_limit,
                  "primary_count": args["filled_count"]},
-                result.note,
+                _with_funding(result.note, self.client),
             )
         elif kind == "exit":
             key = (args["ticker"], args["side"])
@@ -190,6 +258,16 @@ class _Mirror:
                 # Send the largest size this account could be holding and let
                 # reduce-only clamp it down to the truth.
                 count = self.target.max_contracts or self.target.base_contracts
+                inventory = getattr(self.client, "held_contracts", None)
+                if inventory is not None:
+                    # Budgets can now buy more than the old two-contract cap.
+                    # Recover THIS account's size, rather than guessing from
+                    # today's budget after a restart or a size change.
+                    count = await inventory(args["ticker"], args["side"])
+                    if count <= 0:
+                        self._log(self.target.name, kind, "not-held",
+                                  {"ticker": args["ticker"]}, "No position to close")
+                        return
             result = await self.client.close_position(
                 args["ticker"], args["side"], max(1, int(count)),
                 args["limit_price"], args["floor"],
@@ -227,7 +305,31 @@ class _Mirror:
                 self.target.name, kind, "placed" if oid else "no-id",
                 {"ticker": args["ticker"], "side": args["side"], "count": count,
                  "price": args["price"], "client_order_id": coid,
-                 "primary_count": args["count"]}, oid or "",
+                 "primary_count": args["count"]},
+                _with_funding(oid or "", self.client),
+            )
+        elif kind == "combo":
+            # THE RECOVERY COMBO, copied at THIS account's own base size - the
+            # entry count its budget buys at the most the combo may cost - with
+            # the same price check: nothing above the cheaper leg. Her account asks
+            # for its own quote; a maker who answers the primary need not
+            # answer her, and then she simply has no trade this window.
+            from . import combo_recovery
+
+            count = self.target.entry_count(args["product"])
+            result = await combo_recovery.buy(
+                self.client, args["legs"], args["market"], count,
+                max_ratio=args.get("max_ratio", 1.0),
+                wait_s=float(args.get("wait_s", 25.0)),
+                # Her account funds the combo shard like every other order.
+                fund=bool(self.client.auto_fund),
+            )
+            self._log(
+                self.target.name, kind, result.outcome,
+                {"market": args["market"], "count": count,
+                 "legs": [f"{l.asset} {l.side} @{l.ask:.2f}" for l in args["legs"]],
+                 "limit": args["product"], "price": result.price},
+                _with_funding(result.reason, self.client),
             )
         elif kind == "cancel":
             oid = self.order_ids.pop(args["primary_order_id"], None)
@@ -270,8 +372,13 @@ class MirroringExecutionClient:
         base_url: str,
         log_path: str = "runtime/mirror.jsonl",
         drain_timeout: float = 10.0,
+        gate=None,
     ) -> None:
         self._primary = primary
+        # THE PER-ACCOUNT, PER-INSTRUMENT SWITCH: gate(name) -> may this
+        # account take NEW positions on this instrument (main.mirror_on). None
+        # = always, as before it existed.
+        self._gate = gate
         self._log_path = Path(log_path)
         self._drain_timeout = drain_timeout
         self._mirrors: list[_Mirror] = []
@@ -282,6 +389,17 @@ class MirroringExecutionClient:
                 # A bad key path or an unreadable PEM disables that mirror and
                 # nothing else. The primary must still trade.
                 self._write_log(target.name, "init", "disabled", {}, str(exc))
+
+    # Set by the service (operator, 2026-10-05; FINDINGS 163): each mirror's $
+    # stake per copy - `stake_for(name, proposal)` -> dollars or None (main.
+    # mirror_stake_now) - and whether, once the primary is DONE for the day at its
+    # cap, its $ signals still go to the mirrors still trading. None/False: as before.
+    stake_for = None
+    copy_after_primary_done = False
+    # {name: label} for what is said ("Affoue"), set by the service; names otherwise.
+    labels = None
+    # How long the copy path waits for the mirrors' answers (a worker gives up at 25 s).
+    COPY_WAIT_S = 30.0
 
     def __getattr__(self, name):
         return getattr(self._primary, name)
@@ -295,10 +413,15 @@ class MirroringExecutionClient:
         for m in self._mirrors:
             t = m.target
             budget = f"${t.base_budget:.2f}/contract" if t.base_budget > 0 else "no budget"
+            # Since 2026-09-27 the recovery is a combo at this account's own
+            # base size; nothing on it is upsized.
+            recovery = "combo at base size"
             parts.append(
                 f"{t.name}: base {t.base_contracts} ({budget}), "
                 f"upsize {t.add_contracts or 'as primary'}, "
-                f"cap {t.max_contracts or 'none'}"
+                f"recovery {recovery}, "
+                f"cap {t.max_contracts or 'none'}, "
+                f"auto-fund {'on' if t.auto_fund else 'off'}"
             )
         return "; ".join(parts) if parts else "no mirrors"
 
@@ -314,15 +437,86 @@ class MirroringExecutionClient:
             pass  # never let logging break a trade
         print(f"mirror[{mirror}] {kind} {status} {detail} {note}", flush=True)
 
-    def _dispatch(self, kind: str, args: dict) -> None:
+    # What an account can be switched off from: NEW positions. An exit still
+    # goes to an account that holds something this process bought for it, so
+    # a position taken before the switch went off is still cashed out/closed.
+    ENTRY_KINDS = ("entry", "add", "combo")
+
+    def _copies(self, name: str) -> bool:
+        """This account's switch for this instrument. Fails CLOSED: a switch
+        that cannot be read copies nothing new."""
+        if self._gate is None:
+            return True
+        try:
+            return bool(self._gate(name))
+        except Exception as exc:  # noqa: BLE001 - never break the primary
+            self._write_log(name, "gate", "error", {}, f"{exc!r} - not copied")
+            return False
+
+    def _sized(self, name: str, kind: str, args: dict) -> dict:
+        """THIS ACCOUNT'S STAKE for a $ entry copy, decided now (`stake_for`:
+        after a loss, past its target - 2026-10-05). The day's stake when there
+        is no rule or it cannot tell. Never raises."""
+        proposal = args.get("proposal")
+        if (kind != "entry" or self.stake_for is None
+                or getattr(proposal, "strategy", "") != "allsignal"):
+            return args
+        try:
+            stake = self.stake_for(name, proposal)
+        except Exception as exc:  # noqa: BLE001 - never break the primary
+            self._write_log(name, "stake", "error", {}, f"{exc!r} - the day's stake")
+            return args
+        return {**args, "stake": float(stake)} if stake and stake > 0 else args
+
+    def _primary_done(self) -> bool:
+        """Is the primary DONE for the day at its daily cap? Never raises: False."""
+        guard = getattr(self._primary, "daily_profit_guard", None)
+        try:
+            return guard is not None and bool(guard.done_for_day())
+        except Exception:  # noqa: BLE001
+            return False
+
+    def _still_trading(self) -> list[str]:
+        """The mirrors whose switch is on and whose OWN day takes a $ entry now
+        (below its target, or past it at a lower stake). Fails closed."""
+        out = []
         for m in self._mirrors:
+            name = m.target.name
+            guard = getattr(m.client, "daily_profit_guard", None)
+            try:
+                if guard is not None and self._copies(name) \
+                        and guard.taking_entries("allsignal"):
+                    out.append(name)
+            except Exception:  # noqa: BLE001
+                continue
+        return out
+
+    def _dispatch(self, kind: str, args: dict, only=None) -> None:
+        for m in self._mirrors:
+            name = m.target.name
+            if only is not None and name not in only:
+                continue
+            if kind in self.ENTRY_KINDS and not self._copies(name):
+                ticker = (getattr(args.get("proposal"), "ticker", None)
+                          or args.get("ticker") or args.get("market"))
+                self._write_log(name, kind, "switched-off", {"ticker": ticker},
+                                f"mirror_{name}_enabled is off for this instrument")
+                continue
+            if (kind == "exit" and (args["ticker"], args["side"]) not in m.held
+                    and not self._copies(name)):
+                # Switched off and holding nothing we bought: do not send a
+                # blind reduce-only sale into an account we no longer trade.
+                continue
             m.start()
-            m.queue.put_nowait((kind, args))
+            m.queue.put_nowait((kind, self._sized(name, kind, args)))
 
     # -- intercepted order paths -----------------------------------------
     async def execute_with_take_profit(
         self, proposal, slippage: float = 0.0, ceiling: float | None = None,
     ) -> ExecutionResult:
+        # Read and CLEAR the recovery mark before anything can fail, so it can
+        # never leak onto the next, unrelated entry.
+        recovery = bool(self.__dict__.pop("entry_is_recovery", False))
         result = await self._primary.execute_with_take_profit(
             proposal, slippage, ceiling
         )
@@ -334,7 +528,44 @@ class MirroringExecutionClient:
                 "filled_count": result.filled_count,
                 "slippage": slippage,
                 "ceiling": ceiling,
+                "recovery": recovery,
             })
+        elif (result.status == "paused" and self.copy_after_primary_done
+              and getattr(proposal, "strategy", "") == "allsignal"
+              and self._primary_done()):
+            # THE PRIMARY IS DONE FOR THE DAY at its cap; the mirrors are not
+            # (operator, 2026-10-05: stop the primary at 8%, Affoue "becomes the
+            # account that keeps trading after target hit"; FINDINGS 163). The $
+            # signal goes to each mirror still trading by ITS OWN day, and its own
+            # order check still decides. Only the cap: a primary blocked for
+            # anything else (figures unreadable, BTC only) copies nothing.
+            names = self._still_trading()
+            if names:
+                # EACH COPY ANSWERS BACK (review 2026-10-05): the window is TAKEN
+                # only if a mirror bought it; a miss is booked 'unfilled' under
+                # COPY_MISSED_ID, so the retry and the chase re-send it through this
+                # same path - as for the primary's own miss.
+                loop = asyncio.get_running_loop()
+                answers = {n: loop.create_future() for n in names}
+                self._dispatch("entry", {
+                    "proposal": proposal, "filled_count": 0, "slippage": slippage,
+                    "ceiling": ceiling, "recovery": False, "answers": answers},
+                    only=names)
+                await asyncio.wait(list(answers.values()), timeout=self.COPY_WAIT_S)
+                said, bought = [], 0.0
+                for n in names:
+                    fut = answers[n]
+                    a = (fut.result() if fut.done() and not fut.cancelled()
+                         else {"status": "no answer", "filled": 0.0, "count": 0, "stake": None})
+                    label = (self.labels or {}).get(n, n)
+                    stake = f" (${a['stake']:g})" if a.get("stake") else ""
+                    bought += a["filled"]
+                    said.append(f"{label} {a['filled']:g}/{a['count']}{stake}" if a["filled"] > 0
+                                else f"{label} {a['status']}{stake}")
+                note = COPY_NOTE + "; ".join(said)
+                if bought > 0:
+                    return ExecutionResult("copied", 0, "", None, note)
+                return ExecutionResult("unfilled", 0, COPY_MISSED_ID, None, note)
         return result
 
     async def close_position(
@@ -369,6 +600,13 @@ class MirroringExecutionClient:
         })
         return order
 
+    def dispatch_combo(self, legs, market: str, product: float,
+                       max_ratio: float = 1.0, wait_s: float = 25.0) -> None:
+        """Copy a CONFIRMED recovery combo to every mirror (never a maybe)."""
+        self._dispatch("combo", {"legs": legs, "market": market,
+                                 "product": product, "max_ratio": max_ratio,
+                                 "wait_s": wait_s})
+
     async def cancel_order(self, order_id: str) -> tuple[bool, str]:
         ok, note = await self._primary.cancel_order(order_id)
         self._dispatch("cancel", {"primary_order_id": order_id})
@@ -384,6 +622,13 @@ class MirroringExecutionClient:
 
 
 BTC_INSTANCE_ALIASES = ("btc", "primary", "default")
+
+
+# THE COPY PATH ONCE THE PRIMARY IS DONE (2026-10-05, FINDINGS 163): the note that
+# opens a copied window's record, and the order id a missed copy is booked under so
+# the retry/chase finds it (main.allsignal_retry_poll needs an order id).
+COPY_NOTE = "primary done for the day - copied: "
+COPY_MISSED_ID = "mirror-copy"
 
 
 def current_instance() -> str:
@@ -428,14 +673,17 @@ def mirror_allowed(settings) -> tuple[bool, str]:
     return True, ""
 
 
+MIRROR_SLOTS = (1, 2, 3)     # m1 Wife, m2 Uncle George, m3 (added 2026-09-30)
+
+
 def targets_from_settings(settings) -> list[MirrorTarget]:
-    """Read up to two mirror accounts out of the settings.
+    """Read up to three mirror accounts out of the settings.
 
     A target is used only when BOTH its key id and its key path are present, so
     a half-filled block is ignored rather than raising at startup.
     """
     out: list[MirrorTarget] = []
-    for idx in (1, 2):
+    for idx in MIRROR_SLOTS:
         key_id = (getattr(settings, f"mirror_{idx}_api_key_id", "") or "").strip()
         key_path = (getattr(settings, f"mirror_{idx}_private_key_path", "") or "").strip()
         if not key_id or not key_path:
@@ -448,5 +696,12 @@ def targets_from_settings(settings) -> list[MirrorTarget]:
             base_contracts=int(getattr(settings, f"mirror_{idx}_base_contracts", 1)),
             add_contracts=int(getattr(settings, f"mirror_{idx}_add_contracts", 0)),
             max_contracts=int(getattr(settings, f"mirror_{idx}_max_contracts", 0)),
+            auto_fund=bool(getattr(settings, f"mirror_{idx}_auto_fund", True)),
+            fund_source_shard=int(
+                getattr(settings, f"mirror_{idx}_fund_source_shard", 0)),
+            recovery_budget=float(
+                getattr(settings, f"mirror_{idx}_recovery_budget", 0.0)),
+            allsignal_budget=float(
+                getattr(settings, f"mirror_{idx}_allsignal_budget", 1.0)),
         ))
     return out

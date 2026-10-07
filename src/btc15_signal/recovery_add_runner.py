@@ -110,17 +110,33 @@ class RecoveryAddRunner:
         position = self._store.open_position_detail(opened)
         if position is None:
             return
-        side, paid, _count, ticker, _proposal = position
+        side, paid, count, ticker, proposal = position
         await self._consider(
             trader, contract, ticker, side, paid, features, crossed,
             remaining_s, now_ms, opened, crossing_reason, crossing_short_by_ms,
+            base_count=count, add_count=self.add_count(proposal, held=count),
         )
+
+    def add_count(self, proposal_id: str, held: float | None = None) -> int:
+        """Contracts the add rests: `recovery_add_max_contracts` PER BASE
+        CONTRACT (operator, 2026-09-27 - the add follows the base, like the
+        loss step). +1 at base 1, as it always was; +2 at base 2. The base is
+        the one THIS ENTRY was sized from, read off its row - and never more
+        than is actually held, so a base-2 entry that filled 1 gets +1."""
+        per_base = max(1, int(self._settings.recovery_add_max_contracts))
+        base = self._store.entry_base(
+            proposal_id, tiered=self._settings.capital_sizing_enabled
+        ) or 1
+        if held is not None and held > 0:
+            base = min(base, held)
+        return per_base * max(1, int(base))
 
     # ------------------------------------------------------------- decide
 
     async def _consider(
         self, trader, contract, ticker, side, paid, features, crossed,
         remaining_s, now_ms, opened, crossing_reason="", crossing_short_by_ms=0,
+        base_count=1, add_count=1,
     ) -> None:
         state = self._store.recovery_state(self._settings.recovery_steps)
         # FUNDS ARE CHECKED FRESH, EVERY ORDER, against the testing account.
@@ -198,6 +214,8 @@ class RecoveryAddRunner:
                 open_exposure=spent if exposure is None else exposure,
                 limits=self._limits,
                 fee=kalshi_fee_charged,
+                base_count=base_count,
+                add_count=add_count,
             )
 
         # UNKNOWN IS STILL NOT A PASS. When the crossing cannot be established
@@ -307,7 +325,7 @@ class RecoveryAddRunner:
             "side": side,
             "base_fill": paid,
             "limit_price": decision.price,
-            "count": self._settings.recovery_add_max_contracts,
+            "count": add_count,
             "deficit_at_placement": state.deficit,
             "required_at_placement": state.required_per_trade(),
             "conditions_at_placement": conditions,
@@ -336,11 +354,9 @@ class RecoveryAddRunner:
         # RESERVE BEFORE SENDING, including the fee. Kalshi reserves worst-case
         # cost plus fees, so a local claim that omits the fee is smaller than
         # the money actually committed.
-        cost = decision.price * self._settings.recovery_add_max_contracts
+        cost = decision.price * add_count
         claim = round(
-            cost + kalshi_fee_charged(
-                decision.price, self._settings.recovery_add_max_contracts
-            ),
+            cost + kalshi_fee_charged(decision.price, add_count),
             6,
         )
         if self.live and trader is not None:
@@ -376,7 +392,7 @@ class RecoveryAddRunner:
             })
             print(
                 f"recovery add SHADOW [{ticker}]: would rest "
-                f"{self._settings.recovery_add_max_contracts} at "
+                f"{add_count} at "
                 f"{decision.price:.2f} - {decision.reason}",
                 flush=True,
             )
@@ -385,7 +401,7 @@ class RecoveryAddRunner:
         try:
             order = await trader.place_resting_buy(
                 ticker=ticker, side=side, price=decision.price,
-                count=self._settings.recovery_add_max_contracts,
+                count=add_count,
                 expiration_ts=expiration, client_order_id=coid,
             )
         except Exception as exc:  # noqa: BLE001

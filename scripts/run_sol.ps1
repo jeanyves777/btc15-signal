@@ -60,7 +60,12 @@ $env:HOURLY_ENABLED          = "false"   # the ladder is a BTC product
 #     python scripts/auto_switch.py --db sol15.db --off
 # which writes the same row `main.auto_is_on` reads on every decision, so it
 # takes effect within one poll and survives a restart.
-$env:AUTO_TRADE_ENABLED    = "true"
+# BACK TO SHADOW, by the operator's decision of 2026-09-28 ("only gold and
+# BTC are allowed to trade live"; FINDINGS 108). Live record at the time:
+# -$4.78 over 40 automatic trades (fee-free), 75% won, the worst losing streak
+# of any instrument (6). The stored flag was set OFF with scripts/auto_switch.py
+# and it is what decides; this default no longer permits either.
+# $env:AUTO_TRADE_ENABLED    = "true"
 $env:AUTO_DAILY_LOSS_LIMIT = "5"
 
 # EXACTLY ONE INSTANCE LISTENS FOR COMMANDS. Telegram getUpdates is

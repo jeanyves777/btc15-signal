@@ -454,7 +454,7 @@ def recovery_line(state) -> str:
     Two facts, because either alone misleads. A deficit with no word on sizing
     reads as "still broken"; a sizing note with no deficit reads as "fixed".
     """
-    if state is None or not getattr(state, "owes", False):
+    if state is None or not getattr(state, "owes", False) or not _RECOVERY:
         return ""
     if getattr(state, "base_only", False):
         # THE SAME WORDS THE TRANSITION USED. "Recovery: $0.16 outstanding"
@@ -464,8 +464,15 @@ def recovery_line(state) -> str:
         # standing line the continuation of the announcement it follows.
         return (f"{RECOVERY} Recovery size ended · "
                 f"${state.deficit:,.2f} still outstanding · base size only")
+    # Since 2026-09-27 nothing upsizes: a recovery is a combo at base size -
+    # for an instrument that HAS a combo partner. BTC has none since 09-28 and
+    # gold never had one, so for them it says what runs (FINDINGS 108). Told
+    # once at startup (`set_recovery`), so this never reads the instrument.
+    if not _RECOVERY_COMBO:
+        return (f"{RECOVERY} Recovery: ${state.deficit:,.2f} outstanding · "
+                f"every entry at base size, no combo")
     return (f"{RECOVERY} Recovery: ${state.deficit:,.2f} outstanding · "
-            f"extra sizing allowed")
+            f"recovery by combo at base size")
 
 
 # ------------------------------------------------------------ the assembler
@@ -483,6 +490,26 @@ def set_instrument(series: str) -> None:
     """Called once at service startup with `settings.kalshi_series`."""
     global _INSTRUMENT
     _INSTRUMENT = asset(series)
+
+
+# WHETHER THERE IS A RECOVERY AT ALL. Off since 2026-09-28 (operator: "we need
+# no recovery at all"), and then no message carries a recovery line - a
+# standing "Recovery: $36.63 outstanding" for a subsystem that does nothing is
+# the noise that hides a real line. Set once at startup.
+_RECOVERY = True
+# Whether this process's recovery can be a combo - it has a partner and combos
+# are on. Without one the standing line says every entry is base size.
+_RECOVERY_COMBO = True
+
+
+def set_recovery(enabled: bool, combo: bool = True) -> None:
+    global _RECOVERY, _RECOVERY_COMBO
+    _RECOVERY = bool(enabled)
+    _RECOVERY_COMBO = bool(combo)
+
+
+def recovery_on() -> bool:
+    return _RECOVERY
 
 
 # WHETHER THE LEARNED LAYER CAN ACTUALLY ACT. The operator's standing
@@ -538,11 +565,26 @@ def asset(ticker: str) -> str:
     # corpus guard silently switched off - which for gold would have allowed a
     # fit on BTC rows, the exact failure that guard exists to prevent. Any new
     # instrument must be added here before it is run.
-    for name in ("BTC", "ETH", "SOL", "XRP", "DOGE",
+    for name in ("BTC", "ETH", "SOL", "XRP", "DOGE", "NEAR", "BNB",
                  "GOLD", "SILVER", "PLATINUM", "PALLADIUM"):
         if body.startswith(name):
             return name
     return ""
+
+
+def labelled(header: str, ticker: str = "") -> str:
+    """`header` with its instrument in front - `<b>SOL</b> · ...` - or unchanged
+    when none is known. `ticker` may be a market ticker or a series.
+
+    THE ONE PLACE THE LABEL IS WRITTEN. `compose` uses it, and so does every
+    message that is NOT a trading message and so is not assembled by
+    `compose` - the learning update and the market-gap notices. Those were
+    sent bare: seven instances write to one chat, and "LEARNING UPDATE" or "NO
+    MARKET AT THE EXCHANGE" arrived with nothing to say whose it was (gold and
+    silver both send the latter every weekend).
+    """
+    label = asset(ticker) or _INSTRUMENT
+    return f"<b>{label}</b> · {header}" if label else header
 
 
 def compose(*, header: str, ticker: str, essentials: list[str],
@@ -557,9 +599,7 @@ def compose(*, header: str, ticker: str, essentials: list[str],
     worse than none: the reader would learn to assume the unlabelled ones
     were the other instrument.
     """
-    label = asset(ticker) or _INSTRUMENT
-    if label:
-        header = f"<b>{label}</b> · {header}"
+    header = labelled(header, ticker)
     lines = [header]
     if ticker:
         lines.append(f"<code>{escape(ticker)}</code>")

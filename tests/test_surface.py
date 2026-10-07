@@ -256,7 +256,7 @@ def test_recovery_is_one_line_with_deficit_and_permission():
 
     line = surface.recovery_line(State())
     assert "$1.24 outstanding" in line
-    assert "extra sizing allowed" in line
+    assert "recovery by combo at base size" in line   # nothing upsizes since 09-27
     State.base_only = True
     assert "base size only" in surface.recovery_line(State())
     State.owes = False

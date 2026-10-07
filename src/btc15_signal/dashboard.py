@@ -18,7 +18,7 @@ from collections import defaultdict
 from datetime import UTC, datetime
 from pathlib import Path
 
-from .store import ACCOUNTED_SQL, position_pnl
+from .store import ACCOUNTED_SQL, TRADE_WON_JOIN, TRADE_WON_SQL, position_pnl
 from .validation import contracts_for_budget, kalshi_fee_charged, wilson_lower
 
 # Diverging pair: blue for gains, red for losses, validated for colour-vision
@@ -45,9 +45,10 @@ def load(db_path: str, stake: float) -> dict:
     traded = {}
     try:
         for row in db.execute(
-            "SELECT window_open, status, count, COALESCE(fill_price, entry_limit), "
-            "fee_paid, exit_price, exit_count FROM trade_proposals "
-            f"WHERE strategy='primary' AND status IN {ACCOUNTED_SQL}"
+            "SELECT t.window_open, t.status, t.count, "
+            "COALESCE(t.fill_price, t.entry_limit), t.fee_paid, t.exit_price, "
+            f"t.exit_count, {TRADE_WON_SQL} FROM trade_proposals t {TRADE_WON_JOIN}"
+            f"WHERE t.strategy='primary' AND t.status IN {ACCOUNTED_SQL}"
         ):
             traded[row[0]] = row[1:]
     except sqlite3.OperationalError:
@@ -76,7 +77,7 @@ def load(db_path: str, stake: float) -> dict:
         real_paid = real_size = None
         order = traded.get(open_ms)
         if order:
-            _status, count, paid, fee, exit_price, exit_count = order
+            _status, count, paid, fee, exit_price, exit_count, held_won = order
             real_paid, real_size = paid, count
             pnl_real = position_pnl(
                 paid=paid,
@@ -84,7 +85,8 @@ def load(db_path: str, stake: float) -> dict:
                 entry_fee=fee,
                 exit_price=exit_price,
                 exit_count=exit_count,
-                won=bool(won),
+                # Graded on the side the TRADE held (store.TRADE_WON_SQL).
+                won=bool(won if held_won is None else held_won),
             )
             if pnl_real is not None:
                 real = round(pnl_real, 4)

@@ -46,6 +46,7 @@ CONFIGS = {
     "SILVER": "strategy_kalshi_silver.json",
     "SOL": "strategy_kalshi_sol.json",
     "XRP": "strategy_kalshi_xrp.json",
+    "NEAR": "strategy_kalshi_near.json",
 }
 
 
@@ -68,6 +69,8 @@ def test_every_instrument_declares_its_asset():
     assert surface.asset("KXSOL15M") == "SOL"
     assert surface.asset("KXGOLD15M") == "GOLD"
     assert surface.asset("KXXRP15M") == "XRP"
+    assert surface.asset("KXNEAR15M") == "NEAR"
+    assert surface.asset("KXBNB15M") == "BNB"
 
 
 def test_no_instrument_inherits_btcs_price_band():
@@ -77,10 +80,14 @@ def test_no_instrument_inherits_btcs_price_band():
     being traded on another instrument's evidence, which is FINDINGS 43."""
     btc = KalshiBRTIRule()
     assert (btc.min_ask, btc.max_ask) == (0.70, 0.93), "BTC band moved"
-    for name in CONFIGS:
+    for name, path in CONFIGS.items():
         r = rule_for(name)
-        assert (r.min_ask, r.max_ask) != (btc.min_ask, btc.max_ask), name
         assert 0.0 < r.min_ask < r.max_ask <= 1.0, name
+        if (r.min_ask, r.max_ask) == (btc.min_ask, btc.max_ask):
+            # Allowed only as a recorded OPERATOR decision (gold, 2026-09-28,
+            # FINDINGS 110) - never by accident.
+            raw = json.loads((ROOT / path).read_text(encoding="utf-8"))
+            assert "operator's decision of 2026-09-28" in raw.get("_band_comment", ""), name
 
 
 def test_each_config_names_the_evidence_behind_it():
@@ -220,7 +227,8 @@ def test_eth_config_did_not_acquire_any_new_key():
 
 def test_each_launcher_isolates_every_shared_path():
     for name, script in (("silver", "run_silver.ps1"), ("sol", "run_sol.ps1"),
-                         ("xrp", "run_xrp.ps1")):
+                         ("xrp", "run_xrp.ps1"), ("near", "run_near.ps1"),
+                         ("bnb", "run_bnb.ps1")):
         text = (ROOT / "scripts" / script).read_text(encoding="utf-8")
         for needed in (f'BTC15_INSTANCE       = "{name}"',
                        f"runtime-{name}/intelligence_policy.json",
@@ -239,7 +247,7 @@ def test_no_launcher_points_at_another_instruments_corpus():
     """`_corpus_mismatch` catches this at fit time, but a launcher that names
     the wrong corpus is a defect whether or not something else stops it."""
     import re
-    for name in ("gold", "silver", "sol", "eth", "xrp"):
+    for name in ("gold", "silver", "sol", "eth", "xrp", "near", "bnb"):
         script = ROOT / "scripts" / f"run_{name}.ps1"
         if not script.exists():
             continue
@@ -395,3 +403,38 @@ def test_no_config_advertises_a_window_the_service_cannot_act_on():
             f"{name} claims to run until {rule.entry_to_seconds}s but the "
             f"service stops evaluating at {s.entry_to_seconds}s")
         assert rule.entry_to_seconds < rule.entry_from_seconds, name
+
+
+def test_every_deployed_series_is_recognised_by_the_corpus_guard():
+    """THE TRAP THIS CLOSES, which has now caught two instruments.
+
+    `learning_runner._corpus_mismatch` compares `surface.asset(kalshi_series)`
+    against the assets in the corpus rows, and treats an UNRECOGNISED series as
+    "no opinion" so a fresh or synthetic corpus is not refused. So an instrument
+    missing from `surface.asset` has its corpus guard SILENTLY SWITCHED OFF -
+    for gold that would have permitted a fit on BTC rows, the exact failure the
+    guard exists to prevent.
+
+    Gold shipped that way once. NEAR was about to on 2026-09-26:
+    `surface.asset("KXNEAR15M")` returned "" while the launcher was being
+    written. Nothing failed, because nothing asked.
+
+    Derived from the LAUNCHERS rather than a hardcoded list, so adding an
+    instrument cannot pass this test without teaching the guard about it."""
+    import re
+    from btc15_signal import surface
+
+    launchers = sorted((ROOT / "scripts").glob("run_*.ps1"))
+    assert launchers, "no instance launchers found"
+    seen = 0
+    for script in launchers:
+        text = script.read_text(encoding="utf-8")
+        m = re.search(r'KALSHI_SERIES\s*=\s*"([^"]+)"', text)
+        if not m:
+            continue            # not an instrument launcher
+        series = m.group(1)
+        seen += 1
+        assert surface.asset(series), (
+            f"{script.name} runs {series} but surface.asset does not recognise "
+            f"it - its corpus guard would be silently disabled")
+    assert seen >= 4, f"only {seen} instrument launchers parsed"

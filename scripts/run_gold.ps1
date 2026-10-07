@@ -49,6 +49,15 @@ $env:HOURLY_ENABLED          = "false"   # the ladder is a BTC product
 # the three sum to $27 rather than $30 - and raise it deliberately, not by
 # leaving this line out.
 $env:AUTO_DAILY_LOSS_LIMIT = "7"
+# LIVE TRADING, by the operator's decision of 2026-09-28 ("only gold and BTC
+# are allowed to trade live"; FINDINGS 108). The evidence beside it: over 4
+# days, gold's alerts made +5.9c a contract (131 signals, 77.9% won) and the
+# trades its rules would have placed +3.6c (49); BTC+GOLD beat BTC alone on
+# their shared days, and gold lost in only 10 of BTC's 33 losing alert windows.
+# Every interval spans zero - 4 days is not proof. The stored flag was set ON
+# with scripts/auto_switch.py and is what decides. The floor is scaled with
+# the base (x base/2): $14 a day at base 4.
+$env:AUTO_TRADE_ENABLED    = "true"
 
 # EXACTLY ONE INSTANCE LISTENS FOR COMMANDS. Telegram getUpdates is
 # destructive - it acknowledges with an offset - so three processes on one bot

@@ -41,11 +41,12 @@ import asyncio
 import json
 import os
 import sqlite3
+import threading
 import time
 import traceback
 from pathlib import Path
 
-from . import feature_contract, learning, learning_data
+from . import feature_contract, hypotheses, learning, learning_data
 from .intelligence_policy import NEUTRAL, VETO, Policy
 from .learning import Withdrawal
 from .learning_store import (
@@ -80,6 +81,77 @@ class TrainingOutcome:
         self.confidence_arms = 0
         self.promoted_arms = 0
         self.candidates: dict = {}
+        self.carried: list[str] = []
+        self.carry = None
+
+
+# THE LOCAL MODEL RUNS IN A QUIET SLOT. It is a CPU model on this machine (one
+# call measured 44-86s, up to ~110s at the 1200-token cap, all 8 cores) and
+# learning runs fire minutes after the settlement batch - inside the entry
+# period, when an order's latency matters. So a call starts 10s after a window
+# opens and must end (timeout 200s) before entries open with 11 minutes left.
+#
+# ONE INSTRUMENT PER WINDOW, BY THE CLOCK. Each instrument owns the windows
+# whose index is its position modulo 8 - a 2-hour cycle - so no two can share
+# a window whenever their learning runs happen to finish. Offsets counted from
+# each instance's own finish collided: BTC and XRP would have called at the
+# same second every 6 hours (review N3).
+# SEVEN NAMED + ONE SPARE: an instrument not listed here (BNB, added 2026-10-01
+# with learning off) takes slot 7. Listing an EIGHTH name filled the cycle and
+# left an unlisted instrument the unreachable slot 8 - `hypotheses_delay_s`
+# then searched forever (the full suite hung on 2026-10-01). Lengthen
+# SLOT_CYCLE before listing more.
+SLOT_ORDER = ("BTC", "ETH", "SOL", "XRP", "NEAR", "GOLD", "SILVER")
+SLOT_CYCLE = 8
+SLOT_OFFSET_S = 10
+
+
+def hypotheses_slot(asset: str) -> int:
+    """This instrument's window index modulo `SLOT_CYCLE` - always reachable."""
+    if asset in SLOT_ORDER:
+        return SLOT_ORDER.index(asset) % SLOT_CYCLE
+    return min(len(SLOT_ORDER), SLOT_CYCLE - 1)
+
+
+def hypotheses_delay_s(asset: str, now_ms: int) -> float:
+    """Seconds until this instrument's next quiet slot."""
+    now = now_ms / 1000.0
+    window = int(now // 900) + 1
+    while window % SLOT_CYCLE != hypotheses_slot(asset):
+        window += 1
+    return window * 900 + SLOT_OFFSET_S - now
+
+
+async def _in_daemon_thread(fn, *args, **kwargs):
+    """Await `fn` on a DAEMON thread.
+
+    `asyncio.to_thread` uses the default executor, and on Python 3.11 a
+    crashing service waits in `asyncio.run` for that executor with no timeout -
+    so a crash during a model call held the process, and service.lock, until
+    the call returned (FINDINGS 107). A daemon thread is abandoned at exit.
+    """
+    loop = asyncio.get_running_loop()
+    done = loop.create_future()
+
+    def settle(result, error):
+        if not done.done():
+            if error is not None:
+                done.set_exception(error)
+            else:
+                done.set_result(result)
+
+    def work():
+        try:
+            result, error = fn(*args, **kwargs), None
+        except BaseException as exc:  # noqa: BLE001 - handed to the awaiter
+            result, error = None, exc
+        try:
+            loop.call_soon_threadsafe(settle, result, error)
+        except RuntimeError:
+            pass  # the loop has gone; nobody is waiting
+
+    threading.Thread(target=work, name="local-model", daemon=True).start()
+    return await done
 
 
 class LearningRunner:
@@ -103,6 +175,9 @@ class LearningRunner:
         self._busy = False
         self._last_check_ms = 0
         self._task = None
+        # The local model's propose-and-test cycle: one at a time, off the loop.
+        self._hypotheses_busy = False
+        self._hypotheses_task = None
         self.last_status = "not started"
 
     # ------------------------------------------------------------ startup
@@ -403,14 +478,36 @@ class LearningRunner:
                 return outcome
             new = result.policy
             current = Policy.load(self.policy_path)
-            # THE VALIDATION SLICE, not the training slice and not the holdout.
-            # Scoring a new fit on the data it was fitted to would prefer
-            # whichever policy overfits hardest.
-            _train_rows, validate_rows, _holdout = learning.chronological_split(
+            # THE HOLDOUT, the newest slice - not the validation slice. Rules
+            # are PROMOTED on the validation slice, so judging the running
+            # policy there scored its rules on the very data they were picked
+            # on: the incumbent won by construction and every fresher fit was
+            # refused (ETH from 09-27 02:17, SOL from 09-26; FINDINGS 107).
+            # The holdout is newer than any slice either policy was selected
+            # on, and the fit's execution arms never read it.
+            _train_rows, _validate, holdout_rows = learning.chronological_split(
                 rows
             )
+            # EACH LIVE RULE GETS ONE VERDICT (`learning.carry_forward`): kept
+            # on a supporting live record, let go on a condemning one, judged
+            # on the holdout when it has none - and nothing is carried out of
+            # an artefact that cannot act.
+            carry = learning.carry_forward(
+                new, current, forward, holdout_rows,
+                fingerprint=feature_contract.FINGERPRINT,
+                feature_version=feature_contract.CONTRACT.version,
+                slippage=self.settings.entry_slippage,
+                min_changes=self.settings.learning_min_withdrawal_n,
+            )
+            outcome.carry = carry
+            outcome.carried = list(carry.carried)
+            # A rule its live record condemned is out of BOTH sides: its fate
+            # is decided, and leaving it in the running side would let the
+            # holdout veto the whole fresh fit for dropping it. Carried rules
+            # are identical in both, so the comparison scores only what the
+            # fresh fit changed (and what was dropped for want of support).
             comparison = learning.compare(
-                new, current, validate_rows,
+                new, learning.without(current, carry.condemned), holdout_rows,
                 fingerprint=feature_contract.FINGERPRINT,
                 feature_version=feature_contract.CONTRACT.version,
                 slippage=self.settings.entry_slippage,
@@ -424,6 +521,8 @@ class LearningRunner:
             )
             outcome.policy = new
             outcome.should_activate = should
+            if carry.summary():
+                reason += f"; {carry.summary()}"
             outcome.activation_reason = reason
             outcome.confidence_arms = _confidence_arms(new)
             outcome.promoted_arms = _promoted_arms(new)
@@ -431,7 +530,8 @@ class LearningRunner:
                 result, fingerprint=feature_contract.FINGERPRINT,
                 feature_definitions=feature_contract.CONTRACT.payload(),
                 feature_version=feature_contract.CONTRACT.version,
-                now_ms=now_ms,
+                now_ms=now_ms, policy=new,
+                also=current if comparison.current_valid else None,
             )
             outcome.ok = True
             return outcome
@@ -500,6 +600,7 @@ class LearningRunner:
             flush=True,
         )
         self._check_withdrawals(now_ms)
+        self._spawn_hypotheses(now_ms)
         if activated and self.telegram is not None:
             try:
                 from . import messages
@@ -522,6 +623,8 @@ class LearningRunner:
                         # gone missing with a line in the log.
                         confidence_changes=int(outcome.confidence_arms or 0),
                         entry_changes=int(outcome.promoted_arms or 0),
+                        # Which instrument learned: all of them post here.
+                        series=self.settings.kalshi_series,
                     ),
                     now_ms,
                 )
@@ -631,6 +734,84 @@ class LearningRunner:
             handle.flush()
             os.fsync(handle.fileno())
         os.replace(temp, path)
+
+    # ------------------------------------------- the local model's ideas
+    def _spawn_hypotheses(self, now_ms: int) -> None:
+        """Run the local model's propose-and-test cycle after this run.
+
+        IN THE LOOP SINCE 2026-09-28 (operator: "do so the system learns and
+        adapts"). It had run once, by hand, for BTC only. It reads this
+        instance's recorded lifecycles - the losses included - asks the local
+        model for conditions that separate winners from losers, and tests
+        every proposal (`hypotheses.run`). Nothing it finds changes an order:
+        survivors are CANDIDATES, reported, that must still clear the
+        promotion bar. Off the poll loop, one at a time, never raises.
+        """
+        if not getattr(self.settings, "learning_hypotheses_enabled", False):
+            return
+        if self._hypotheses_busy:
+            return
+        self._hypotheses_busy = True
+        self._hypotheses_task = asyncio.get_running_loop().create_task(
+            self._hypotheses(now_ms))
+
+    async def _hypotheses(self, now_ms: int) -> None:
+        from . import surface
+
+        asset = surface.asset(self.settings.kalshi_series) or "?"
+        try:
+            await asyncio.sleep(hypotheses_delay_s(asset, int(time.time() * 1000)))
+            result = await _in_daemon_thread(
+                hypotheses.run, self.settings.database_path, asset,
+                url=self.settings.learning_hypotheses_url,
+                model=self.settings.learning_hypotheses_model,
+                timeout=self.settings.learning_hypotheses_timeout_s,
+            )
+            result["at_ms"] = now_ms
+            self._write_json(self.policy_path.parent / "hypotheses.json", result)
+            try:
+                with open(self.policy_path.parent / "hypotheses_history.jsonl",
+                          "a", encoding="utf-8") as fh:
+                    fh.write(json.dumps({
+                        "at_ms": now_ms, "asset": asset,
+                        "windows": result["windows"],
+                        "model_ok": result["model_ok"],
+                        "model_error": result["model_error"],
+                        "model_note": result.get("model_note", ""),
+                        "proposed": result["proposed"],
+                        "survivors": result["survivors"],
+                    }, default=str) + "\n")
+            except OSError:
+                pass
+            if result.get("skipped"):
+                note = f"{result['skipped']} - nothing tested"
+            elif result["model_error"] and not result["model_ok"]:
+                note = (f"model gave nothing usable ({result['model_error']}); "
+                        f"controls only")
+            else:
+                note = (f"proposed {result['proposed']}, "
+                        f"{len(result['survivors'])} survived testing")
+                if result.get("model_note"):
+                    note += f" ({result['model_note']})"
+            print(f"learning: local model [{asset}] over {result['windows']} "
+                  f"windows - {note} (candidates only, nothing adopted)",
+                  flush=True)
+            if result["survivors"] and self.telegram is not None:
+                from . import messages
+                from .notify import Notifier
+
+                notifier = Notifier(self.telegram, self.store, self.settings)
+                await notifier.send_once(
+                    "hypotheses", f"{asset}:{now_ms}",
+                    messages.hypotheses_message(
+                        asset=asset, result=result,
+                        series=self.settings.kalshi_series),
+                    now_ms,
+                )
+        except Exception as exc:  # noqa: BLE001 - never fatal to the service
+            print(f"learning: local model cycle failed {exc!r}", flush=True)
+        finally:
+            self._hypotheses_busy = False
 
     # ------------------------------------------------------- withdrawal
     def _check_withdrawals(self, now_ms: int) -> None:

@@ -1,3 +1,4 @@
+import json
 import math
 import sqlite3
 import time
@@ -103,6 +104,10 @@ class TradeProposal:
 # see. 'unprotected' is the most dangerous of the three to lose track of.
 HELD_STATUSES = ("filled", "protected", "unprotected")
 HELD_SQL = "('filled','protected','unprotected')"
+# Proposals that certainly bought nothing: never sent, or an IOC that came back
+# empty. 'failed' is NOT here - it is an exception from the order call, and the
+# order may exist.
+NOT_TRADED_SQL = "('pending','unfilled','rejected','expired')"
 @dataclass(frozen=True)
 class LifetimeRecord:
     """Realised performance over the whole reconciled record.
@@ -208,6 +213,23 @@ from . import recovery_exit  # noqa: E402
 from .sessions import breakdown as session_breakdown  # noqa: E402
 
 ACCOUNTED_SQL = "('filled','protected','unprotected','exited')"
+
+# A TRADE IS GRADED ON THE SIDE IT HELD. `predictions` is written once, at the
+# first alert (INSERT OR IGNORE), so `p.won` is the result for the side the
+# SIGNAL named first; a trade placed after the signal flipped sides was booked
+# the opposite way - KXSOL15M-26SEP271615-15 held DOWN, lost $3.32, and the
+# daily floor's local rebuild booked +$0.68 (FINDINGS 108). The broker's result
+# on the trade's own ticker comes first, as `settled_bot_markets` does; until it
+# syncs, the signal's grade is re-expressed for the held side. A combo is priced
+# by the broker only - its trigger leg's result says nothing about the pair.
+# Used with TRADE_WON_JOIN, on `trade_proposals t`.
+TRADE_WON_JOIN = ("LEFT JOIN predictions p ON p.window_open = t.window_open "
+                  "LEFT JOIN settlements s ON s.ticker = t.ticker ")
+TRADE_WON_SQL = ("CASE WHEN t.strategy = 'combo_recovery' THEN NULL "
+                 "WHEN s.market_result IN ('yes','no') "
+                 "THEN (s.market_result = 'yes') = (t.side = 'UP') "
+                 "WHEN p.won IS NULL OR p.side IS NULL THEN NULL "
+                 "WHEN p.side = t.side THEN p.won ELSE 1 - p.won END")
 
 
 def _hour_utc(window_open: int) -> int:
@@ -513,6 +535,37 @@ class Store:
                 PRIMARY KEY (strategy, window_open)
             )
         """)
+        # THE ALL-SIGNAL STRATEGY'S OWN BOOK (operator, 2026-09-28). A table of
+        # its own ON PURPOSE: the main strategy's forty-odd trade_proposals
+        # queries - its guards, its floor, its reports - never see a $1 trade.
+        # One row per window; the claim is the idempotency key.
+        self.db.execute("""
+            CREATE TABLE IF NOT EXISTS allsignal_trades (
+                window_open INTEGER PRIMARY KEY,
+                ticker TEXT NOT NULL, side TEXT NOT NULL,
+                ask REAL NOT NULL, count REAL NOT NULL, limit_price REAL NOT NULL,
+                created_ms INTEGER NOT NULL,
+                status TEXT NOT NULL DEFAULT 'claimed',
+                order_id TEXT, filled REAL, fill_price REAL, fee REAL, note TEXT,
+                won INTEGER, pnl REAL, graded_ms INTEGER
+            )
+        """)
+        # The trade's one Telegram message, edited in place when it settles.
+        # And its CASH-OUT (operator, 2026-09-28: "cash out must be part of
+        # the system at all levels"): the main strategy's rule, on this book -
+        # see main.allsignal_cash_out.
+        self._add_columns("allsignal_trades", {
+            "tg_message_id": "INTEGER", "reported_ms": "INTEGER",
+            "exit_price": "REAL", "exit_count": "REAL", "exit_fee": "REAL",
+            "exit_order_id": "TEXT", "exited_ms": "INTEGER",
+            # The retry (2026-09-30): when the latest attempt went, and how
+            # many retries - so a restart keeps the 60 s spacing and the
+            # reconcile finds a retry's fill around ITS time.
+            "attempt_ms": "INTEGER", "retries": "INTEGER",
+            # The stake this entry was sized at: $6, or $3 after the primary's
+            # daily target (2026-09-30) - what its messages say.
+            "stake": "REAL",
+        })
         # The exchange's own record of every settled market. Realised P&L is
         # READ from here, not rebuilt: see KalshiExecutionClient.settlements.
         self.db.execute("""
@@ -1129,7 +1182,72 @@ class Store:
             self.db.execute("ALTER TABLE trade_proposals ADD COLUMN fill_price REAL")
         if "fee_paid" not in proposal_columns:
             self.db.execute("ALTER TABLE trade_proposals ADD COLUMN fee_paid REAL")
+        # WHAT THE SIZING DECIDED, kept apart from what filled. `count` is
+        # rewritten to the FILLED count by `record_fill`, so "was this entry
+        # the loss step" read off it was wrong on every partial fill - a 4-lot
+        # step that filled 2 at base 2 read as a base entry, re-armed the step
+        # and let the add-on stack behind it. `base_count` is the size the base
+        # rule produced before any upsize; `ordered_count` is what was sent.
+        # NULL on rows written before 2026-09-27, which fall back to the tier.
+        self._add_columns("trade_proposals", {
+            "base_count": "REAL", "ordered_count": "REAL",
+        })
         self.db.commit()
+        # Last: every table it rewrites exists by now.
+        self._migrate_window_clock()
+
+    # Every table that stores a ticker-derived `window_ms`, with its key.
+    WINDOW_CLOCK_TABLES = (
+        ("settlements", "ticker"),
+        ("fills", "fill_id"),
+        ("daily_ledger", "ticker"),
+        ("realised_events", "event_id"),
+    )
+
+    def _migrate_window_clock(self) -> int:
+        """Re-derive every stored `window_ms` from its ticker, on the New York clock.
+
+        `market_open_ms` read the ticker's time as UTC until 2026-09-28, so
+        every row written from it sits 3h45m early (4h45m in EST, 3h00m for
+        the hourly ladder). `settlements` and `fills` would heal on the next
+        broker sync because they upsert `window_ms`; `daily_ledger` and
+        `realised_events` never would - `record_realised` keeps the first
+        window it was given - and they are what `ledger_today`,
+        `session_rows` and the money footer read.
+
+        IDEMPOTENT BY CONSTRUCTION, NOT BY MARKER: each row is set to what
+        `market_open_ms` now returns for its ticker, so a second run finds
+        nothing to change. Rows whose ticker names no time (combos, daily gas)
+        are left exactly as they are. It runs on every start, which costs one
+        pass over a few thousand rows, so a process still running the old code
+        cannot leave rows behind a marker that says the job is done. Returns
+        the number of rows changed.
+        """
+        from .execution import KalshiExecutionClient
+
+        changed: dict[str, int] = {}
+        for table, key in self.WINDOW_CLOCK_TABLES:
+            updates = []
+            for row_key, ticker, stored in self.db.execute(
+                f"SELECT {key}, ticker, window_ms FROM {table}"
+            ).fetchall():
+                parsed = KalshiExecutionClient.market_open_ms(ticker)
+                if parsed is not None and parsed != stored:
+                    updates.append((parsed, row_key))
+            if updates:
+                self.db.executemany(
+                    f"UPDATE {table} SET window_ms = ? WHERE {key} = ?", updates
+                )
+                changed[table] = len(updates)
+        if changed:
+            self.db.execute(
+                "INSERT OR REPLACE INTO settings_text (key, text_value, updated_at) "
+                "VALUES ('window_clock_migrated', ?, ?)",
+                (json.dumps(changed), int(time.time() * 1000)),
+            )
+            self.db.commit()
+            print(f"window_ms moved to the New York clock: {changed}", flush=True)
+        return sum(changed.values())
 
     def proposal_created_at(self, proposal_id: str) -> int | None:
         """When the proposal was written, i.e. when the price was judged.
@@ -1461,6 +1579,114 @@ class Store:
             "exited": bool(base.get("exited")),
         }
 
+    # ----------------------------------------------- recovery combos (09-27)
+
+    def combo_tickers(self) -> set[str]:
+        """Every combo market this system bought for its recovery. A KXMVE...
+        ticker names no instrument, so without this list each of them would
+        be scoped out of this instance's figures as the operator's own."""
+        return {r[0] for r in self.db.execute(
+            "SELECT ticker FROM trade_proposals WHERE strategy = 'combo_recovery' "
+            f"  AND status NOT IN {NOT_TRADED_SQL} AND status != 'failed'"
+        )}
+
+    def combo_status(self, window_open: int) -> str | None:
+        """The latest recovery combo's status in this window, or None."""
+        row = self.db.execute(
+            "SELECT status FROM trade_proposals WHERE strategy = 'combo_recovery' "
+            "   AND window_open = ? ORDER BY created_at DESC, rowid DESC LIMIT 1",
+            (int(window_open),),
+        ).fetchone()
+        return row[0] if row else None
+
+    def combo_attempted(self, window_open: int) -> bool:
+        """Was a recovery combo already asked for in this window - bought or
+        not? One quote round per window: a second would spend another half
+        minute of the entry window on the same answer."""
+        return self.db.execute(
+            "SELECT 1 FROM trade_proposals WHERE strategy = 'combo_recovery' "
+            "   AND window_open = ? LIMIT 1", (int(window_open),),
+        ).fetchone() is not None
+
+    def reconcile_combos(self, now_ms: int, grace_ms: int = 120_000,
+                         close_grace_ms: int = 600_000) -> list[str]:
+        """Settle what an UNKNOWN or interrupted combo actually did.
+
+        'unprotected' is an accept whose outcome was not read; 'executing' is a
+        buy a restart cut short. Both are held - the conservative reading -
+        until the broker's own fills (the `fills` mirror, synced every minute)
+        say otherwise: a fill after the row was created books it 'filled' at
+        the real price; no fill by `close_grace_ms` after the window closed
+        books it 'unfilled', and it stops counting as a position.
+        """
+        done = []
+        rows = self.db.execute(
+            "SELECT id, ticker, window_open, created_at, close_ms, status, "
+            "       result_note FROM trade_proposals "
+            " WHERE strategy = 'combo_recovery' "
+            "   AND status IN ('unprotected', 'executing') AND created_at < ?",
+            (int(now_ms) - grace_ms,),
+        ).fetchall()
+        for pid, ticker, window, created, close_ms, status, note in rows:
+            n, cost, fee = self.db.execute(
+                "SELECT COALESCE(SUM(count), 0), COALESCE(SUM(count * yes_price), 0), "
+                "       COALESCE(SUM(fee_cost), 0) FROM fills "
+                " WHERE ticker = ? AND filled_ms >= ?",
+                (ticker, int(created) - 5_000),
+            ).fetchone()
+            try:
+                body = json.loads(note or "{}")
+            except (TypeError, ValueError):
+                body = {}
+            if float(n or 0) > 0:
+                self.record_fill(pid, window, round(float(cost) / float(n), 4),
+                                 float(n), float(fee or 0))
+                body["reconciled"] = f"broker fills show {float(n):g} bought ({status} before)"
+                self.finish_proposal(pid, "filled", json.dumps(body)[:1000])
+                done.append(f"{ticker}: filled {float(n):g}")
+            elif int(close_ms) < int(now_ms) - close_grace_ms:
+                body["reconciled"] = f"no fill at the broker ({status} before)"
+                self.finish_proposal(pid, "unfilled", json.dumps(body)[:1000])
+                done.append(f"{ticker}: nothing bought")
+        return done
+
+    def combo_for_window(self, window_open: int) -> dict | None:
+        """The recovery combo that was this window's trade, if one was."""
+        row = self.db.execute(
+            "SELECT id, ticker, count, fill_price, status, result_note "
+            "  FROM trade_proposals WHERE strategy = 'combo_recovery' "
+            "   AND window_open = ? AND status IN ('filled', 'unprotected') "
+            " ORDER BY created_at DESC LIMIT 1",
+            (int(window_open),),
+        ).fetchone()
+        if not row:
+            return None
+        try:
+            note = json.loads(row[5] or "{}")
+        except (TypeError, ValueError):
+            note = {}
+        return {"id": row[0], "ticker": row[1], "count": float(row[2] or 0),
+                "price": float(row[3] or 0), "status": row[4],
+                "legs": note.get("legs") or [], "window_open": int(window_open)}
+
+    def combos_settled_since(self, since_ms: int) -> list[dict]:
+        """Recovery combos whose broker result is in the ledger - for the one
+        result message each - newest windows first."""
+        out = []
+        for (window,) in self.db.execute(
+            "SELECT DISTINCT p.window_open FROM trade_proposals p "
+            "  JOIN daily_ledger d ON d.ticker = p.ticker "
+            " WHERE p.strategy = 'combo_recovery' "
+            "   AND p.status IN ('filled', 'unprotected') AND p.window_open >= ? "
+            " ORDER BY p.window_open DESC",
+            (int(since_ms),),
+        ):
+            combo = self.combo_for_window(window)
+            if combo:
+                combo["pnl"] = self.realised_for_ticker(combo["ticker"])
+                out.append(combo)
+        return out
+
     def trade_for_window(self, window_open: int) -> dict | None:
         """The real order behind a signal, or None if it was never traded.
 
@@ -1790,9 +2016,11 @@ class Store:
         traded = {
             row[0]: row[1:]
             for row in self.db.execute(
-                f"SELECT window_open, count, COALESCE(fill_price, entry_limit), fee_paid, "
-                f"exit_price, exit_count FROM trade_proposals "
-                f"WHERE strategy='primary' AND status IN {ACCOUNTED_SQL}"
+                f"SELECT t.window_open, t.count, "
+                f"COALESCE(t.fill_price, t.entry_limit), t.fee_paid, "
+                f"t.exit_price, t.exit_count, {TRADE_WON_SQL} FROM trade_proposals t "
+                f"{TRADE_WON_JOIN}"
+                f"WHERE t.strategy='primary' AND t.status IN {ACCOUNTED_SQL}"
             )
         }
 
@@ -1808,10 +2036,11 @@ class Store:
                 b["paper"] += trade_pnl(price, bool(won), contracts=1)
                 order = traded.get(window)
                 if order:
-                    count, paid, fee, exit_price, exit_count = order
+                    count, paid, fee, exit_price, exit_count, held_won = order
                     pnl = position_pnl(
                         paid=paid, count=count, entry_fee=fee,
-                        exit_price=exit_price, exit_count=exit_count, won=bool(won),
+                        exit_price=exit_price, exit_count=exit_count,
+                        won=bool(won if held_won is None else held_won),
                     )
                     if pnl is not None:
                         b["trades"] += 1
@@ -1828,16 +2057,22 @@ class Store:
         rows = self.db.execute(
             f"SELECT t.created_at, t.ticker, t.side, t.count, "
             f"COALESCE(t.fill_price, t.entry_limit), t.fee_paid, t.exit_price, "
-            f"t.exit_count, t.status, p.won FROM trade_proposals t "
-            f"LEFT JOIN predictions p ON p.window_open = t.window_open "
+            f"t.exit_count, t.status, {TRADE_WON_SQL}, t.strategy "
+            f"FROM trade_proposals t {TRADE_WON_JOIN}"
             f"WHERE t.status IN {ACCOUNTED_SQL} ORDER BY t.created_at ASC"
         ).fetchall()
         out, running = [], 0.0
-        for created, ticker, side, count, paid, fee, ex_px, ex_ct, _status, won in rows:
-            pnl = position_pnl(
-                paid=paid, count=count, entry_fee=fee, exit_price=ex_px,
-                exit_count=ex_ct, won=None if won is None else bool(won),
-            )
+        for (created, ticker, side, count, paid, fee, ex_px, ex_ct, _status,
+             won, strategy) in rows:
+            if strategy == "combo_recovery":
+                # A COMBO IS THE BROKER'S FIGURE. `won` here is the trigger
+                # leg's result; the combo wins only if both legs do.
+                pnl = self.realised_for_ticker(ticker)
+            else:
+                pnl = position_pnl(
+                    paid=paid, count=count, entry_fee=fee, exit_price=ex_px,
+                    exit_count=ex_ct, won=None if won is None else bool(won),
+                )
             if pnl is None:
                 continue  # still open: nothing realised to add
             running += pnl
@@ -1848,7 +2083,8 @@ class Store:
                     "side": side,
                     "paid": paid,
                     "sold_at": ex_px,
-                    "how": "sold early" if ex_px is not None else "settled",
+                    "how": ("recovery combo" if strategy == "combo_recovery"
+                            else "sold early" if ex_px is not None else "settled"),
                     "pnl": round(pnl, 4),
                     "running": round(running, 4),
                 }
@@ -1916,7 +2152,7 @@ class Store:
                     float(row.get("fee_cost") or 0),
                     KalshiExecutionClient.settlement_pnl(row),
                     settled_ms, now_ms,
-                    KalshiExecutionClient.market_open_ms(ticker) or settled_ms,
+                    self._window_of(ticker, settled_ms),
                 ),
             )
             written += 1
@@ -2088,7 +2324,103 @@ class Store:
             out.append((int(window), (proceeds - spend) >= 0.0))
         return out
 
-    def upsized_since(self, window_open: int) -> bool:
+    def _window_of(self, ticker: str, fallback_ms):
+        """The market's own window: parsed from its ticker, or - for a combo,
+        whose KXMVE... ticker names no time - the trigger window this system
+        placed it on. The fallback (settlement or fill time) only when neither
+        is known."""
+        from .execution import KalshiExecutionClient
+
+        parsed = KalshiExecutionClient.market_open_ms(ticker)
+        if parsed:
+            return parsed
+        row = self.db.execute(
+            "SELECT window_open FROM trade_proposals "
+            " WHERE ticker = ? AND strategy = 'combo_recovery' LIMIT 1",
+            (ticker,),
+        ).fetchone()
+        return int(row[0]) if row else fallback_ms
+
+    def base_tier_at(self, at_ms: int) -> int:
+        """The base size the sizing path read at that instant.
+
+        EXACTLY what `CapitalController.base_contracts` returned then: the New
+        York day's reviewed tier if the review had been written by `at_ms`,
+        otherwise 1. The second half matters. A day's row is written by the
+        first review that SUCCEEDS, and a review that cannot read the broker
+        at midnight is retried every poll - so the first entries of a day can
+        be sized at 1 and later ones at 2. Judging the early ones against the
+        tier written afterwards would read a real step as base size and let
+        it fire twice on one loss. (No production path rewrites a written row:
+        nothing passes `force`.)
+        """
+        from .capital import ny_day
+
+        capital = self.capital_for_day(ny_day(int(at_ms)))
+        if capital is None or int(capital.reconciled_ms) > int(at_ms):
+            return 1
+        return max(1, int(capital.base_contracts))
+
+    def _base_of(self, base_count, created_at, tiered: bool) -> float:
+        """The recorded base when there is one; otherwise the tier that was
+        in effect at creation (rows written before the base was recorded)."""
+        if base_count is not None:
+            return float(base_count)
+        return float(self.base_tier_at(created_at)) if tiered else 1.0
+
+    def entry_base(self, proposal_id: str, tiered: bool = True) -> float | None:
+        """The base an entry was sized from. Recorded on the row since
+        2026-09-27; before that, the tier in effect when it was created. None
+        for an unknown id. `tiered=False` is a service running without capital
+        sizing, whose base is one contract whatever the review recorded."""
+        row = self.db.execute(
+            "SELECT base_count, created_at FROM trade_proposals WHERE id = ?",
+            (proposal_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        return self._base_of(row[0], row[1], tiered)
+
+    def entry_was_upsized(self, proposal_id: str, tiered: bool = True) -> bool:
+        """Did this entry go out above the base it was sized from?
+
+        "Above base" used to be spelled `count > 1`, which was the same thing
+        while the base was one contract. On 2026-09-27 the capital review moved
+        every instance to a base of 2, and from then on EVERY entry read as an
+        upsize. It compares what was ORDERED, not what filled: `count` becomes
+        the filled count, and a 4-lot step that filled 2 is still the step.
+        """
+        row = self.db.execute(
+            "SELECT base_count, created_at, COALESCE(ordered_count, count) "
+            "FROM trade_proposals WHERE id = ?",
+            (proposal_id,),
+        ).fetchone()
+        if row is None:
+            return False
+        return float(row[2]) > self._base_of(row[0], row[1], tiered)
+
+    def window_was_upsized(self, window_open: int, tiered: bool = True) -> bool:
+        """Was the primary entry in THIS window sized above its base?
+
+        Asked of the losing market that would arm the loss step: if that loss
+        was itself a recovery trade, it must not arm another (operator,
+        2026-09-27: "remove the back to back, it should only happen once").
+        Same test as `upsized_since` - what was ordered against the base it
+        was sized from, only for orders that traded or might have.
+        """
+        rows = self.db.execute(
+            "SELECT base_count, created_at, COALESCE(ordered_count, count) "
+            "FROM trade_proposals "
+            " WHERE strategy = 'primary' AND window_open = ? "
+            f"   AND status NOT IN {NOT_TRADED_SQL}",
+            (int(window_open),),
+        ).fetchall()
+        return any(
+            float(ordered) > self._base_of(base_count, created, tiered)
+            for base_count, created, ordered in rows
+        )
+
+    def upsized_since(self, window_open: int, tiered: bool = True) -> bool:
         """Has a primary entry already gone out above base size since then?
 
         THE "ALREADY SPENT" TEST, derived rather than flagged. The waiting loss
@@ -2097,14 +2429,40 @@ class Store:
         loss. A stored flag would have to be written by the sizing path and
         would then be wrong whenever an order failed after it; this reads what
         actually happened.
+
+        ABOVE THE BASE IT WAS SIZED FROM, not above one contract. At base 2
+        the old `count > 1` counted every ordinary entry as the step, so the
+        first trade after a loss - at any price - marked the recovery spent
+        before it could fire. See `entry_was_upsized`.
+
+        ONLY AN ORDER THAT TRADED, OR MIGHT HAVE, SPENDS IT. An IOC that came
+        back with nothing ('unfilled'), a proposal never sent ('pending',
+        'rejected', 'expired') did not recover anything, and counting it made
+        the same-window retry go out at base. 'failed' still counts: that is an
+        exception from the order call, and the order may exist.
         """
-        row = self.db.execute(
+        # A COMBO RECOVERY SPENDS IT (2026-09-27). Since then the step's trade
+        # is a combo at base size - never above base, so the size test below
+        # cannot see it - recorded as its own `combo_recovery` proposal.
+        combo = self.db.execute(
             "SELECT 1 FROM trade_proposals "
-            " WHERE strategy = 'primary' AND window_open > ? AND count > 1 "
-            " LIMIT 1",
+            " WHERE strategy = 'combo_recovery' AND window_open > ? "
+            f"   AND status NOT IN {NOT_TRADED_SQL} LIMIT 1",
             (int(window_open),),
         ).fetchone()
-        return row is not None
+        if combo is not None:
+            return True
+        rows = self.db.execute(
+            "SELECT base_count, created_at, COALESCE(ordered_count, count) "
+            "FROM trade_proposals "
+            " WHERE strategy = 'primary' AND window_open > ? "
+            f"   AND status NOT IN {NOT_TRADED_SQL}",
+            (int(window_open),),
+        ).fetchall()
+        for base_count, created, ordered in rows:
+            if float(ordered) > self._base_of(base_count, created, tiered):
+                return True
+        return False
 
     def recovery_state(
         self, plan_steps: int = DEFAULT_RECOVERY_STEPS, now_ms: int | None = None
@@ -2522,8 +2880,6 @@ class Store:
         """Mirror the broker's executions. Upsert by `fill_id`."""
         from datetime import datetime
 
-        from .execution import KalshiExecutionClient
-
         written = 0
         for row in rows:
             fill_id = row.get("fill_id") or row.get("trade_id")
@@ -2547,7 +2903,7 @@ class Store:
                     float(row.get("fee_cost") or 0),
                     1 if row.get("is_taker") else 0,
                     filled_ms,
-                    KalshiExecutionClient.market_open_ms(ticker) or filled_ms,
+                    self._window_of(ticker, filled_ms),
                     now_ms,
                 ),
             )
@@ -2555,18 +2911,34 @@ class Store:
         self.db.commit()
         return written
 
-    def exchange_record(self, since_ms: int | None = None) -> tuple[int, int, float]:
+    def exchange_record(self, since_ms: int | None = None, *,
+                        series: str | None = None,
+                        combos: set[str] | None = None) -> tuple[int, int, float]:
         """(markets, winners, dollars) straight off the exchange's own numbers.
 
         Filtered on `window_ms` - the market's own time, parsed from the ticker
-        - and never on `settled_ms`. Kalshi settles in batches hours after
-        close, so a 04:45 market can settle at 08:45; filtering by settlement
-        would have handed the daily loss floor a window that mixed one day's
-        trades with another's.
+        on the New York clock - and never on `settled_ms`. (Settlement lands
+        5-8 seconds after close; the "settles hours late" this once said was
+        the ticker's ET close misread as UTC, which is also what dropped
+        00:15-03:45 ET closes from their own day until 2026-09-28.)
+
+        `series` scopes it to ONE instrument's markets (plus `combos`, the
+        combo tickers that instrument bought) - the daily floor's view since
+        2026-09-28. Without it, the whole account, as every report reads it.
         """
-        where, args = "", []
+        clauses, args = [], []
         if since_ms is not None:
-            where, args = " WHERE COALESCE(window_ms, settled_ms) >= ?", [since_ms]
+            clauses.append("COALESCE(window_ms, settled_ms) >= ?")
+            args.append(since_ms)
+        if series:
+            owned = sorted(combos or ())
+            scope = "ticker LIKE ?"
+            args.append(f"{series}-%")
+            if owned:
+                scope += f" OR ticker IN ({','.join('?' * len(owned))})"
+                args.extend(owned)
+            clauses.append(f"({scope})")
+        where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
         row = self.db.execute(
             "SELECT COUNT(*), SUM(pnl > 0), COALESCE(SUM(pnl), 0) "
             f"FROM settlements{where}",
@@ -2766,9 +3138,8 @@ class Store:
             f"{source}:{ticker}", ticker, when, amount, source, now_ms, window_ms
         )
 
-    # How far back a sync looks. Kalshi settles in batches and can credit a
-    # market hours after its close, so the window has to be wider than the lag,
-    # not wider than the day.
+    # How far back a sync looks. Settlement normally lands seconds after close;
+    # the margin covers a late correction or an outage, not a routine lag.
     LEDGER_SYNC_LOOKBACK_MS = 3 * 86_400_000
 
     def sync_ledger_from_settlements(self, now_ms: int) -> None:
@@ -2891,7 +3262,19 @@ class Store:
             "  SELECT 1 FROM settlements s WHERE s.ticker = p.ticker"
             ")"
         ).fetchone()
-        return round(float(row[0] or 0.0), 6)
+        # THE ALL-SIGNAL STRATEGY'S OPEN $1 POSITIONS are committed money too.
+        # The midnight review runs seconds after 00:00, while the 23:45
+        # position is still unsettled; its cost is already out of the cash, so
+        # without this the main strategy's tier could drop for the whole day
+        # (review, 2026-09-28: $120.50 read as $119.75, base 4 -> 3).
+        # A cashed-out contract is cash again, so only what is still held.
+        extra = self.db.execute(
+            "SELECT COALESCE(SUM((a.filled - COALESCE(a.exit_count, 0)) "
+            "* COALESCE(a.fill_price, a.limit_price)), 0) "
+            "FROM allsignal_trades a WHERE a.status = 'filled' AND NOT EXISTS ("
+            "  SELECT 1 FROM settlements s WHERE s.ticker = a.ticker)"
+        ).fetchone()
+        return round(float(row[0] or 0.0) + float(extra[0] or 0.0), 6)
 
     def reserve_funds(
         self, key: str, amount: float, now_ms: int, available: float | None = None
@@ -3144,46 +3527,19 @@ class Store:
         return self.apply_realised_to_deficit(now_ms, steps)
 
     def migrate_day_boundary(self, now_ms: int) -> float:
-        """Carry today's pre-New-York losses across the timezone change. Once.
+        """RETIRED 2026-09-28. The UTC -> New York move it carried was on 2026-09-22.
 
-        Returns the carried amount (<= 0). Idempotent: the marker is written
-        with the day it applies to, so a restart cannot bank it twice.
+        The marker was keyed on the DAY, so this recomputed at every New York
+        midnight. With `window_ms` on the true clock, [UTC midnight, NY
+        midnight) is the PREVIOUS evening's 20:00-24:00 ET markets, and the
+        carry would have added them to today's floor a second time (-5.57 on
+        09-21, -4.39 on 09-24 in the replay). Kept so callers need no change.
         """
-        from .capital import ny_day
-
-        day = ny_day(now_ms)
-        marker = self.db.execute(
-            "SELECT text_value FROM settings_text WHERE key='day_boundary_migrated'"
-        ).fetchone()
-        if marker and marker[0] == day:
-            return self.get_setting("day_boundary_carry", 0.0)
-        utc_start = now_ms - (now_ms % 86_400_000)
-        ny_start = self.day_start_ms(now_ms)
-        carry = 0.0
-        if ny_start > utc_start:
-            _, _, carry = self.exchange_record(utc_start)
-            _, _, after = self.exchange_record(ny_start)
-            carry = round(min(0.0, carry - after), 6)
-        self.set_setting("day_boundary_carry", carry, now_ms)
-        self.set_setting_text("day_boundary_migrated", day, now_ms)
-        if carry:
-            print(
-                f"day boundary moved to New York: carrying {carry:+.4f} of "
-                f"losses already booked today so the floor is not refunded",
-                flush=True,
-            )
-        return carry
+        return 0.0
 
     def day_boundary_carry(self, now_ms: int) -> float:
-        """The carried loss, but only on the day the migration happened."""
-        from .capital import ny_day
-
-        marker = self.db.execute(
-            "SELECT text_value FROM settings_text WHERE key='day_boundary_migrated'"
-        ).fetchone()
-        if not marker or marker[0] != ny_day(now_ms):
-            return 0.0
-        return self.get_setting("day_boundary_carry", 0.0)
+        """RETIRED with `migrate_day_boundary`: nothing is carried any more."""
+        return 0.0
 
     def realised_for_ticker(self, ticker: str | None) -> float | None:
         """The broker's realised P&L for one market, or None if not booked.
@@ -4154,14 +4510,30 @@ class Store:
         )
 
     def record_candidate_evaluations(self, rows: list[dict]) -> None:
-        """Log each candidate's prediction. Never raises; one per market."""
+        """Log each candidate's prediction. Never raises; one per market.
+
+        THE ROW IS THE POLL WHERE THE CANDIDATE FIRST DISAGREED, if it ever
+        did. This kept the first matching poll and ignored the rest, and a
+        veto only disagrees on a poll the rule accepted - usually a later one.
+        SOL's live veto acted in 35 windows by 09-28; its forward record had
+        counted 8 (FINDINGS 107), and that record is what keeps or lets go a
+        carried rule. A row that already disagrees, or is graded, is final.
+        """
         for row in rows:
             try:
                 columns = ", ".join(row)
                 placeholders = ", ".join(f":{name}" for name in row)
+                updates = ", ".join(
+                    f"{name} = excluded.{name}" for name in row
+                    if name not in ("window_open", "candidate_id")
+                )
                 self.db.execute(
-                    f"INSERT OR IGNORE INTO candidate_evaluations "
-                    f"({columns}) VALUES ({placeholders})",
+                    f"INSERT INTO candidate_evaluations "
+                    f"({columns}) VALUES ({placeholders}) "
+                    f"ON CONFLICT(window_open, candidate_id) DO UPDATE SET "
+                    f"{updates} WHERE candidate_evaluations.would_change = 0 "
+                    f"AND excluded.would_change = 1 "
+                    f"AND candidate_evaluations.graded_ms IS NULL",
                     row,
                 )
             except sqlite3.Error as exc:
@@ -4378,14 +4750,22 @@ class Store:
         # so the series prefix is what separates "what this strategy did" from
         # "what the account holds". Anything outside it is real money and is
         # reported, but never as this strategy's result.
+        # ITS COMBOS ARE ITS OWN (2026-09-27). A recovery combo trades under a
+        # KXMVE... ticker that names no instrument, so the series prefix alone
+        # filed this strategy's recovery trades as foreign money. The combos
+        # this instance placed are in its own `trade_proposals`.
+        mine = (
+            "(ticker LIKE ? OR ticker IN (SELECT ticker FROM trade_proposals "
+            f" WHERE strategy = 'combo_recovery' AND status NOT IN {NOT_TRADED_SQL}))"
+        )
         row = self.db.execute(
             "SELECT COUNT(*), COALESCE(SUM(pnl > 0), 0), COALESCE(SUM(pnl), 0), "
             "MIN(COALESCE(window_ms, first_ms)) FROM daily_ledger "
-            "WHERE ticker LIKE ?", (f"{series}-%",),
+            f"WHERE {mine}", (f"{series}-%",),
         ).fetchone()
         other = self.db.execute(
             "SELECT COUNT(*), COALESCE(SUM(pnl), 0) FROM daily_ledger "
-            "WHERE ticker NOT LIKE ?", (f"{series}-%",),
+            f"WHERE NOT {mine}", (f"{series}-%",),
         ).fetchone()
         return LifetimeRecord(
             markets=int(row[0] or 0), winners=int(row[1] or 0),
@@ -4431,9 +4811,8 @@ class Store:
         all-time total reported beside it looks like the bot is lying. The two
         differed by $5.47 on 2026-09-22: -1.40 all-time against +4.07 today.
 
-        The day is the MARKET's day, from `window_ms`, never the settlement
-        timestamp - Kalshi settles in batches hours late, and a 04:45 market
-        settling at 08:45 would otherwise land on the wrong side of midnight.
+        The day is the MARKET's day, from `window_ms` (the ticker's New York
+        close, less the market's length), never the settlement timestamp.
 
         The fallback is the old local path, used only while the settlements
         mirror is still empty - a fresh database, or before the first sync.
@@ -4447,9 +4826,10 @@ class Store:
 
         rows = self.db.execute(
             "SELECT t.count, COALESCE(t.fill_price, t.entry_limit), t.fee_paid, "
-            "t.exit_price, t.exit_count, p.won FROM trade_proposals t "
-            "LEFT JOIN predictions p ON p.window_open = t.window_open "
-            f"WHERE t.status IN {ACCOUNTED_SQL}"
+            f"t.exit_price, t.exit_count, {TRADE_WON_SQL} FROM trade_proposals t "
+            f"{TRADE_WON_JOIN}"
+            f"WHERE t.status IN {ACCOUNTED_SQL} "
+            "  AND t.strategy != 'combo_recovery'"
         ).fetchall()
 
         trades = wins = 0
@@ -4501,14 +4881,34 @@ class Store:
         # daily floor off on a day that had already lost money. So the local
         # reconstruction is still computed, and the floor uses whichever is
         # MORE negative. It can be early to stop, never late.
-        _, _, exchange_today = self.exchange_record(day_start)
+        #
+        # EACH INSTRUMENT'S OWN MONEY (operator, 2026-09-28: gold "must be
+        # live"; the launchers always said each process "carries its own daily
+        # loss floor"). This read the WHOLE account, so one instrument's
+        # losses stopped another - with the clock fixed, the morning's
+        # ETH/SOL/BTC losses (-22.15) would have stopped gold at its $14 while
+        # gold itself was flat. Scoped to this store's series and the combos
+        # it bought; unscoped only for a store never bound to an instrument.
+        _, _, exchange_today = self.exchange_record(
+            day_start, series=getattr(self, "instrument_series", None),
+            combos=self.combo_tickers())
+        # THE ALL-SIGNAL STRATEGY TRADES THE SAME MARKETS, and the exchange
+        # books one position per market. Its own graded money is taken back
+        # out, so the $1 test can never stop - or excuse - the main strategy.
+        exchange_today -= self.allsignal_net_since(
+            day_start, getattr(self, "instrument_series", None))
 
         realised = 0.0
         for count, paid, fee, exit_price, exit_count, won in self.db.execute(
             "SELECT t.count, COALESCE(t.fill_price, t.entry_limit), t.fee_paid, "
-            "t.exit_price, t.exit_count, p.won FROM trade_proposals t "
-            "LEFT JOIN predictions p ON p.window_open = t.window_open "
-            f"WHERE t.status IN {ACCOUNTED_SQL} AND t.created_at >= ?",
+            f"t.exit_price, t.exit_count, {TRADE_WON_SQL} FROM trade_proposals t "
+            f"{TRADE_WON_JOIN}"
+            f"WHERE t.status IN {ACCOUNTED_SQL} AND t.created_at >= ? "
+            # A COMBO IS PRICED BY THE EXCHANGE ONLY. `predictions.won` is
+            # the trigger leg's result; a combo wins only if BOTH legs do, so
+            # this rebuild would book a partner loss as a win. The exchange
+            # figure above is account-wide and carries the combo's real P&L.
+            "  AND t.strategy != 'combo_recovery'",
             (day_start,),
         ).fetchall():
             pnl = position_pnl(
@@ -4821,6 +5221,247 @@ class Store:
                 flush=True,
             )
 
+    # ------------------------------------------ the all-signal strategy
+    def allsignal_claim(self, window_open: int, ticker: str, side: str,
+                        ask: float, count: float, limit: float, now_ms: int,
+                        stake: float | None = None) -> bool:
+        """Claim this window for one all-signal order. False if already taken."""
+        cursor = self.db.execute(
+            "INSERT OR IGNORE INTO allsignal_trades (window_open, ticker, side, "
+            "ask, count, limit_price, created_ms, stake) VALUES (?,?,?,?,?,?,?,?)",
+            (window_open, ticker, side, ask, count, limit, now_ms, stake),
+        )
+        self.db.commit()
+        return cursor.rowcount == 1
+
+    def allsignal_finish(self, window_open: int, status: str, *, order_id=None,
+                         filled: float = 0.0, fill_price=None, fee=None,
+                         note: str = "") -> None:
+        self.db.execute(
+            "UPDATE allsignal_trades SET status=?, order_id=?, filled=?, "
+            "fill_price=?, fee=?, note=? WHERE window_open=?",
+            (status, order_id, filled, fill_price, fee, note, window_open),
+        )
+        self.db.commit()
+
+    def allsignal_open(self, window_open: int) -> dict | None:
+        """This window's $1 position while any of it is still held."""
+        rows = self._dicts(
+            "SELECT * FROM allsignal_trades WHERE window_open = ? "
+            "AND status = 'filled' AND won IS NULL "
+            "AND COALESCE(filled, 0) > COALESCE(exit_count, 0)", (window_open,))
+        return rows[0] if rows else None
+
+    def allsignal_mark_exited(self, window_open: int, *, price: float, count: float,
+                              fee=None, order_id=None, now_ms: int) -> None:
+        """Book a cash-out. A FULL exit is graded here, at the sale: the money
+        is final then, so the result goes out then - not a minute after the
+        market settles. A partial one is graded at settlement, remainder
+        included (`allsignal_grade`). Scored at what it realised."""
+        row = self.db.execute(
+            "SELECT filled, COALESCE(fill_price, limit_price) FROM allsignal_trades "
+            "WHERE window_open = ?", (window_open,)).fetchone()
+        if row is None:
+            return
+        filled, paid = float(row[0] or 0), float(row[1] or 0)
+        count = min(float(count), filled)
+        self.db.execute(
+            "UPDATE allsignal_trades SET exit_price=?, exit_count=?, exit_fee=?, "
+            "exit_order_id=?, exited_ms=? WHERE window_open=?",
+            (float(price), count, fee, order_id, now_ms, window_open))
+        if count >= filled - 1e-9:
+            pnl = round(count * (float(price) - paid), 6)
+            self.db.execute(
+                "UPDATE allsignal_trades SET won=?, pnl=?, graded_ms=? "
+                "WHERE window_open=?", (int(pnl > 0), pnl, now_ms, window_open))
+        self.db.commit()
+
+    def allsignal_reconcile(self, now_ms: int) -> int:
+        """Settle what the order path could not, from the broker's own fills.
+
+        An order interrupted mid-flight (restart, cancellation, a response lost
+        after Kalshi executed it) leaves its row 'claimed' or 'failed'; a fill
+        that was not yet visible leaves the price at the limit and no fee. The
+        synced `fills` table is the broker's record: the all-signal's order is
+        the buy on that ticker within a minute of the claim that is NOT one of
+        the main strategy's entry orders. Only after the market has closed.
+        """
+        rows = self.db.execute(
+            "SELECT window_open, ticker, side, COALESCE(attempt_ms, created_ms), status, "
+            "order_id, note "
+            "FROM allsignal_trades WHERE won IS NULL AND window_open + 900000 < ? "
+            "AND (status IN ('claimed', 'failed') "
+            "     OR (status = 'filled' AND fee IS NULL))", (now_ms,),
+        ).fetchall()
+        fixed = 0
+        for window, ticker, side, created, status, order_id, note in rows:
+            price_col = "yes_price" if side == "UP" else "no_price"
+            refused = any(k in (note or "") for k in ("400 from", "insufficient_balance",
+                                                      "403 from", "401 from"))
+            if status == "filled" and order_id:
+                where, args = "order_id = ?", [order_id]
+            elif refused:
+                where, args = "0", []           # Kalshi refused it: no order existed
+            else:
+                # The ENTRY's own shape only - UP buys YES, DOWN is booked as
+                # sell/no - so a main-strategy exit or a manual trade in the
+                # same minute is never taken for it (re-check, 2026-09-30).
+                action, fside = ("buy", "yes") if side == "UP" else ("sell", "no")
+                where = ("ticker = ? AND filled_ms BETWEEN ? AND ? AND action = ? "
+                         "AND side = ? AND order_id NOT IN "
+                         "(SELECT entry_order_id FROM trade_proposals "
+                         " WHERE ticker = ? AND entry_order_id IS NOT NULL)")
+                args = [ticker, created - 5_000, created + 60_000, action, fside, ticker]
+            got = self.db.execute(
+                f"SELECT order_id, SUM(count), SUM(count * {price_col}), "
+                f"SUM(fee_cost) FROM fills WHERE {where} GROUP BY order_id "
+                "ORDER BY MIN(filled_ms) LIMIT 1", args,
+            ).fetchone()
+            if got and got[1]:
+                oid, filled, cost, fee = got
+                self.db.execute(
+                    "UPDATE allsignal_trades SET status='filled', order_id=?, "
+                    "filled=?, fill_price=?, fee=? WHERE window_open=?",
+                    (oid, float(filled), float(cost) / float(filled),
+                     float(fee or 0.0), window))
+                fixed += 1
+            elif status in ("claimed", "failed") and \
+                    now_ms > window + 900_000 + 600_000:
+                # Ten minutes past close with no fill of ours on record.
+                self.db.execute(
+                    "UPDATE allsignal_trades SET status='unfilled', note=COALESCE("
+                    "note, '') || ' [no fill on the broker record]' "
+                    "WHERE window_open=?", (window,))
+                fixed += 1
+        if fixed:
+            self.db.commit()
+        return fixed
+
+    def allsignal_reconcile_exits(self) -> int:
+        """Correct each cash-out's price from the broker's own fills.
+
+        The sale price is read back right after the order, but Kalshi's fills
+        feed lags the ack, and a read that comes back empty leaves the
+        discounted QUOTE in the book: BTC 18:45 on 2026-09-28 was recorded at
+        0.974 while the broker filled 0.99, in three pieces. `exit_fee` NULL
+        marks a price the broker has not confirmed; the synced `fills` table
+        confirms it, and a full exit is re-graded at the real price.
+        """
+        rows = self.db.execute(
+            "SELECT window_open, side, filled, COALESCE(fill_price, limit_price), "
+            "exit_order_id FROM allsignal_trades "
+            "WHERE exit_order_id IS NOT NULL AND exit_fee IS NULL").fetchall()
+        fixed = 0
+        for window, side, filled, paid, order_id in rows:
+            col = "yes_price" if side == "UP" else "no_price"
+            got = self.db.execute(
+                f"SELECT SUM(count), SUM(count * {col}), SUM(fee_cost) FROM fills "
+                "WHERE order_id = ?", (order_id,)).fetchone()
+            if not got or not got[0]:
+                continue
+            held = float(filled or 0)
+            count = min(float(got[0]), held)
+            price = float(got[1]) / float(got[0])
+            self.db.execute(
+                "UPDATE allsignal_trades SET exit_price=?, exit_count=?, exit_fee=? "
+                "WHERE window_open=?", (price, count, float(got[2] or 0.0), window))
+            if count >= held - 1e-9:
+                pnl = round(count * (price - float(paid or 0)), 6)
+                self.db.execute(
+                    "UPDATE allsignal_trades SET won=?, pnl=? WHERE window_open=?",
+                    (int(pnl > 0), pnl, window))
+            fixed += 1
+        if fixed:
+            self.db.commit()
+        return fixed
+
+    def allsignal_grade(self, now_ms: int) -> int:
+        """Grade filled rows from the broker's result on the SAME ticker.
+
+        Gross P&L (fee-free, the operator's rule); the fee is kept beside it.
+        Reconciles interrupted rows first, from the broker's fills.
+        """
+        try:
+            self.allsignal_reconcile(now_ms)
+            self.allsignal_reconcile_exits()
+        except sqlite3.Error as exc:
+            print(f"allsignal reconcile failed: {exc!r}", flush=True)
+        rows = self.db.execute(
+            "SELECT a.window_open, a.side, a.filled, a.fill_price, s.market_result, "
+            "a.exit_price, a.exit_count "
+            "FROM allsignal_trades a JOIN settlements s ON s.ticker = a.ticker "
+            "WHERE a.status = 'filled' AND a.won IS NULL "
+            "AND s.market_result IN ('yes','no')"
+        ).fetchall()
+        for window, side, filled, price, result, exit_price, exit_count in rows:
+            won = int((result == "yes") == (side == "UP"))
+            # A PARTIAL cash-out: what was sold at its price, the rest at the
+            # result. A full one never gets here - it was graded at the sale.
+            sold = float(exit_count or 0)
+            held = float(filled or 0) - sold
+            pnl = round(held * (won - float(price or 0))
+                        + sold * (float(exit_price or 0) - float(price or 0)), 6)
+            if sold:
+                won = int(pnl > 0)
+            self.db.execute(
+                "UPDATE allsignal_trades SET won=?, pnl=?, graded_ms=? "
+                "WHERE window_open=?", (won, pnl, now_ms, window))
+        if rows:
+            self.db.commit()
+        return len(rows)
+
+    def allsignal_set_message(self, window_open: int, message_id) -> None:
+        self.db.execute("UPDATE allsignal_trades SET tg_message_id=? WHERE window_open=?",
+                        (message_id, window_open))
+        self.db.commit()
+
+    def allsignal_unreported(self) -> list[dict]:
+        """Settled trades whose message still says 'open'."""
+        return self._dicts(
+            "SELECT * FROM allsignal_trades WHERE won IS NOT NULL "
+            "AND reported_ms IS NULL ORDER BY window_open")
+
+    def allsignal_unannounced_misses(self, since_ms: int) -> list[dict]:
+        """Signals whose order bought nothing and were never reported."""
+        return self._dicts(
+            "SELECT * FROM allsignal_trades WHERE status IN "
+            "('unfilled', 'failed', 'paused', 'skipped') "
+            "AND reported_ms IS NULL AND created_ms >= ? ORDER BY window_open",
+            (since_ms,))
+
+    def allsignal_mark_attempt(self, window_open: int, at_ms: int, retries: int) -> None:
+        self.db.execute("UPDATE allsignal_trades SET attempt_ms=?, retries=? "
+                        "WHERE window_open=?", (at_ms, retries, window_open))
+        self.db.commit()
+
+    def allsignal_mark_reported(self, window_open: int, now_ms: int) -> None:
+        self.db.execute("UPDATE allsignal_trades SET reported_ms=? WHERE window_open=?",
+                        (now_ms, window_open))
+        self.db.commit()
+
+    def allsignal_net_for_ticker(self, ticker: str) -> float:
+        """The all-signal's graded money on one market (0.0 if none)."""
+        row = self.db.execute(
+            "SELECT COALESCE(SUM(pnl - COALESCE(fee, 0) - COALESCE(exit_fee, 0)), 0) "
+            "FROM allsignal_trades "
+            "WHERE ticker = ? AND won IS NOT NULL", (ticker,),
+        ).fetchone()
+        return float(row[0] or 0.0)
+
+    def allsignal_net_since(self, since_ms: int, series: str | None = None) -> float:
+        """Graded all-signal money (net of fee, as the exchange books it)."""
+        args: list = [since_ms]
+        scope = ""
+        if series:
+            scope = " AND ticker LIKE ?"
+            args.append(f"{series}-%")
+        row = self.db.execute(
+            "SELECT COALESCE(SUM(pnl - COALESCE(fee, 0) - COALESCE(exit_fee, 0)), 0) "
+            "FROM allsignal_trades "
+            f"WHERE won IS NOT NULL AND window_open >= ?{scope}", args,
+        ).fetchone()
+        return float(row[0] or 0.0)
+
     def record_alert(self, strategy: str, window_open: int, created_at: int) -> bool:
         cursor = self.db.execute(
             "INSERT OR IGNORE INTO strategy_alerts(strategy,window_open,created_at) VALUES(?,?,?)",
@@ -4841,7 +5482,10 @@ class Store:
         expires_at: int,
         close_ms: int,
         created_at: int,
+        base_count: int | None = None,
     ) -> TradeProposal:
+        """`base_count` is the size the base rule produced before any upsize;
+        None where no upsize can apply (manual and alert proposals)."""
         proposal_id = uuid4().hex[:20]
         # Next attempt number for this window, so every try gets its own row and
         # its own id while staying joinable to the one signal.
@@ -4855,7 +5499,8 @@ class Store:
         self.db.execute(
             "INSERT OR IGNORE INTO trade_proposals "
             "(id,strategy,window_open,ticker,side,entry_limit,take_profit,count,expires_at,"
-            "close_ms,status,created_at,attempt) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            "close_ms,status,created_at,attempt,base_count,ordered_count) "
+            "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (
                 proposal_id,
                 strategy,
@@ -4870,6 +5515,8 @@ class Store:
                 "pending",
                 created_at,
                 attempt,
+                base_count,
+                count,
             ),
         )
         self.db.commit()

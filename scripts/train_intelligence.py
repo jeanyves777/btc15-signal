@@ -205,4 +205,28 @@ def main() -> None:
 
 
 if __name__ == "__main__":
+    # THIS SCRIPT OVERWRITES THE LIVE POLICY, and it took no arguments at all -
+    # so `train_intelligence.py --help`, typed to find out what it does, RAN it
+    # and replaced a running 29-arm brti-4 artefact with a 7-arm one carrying no
+    # fingerprint. The service happened to hold the good policy in memory, so
+    # nothing reached an order, but the file on disk was wrong until it was
+    # restored from `runtime/policies/`.
+    #
+    # A script whose only mode is "rewrite the thing the live service loads"
+    # must not treat an unrecognised argument as consent to run.
+    import argparse
+
+    parser = argparse.ArgumentParser(
+        description="Refit the adaptive policy and OVERWRITE the live "
+                    "artefact at runtime/intelligence_policy.json. The "
+                    "previous version is archived under runtime/policies/.")
+    parser.add_argument(
+        "--write", action="store_true",
+        help="required: confirm that the live policy may be overwritten")
+    args = parser.parse_args()
+    if not args.write:
+        parser.error(
+            "refusing to overwrite the live policy without --write. "
+            "The running service loads that file; rewriting it is a "
+            "deployment, not an inspection.")
     main()

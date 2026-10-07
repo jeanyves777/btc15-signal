@@ -81,8 +81,49 @@ class Notifier:
         return None
 
     # --------------------------------------------------------- delivery
+    # What a SHADOW instance still sends: money that actually moved, and the
+    # summary itself. Everything else it records and keeps quiet about.
+    MONEY_KINDS = frozenset({
+        "fill", "not_filled", "cash_out", "auto_exit", "exit_warning",
+        "combo", "combo_result", "shadow_summary",
+        "allsignal_trade", "allsignal_result", "allsignal_settled",
+        "allsignal_cashout", "allsignal_missed",
+        # the mirrors' copied windows once the primary is done (2026-10-05)
+        "allsignal_copied", "allsignal_copy_result", "allsignal_copy_missed",
+    })
+
+    def alerts_on(self) -> bool:
+        """Does this instance send its alerts? See config.telegram_alert_instruments.
+
+        Listed instruments alert; so does any instance that is auto-trading,
+        so a live instrument can never go quiet by being left off the list.
+        """
+        from .shadow_summary import alert_list
+
+        listed = alert_list(self.settings)
+        if not listed:
+            return True
+        # THE OLD SYSTEM'S MESSAGES FOLLOW THE OLD SYSTEM (operator,
+        # 2026-09-28: "these current messages should be owned by the old
+        # system"). With the main strategy paused they are quiet, like any
+        # shadow; the new strategy speaks through its own kinds above.
+        try:
+            if not bool(self.store.get_setting("main_enabled", 1.0)):
+                return False
+        except Exception:  # noqa: BLE001 - when unsure, alert
+            return True
+        if (surface.asset(getattr(self.settings, "kalshi_series", "")) or "") in listed:
+            return True
+        try:
+            # The same stored row `main.auto_is_on` reads on every decision.
+            default = 1.0 if getattr(self.settings, "auto_trade_enabled", False) else 0.0
+            return bool(self.store.get_setting("auto_trade_enabled", default))
+        except Exception:  # noqa: BLE001 - when unsure, alert
+            return True
+
     async def send_once(self, kind: str, key: str, text: str, now_ms: int,
-                        buttons=None) -> bool:
+                        buttons=None, *, money: bool = False,
+                        reply_to: int | None = None) -> bool:
         """Send this event once. True if it went out on this call.
 
         NOT "exactly once", and the difference matters. Telegram offers no
@@ -103,6 +144,11 @@ class Notifier:
         would let a formatting or connectivity problem reach the code that
         manages real money. The failure is printed, loudly, and returns False.
         """
+        # A SHADOW KEEPS QUIET about everything but money (operator,
+        # 2026-09-28). Not claimed, so nothing is left pending and nothing is
+        # resent later; the event is still recorded where it always was.
+        if not (money or kind in self.MONEY_KINDS) and not self.alerts_on():
+            return False
         try:
             claimed = self.store.begin_delivery(kind, key, now_ms)
         except Exception as exc:  # noqa: BLE001 - see the docstring
@@ -111,7 +157,8 @@ class Notifier:
         if not claimed:
             return False
         try:
-            message_id = await self.telegram.send(text, buttons)
+            message_id = (await self.telegram.send(text, buttons, reply_to=reply_to)
+                          if reply_to else await self.telegram.send(text, buttons))
         except Exception as exc:  # noqa: BLE001
             # The request may or may not have reached Telegram. Leaving the
             # claim as `pending` is the honest record: startup resolves it by
@@ -182,7 +229,9 @@ class Notifier:
     # sold is as expensive as the reverse. `exit_warning` is not, because it
     # placed no order and the next poll re-raises it if it still applies.
     RESEND_ON_AMBIGUITY = ("settlement", "recovery", "learning",
-                           "fill", "not_filled", "cash_out", "auto_exit")
+                           "fill", "not_filled", "cash_out", "auto_exit",
+                           # the $1 book's closes, for the same reason
+                           "allsignal_cashout", "allsignal_settled")
 
     def resolve_crash_window(self, now_ms: int) -> list[dict]:
         """Settle every claim a previous process left unconfirmed.
@@ -201,7 +250,7 @@ class Notifier:
             return []
 
     async def deliver_result(self, window_open: int, kind: str, key: str,
-                             text: str, now_ms: int) -> bool:
+                             text: str, now_ms: int, *, money: bool = False) -> bool:
         """A market-result message, after which the rotation advances.
 
         Advancing here and nowhere else is what makes the rotation legible:
@@ -209,7 +258,7 @@ class Notifier:
         sees each variant in turn instead of it skipping on messages they
         never received.
         """
-        sent = await self.send_once(kind, key, text, now_ms)
+        sent = await self.send_once(kind, key, text, now_ms, money=money)
         if sent:
             self.store.advance_insight(surface.INSIGHTS, now_ms)
         return sent

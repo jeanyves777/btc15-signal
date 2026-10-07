@@ -7,9 +7,9 @@
 
   "enabled": true,
 
-  "_band_comment": "0.60-0.80, widened from 0.65-0.75. NOT BTC's 0.70-0.93. Gold's edge is a price bucket rather than a floor, and jointly with the distance band the bucket is wider than the marginal fit suggested: the wider band adds volume (20.4% of points against 15.6%) without costing residual, and volume is what lets the learned layer accumulate evidence. Above 0.85 the residual goes negative on every sample.",
-  "min_ask": 0.60,
-  "max_ask": 0.80,
+  "_band_comment": "0.70-0.93, THE SAME AS BTC, by the operator's decision of 2026-09-28 (\"set gold to 70-93 same as btc\"; FINDINGS 110), AGAINST the measurement beside it: on gold's live alerts to that date, 60-70c made +10.3c a contract (55 signals, 76% won), 70-80c 0.0c (54, 74%), 80-93c +5.8c (30, 90%); the 49-day corpus fit put the edge at 0.60-0.80 and found the residual negative above 0.85 on every sample. Previous: 0.60-0.80, widened from 0.65-0.75. NOT BTC's 0.70-0.93. Gold's edge is a price bucket rather than a floor, and jointly with the distance band the bucket is wider than the marginal fit suggested: the wider band adds volume (20.4% of points against 15.6%) without costing residual, and volume is what lets the learned layer accumulate evidence. Above 0.85 the residual goes negative on every sample.",
+  "min_ask": 0.70,
+  "max_ask": 0.93,
 
   "_distance_comment": "AN ABSOLUTE BAND IN BPS, unchanged at 1.5-6.0, because the normalised distance does not mean on gold what it means on BTC. Gold's per-second feed jitters ~7x more but that jitter mean-reverts: only 4.0% survives to settlement against BTC's 30.5%. Dividing by it puts gold's median normalised distance at 0.83 where BTC reads 6.92, while the two are equivalent risk-adjusted. BTC's 10-15x floor rejects 99.4% of gold setups - a measurement error, not a verdict on gold. A BAND and not a floor: 2-5bp scores +0.0453 while <2bp is -0.0108 and 5-10bp is -0.0380, so both ends carry weight. The joint fit re-derived this band independently and returned the same one, which is the strongest thing that can be said for a threshold.",
   "min_abs_distance_bps": 1.5,

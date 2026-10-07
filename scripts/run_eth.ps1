@@ -31,6 +31,12 @@ $env:HOURLY_ENABLED          = "false"   # the ladder is a BTC product
 # COMBINED floor stays at the $20 the operator set, rather than silently
 # becoming $40. Raise deliberately, not by leaving this out.
 $env:AUTO_DAILY_LOSS_LIMIT = "10"
+# BACK TO SHADOW, by the operator's decision of 2026-09-28 ("only gold and
+# BTC are allowed to trade live"; FINDINGS 108). Live record at the time:
+# -$12.31 over 141 trades (fee-free, combos included), -4.4c a contract, and it
+# lost in 54 of BTC's 89 losing alert windows - it deepened BTC's bad windows
+# rather than offsetting them. The stored flag was set OFF with
+# scripts/auto_switch.py; nothing here sets AUTO_TRADE_ENABLED.
 
 # EXACTLY ONE INSTANCE LISTENS FOR COMMANDS. Telegram getUpdates is
 # destructive - it acknowledges with an offset - so two processes on one bot

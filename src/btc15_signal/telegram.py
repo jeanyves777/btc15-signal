@@ -19,13 +19,43 @@ def safe_print(text: str) -> None:
 
 
 class Telegram:
+    status_footer = None
+
+    def with_status(self, text: str) -> str:
+        if self.status_footer is not None:
+            footer = self.status_footer()
+            if footer and footer not in text:
+                # Keep under Telegram's 4096-character text ceiling.
+                if len(text) + len(footer) + 2 <= 4096:
+                    text += "\n\n" + footer
+        return text
+
     def __init__(self, token: str, chat_id: str, dry_run: bool) -> None:
         self.token = token
         self.chat_id = chat_id
         self.dry_run = dry_run
         self.offset = 0
 
-    async def send(self, text: str, buttons: list[tuple[str, str]] | None = None) -> int | None:
+    _http_client = None      # class-level so a test double without __init__ works
+
+    def _http(self) -> httpx.AsyncClient:
+        """ONE connection, reused for every call. A new AsyncClient per call
+        loaded the certificate bundle each time: 270-470 ms with the whole
+        event loop blocked, on every Telegram read and send - most of the
+        ~720 ms a poll spent on Telegram, and it stalled orders (2026-09-30)."""
+        client = self._http_client
+        if client is None or getattr(client, "is_closed", False):
+            client = self._http_client = httpx.AsyncClient(timeout=8)
+        return client
+
+    async def close(self) -> None:
+        client = self._http_client
+        if client is not None and not getattr(client, "is_closed", False):
+            await client.aclose()
+
+    async def send(self, text: str, buttons: list[tuple[str, str]] | None = None,
+                   reply_to: int | None = None) -> int | None:
+        text = self.with_status(text)
         if self.dry_run or not self.token or not self.chat_id:
             safe_print(text)
             return None
@@ -43,13 +73,17 @@ class Telegram:
                     [{"text": label, "callback_data": data} for label, data in buttons]
                 ]
             }
-        async with httpx.AsyncClient(timeout=8) as client:
-            response = await client.post(
-                f"https://api.telegram.org/bot{self.token}/sendMessage",
-                json=payload,
-            )
-            response.raise_for_status()
-            return response.json()["result"]["message_id"]
+        if reply_to:
+            # Sent even if the original was deleted: the result still matters.
+            payload["reply_parameters"] = {
+                "message_id": int(reply_to), "allow_sending_without_reply": True,
+            }
+        response = await self._http().post(
+            f"https://api.telegram.org/bot{self.token}/sendMessage",
+            json=payload,
+        )
+        response.raise_for_status()
+        return response.json()["result"]["message_id"]
 
     async def edit(self, message_id: int, text: str,
                    buttons: list[tuple[str, str]] | None = None) -> bool:
@@ -64,6 +98,7 @@ class Telegram:
         old. That is success, not an error: it means the screen already says
         what we wanted it to say.
         """
+        text = self.with_status(text)
         if self.dry_run or not self.token or not self.chat_id:
             safe_print(text)
             return False
@@ -81,11 +116,10 @@ class Telegram:
                      for label, data in buttons]
                 ]
             }
-        async with httpx.AsyncClient(timeout=8) as client:
-            response = await client.post(
-                f"https://api.telegram.org/bot{self.token}/editMessageText",
-                json=payload,
-            )
+        response = await self._http().post(
+            f"https://api.telegram.org/bot{self.token}/editMessageText",
+            json=payload,
+        )
         if response.status_code == 400 and "not modified" in response.text:
             return False
         response.raise_for_status()
@@ -94,17 +128,16 @@ class Telegram:
     async def updates(self) -> list[dict]:
         if self.dry_run or not self.token:
             return []
-        async with httpx.AsyncClient(timeout=8) as client:
-            response = await client.get(
-                f"https://api.telegram.org/bot{self.token}/getUpdates",
-                params={
-                    "offset": self.offset,
-                    "timeout": 0,
-                    "allowed_updates": '["message","callback_query"]',
-                },
-            )
-            response.raise_for_status()
-            updates = response.json()["result"]
+        response = await self._http().get(
+            f"https://api.telegram.org/bot{self.token}/getUpdates",
+            params={
+                "offset": self.offset,
+                "timeout": 0,
+                "allowed_updates": '["message","callback_query"]',
+            },
+        )
+        response.raise_for_status()
+        updates = response.json()["result"]
         if updates:
             self.offset = max(item["update_id"] for item in updates) + 1
         return updates
@@ -112,19 +145,17 @@ class Telegram:
     async def answer_callback(self, callback_id: str, text: str) -> None:
         if self.dry_run or not self.token:
             return
-        async with httpx.AsyncClient(timeout=8) as client:
-            response = await client.post(
-                f"https://api.telegram.org/bot{self.token}/answerCallbackQuery",
-                json={"callback_query_id": callback_id, "text": text, "show_alert": True},
-            )
-            response.raise_for_status()
+        response = await self._http().post(
+            f"https://api.telegram.org/bot{self.token}/answerCallbackQuery",
+            json={"callback_query_id": callback_id, "text": text, "show_alert": True},
+        )
+        response.raise_for_status()
 
     async def clear_buttons(self, chat_id: int, message_id: int) -> None:
         if self.dry_run or not self.token:
             return
-        async with httpx.AsyncClient(timeout=8) as client:
-            response = await client.post(
-                f"https://api.telegram.org/bot{self.token}/editMessageReplyMarkup",
-                json={"chat_id": chat_id, "message_id": message_id, "reply_markup": {}},
-            )
-            response.raise_for_status()
+        response = await self._http().post(
+            f"https://api.telegram.org/bot{self.token}/editMessageReplyMarkup",
+            json={"chat_id": chat_id, "message_id": message_id, "reply_markup": {}},
+        )
+        response.raise_for_status()

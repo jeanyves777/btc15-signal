@@ -100,7 +100,11 @@ def test_the_tier_is_a_step_function_of_reconciled_capital():
     assert tier_for(29.99, 30.0, 2) == 1
     assert tier_for(30.0, 30.0, 2) == 1
     assert tier_for(60.0, 30.0, 2) == 2
-    assert tier_for(6_000.0, 30.0, 2) == 2, "the ceiling binds"
+    assert tier_for(6_000.0, 30.0, 2) == 2, "a ceiling, when set, binds"
+    # UNCAPPED (operator, 2026-09-27): 0 means no ceiling.
+    assert tier_for(132.95, 30.0, 0) == 4
+    assert tier_for(6_000.0, 30.0, 0) == 200
+    assert tier_for(10.0, 30.0, 0) == 1, "still never zero"
     assert tier_for(0.0, 30.0, 2) == 1, "never zero - that is a silent stop"
 
 
@@ -300,3 +304,13 @@ def test_partial_exit_allocates_entry_cost_and_fees_to_the_portion_sold():
         paid=0.70, bid=0.90, filled=2, held=2, entry_fee=0.04, exit_fee=0.02
     )
     assert round(whole, 6) == round((0.90 - 0.70) * 2 - 0.04 - 0.02, 6)
+
+
+
+def test_the_shipped_base_is_uncapped():
+    """Operator, 2026-09-27: "auto scale and contracts should not be capped,
+    it should scale as capital grows"."""
+    from btc15_signal.config import Settings
+    s = Settings()
+    assert s.max_base_contracts == 0 and s.capital_per_contract == 30.0
+    assert tier_for(132.95, s.capital_per_contract, s.max_base_contracts) == 4

@@ -351,12 +351,17 @@ def test_the_watchdog_cannot_reset_a_trading_limit():
         assert forbidden not in source
 
 
-def test_the_watchdog_gives_up_rather_than_looping_forever():
+def test_the_watchdog_slows_down_rather_than_looping_fast_or_giving_up():
+    """It used to stop for good after 7 exits an hour - and with it every
+    shadow recorder on the instance (operator, 2026-09-30: recording never
+    stops). Now it says so once and retries every 15 minutes; behaviour is
+    pinned in tests/test_recording_never_pauses.py."""
     from pathlib import Path
 
     source = Path("scripts/watchdog.py").read_text(encoding="utf-8")
     assert "MAX_RESTARTS_PER_HOUR" in source
-    assert "giving up" in source
+    assert "BACKOFF_SECONDS = 900" in source
+    assert "giving up" not in source
 
 
 def test_the_watchdog_relies_on_the_lock_rather_than_guessing_liveness(tmp_path):

@@ -251,3 +251,293 @@ def test_no_module_restates_the_version_as_a_literal():
             if re.search(r'=\s*["\']brti-\d["\']', code):
                 offenders.append(f"{path.name}: {line.strip()}")
     assert not offenders, offenders
+
+
+# --------------------------------------------------------------- the freeze
+
+# FROZEN 2026-09-27 BY OPERATOR DECISION. These two literals are the ONLY
+# place in the repo that restates the contract's identity, and they exist to
+# make changing it deliberate rather than possible.
+#
+# WHAT A CHANGE COSTS, measured rather than asserted. `learning_data` excludes
+# any live decision whose `feature_version` is not the current one - correctly,
+# because a decision taken under other definitions describes a cell that does
+# not exist under these. The consequence is that changing the contract DELETES
+# THE LIVE EVIDENCE BASE. On BTC that was 6,395 of 8,982 decisions, 71%.
+#
+# It had happened four times in three days when this was frozen:
+#
+#     brti-1   0.7 days | brti-2  1.9 days | brti-3  34 MINUTES | brti-4  1.1 days
+#
+# leaving 177 qualified signals across seven live instruments, none older than
+# 1.1 days, and silver with zero. Every tuning decision, every confidence arm
+# and every hypothesis the local model can reason over is drawn from that
+# window, so the contract moving is the single largest limit on the system
+# learning anything at all. See FINDINGS 90.
+#
+# TO CHANGE IT ANYWAY - which is allowed, and sometimes right:
+#   1. change the contract (or the arithmetic in brti.features_from_series),
+#   2. give it a NEW version, update the literals below, APPEND the new pair
+#      to CONTRACT_HISTORY and re-record GOLDEN_* - all in the same commit,
+#   3. record in FINDINGS what was reset and why it was worth the reset.
+# Step 2 is the whole mechanism. It cannot be satisfied by accident, and it
+# puts this comment in front of whoever does it.
+FROZEN_FINGERPRINT = "a641ab8e2a05aa44"
+FROZEN_VERSION = "brti-4"
+# The payload the fingerprint was taken over, so a failure can say WHICH
+# field moved instead of only that the hash differs.
+FROZEN_PAYLOAD = (
+    '{"context_recorded": ["session", "vol_regime", "band_hold_s", '
+    '"remaining_s", "momentum_45m", "volatility_45m"], '
+    '"cutoff_rule": "t <= decision_ms", '
+    '"distance_bands": [[0.0, 5.0, "bd<5"], [5.0, 10.0, "bd5-10"], '
+    '[10.0, 15.0, "bd10-15"], [15.0, 999.0, "bd15+"]], '
+    '"family": "brti", "key_dimensions": ["distance", "price", "momentum"], '
+    '"level_window_s": 2700, '
+    '"momentum_bands": [[-9000000000.0, 0.0, "mom<=0"], [0.0, 5.0, "mom0-5"], '
+    '[5.0, 9000000000.0, "mom5+"]], '
+    '"momentum_window_s": 300, '
+    '"price_bands": [[0.0, 0.7, "px<70"], [0.7, 0.85, "px70-85"], '
+    '[0.85, 0.9301, "px85-93"], [0.9301, 1.0, "px93+"]], '
+    '"price_source": "kalshi:orderbook", "sampling_cadence_s": 1, '
+    '"smoothing": "none added; BRTI is a published trailing 60s mean", '
+    '"source": "kalshi:/live_data/events/{event} + /cfbenchmarks/values", '
+    '"units": "bps; normalized_distance = |signed_bps| / volatility_bps", '
+    '"version": "brti-4", '
+    '"vol_bands": [[0.0, 0.5, "low"], [0.5, 1.5, "mid"], '
+    '[1.5, 9000000000.0, "high"]], '
+    '"volatility_window_s": 300}'
+)
+# APPEND-ONLY. Every (version, fingerprint) the system has run under. The
+# version string is what `learning_data` filters evidence on, so a new
+# fingerprint re-pinned under an OLD version would pool two arithmetics
+# instead of resetting. One line per version, never edited.
+CONTRACT_HISTORY = [
+    ("brti-4", "a641ab8e2a05aa44"),
+]
+
+
+def _freeze_message(contract) -> str:
+    import json
+    moved = contract.differences(json.loads(FROZEN_PAYLOAD))
+    return (
+        f"THE FEATURE CONTRACT HAS CHANGED.\n"
+        f"  frozen:  {FROZEN_FINGERPRINT}\n"
+        f"  current: {contract.fingerprint()}\n"
+        f"  moved:   {'; '.join(moved) or '(payload equal - hash function changed?)'}\n\n"
+        f"This deletes every live decision recorded under the old contract - "
+        f"71% of them last time - and resets the evidence every instrument "
+        f"learns from to zero. If that is intended, follow the three steps "
+        f"above FROZEN_FINGERPRINT in the same commit."
+    )
+
+
+def test_the_feature_contract_is_frozen():
+    """The contract's identity is pinned, not merely self-consistent.
+
+    Every other test here checks the MECHANISM - that a changed lookback
+    changes the hash, that a mismatch is refused. All of them keep passing
+    when the contract changes, because they compare the contract to itself.
+    This one compares it to a literal, so a change has to be declared.
+    """
+    assert fc.FINGERPRINT == FROZEN_FINGERPRINT, _freeze_message(fc.CONTRACT)
+
+
+def test_the_frozen_payload_is_the_one_that_was_hashed():
+    """Three literals that could drift apart; this keeps them one fact."""
+    import hashlib
+    import json
+    blob = json.dumps(json.loads(FROZEN_PAYLOAD), sort_keys=True,
+                      separators=(",", ":"))
+    assert hashlib.sha256(blob.encode()).hexdigest()[:16] == FROZEN_FINGERPRINT
+    assert json.loads(FROZEN_PAYLOAD)["version"] == FROZEN_VERSION
+
+
+def test_a_new_fingerprint_needs_a_new_version():
+    """Re-pinning a changed contract under the same version name would let
+    `learning_data` pool rows computed two different ways. The history makes
+    that visible: each version appears once, each fingerprint once, and the
+    frozen pair is the last line."""
+    versions = [v for v, _ in CONTRACT_HISTORY]
+    prints = [f for _, f in CONTRACT_HISTORY]
+    assert len(set(versions)) == len(versions), "a version was reused"
+    assert len(set(prints)) == len(prints), "a fingerprint was reused"
+    assert CONTRACT_HISTORY[-1] == (FROZEN_VERSION, FROZEN_FINGERPRINT), (
+        "the frozen pair must be the newest history line - append it, do not "
+        "edit an old one")
+
+
+def test_the_freeze_message_names_the_field_that_moved():
+    """The message was dead code once: it called a method that does not exist,
+    so the pin would have fired as an AttributeError and never printed the
+    warning it exists for. Render it."""
+    moved = fc.FeatureContract(
+        momentum_window_s=fc.CONTRACT.momentum_window_s + 1)
+    message = _freeze_message(moved)
+    assert "momentum_window_s" in message
+    assert moved.fingerprint() in message
+
+
+def test_the_frozen_version_matches_the_contract():
+    assert fc.CONTRACT.version == FROZEN_VERSION, (
+        f"feature version moved from {FROZEN_VERSION} to "
+        f"{fc.CONTRACT.version} without the freeze being updated"
+    )
+
+
+def test_the_freeze_would_actually_catch_a_change():
+    """A guard nobody has seen fail is a guard nobody knows works.
+
+    FINDINGS 92 records a gate whose thresholds no input could fail being
+    counted as eight passed checks. So this builds a contract that differs in
+    one lookback and asserts the pin rejects it.
+    """
+    # DERIVED FROM THE LIVE VALUE, never a literal. A hardcoded 301 passed
+    # while the contract said 300 and then FAILED under a mutation test that
+    # set the contract to 301 - the guard's own check collided with the thing
+    # it was checking. Deriving the perturbation makes that impossible.
+    moved = fc.FeatureContract(
+        momentum_window_s=fc.CONTRACT.momentum_window_s + 1)
+    assert moved.fingerprint() != fc.FINGERPRINT
+    assert fc.compatible(moved.fingerprint()) is False
+
+
+# ------------------------------------------------- the freeze covers the maths
+#
+# The fingerprint hashes the contract's DECLARATIONS. The numbers the gates
+# and arms read are computed in brti.features_from_series, which never reads
+# the contract: its windows are its own default arguments, and the volatility
+# estimator (pstdev x sqrt(n)), the 1e-9 denominator floor, the rejection
+# threshold and the 45-minute context are code, not fields. An adversarial
+# probe on 2026-09-27 changed each of them - removing sqrt(n) moved 80% of
+# brti-4 rows to another band, a 10x floor change took admission from 34% to
+# 96%, a 3600s level window re-based held/rejections/accel - and the
+# fingerprint stayed a641ab8e2a05aa44 with every test passing.
+#
+# So the arithmetic is pinned directly, on fixed series, to exact numbers.
+# These do not describe what the features SHOULD be; they record what brti-4
+# IS, so that changing it is a declared act like changing the contract.
+
+GOLDEN_END_MS = 1_790_000_000_000
+
+
+def _golden_wavy():
+    """An hour of 1s prints: drift, a slow swing and a fast wobble, so the
+    level lookback sees approaches and turn-backs and every feature is live."""
+    import math
+    out = []
+    for i in range(3600):
+        t = GOLDEN_END_MS - (3599 - i) * 1000
+        v = 65_000 * (1 + 0.0009 * math.sin(i / 211.0)
+                      + 0.00025 * math.sin(i / 17.0)
+                      + 0.0000004 * i)
+        out.append((t, round(v, 2)))
+    return out
+
+
+# Recorded from brti-4 on 2026-09-27. Re-record ONLY with a new version.
+GOLDEN_WAVY = {
+    "target": 65099.53,
+    "value": 65021.25,
+    "signed_distance_bps": -12.024664386978134,
+    "brti_momentum_bps": -8.922957400292475,
+    "brti_volatility_bps": 1.8088401865936568,
+    "brti_normalized_distance": 6.647720719663218,
+    "samples": 3600,
+    "span_ms": 3599000,
+    "brti_retrace": 0.0,
+    "brti_choppiness": 0.8592074676085394,
+    "brti_rsi": 40.682996020179395,
+    "brti_accel": 6.238022430643531,
+    "brti_held_s": 340.0,
+    "brti_rejections": 5,
+    "brti_momentum_45m_bps": 6.520580225453099,
+    "brti_volatility_45m_bps": 5.637850941506642,
+}
+
+# A dead-flat series has zero volatility, so the normalized distance IS the
+# denominator floor at work: |1.5387 bps| / 1e-9.
+GOLDEN_FLAT = {
+    "signed_distance_bps": 1.5386982612719535,
+    "brti_volatility_bps": 0.0,
+    "brti_normalized_distance": 1538698261.2719533,
+    "brti_held_s": 599.0,
+    "brti_rejections": 0,
+}
+
+
+def _assert_golden(got, expected):
+    import pytest
+    moved = []
+    for name, want in expected.items():
+        have = getattr(got, name)
+        if have != pytest.approx(want, rel=1e-9, abs=1e-9):
+            moved.append(f"{name}: brti-4 {want!r} -> now {have!r}")
+    assert not moved, (
+        "THE FEATURE ARITHMETIC HAS CHANGED under an unchanged contract.\n  "
+        + "\n  ".join(moved)
+        + "\nEvery keyed arm and gate reads these numbers. Treat this exactly "
+          "like a contract change: new version, new golden values, FINDINGS.")
+
+
+def test_the_feature_arithmetic_is_frozen():
+    s = _golden_wavy()
+    target = s[3600 - 900][1]
+    assert target == GOLDEN_WAVY["target"], "the golden series itself moved"
+    got = features_from_series("KXBTCD-GOLDEN", s, target, GOLDEN_END_MS)
+    _assert_golden(got, GOLDEN_WAVY)
+
+
+def test_the_distance_denominator_floor_is_frozen():
+    flat = [(GOLDEN_END_MS - (599 - i) * 1000, 65_000.0) for i in range(600)]
+    got = features_from_series("KXBTCD-FLAT", flat, 64_990.0, GOLDEN_END_MS)
+    _assert_golden(got, GOLDEN_FLAT)
+
+
+def test_the_golden_check_would_catch_a_changed_estimator():
+    """Seen to fail: the same series with a different window must NOT match,
+    or the golden numbers pin nothing."""
+    s = _golden_wavy()
+    got = features_from_series("KXBTCD-GOLDEN", s, s[2700][1], GOLDEN_END_MS,
+                               level_window_s=fc.CONTRACT.level_window_s + 900)
+    import pytest
+    with pytest.raises(AssertionError, match="brti_rejections|_45m_bps"):
+        _assert_golden(got, GOLDEN_WAVY)
+
+
+def test_the_feature_function_defaults_are_the_contracts_windows():
+    """brti.py states each window a SECOND time, as a default argument, and
+    that default - not the contract field - is what the live path runs. Held
+    equal here, derived from the contract, never typed as a literal."""
+    import inspect
+    params = inspect.signature(features_from_series).parameters
+    for name in ("momentum_window_s", "volatility_window_s", "level_window_s"):
+        assert params[name].default == getattr(fc.CONTRACT, name), (
+            f"brti.features_from_series({name}={params[name].default}) but the "
+            f"contract says {getattr(fc.CONTRACT, name)} - the live features "
+            f"and the fingerprint now describe different windows")
+
+
+def test_no_live_call_site_overrides_a_contracted_window():
+    """The windows are parameters, so a caller could re-base the live features
+    while the hash certifies the defaults. No module in src/ may pass one."""
+    import re
+    from pathlib import Path
+    src = Path(__file__).resolve().parents[1] / "src" / "btc15_signal"
+    pattern = re.compile(
+        r"\b(momentum_window_s|volatility_window_s|level_window_s)\s*=")
+    offenders = []
+    for path in src.glob("*.py"):
+        if path.name == "feature_contract.py":
+            continue
+        text = path.read_text(encoding="utf-8")
+        if path.name == "brti.py":
+            # The signature is the one place these names are assigned.
+            start = text.index("def features_from_series(")
+            end = text.index(") -> BRTIFeatures | None:", start)
+            text = text[:start] + text[end:]
+        for line in text.splitlines():
+            code = line.split("#", 1)[0]
+            if pattern.search(code):
+                offenders.append(f"{path.name}: {line.strip()}")
+    assert not offenders, offenders

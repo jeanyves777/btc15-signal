@@ -161,15 +161,20 @@ def test_eth_config_did_not_acquire_a_band():
 
 # ------------------------------------------------- the shipped gold numbers
 
-def test_the_gold_price_band_is_measured_not_inherited():
-    """0.60-0.80 against BTC's 0.70-0.93. If these ever converge by accident,
-    gold is being traded on BTC's evidence. The exact band is a measurement and
-    moves when re-measured - what must hold is that it is not BTC's."""
+def test_the_gold_price_band_is_btcs_by_decision_not_by_accident():
+    """Measured at 0.60-0.80; set to BTC's 0.70-0.93 by the operator on
+    2026-09-28 ("set gold to 70-93 same as btc"; FINDINGS 110), against that
+    measurement. What must hold is that the convergence is a DECISION on the
+    record - the rule file says so and carries the evidence it overrode - never
+    an accident that trades gold on BTC's evidence silently."""
+    import json
+
     rule = gold_rule()
     btc = KalshiBRTIRule()
-    assert (rule.min_ask, rule.max_ask) != (btc.min_ask, btc.max_ask)
-    assert rule.max_ask < btc.max_ask
-    assert rule.min_ask < btc.min_ask
+    assert (rule.min_ask, rule.max_ask) == (btc.min_ask, btc.max_ask) == (0.70, 0.93)
+    raw = json.loads((ROOT / "strategy_kalshi_gold.json").read_text(encoding="utf-8"))
+    assert "operator's decision of 2026-09-28" in raw["_band_comment"]
+    assert "0.60-0.80" in raw["_band_comment"], "the overridden measurement stays"
 
 
 def test_the_entry_window_is_the_one_that_actually_runs():

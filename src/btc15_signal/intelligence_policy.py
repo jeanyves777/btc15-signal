@@ -133,7 +133,10 @@ class Policy:
     arms: dict = field(default_factory=dict)
     vetoes_enabled: bool = False
     admissions_enabled: bool = False
-    min_evidence: int = 120
+    # 100 BY OPERATOR DECISION, 2026-09-26. A policy written before that date
+    # carries its own value and keeps it - this is only the default for a
+    # policy that does not say. See `learning.MIN_PROMOTION_N`.
+    min_evidence: int = 100
     notes: str = ""
     # What the fit was actually computed under. `feature_version` is a name;
     # these are the definitions. Absent means "cannot be shown to match",

@@ -31,7 +31,7 @@
 # Remove with -Uninstall.
 
 param(
-    [string[]]$Instances = @('eth', 'gold', 'silver', 'sol'),
+    [string[]]$Instances = @('eth', 'gold', 'silver', 'sol', 'xrp'),
     [switch]$Uninstall
 )
 

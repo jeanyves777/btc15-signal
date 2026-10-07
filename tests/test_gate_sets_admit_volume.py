@@ -55,6 +55,7 @@ INSTRUMENTS = {
     "SOL": ("strategy_kalshi_sol.json", "brti_history_sol_v5.db"),
     # XRP's corpus was built after the retrace fix, so there is only one of it.
     "XRP": ("strategy_kalshi_xrp.json", "brti_history_xrp.db"),
+    "NEAR": ("strategy_kalshi_near.json", "brti_history_near.db"),
 }
 
 
@@ -142,7 +143,8 @@ def admit(rule, rows):
 MARKETS = {"GOLD": "market_data_kxgold15m.db",
            "SILVER": "market_data_kxsilver15m.db",
            "SOL": "market_data_kxsol15m.db",
-           "XRP": "market_data_kxxrp15m.db"}
+           "XRP": "market_data_kxxrp15m.db",
+           "NEAR": "market_data_kxnear15m.db"}
 
 
 def loaded(name):
@@ -178,20 +180,44 @@ def test_the_deployed_set_admits_a_learnable_share(name):
 
 @pytest.mark.parametrize("name", sorted(INSTRUMENTS))
 def test_the_deployed_set_does_not_select_for_losers(name):
-    """Admitting at a worse win rate than the corpus overall means the gates
-    are choosing badly - the other half of "don't just block or let through
-    bad setups"."""
+    """Admitting at a worse RESIDUAL than the corpus overall means the gates are
+    choosing badly - the other half of "don't just block or let through bad
+    setups".
+
+    RESIDUAL, NOT WIN RATE, and the difference is not pedantry. Expected value
+    per contract is `p * (1 - ask) - (1 - p) * ask = p - ask`, so the payoff
+    ratio cancels and the win rate alone says nothing unless the price is held
+    equal (FINDINGS 78). NEAR tripped the win-rate version of this guard on
+    2026-09-26: it admits at 68.8% against a 76.0% baseline, but buys at 0.668
+    against 0.758, so its admitted set is BETTER than taking everything while
+    winning less often. A set that deliberately buys cheaper contracts should
+    win less often.
+
+    This is not the guard weakened to pass. It still catches what it was built
+    for: SOL's old config admitted 2.16% of points at a 50.6% win rate for a
+    residual of -0.0502 against a +0.0013 baseline, and fails on residual by a
+    wide margin. The win rate is reported in the message because when a set
+    genuinely does select for losers, that is the number worth seeing.
+    """
     rule, rows = loaded(name)
     rows = in_window(rule, rows)
     through = admit(rule, rows)
     assert through, f"{name}: nothing admitted"
     # `sum(1 for _, won in through)` counts every row, not the wins. It read
     # as 100% for both instruments and made this assertion vacuous.
-    got = sum(1 for _, won in through if won) / len(through)
-    base = sum(1 for *_, won in rows if won) / len(rows)
+    got_win = sum(1 for _, won in through if won) / len(through)
+    got_ask = sum(price for price, _ in through) / len(through)
+    got = got_win - got_ask
+
+    base_win = sum(1 for *_, won in rows if won) / len(rows)
+    base_ask = sum(rule.ask_for(f, bid, ask) for f, bid, ask, _, _ in rows) / len(rows)
+    base = base_win - base_ask
+
     assert got >= base - 0.02, (
-        f"{name} admits at {got:.1%} against a {base:.1%} corpus baseline - "
-        f"the gates are selecting worse setups than taking everything")
+        f"{name} admits at residual {got:+.4f} ({got_win:.1%} at {got_ask:.3f}) "
+        f"against a corpus baseline of {base:+.4f} ({base_win:.1%} at "
+        f"{base_ask:.3f}) - the gates are selecting worse setups than taking "
+        f"everything")
 
 
 @pytest.mark.parametrize("name", sorted(INSTRUMENTS))

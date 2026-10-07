@@ -33,6 +33,11 @@ TICKER = "KXBTC15M-26SEP221500-00"
 NOW = int(time.time() * 1000)
 DAY = 86_400_000
 TODAY = ny_day_start_ms(NOW)
+# The fixture's fill comes after its 01:00 window opens. Between midnight and
+# 02:00 New York the wall clock has not got there, and the suite failed for
+# that hour alone - so hold NOW at 02:00. Still the same New York day, which
+# is the only thing the store reads from it.
+NOW = max(NOW, TODAY + 7_200_000)
 WINDOW = TODAY + 3_600_000
 
 

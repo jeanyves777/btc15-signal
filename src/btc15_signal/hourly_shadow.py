@@ -127,7 +127,7 @@ class HourlyShadow:
                     f"{'; '.join(integrity.reasons)}",
                     flush=True,
                 )
-        except (httpx.HTTPError, RuntimeError, ValueError, OSError, KeyError) as exc:
+        except Exception as exc:  # noqa: BLE001 - "Never raises": sqlite errors escaped
             # Shadow work is never allowed to take the trading loop down.
             print(f"hourly poll error: {type(exc).__name__}: {exc}", flush=True)
 
@@ -179,5 +179,5 @@ class HourlyShadow:
                     chain_id, _close_ms, value, int(time.time() * 1000)
                 )
                 print(f"hourly: {chain_id} settled at {value:,.2f}", flush=True)
-        except (httpx.HTTPError, RuntimeError, ValueError, OSError, KeyError) as exc:
+        except Exception as exc:  # noqa: BLE001 - "Never raises" (2026-09-30)
             print(f"hourly settle error: {type(exc).__name__}: {exc}", flush=True)
