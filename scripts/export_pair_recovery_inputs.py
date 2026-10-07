@@ -149,6 +149,30 @@ def outcomes_from_trading(db, market: str, since_ms: int) -> dict[str, dict]:
     return found
 
 
+def outcomes_from_observations(db, market: str, since_ms: int) -> dict[str, dict]:
+    """Market result per window, derived from the settled observation archive.
+
+    `observations.won` is stored relative to each row's own `side` (the model
+    flips side mid-window, so one window holds both), so the winning side is
+    `side` when won else the opposite - identical across every settled row of
+    the window. This covers far more windows than `settlements`, which holds
+    only markets the bot actually settled.
+    """
+    if not has_table(db, "observations"):
+        return {}
+    found: dict[str, dict] = {}
+    for r in db.execute(
+        "SELECT window_open, ticker, side, won FROM observations "
+        "WHERE won IS NOT NULL AND side IS NOT NULL AND ticker IS NOT NULL "
+        "AND window_open + ? >= ? ORDER BY window_open", (WINDOW_MS, since_ms),
+    ):
+        win_yes = (r["side"] == "yes") == bool(r["won"])
+        found.setdefault(r["ticker"], {
+            "market": market, "ticker": r["ticker"], "close_ms": r["window_open"] + WINDOW_MS,
+            "result": "yes" if win_yes else "no", "settled_ms": ""})
+    return found
+
+
 def outcomes_from_cache(path: str, market: str, prefix: str, since_ms: int) -> dict[str, dict]:
     db = ro(path)
     if not has_table(db, "markets"):
@@ -202,6 +226,8 @@ def main() -> None:
         quotes += quotes_from_book(path, "BTC", a.btc_prefix, since)
         quotes += quotes_from_book(path, "GOLD", a.gold_prefix, since)
 
+    # Authoritative settlements first, then the market cache, then the
+    # observation-derived result fills every remaining window.
     outcomes = outcomes_from_trading(btc, "BTC", since)
     outcomes.update(outcomes_from_trading(gold, "GOLD", since))
     for market, path, prefix in (("BTC", a.btc_cache, a.btc_prefix),
@@ -209,6 +235,9 @@ def main() -> None:
         if Path(path).exists():
             for tk, row in outcomes_from_cache(path, market, prefix, since).items():
                 outcomes.setdefault(tk, row)
+    for db, market in ((btc, "BTC"), (gold, "GOLD")):
+        for tk, row in outcomes_from_observations(db, market, since).items():
+            outcomes.setdefault(tk, row)
 
     write(out / "btc_trades.csv", trades,
           ["ticker", "close_ms", "side", "entry_ms", "contracts", "cost", "net_pnl",
