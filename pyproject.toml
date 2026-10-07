@@ -28,6 +28,7 @@ btc15-intel = "btc15_signal.intel_query:run"
 btc15-profit-test = "btc15_signal.profittest:run"
 btc15-dashboard = "btc15_signal.dashboard:run"
 btc15-record = "btc15_signal.recorder:run"
+btc15-pair-recovery = "btc15_signal.pair_recovery_backtest:run"
 
 [build-system]
 requires = ["hatchling"]
