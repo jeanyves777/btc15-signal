@@ -1,0 +1,1430 @@
+{
+  "created_ms": 1791399629901,
+  "snapshot_semantics": "one read transaction per database; different databases are not globally atomic",
+  "files": {
+    "mirror.jsonl.gz": {
+      "bytes": 34402,
+      "sha256": "c10f150a548a8d576fa71d85fa6d96445bf937525a83418f8b05ca0fe244b48e"
+    },
+    "README.md": {
+      "bytes": 5177,
+      "sha256": "7f3a61e5a81a73bcf7e194f7a5d4f94092678f706b9958afc119860eddf9f081"
+    },
+    "settings.sanitized.json": {
+      "bytes": 6362,
+      "sha256": "c40e6ef82a4b795a172b28d27a306c404c98c21388ff70107cbdce33aa5548b0"
+    },
+    "bnb/allsignal_trades.csv.gz": {
+      "bytes": 174,
+      "sha256": "9ec3ff5b84abacc27cf640cdaa4eaeb9181cd40037723a73cfa3748becaaff6f"
+    },
+    "bnb/candidate_evaluations.csv.gz": {
+      "bytes": 177,
+      "sha256": "13558ff7e73d8c88dd66061e678a3ce0c6773980bdc5e3ce74b7d160909b0cd6"
+    },
+    "bnb/capital_days.csv.gz": {
+      "bytes": 246,
+      "sha256": "c32a2e1cdc4574875aeee6446816b55d6c1f761726724a4666a5d747f1599d01"
+    },
+    "bnb/daily_ledger.csv.gz": {
+      "bytes": 13562,
+      "sha256": "6006631dc279501ab5968405868ccdaab6b915ddaa5acb4e3b53a658fc9e235d"
+    },
+    "bnb/decision_details.csv.gz": {
+      "bytes": 66667,
+      "sha256": "9f61b7f20b7eb6d63223dd8b2766de2d2cd453a2915f39000926d6f44a5ed0e2"
+    },
+    "bnb/decision_records.csv.gz": {
+      "bytes": 313,
+      "sha256": "1f3b9547ebf27233364a6637157605fadb8a8bbca7af06098599d993be7cfc00"
+    },
+    "bnb/executions.csv.gz": {
+      "bytes": 164,
+      "sha256": "151676a8c23a257e330e4eb526925cbdd29aea3d48bbd84c27062311cd88cb77"
+    },
+    "bnb/fills.csv.gz": {
+      "bytes": 117566,
+      "sha256": "43e8bdc57181aa4104bc7baba0cd5ba6e13db21c9aa01d856c60713af8f7edfe"
+    },
+    "bnb/fund_reservations.csv.gz": {
+      "bytes": 76,
+      "sha256": "a43ae9181436f82017ca1e0d3013fd592c7dda3e944dacbf6d0a8c89a5325f1f"
+    },
+    "bnb/input_gaps.csv.gz": {
+      "bytes": 23456,
+      "sha256": "d406e5780bf190ac427dc47fee6159bbde2ddbd2c06ed580dae52bd11b9f994a"
+    },
+    "bnb/intelligence_decisions.csv.gz": {
+      "bytes": 1776494,
+      "sha256": "1e39c69f8156ff889d3dd8129fd3abd288bc70c5c42095e435144efcb36a747e"
+    },
+    "bnb/learning_runs.csv.gz": {
+      "bytes": 263,
+      "sha256": "a3eda1f22682fe698ebbce47358b13e0b84102048ee78119c80240d868374be6"
+    },
+    "bnb/learning_state.csv.gz": {
+      "bytes": 95,
+      "sha256": "cb41ef18507ce2a9e37395f4e2b131c89644ff0dad76863a81a4e35951456658"
+    },
+    "bnb/observations.csv.gz": {
+      "bytes": 2939103,
+      "sha256": "f999582a3c9c0a949385ea368b68b2bd258ae3c2d4f21cb3f4ccd5de1f12d4d6"
+    },
+    "bnb/policy_activations.csv.gz": {
+      "bytes": 187,
+      "sha256": "5073d9d34b167680d488491fb68e767935d012f4c7dcc6c59d7ddc83cd7723ce"
+    },
+    "bnb/policy_withdrawals.csv.gz": {
+      "bytes": 112,
+      "sha256": "4714abeccd1e533ba599bae20681dd633f10ff4fe1b07a2b26496141667e2318"
+    },
+    "bnb/predictions.csv.gz": {
+      "bytes": 14827,
+      "sha256": "aaafce59a840e343de0fc28fa727c5ac11765882b05b0c368dd1a5eedfa85786"
+    },
+    "bnb/realised_events.csv.gz": {
+      "bytes": 18470,
+      "sha256": "b483abe7ccdeb17411eb598eaea93b577951a60c1606510fa4711d4686c15282"
+    },
+    "bnb/recovery_adds.csv.gz": {
+      "bytes": 226,
+      "sha256": "5c9a3c5a070c1739646ae195a8feb7a9f596f7f6400dc3bbefb6495888d23ec3"
+    },
+    "bnb/recovery_add_budget.csv.gz": {
+      "bytes": 87,
+      "sha256": "1685d87a0fde23cdb0c4ade2a6747b1fe1d3367819955c12fbde55c51874f496"
+    },
+    "bnb/recovery_cycle_wins.csv.gz": {
+      "bytes": 3142,
+      "sha256": "b85c51fe588e0383940a545d6b5a00787bd383853616adb8fff4907dafa14c10"
+    },
+    "bnb/recovery_deficit.csv.gz": {
+      "bytes": 183,
+      "sha256": "03a581f947a35542e00fef3d00c66f4ec79e06bbd2fb851d50f2294aadb61b56"
+    },
+    "bnb/reversion_signals.csv.gz": {
+      "bytes": 134,
+      "sha256": "9b8de472b4eeb494514b2c39d9bc52e2c75d637e597fc01a3b59aef9a1fe8fd4"
+    },
+    "bnb/schema.json": {
+      "bytes": 17467,
+      "sha256": "7615b30744f438b5b4b8d6d6fcac391799caf4b4f6d0797d8eb08d1aa0b88ba0"
+    },
+    "bnb/settings.csv.gz": {
+      "bytes": 148,
+      "sha256": "70f01844226928ca08a735d344c36b72a35cbe943f1fef9faadfa2afa187c872"
+    },
+    "bnb/settlements.csv.gz": {
+      "bytes": 46475,
+      "sha256": "8ee0b4b811e8208d3b7d9677df403320898e28a0cf69af1dfc3331bbfc20ef1f"
+    },
+    "bnb/shadow_decisions.csv.gz": {
+      "bytes": 63861,
+      "sha256": "807f528d7727cf2f394f5dd39c2ba3fde9b6947bd32abc18b1284cab0fe09022"
+    },
+    "bnb/strategy_alerts.csv.gz": {
+      "bytes": 6932,
+      "sha256": "fe70bc2b8693760dfbf02e0825e6327af9357f8cfc2f6d5823e89c785fd09d2a"
+    },
+    "bnb/trade_proposals.csv.gz": {
+      "bytes": 22551,
+      "sha256": "ab8c97a414a204d83404893afe3d15df0ac409861b389d5f7c1db81d01ba21f3"
+    },
+    "btc/allsignal_trades.csv.gz": {
+      "bytes": 52182,
+      "sha256": "f7f0521664c9f6d8348bf759868a284f0d8fad3b175b3ec8820203342aa02db3"
+    },
+    "btc/candidate_evaluations.csv.gz": {
+      "bytes": 16159,
+      "sha256": "fea3387eaee3e18d55ad210c7e77d2c2b5ecf4a7aa64f956aef5016c5b3c4797"
+    },
+    "btc/capital_days.csv.gz": {
+      "bytes": 393,
+      "sha256": "627546703b0955f2da9bbffa14a2a5a4d830910944b1b6fc2a6d3fba8e6c53e1"
+    },
+    "btc/daily_ledger.csv.gz": {
+      "bytes": 25552,
+      "sha256": "f23a239bea7b3b54296880ba28da2d3e22a9a44ea07c90fb068155d781a8602d"
+    },
+    "btc/decision_details.csv.gz": {
+      "bytes": 178820,
+      "sha256": "dd7ce6af7715818ef3aaea264659abe49d2ea2764045a74644592bfac5cca729"
+    },
+    "btc/decision_records.csv.gz": {
+      "bytes": 315753,
+      "sha256": "fab2bd3257650fe8c6809331168d32addabb16c30c32fde8407b2dd1d0c6dea6"
+    },
+    "btc/executions.csv.gz": {
+      "bytes": 20121,
+      "sha256": "b95dc0ffafb7ff9b079f473a7d42feed1970722821e789ef6580e7d399b224fa"
+    },
+    "btc/fills.csv.gz": {
+      "bytes": 117559,
+      "sha256": "d7890e9fc3aa2c34945dbe6ebddac9db6aadc899a3e1329d96a0af678fe97725"
+    },
+    "btc/fund_reservations.csv.gz": {
+      "bytes": 141,
+      "sha256": "12979d1c4ec6d192f5596d430b173e6d420c236eaa4168b50bdbd9fd40a17373"
+    },
+    "btc/input_gaps.csv.gz": {
+      "bytes": 52112,
+      "sha256": "6c22d9c9d832068d1993ca4517ce050cf19a21ce8df479ea45c7b1dc23f3b15e"
+    },
+    "btc/intelligence_decisions.csv.gz": {
+      "bytes": 3785507,
+      "sha256": "7caf91f6e9250109e1dcc0d6197cfbb5735467f6db453da44863fe1ed49bb938"
+    },
+    "btc/learning_runs.csv.gz": {
+      "bytes": 11342,
+      "sha256": "b10a3a975c8cc00087434752974b148a331bce23110f890edd3688374dc6390f"
+    },
+    "btc/learning_state.csv.gz": {
+      "bytes": 180,
+      "sha256": "97401bbd2976b1765943da8b9c3d323979387f8e310953386684669355e5c57d"
+    },
+    "btc/observations.csv.gz": {
+      "bytes": 13827330,
+      "sha256": "30de3c07263fbe67cb54debb39acb06eca8ec53f82f2c9a03b089cf32a667327"
+    },
+    "btc/policy_activations.csv.gz": {
+      "bytes": 2213,
+      "sha256": "a652ff9f77e6a1f56d9fae4e550f5db577c34f7fec02ca1ff5c815a920f4b11f"
+    },
+    "btc/policy_withdrawals.csv.gz": {
+      "bytes": 401,
+      "sha256": "3c5b0ba595bd3e239c83c381e2abe34fa22ed0ffbb15ce44989910cd6742a5a1"
+    },
+    "btc/predictions.csv.gz": {
+      "bytes": 45385,
+      "sha256": "5e294868f38155be1301bbdfb67bcf0cfb943d8893c04bf38f5e5a287cc3c76d"
+    },
+    "btc/realised_events.csv.gz": {
+      "bytes": 33855,
+      "sha256": "d8d28bc173fa63d752acd989e06c5c143549545abeb68d29ea9400fdfcc7bbc6"
+    },
+    "btc/recovery_adds.csv.gz": {
+      "bytes": 19159,
+      "sha256": "3e6677abd077ed119e74b77a7068f368c7ab52199f18fd090030cfff7f76a957"
+    },
+    "btc/recovery_add_budget.csv.gz": {
+      "bytes": 125,
+      "sha256": "84fdee155c146f1186cbe02d88148f10b5de635238ddd7b17b9bb3694ebbf71f"
+    },
+    "btc/recovery_cycle_wins.csv.gz": {
+      "bytes": 10665,
+      "sha256": "987acd09941bde2906e258b49b6624969642699d6d6d898b81bc17907b77309c"
+    },
+    "btc/recovery_deficit.csv.gz": {
+      "bytes": 181,
+      "sha256": "95113c5d770a59750630d11518b1057a6f21431cb6860cf47ec7a34d0942ba17"
+    },
+    "btc/reversion_signals.csv.gz": {
+      "bytes": 3099,
+      "sha256": "958ba5e13f61439757f67381d94977b41510f08e99d1aee4ba328bdc2970b870"
+    },
+    "btc/schema.json": {
+      "bytes": 17591,
+      "sha256": "cd6552676b3fbd0f9ec3248949b5658925bfc7cb2d042e3c74e9a6a7dcafe3ac"
+    },
+    "btc/settings.csv.gz": {
+      "bytes": 289,
+      "sha256": "f8250ac131287939409ed135d585af5a26d029248544ba91fb3ad3cf5af60df8"
+    },
+    "btc/settlements.csv.gz": {
+      "bytes": 49034,
+      "sha256": "fd56bdc111a24b0502e4cbcfae6c6d9fb3f18d178f1cddf7a6d325633646943d"
+    },
+    "btc/shadow_decisions.csv.gz": {
+      "bytes": 175100,
+      "sha256": "d35fb382d3d148ab1c89b95a551ec3636f54ace7f4f987b552301a27cf1e66a7"
+    },
+    "btc/strategy_alerts.csv.gz": {
+      "bytes": 22923,
+      "sha256": "6b71a3e8543753df93ecf3961e317ac4e313663e6c0f37203324c0b0c16757b1"
+    },
+    "btc/trade_proposals.csv.gz": {
+      "bytes": 73860,
+      "sha256": "29b413c31a120da0ea98b251d165e790c807ec42199106f0554bbecbaaf289fa"
+    },
+    "cache_market_data/markets.csv.gz": {
+      "bytes": 207991,
+      "sha256": "05ae9a0731b2de8c2f7c7c03c2c62d279dbea1a1aacb86c68df0d7551bdf7b03"
+    },
+    "cache_market_data/schema.json": {
+      "bytes": 306,
+      "sha256": "b774c4a33eb9280435c72280871423ae5a769ec6f61ebf63f1ad971ef3a4a668"
+    },
+    "cache_market_data_kxbtcd/markets.csv.gz": {
+      "bytes": 1515596,
+      "sha256": "9bb7ad9efdf0f764fecf4e9d58269833ec385430d587f40fce22fecf20a3e876"
+    },
+    "cache_market_data_kxbtcd/schema.json": {
+      "bytes": 272,
+      "sha256": "5cf7e7bed5f01727fe0635428ebad0baf1f09b3d19192a9160b8749fa42c2b9b"
+    },
+    "cache_market_data_kxeth15m/markets.csv.gz": {
+      "bytes": 100698,
+      "sha256": "6e1c73a849ae223071d88588ec6bde37f70d445a7a2e3c7bf8e7b51ca3e1f16c"
+    },
+    "cache_market_data_kxeth15m/schema.json": {
+      "bytes": 276,
+      "sha256": "63d6032696a390868fe2742aa90f9eb47e311cc9cb6d212510fc932e0901794d"
+    },
+    "cache_market_data_kxgold15m/markets.csv.gz": {
+      "bytes": 59475,
+      "sha256": "007d029dee683df15ca3c2f138045a67e373282e90d4d00a53899da8d1ea0787"
+    },
+    "cache_market_data_kxgold15m/schema.json": {
+      "bytes": 276,
+      "sha256": "63d6032696a390868fe2742aa90f9eb47e311cc9cb6d212510fc932e0901794d"
+    },
+    "cache_market_data_kxnear15m/markets.csv.gz": {
+      "bytes": 61225,
+      "sha256": "b7bc3a7022bc11e7f0e4bafd83177ce792866268dcc50ebbece9761312cd00d4"
+    },
+    "cache_market_data_kxnear15m/schema.json": {
+      "bytes": 276,
+      "sha256": "63d6032696a390868fe2742aa90f9eb47e311cc9cb6d212510fc932e0901794d"
+    },
+    "cache_market_data_kxsilver15m/markets.csv.gz": {
+      "bytes": 57259,
+      "sha256": "1f1be4bb8c8face54129cd035286a96c690352244a8522107dbec590fa1a4e79"
+    },
+    "cache_market_data_kxsilver15m/schema.json": {
+      "bytes": 276,
+      "sha256": "63d6032696a390868fe2742aa90f9eb47e311cc9cb6d212510fc932e0901794d"
+    },
+    "cache_market_data_kxsol15m/markets.csv.gz": {
+      "bytes": 97449,
+      "sha256": "0439b73dcf4f09d2cfec4832e73877c58bc5139bfb59477fe9be293a9c629549"
+    },
+    "cache_market_data_kxsol15m/schema.json": {
+      "bytes": 276,
+      "sha256": "63d6032696a390868fe2742aa90f9eb47e311cc9cb6d212510fc932e0901794d"
+    },
+    "cache_market_data_kxsol15m_new/markets.csv.gz": {
+      "bytes": 86752,
+      "sha256": "09ad3b89e0dde78a404f4533b831d0ddd39080e7c038ab614053930a56022764"
+    },
+    "cache_market_data_kxsol15m_new/schema.json": {
+      "bytes": 276,
+      "sha256": "63d6032696a390868fe2742aa90f9eb47e311cc9cb6d212510fc932e0901794d"
+    },
+    "cache_market_data_kxxrp15m/markets.csv.gz": {
+      "bytes": 58156,
+      "sha256": "b8143d8a0b1970e6ed1d55b892bcc871edbe8f42370cf9b10a00856f9ebc408e"
+    },
+    "cache_market_data_kxxrp15m/schema.json": {
+      "bytes": 276,
+      "sha256": "63d6032696a390868fe2742aa90f9eb47e311cc9cb6d212510fc932e0901794d"
+    },
+    "daily_profit/profit_days.csv.gz": {
+      "bytes": 1446,
+      "sha256": "7c5ef100a8a3970e8081b95095e9f0d2dd5696222041a17caf47d342ab22fa81"
+    },
+    "daily_profit/schema.json": {
+      "bytes": 548,
+      "sha256": "d5a6547c1aedb61eca0e8e1667b35c2ca60c8347f10bd51adb4ed296d0268538"
+    },
+    "eth/allsignal_trades.csv.gz": {
+      "bytes": 174,
+      "sha256": "59384765743eb5966548b0e97e2f733d5bde410aa23cfd77fe3b9d39b24dbf06"
+    },
+    "eth/candidate_evaluations.csv.gz": {
+      "bytes": 17192,
+      "sha256": "2489a81e8a5a24c19b58dea4d9e3285430a111b5cf0c9abd0d77559d198e2fc9"
+    },
+    "eth/capital_days.csv.gz": {
+      "bytes": 351,
+      "sha256": "266631268988ab735a50282d1c04b489bb4271a99a958fd9ec6f5245c9f052a8"
+    },
+    "eth/daily_ledger.csv.gz": {
+      "bytes": 23982,
+      "sha256": "12120e5071fb18e5d84f81e7bafe61373c5d5d799150179f6537238ee41fcc45"
+    },
+    "eth/decision_details.csv.gz": {
+      "bytes": 152518,
+      "sha256": "0ba551d32fe1f126e70ecde66cce52c947ad4f8e6af30c77a1d49fecd7bcf133"
+    },
+    "eth/decision_records.csv.gz": {
+      "bytes": 137033,
+      "sha256": "edfaabf825582ba91979750ddec3533bad19d03d4097a2b510f6ca7978a5baa8"
+    },
+    "eth/executions.csv.gz": {
+      "bytes": 10191,
+      "sha256": "3f36930ebdbe06b148d2e4bc593e77ac86fbfa1b8518220aa101e9a57bc19bc8"
+    },
+    "eth/fills.csv.gz": {
+      "bytes": 117565,
+      "sha256": "16ad533a40ea34573c3c1067981becc5a084b8122bda37584eda1bf38edcdef5"
+    },
+    "eth/fund_reservations.csv.gz": {
+      "bytes": 76,
+      "sha256": "c79f4aab941fbd7f5b9987030ff681aebd409e9e95780dec21546871ead22992"
+    },
+    "eth/input_gaps.csv.gz": {
+      "bytes": 39031,
+      "sha256": "5949d21decc80143941437aba799089cb82c6dda8a412bc617adc196eacc3013"
+    },
+    "eth/intelligence_decisions.csv.gz": {
+      "bytes": 3801529,
+      "sha256": "f564a873b8756d450833cb2e0e5dda11e9939146a728eea4086c04f5da26da63"
+    },
+    "eth/learning_runs.csv.gz": {
+      "bytes": 10555,
+      "sha256": "f27d159912520a870672560e40c6a7835c6ea4059bae4fc8999b360142a16e3d"
+    },
+    "eth/learning_state.csv.gz": {
+      "bytes": 182,
+      "sha256": "ab82f99355423a210d59aa2b5b24f9e63d7b8dcb94c705a44f86daa802b4adb9"
+    },
+    "eth/observations.csv.gz": {
+      "bytes": 6341686,
+      "sha256": "af3c3e2329cc42b5abd28e3e124a983667230e1647ca2a0fa45e1fe37dc9ed26"
+    },
+    "eth/policy_activations.csv.gz": {
+      "bytes": 1931,
+      "sha256": "8c15bd834910856e4e628f939212a9b27eb729b09e7626f5a20481ca92a8779e"
+    },
+    "eth/policy_withdrawals.csv.gz": {
+      "bytes": 323,
+      "sha256": "699d463c3e11df62e89c74ea250c43162e0bec35fe818e0970214bcc21004a15"
+    },
+    "eth/predictions.csv.gz": {
+      "bytes": 31927,
+      "sha256": "9212659378cb626c8b1a96cb84f9353cfd7896d79d2c7ff14f12a55398e8a6c9"
+    },
+    "eth/realised_events.csv.gz": {
+      "bytes": 31994,
+      "sha256": "bb0ec104eb049628a121e9387c689dd112891aa7bd0606f40469d4b042159d52"
+    },
+    "eth/recovery_adds.csv.gz": {
+      "bytes": 12835,
+      "sha256": "c578df808171c988aa9d2b1495211245671052ca36af3fcb956a0d5185a22c27"
+    },
+    "eth/recovery_add_budget.csv.gz": {
+      "bytes": 87,
+      "sha256": "a861e4ac7fe233d4bf4181591080208517816eb489912e3735be21e6a790ae88"
+    },
+    "eth/recovery_cycle_wins.csv.gz": {
+      "bytes": 10589,
+      "sha256": "3f463351f62483303f2a7f019439a0a4f1c8b1c72c9793f239624904496f1cbd"
+    },
+    "eth/recovery_deficit.csv.gz": {
+      "bytes": 181,
+      "sha256": "7f6b6eda6d0b40c2392249d546341f6feaba809d6bde26dce3df05a73a75d3af"
+    },
+    "eth/reversion_signals.csv.gz": {
+      "bytes": 134,
+      "sha256": "74514139f09d942a38ef22056ae51a62b11510102563b11527af8b1a7a3f15ea"
+    },
+    "eth/schema.json": {
+      "bytes": 17543,
+      "sha256": "12aa7d3d03f1e4bfe2b97dfe7430e1c4c08788a10ea17162fb6d352d1b357928"
+    },
+    "eth/settings.csv.gz": {
+      "bytes": 202,
+      "sha256": "b889107cb521deb19b1487df80201fd7350fc799184fd5126a3e52512e479abe"
+    },
+    "eth/settlements.csv.gz": {
+      "bytes": 49064,
+      "sha256": "93c8f738a40019d3b01fb1c23ce23f82e34589b7501a50c91c621322d6bb7eb0"
+    },
+    "eth/shadow_decisions.csv.gz": {
+      "bytes": 140100,
+      "sha256": "4c859978104160967a009bc0c1646f95811a308a4592b6b4aba1035109238b8e"
+    },
+    "eth/strategy_alerts.csv.gz": {
+      "bytes": 15525,
+      "sha256": "9e90cf5b22f93a1eaec4d9e5cedb9223cbbcfc93de126ae98788d5942b179965"
+    },
+    "eth/trade_proposals.csv.gz": {
+      "bytes": 54977,
+      "sha256": "7411f2b596fc840f9257307058bcd3bc2e310a01cd22b6deaa388267b48d656b"
+    },
+    "gold/allsignal_trades.csv.gz": {
+      "bytes": 7113,
+      "sha256": "b9ce5403e29682d9ffea702310dc0c2045b9e1cf8400af6a9056d6470bdf9143"
+    },
+    "gold/candidate_evaluations.csv.gz": {
+      "bytes": 532,
+      "sha256": "7f9478977f804003289c116c94d7a7ddde5ad45c589946b9668a0e12baab0d81"
+    },
+    "gold/capital_days.csv.gz": {
+      "bytes": 348,
+      "sha256": "91d194fc7b323ffdfdf65279b14658574ef5adda777dea64551d6cb4f2e9d70e"
+    },
+    "gold/daily_ledger.csv.gz": {
+      "bytes": 22946,
+      "sha256": "792873ffcd61ec159892ffda5977baa075252c9a0764c2c3ec12e7d16f3bc136"
+    },
+    "gold/decision_details.csv.gz": {
+      "bytes": 87317,
+      "sha256": "1fe2cf31dbeb8d1d3c6c4a311690efcbd80f97923ee9ead40e3c6a5cd71420b9"
+    },
+    "gold/decision_records.csv.gz": {
+      "bytes": 9469,
+      "sha256": "c8a1ff2812cb266b92cfde183ae5ec4aa34c9bc9048a6ff14defe112e707aae7"
+    },
+    "gold/executions.csv.gz": {
+      "bytes": 949,
+      "sha256": "fb39d47018da3eca42035325c01f5fe7225b6330273fdecab51a7655fbdce03f"
+    },
+    "gold/fills.csv.gz": {
+      "bytes": 117569,
+      "sha256": "541a9ad2a377728f270f20a6de61b9bdf1bbe694b299e3a2250de09d37342d30"
+    },
+    "gold/fund_reservations.csv.gz": {
+      "bytes": 76,
+      "sha256": "a934fce6ff7ca604b7fe12c74a6e7c68bd71dfa3342ec56c6fa3ef9414887e0d"
+    },
+    "gold/input_gaps.csv.gz": {
+      "bytes": 5083,
+      "sha256": "59f04f63bc57aad3a538d429a809d24bd02468cad3827343a70eec60a59b7bce"
+    },
+    "gold/intelligence_decisions.csv.gz": {
+      "bytes": 2458269,
+      "sha256": "88ad95c19278fc2be6d79bbd6c1106147c0aa19d4cfe078626be25bcbf625124"
+    },
+    "gold/learning_runs.csv.gz": {
+      "bytes": 7279,
+      "sha256": "4a4cabf847b61b249ccd4fc21f65f2d93de1f5fc4eb1e756f5ccd92c17b454b0"
+    },
+    "gold/learning_state.csv.gz": {
+      "bytes": 178,
+      "sha256": "f6cb4e12b08cedc00e89575ebea45554ca4f5db3fc4cbc48763a11b8256f8570"
+    },
+    "gold/observations.csv.gz": {
+      "bytes": 3930863,
+      "sha256": "f9dd50c7ac96be1645e5294a10a55eea3ed78c24ea0f52f6eea5332fe5529b05"
+    },
+    "gold/policy_activations.csv.gz": {
+      "bytes": 1808,
+      "sha256": "9c399cd724a34dbc2f1b5e50a87dcd61c8567e7c193ca1b43c2515a9ba373a83"
+    },
+    "gold/policy_withdrawals.csv.gz": {
+      "bytes": 112,
+      "sha256": "28d750390dbebfc4a737b4ef19ca3f6443155bb576861bc7646c4ab28d59b80f"
+    },
+    "gold/predictions.csv.gz": {
+      "bytes": 18369,
+      "sha256": "2e9b7d63c54818a8b0f763890ade0bf1cf8a55fd27c60f0c5eae99a71f2c47bf"
+    },
+    "gold/realised_events.csv.gz": {
+      "bytes": 30349,
+      "sha256": "540b63ee36ae0100729385df842b9c2e39fe6ffb67ea0147e927029edab3fe08"
+    },
+    "gold/recovery_adds.csv.gz": {
+      "bytes": 1284,
+      "sha256": "0102d03001611a5421a410840053efff162df5d75f20565028237602724c8777"
+    },
+    "gold/recovery_add_budget.csv.gz": {
+      "bytes": 87,
+      "sha256": "ee2e651a8d0d672352fcece74146cdd4e16b1e5da6b750988cac266d61514155"
+    },
+    "gold/recovery_cycle_wins.csv.gz": {
+      "bytes": 9971,
+      "sha256": "0ba8d4f7bdb571d63a4a1d4160675f1d9419fb852d10bc473d372743ac3a2e93"
+    },
+    "gold/recovery_deficit.csv.gz": {
+      "bytes": 180,
+      "sha256": "cc976015dfc076fd009a60e5015fa9c34e42357ed84fa0aff2797a08b1698f9f"
+    },
+    "gold/reversion_signals.csv.gz": {
+      "bytes": 134,
+      "sha256": "b192e0fc773dcad37ca0ffc2b9ea3e6d9600c63e2d93a757bd89a63e35a87c2c"
+    },
+    "gold/schema.json": {
+      "bytes": 17467,
+      "sha256": "7615b30744f438b5b4b8d6d6fcac391799caf4b4f6d0797d8eb08d1aa0b88ba0"
+    },
+    "gold/settings.csv.gz": {
+      "bytes": 204,
+      "sha256": "3d90e9cd1a8b1eacc3f827ea200f6f5d7446984abba3ef1ddfb9dca144206f4b"
+    },
+    "gold/settlements.csv.gz": {
+      "bytes": 48488,
+      "sha256": "d26fb01a15495b56187408fcc92b90f62e311784d2f1dececc4952ab9132acd0"
+    },
+    "gold/shadow_decisions.csv.gz": {
+      "bytes": 81606,
+      "sha256": "be4941a03b051be2e3f3e3208e03f9e568012fcbf64a0acbf653b3aac0932590"
+    },
+    "gold/strategy_alerts.csv.gz": {
+      "bytes": 9821,
+      "sha256": "23ce06f67b73618097390fa457987ca85533062a38c4fa2e74c0c2e2520abd18"
+    },
+    "gold/trade_proposals.csv.gz": {
+      "bytes": 30467,
+      "sha256": "c36bfe5b774192b09f53b6b4fc36c6a19769200c7a783f41581af684dcfeea2f"
+    },
+    "hourly/hourly_chains.csv.gz": {
+      "bytes": 720149,
+      "sha256": "00c4e57d7ceb576d0d17bf45a41153d6d2e6eaded83256b1410f49b69c0ad487"
+    },
+    "hourly/hourly_settlements.csv.gz": {
+      "bytes": 5546,
+      "sha256": "daab3c505f64b68a43c121eedf8305f97c1892e61082f34f6b92ed6c02078e00"
+    },
+    "hourly/hourly_strikes.csv.gz": {
+      "bytes": 27664399,
+      "sha256": "442310a2e4e6756a8888334a27adba37a731b2a52bb10bed59d600cfc468b5ad"
+    },
+    "hourly/schema.json": {
+      "bytes": 1657,
+      "sha256": "1256b6dbd8719bb0a003c50bbecdfa2ca17943c05c31854e165d23f433f269cd"
+    },
+    "near/allsignal_trades.csv.gz": {
+      "bytes": 174,
+      "sha256": "7e58d588464353c8a1df64fd3cd29f09e38c7b6a427b0b9eaba179cc258772f3"
+    },
+    "near/candidate_evaluations.csv.gz": {
+      "bytes": 37628,
+      "sha256": "4ff0c7e9f9123532f6b0bf84e884ba6782ea2b53125ce6b78c0cdbb3264c70fc"
+    },
+    "near/capital_days.csv.gz": {
+      "bytes": 315,
+      "sha256": "0d0988af2bb2ca65222e475a309bb1f8b3e6ae1a81495c835b47a9764ccefc7e"
+    },
+    "near/daily_ledger.csv.gz": {
+      "bytes": 21487,
+      "sha256": "4e814121433fe062be2e3299b82ce5a6319214817536957aa3fb9210950d9f7a"
+    },
+    "near/decision_details.csv.gz": {
+      "bytes": 119619,
+      "sha256": "0acf8ec96b5bbe7ff5fbbeebc3fcac89dc5303f4a24136aef2dbc687a813ba61"
+    },
+    "near/decision_records.csv.gz": {
+      "bytes": 313,
+      "sha256": "e8f8e65fff26a0cec3765a01ce9ed5d6da72d8fc4d323515ddc9717566909a92"
+    },
+    "near/executions.csv.gz": {
+      "bytes": 164,
+      "sha256": "1e7bfb348b5f9dd7824a96278dac04e702f030ec01713a16dbd4d2b415bb9ca5"
+    },
+    "near/fills.csv.gz": {
+      "bytes": 117565,
+      "sha256": "e9e1cc4fd1256ddf841fcf3a2c64ceee4051ead99e27baeed9af6f2ede6ef110"
+    },
+    "near/fund_reservations.csv.gz": {
+      "bytes": 76,
+      "sha256": "9358762a8a8df5b2356227eb548783a2461ac42e5edee57f96bedae2b7d93b4b"
+    },
+    "near/input_gaps.csv.gz": {
+      "bytes": 42203,
+      "sha256": "417b61fc42dfaed538172da4293842f58152476ab41e354efa0bd98ac637f017"
+    },
+    "near/intelligence_decisions.csv.gz": {
+      "bytes": 3303882,
+      "sha256": "a869aada8a86d7ed4b6a95aa3d726b55663236ea2c798969076ab0d585a60a83"
+    },
+    "near/learning_runs.csv.gz": {
+      "bytes": 8209,
+      "sha256": "1e040fdeb7eb695cd9b493369f7cc2de0cef401d863ca36030ac87e69ee84579"
+    },
+    "near/learning_state.csv.gz": {
+      "bytes": 182,
+      "sha256": "1f3f173f2d56b718eefc25d8d5a18f952cc7ed298e87735fe597114afa2f26c7"
+    },
+    "near/observations.csv.gz": {
+      "bytes": 5357165,
+      "sha256": "d6ed1c06054e8319608ee4306328f728a74acc416ffb68f682eec5ed08983cd4"
+    },
+    "near/policy_activations.csv.gz": {
+      "bytes": 1686,
+      "sha256": "a80cb91498c75c747ea67fe023037441359f77ccb13f975d58552285b210dcc0"
+    },
+    "near/policy_withdrawals.csv.gz": {
+      "bytes": 112,
+      "sha256": "106162a2bffc7279d83883fb533b326ac486bcd85ade3261c4e04b0b99a87750"
+    },
+    "near/predictions.csv.gz": {
+      "bytes": 26848,
+      "sha256": "33ffbbb5ad7e7562e94a23bb6870bf204f9d1024631f1f8a13f5dedd7ec94e40"
+    },
+    "near/realised_events.csv.gz": {
+      "bytes": 28064,
+      "sha256": "0883f286dc9068fd33e23fcbdefd6c269c5637c00eb3982b531e679eb2f10036"
+    },
+    "near/recovery_adds.csv.gz": {
+      "bytes": 226,
+      "sha256": "acd4bc83ad5af3d39907f76351f450e6bb37376fa0dc9ad72e84cffbfb6854e6"
+    },
+    "near/recovery_add_budget.csv.gz": {
+      "bytes": 87,
+      "sha256": "021bf74f29c58568ec311cf626dd69a37fb08179be511c2304e231b33efa6917"
+    },
+    "near/recovery_cycle_wins.csv.gz": {
+      "bytes": 9679,
+      "sha256": "c206c4ae4413721b1db0953553ce96ca957f77b91ae01789c41f079b056f2169"
+    },
+    "near/recovery_deficit.csv.gz": {
+      "bytes": 180,
+      "sha256": "a6d2908b095655bf2abeb45fa827c843d0f413aaa08d256fab846900099da9d0"
+    },
+    "near/reversion_signals.csv.gz": {
+      "bytes": 134,
+      "sha256": "c1a56b7c3b665910335e7f7c91f002a525b13cefb6ee89a37b0a7aa3e886dafd"
+    },
+    "near/schema.json": {
+      "bytes": 17467,
+      "sha256": "7615b30744f438b5b4b8d6d6fcac391799caf4b4f6d0797d8eb08d1aa0b88ba0"
+    },
+    "near/settings.csv.gz": {
+      "bytes": 206,
+      "sha256": "3d3a5ad09bf8220ab326351c2efd8cdee2d0c46072bcc6844630d30c5b35e388"
+    },
+    "near/settlements.csv.gz": {
+      "bytes": 48099,
+      "sha256": "48e2c684d69bedbb4a47c12839d4171066f2912136696f0a4522dbcb567ed50c"
+    },
+    "near/shadow_decisions.csv.gz": {
+      "bytes": 113312,
+      "sha256": "707e233bcd0fe65ad821f233d0256e33c4bfd2b86a960eebc6f25e15d3a1e679"
+    },
+    "near/strategy_alerts.csv.gz": {
+      "bytes": 12496,
+      "sha256": "9b7d8e8f04db479ede971310dab6aa7311966c8ddf22b8d0251761ea1979d423"
+    },
+    "near/trade_proposals.csv.gz": {
+      "bytes": 40752,
+      "sha256": "f4a442062d5c41da3db59fa422b20ea9c9f501eb19c00587904ea3525d10c408"
+    },
+    "settlement_reference/schema.json": {
+      "bytes": 3766,
+      "sha256": "db781a904ee49d55992e5d07ad3ef016e2b58961df018bd8e10c0f2721cb0902"
+    },
+    "silver/allsignal_trades.csv.gz": {
+      "bytes": 174,
+      "sha256": "ad73ce7bf1c4a8cbb23141c9c938e5260545d9c549a645b36ce58f6dc19a6fc2"
+    },
+    "silver/candidate_evaluations.csv.gz": {
+      "bytes": 23034,
+      "sha256": "8191dc123faaf83bbbbba9cfda5553d00b0fbd20c2061cb4b0252213ca6de820"
+    },
+    "silver/capital_days.csv.gz": {
+      "bytes": 333,
+      "sha256": "d62d2e9bf884146c7c9b14919f882e5ed2a3da30602abf2c6c782676778bc91f"
+    },
+    "silver/daily_ledger.csv.gz": {
+      "bytes": 22478,
+      "sha256": "86cb9e2b8d97b5f814763393c80c101716351504fbd2066b8f0e473a94b44069"
+    },
+    "silver/decision_details.csv.gz": {
+      "bytes": 81021,
+      "sha256": "43ad0207836148da0d263ffaa17efcea82db1dea52a76c047f02433062d55314"
+    },
+    "silver/decision_records.csv.gz": {
+      "bytes": 313,
+      "sha256": "0f710f55cc2df5cba1da45b7f874bac780fcea4e3197b3726c272df21c70b087"
+    },
+    "silver/executions.csv.gz": {
+      "bytes": 164,
+      "sha256": "11ee5ee392ff9e2ea53ab7eaf09d3a9b9750e5314a820e45c2bb90c2c47e2104"
+    },
+    "silver/fills.csv.gz": {
+      "bytes": 117573,
+      "sha256": "0fbb58d053827c263a746c0730258b79818c53fc79fabb97ccc1506a853a73a1"
+    },
+    "silver/fund_reservations.csv.gz": {
+      "bytes": 76,
+      "sha256": "4beb17f94c2b8c29f0850b0838d22a6986bc8c078496e07da12c3a1addb0dcb0"
+    },
+    "silver/input_gaps.csv.gz": {
+      "bytes": 5951,
+      "sha256": "d96e2d4c8385609190939c38886ab9e7abeb65b9f9361bf991418f362d5fe219"
+    },
+    "silver/intelligence_decisions.csv.gz": {
+      "bytes": 2336646,
+      "sha256": "c96d3c4670f70418cba6e821d17b2638e87cbd459410370d29282a9a16a2a260"
+    },
+    "silver/learning_runs.csv.gz": {
+      "bytes": 6890,
+      "sha256": "b4d8e6c9308e86ff2eba1efebe60d19eea6c112ae38e6270219d439fc0d45161"
+    },
+    "silver/learning_state.csv.gz": {
+      "bytes": 180,
+      "sha256": "6ef8da11acbf62a8dd22b831e4b87baf0a366993375f7dbd78de79d523a3725e"
+    },
+    "silver/observations.csv.gz": {
+      "bytes": 3655851,
+      "sha256": "03ed7db45b22b1b4859a3806526d9e5d2178bd9770bbef751e966407a3aeccb2"
+    },
+    "silver/policy_activations.csv.gz": {
+      "bytes": 1752,
+      "sha256": "9db5a670c30f11e1da26f54638aa573e3583ae9db7ed3f9a2bace39a09a5ace8"
+    },
+    "silver/policy_withdrawals.csv.gz": {
+      "bytes": 112,
+      "sha256": "80aaa6b4693e499cdea7ca99a0ba4253988c642c79101dc761f90d568783fe4e"
+    },
+    "silver/predictions.csv.gz": {
+      "bytes": 16453,
+      "sha256": "002a56d3cf0a6796d16e998efd2b35551a93243454e02b75b948c909382b9862"
+    },
+    "silver/realised_events.csv.gz": {
+      "bytes": 29526,
+      "sha256": "43b349c3d72a0def4dc687eb375a5fa50ac26d1dcaedc2a18b0ff810578a5011"
+    },
+    "silver/recovery_adds.csv.gz": {
+      "bytes": 226,
+      "sha256": "319ccaa5ceabf7d72b4d3592a5e3494cbbe5b3f5adc66c7283d0f7826f490df0"
+    },
+    "silver/recovery_add_budget.csv.gz": {
+      "bytes": 87,
+      "sha256": "e179f5c4eef5b4dccb2f67b4f2b3f78aace1c3ae18df2328065400dd88906603"
+    },
+    "silver/recovery_cycle_wins.csv.gz": {
+      "bytes": 9967,
+      "sha256": "10d7f6965b2deb4f8fae31c6a9565fcb26af72ae96b5edde2870068d401dd15b"
+    },
+    "silver/recovery_deficit.csv.gz": {
+      "bytes": 180,
+      "sha256": "99f66e32b46a316e0249cb855e5259c4f6044eadc83ad73b5af110a25fe3d017"
+    },
+    "silver/reversion_signals.csv.gz": {
+      "bytes": 134,
+      "sha256": "e57be38a5607943ccbdea6163b49808fbec7ea40b2c7878c856c208ab191f028"
+    },
+    "silver/schema.json": {
+      "bytes": 17467,
+      "sha256": "7615b30744f438b5b4b8d6d6fcac391799caf4b4f6d0797d8eb08d1aa0b88ba0"
+    },
+    "silver/settings.csv.gz": {
+      "bytes": 203,
+      "sha256": "99a1c06014d42ab5ae8b2b695abba6cc4043c4f6cd8d22fcc74fa1b76fdbd062"
+    },
+    "silver/settlements.csv.gz": {
+      "bytes": 48474,
+      "sha256": "1d8da86adc74257fabe1a62f3ee0e0e3c726aec6f6e1fd5b74b73ea7df95e76f"
+    },
+    "silver/shadow_decisions.csv.gz": {
+      "bytes": 76831,
+      "sha256": "52d4c52a3ef704405ec086635dedd9fc27df11ed65c0447588c998db30620292"
+    },
+    "silver/strategy_alerts.csv.gz": {
+      "bytes": 8804,
+      "sha256": "c4d0fc81d9867075145f6e4ef30c8ecaccb0d7728930ddf61082d3fec09aac29"
+    },
+    "silver/trade_proposals.csv.gz": {
+      "bytes": 27734,
+      "sha256": "f5d2358883ccce67d1428d7394ea33645ee20e018b56dfb71a6108f64ebce6f9"
+    },
+    "sol/allsignal_trades.csv.gz": {
+      "bytes": 174,
+      "sha256": "4e2b0b82022c65c080e3f07562ea875f00d0bae610901e03fb387659981344c0"
+    },
+    "sol/candidate_evaluations.csv.gz": {
+      "bytes": 64768,
+      "sha256": "a76025b3200a17a57f7f13fc768a718b8649553500993efc34bda2234be92c96"
+    },
+    "sol/capital_days.csv.gz": {
+      "bytes": 334,
+      "sha256": "730dc943a54b87616701923d6dcbbcdcc876c5d8c113b456e217593811bc030c"
+    },
+    "sol/daily_ledger.csv.gz": {
+      "bytes": 22686,
+      "sha256": "978f76b3151bbd2ffd1a734fd5998baab3d3462eb358e9122bbbb118c7e6fd52"
+    },
+    "sol/decision_details.csv.gz": {
+      "bytes": 136357,
+      "sha256": "26df93671e2781538b4d56eec9b92d1d9e1246fbec771d27b022cb4e3976f738"
+    },
+    "sol/decision_records.csv.gz": {
+      "bytes": 120340,
+      "sha256": "86eda5f87aeed0fc161a200de33f0132830ee991bf5315bc3dc2f1af26e87908"
+    },
+    "sol/executions.csv.gz": {
+      "bytes": 3210,
+      "sha256": "91b20719134dfd37fbec08a33c34e5b48563097c874e7ae04269037827b03067"
+    },
+    "sol/fills.csv.gz": {
+      "bytes": 117565,
+      "sha256": "42428ef8e75c4dcc9e3f218f41bbaf7e2a20c36c65d8fe8d2cff400e7941ef22"
+    },
+    "sol/fund_reservations.csv.gz": {
+      "bytes": 76,
+      "sha256": "3794f2ff10a273231c751fb3037d476adb7aff09f6f6d305edb52ccb8309dd13"
+    },
+    "sol/input_gaps.csv.gz": {
+      "bytes": 37189,
+      "sha256": "d1f01ada8742d9fb58d37559290df941b9aaf8a1c652b2de4431371feb2c5391"
+    },
+    "sol/intelligence_decisions.csv.gz": {
+      "bytes": 3578305,
+      "sha256": "c4a2f9c86e8cf845a6c9e0fa329c1ec7677dc359e1d14b5c79ee5cd1027789c5"
+    },
+    "sol/learning_runs.csv.gz": {
+      "bytes": 9567,
+      "sha256": "3a617c034c8e5af6cc1892d7eafde438e6a562d6e016f86d779e65963b4650b7"
+    },
+    "sol/learning_state.csv.gz": {
+      "bytes": 181,
+      "sha256": "05fe28786547ef190aa14a130f3ba0da030254c48a45b7b22100ff72b8f34735"
+    },
+    "sol/observations.csv.gz": {
+      "bytes": 5817552,
+      "sha256": "589ac08f9093a456236a54d399267b65eb632176af77d8d7631acb7e28da6af2"
+    },
+    "sol/policy_activations.csv.gz": {
+      "bytes": 1737,
+      "sha256": "11d47c3add3ce25ad53b2677f64d19e34e06733901f049e5e9166d5644603637"
+    },
+    "sol/policy_withdrawals.csv.gz": {
+      "bytes": 112,
+      "sha256": "c06b422abb090712d6dc1217066b664557f5b7bbf40253f8d97d9041661e2bab"
+    },
+    "sol/predictions.csv.gz": {
+      "bytes": 28755,
+      "sha256": "0a57a84a19a0ac5712090ea5210c58009eb9fd16b1ddd5e6ea2b648d394f0df9"
+    },
+    "sol/realised_events.csv.gz": {
+      "bytes": 29638,
+      "sha256": "5ca36ff4f4969b44ac6ca23d1dcd37ca0c075dbcfcd812edde5061468a0abcb9"
+    },
+    "sol/recovery_adds.csv.gz": {
+      "bytes": 4155,
+      "sha256": "3eb63fce859542a818c9ff3be766919f3b71222f932984bd9ff4ea6b39263f6e"
+    },
+    "sol/recovery_add_budget.csv.gz": {
+      "bytes": 87,
+      "sha256": "b9133e25d1bdcead486d13237ad3ed4e1b83f3fc7ac54c96ef4017438c896e6c"
+    },
+    "sol/recovery_cycle_wins.csv.gz": {
+      "bytes": 10028,
+      "sha256": "053ba2da9faa1cc3a71d9f9307de270a43c0e4c2b08fbaa65d482a0211cee58d"
+    },
+    "sol/recovery_deficit.csv.gz": {
+      "bytes": 181,
+      "sha256": "dca835d411e800e3a9b075cda64b3657823389df502b9771ca15a0694aa35755"
+    },
+    "sol/reversion_signals.csv.gz": {
+      "bytes": 134,
+      "sha256": "a2c4ee2ca4145fa6709b665e3c9b6c5df7a8d49c65160fa046f9a00a189630c1"
+    },
+    "sol/schema.json": {
+      "bytes": 17467,
+      "sha256": "7615b30744f438b5b4b8d6d6fcac391799caf4b4f6d0797d8eb08d1aa0b88ba0"
+    },
+    "sol/settings.csv.gz": {
+      "bytes": 205,
+      "sha256": "f75e80f821800e3b516c65b10935583ef517118de53e11e9d8e7b12950e95b50"
+    },
+    "sol/settlements.csv.gz": {
+      "bytes": 48368,
+      "sha256": "04ba3c6f1c141c9763900c43f99dbd5063997fa402900029916767a5c5507de0"
+    },
+    "sol/shadow_decisions.csv.gz": {
+      "bytes": 127477,
+      "sha256": "a8edb059d2e9781fe446ee0f55326b968645441a78197e138cfba4f472a36e60"
+    },
+    "sol/strategy_alerts.csv.gz": {
+      "bytes": 13743,
+      "sha256": "a12544cd440f30c5ac5d52e062015c58f109753b0ac19ce581bcfcfb11f38331"
+    },
+    "sol/trade_proposals.csv.gz": {
+      "bytes": 46958,
+      "sha256": "7fa9e08b497c4a11784ca9b2f5ed439e4fd311d7f905efc24aba42c473c93e4e"
+    },
+    "xrp/allsignal_trades.csv.gz": {
+      "bytes": 174,
+      "sha256": "f01d09098d5d564ef4ea00759d6dbb719acc11abe1bdc759d82b46aac85496dd"
+    },
+    "xrp/candidate_evaluations.csv.gz": {
+      "bytes": 28863,
+      "sha256": "5f8d8d56a78e464f54cc77d794982e88db640dd506422960aa405b160f50924f"
+    },
+    "xrp/capital_days.csv.gz": {
+      "bytes": 321,
+      "sha256": "e37dfb6b535fa34852e1a59434629f55cc29cb5d652367b7663fcdf3c1b80649"
+    },
+    "xrp/daily_ledger.csv.gz": {
+      "bytes": 21613,
+      "sha256": "8b694ed256e7c10cc88a5cb21b8dfc2e50858b603b22c09fdeea1cda3facd659"
+    },
+    "xrp/decision_details.csv.gz": {
+      "bytes": 121967,
+      "sha256": "ee7c026b5eb9f9d02f6262d7df8d3b2d61692e3cb8fafa87456c32b85768977a"
+    },
+    "xrp/decision_records.csv.gz": {
+      "bytes": 313,
+      "sha256": "00c0a5d84aa06f47353fcf97b467ff5e24e23c7c284ffe21068c9821225e56b3"
+    },
+    "xrp/executions.csv.gz": {
+      "bytes": 164,
+      "sha256": "72423832ad909969700787ea328e2f8052bfe3bce01f6c86aac882bd8f8f55be"
+    },
+    "xrp/fills.csv.gz": {
+      "bytes": 117561,
+      "sha256": "b0f9217709895be1cd58c6d514eb7ad4be87c77bffa8ab095fe6a4ec2ee1637c"
+    },
+    "xrp/fund_reservations.csv.gz": {
+      "bytes": 76,
+      "sha256": "380c8275a280423a9e38221d8cfa2505d63b71d944a63407561bbaca002fe7d9"
+    },
+    "xrp/input_gaps.csv.gz": {
+      "bytes": 31654,
+      "sha256": "db9327888743f04fbea15a2e8f675075711da9cf49978b66cd86052bf7252f25"
+    },
+    "xrp/intelligence_decisions.csv.gz": {
+      "bytes": 3336168,
+      "sha256": "72d00d55139f34953ca7c580af023c70b8ec413185d1c136cf7ffa7d408659c5"
+    },
+    "xrp/learning_runs.csv.gz": {
+      "bytes": 8360,
+      "sha256": "22cd55791a379400ac47b517ff9ad5d176b6fc4dd7959fdf4643994646e9ad5f"
+    },
+    "xrp/learning_state.csv.gz": {
+      "bytes": 182,
+      "sha256": "55424afa159aff5bf48dbe96ee77ac447e9ca97ce3f16c09c1c7b05b93e04ca5"
+    },
+    "xrp/observations.csv.gz": {
+      "bytes": 5467936,
+      "sha256": "78f2af2cf6e84889cfabae296829baf3f9d7a9b7f0954708e12fac2432b8b00e"
+    },
+    "xrp/policy_activations.csv.gz": {
+      "bytes": 1712,
+      "sha256": "e7db15dc94606a05b79a574cbaf773eb057ac365bbc4f8ce33dbe58835877c98"
+    },
+    "xrp/policy_withdrawals.csv.gz": {
+      "bytes": 112,
+      "sha256": "baabc1b622148f06c1e991a8b2f469dc428464d2d982b6559ada62ff1a43ce54"
+    },
+    "xrp/predictions.csv.gz": {
+      "bytes": 26218,
+      "sha256": "5cfffb11252dfe428bec7ae4ad64ffe61811c15e48642fc9ee67e05a2c67d85b"
+    },
+    "xrp/realised_events.csv.gz": {
+      "bytes": 28319,
+      "sha256": "65eea30c177987196f588b6dd54cf7ebd292052ce7086d520a228ccaf7a46865"
+    },
+    "xrp/recovery_adds.csv.gz": {
+      "bytes": 226,
+      "sha256": "7be3e5f4c5ae03faa2cd0ba4f97c2ef6a28de8d5954cf50185ae029a9d3d4ac5"
+    },
+    "xrp/recovery_add_budget.csv.gz": {
+      "bytes": 87,
+      "sha256": "898396c83b9defad55ee56f84b33114ae91793357afa3219122317d6a8c5503b"
+    },
+    "xrp/recovery_cycle_wins.csv.gz": {
+      "bytes": 9711,
+      "sha256": "0bf92b8b138701747304489969f6c8ab1b3d6b38bc79e0587aa3280d62b04ed7"
+    },
+    "xrp/recovery_deficit.csv.gz": {
+      "bytes": 180,
+      "sha256": "6b129062c2b097f42725b8f2541e351648e63bf042f35612fb6f279ca62cd2d8"
+    },
+    "xrp/reversion_signals.csv.gz": {
+      "bytes": 134,
+      "sha256": "a6631204a3a7efa5e380678fb5adc587651091684113d85563a7366516973110"
+    },
+    "xrp/schema.json": {
+      "bytes": 17467,
+      "sha256": "7615b30744f438b5b4b8d6d6fcac391799caf4b4f6d0797d8eb08d1aa0b88ba0"
+    },
+    "xrp/settings.csv.gz": {
+      "bytes": 203,
+      "sha256": "9ad58347c7eadce6154217fbe62b8b9ab13c5d4c910df240d9265a2b2a60e756"
+    },
+    "xrp/settlements.csv.gz": {
+      "bytes": 48237,
+      "sha256": "0c64c04e79be20e11fa3946e8c320602ffdc160b7974a51e57d24cd26108afce"
+    },
+    "xrp/shadow_decisions.csv.gz": {
+      "bytes": 115083,
+      "sha256": "504e2c05b68d64fddaed331a18f93d8b8a551431ac88307123ace3a921ce98a3"
+    },
+    "xrp/strategy_alerts.csv.gz": {
+      "bytes": 12598,
+      "sha256": "afc352364476c567781a1a87b926b9606b85fa64cd0c16aa0eb309fa5f71b3d5"
+    },
+    "xrp/trade_proposals.csv.gz": {
+      "bytes": 41147,
+      "sha256": "42d1fc73266feb947a5716d1018f127be60de3190bb1ae86fd9639f451e6da15"
+    },
+    "settlement_reference/brti_features.csv.gz": {
+      "bytes": 7143382,
+      "sha256": "6d641da1a63c933609b6252f233a9c29e82f45c114b866877341dd0b148d13cd"
+    },
+    "settlement_reference/feed_gaps.csv.gz": {
+      "bytes": 15926,
+      "sha256": "b77bfa08b4edd74816e6bb46aa65f47944035abc86e2a84f037df8e8bd854376"
+    },
+    "settlement_reference/reference_observations.csv.gz": {
+      "bytes": 6123780,
+      "sha256": "0550afcc8bb43167b60581ecf5b2b5b8b342bc517138df0b845cb5145186e094"
+    },
+    "settlement_reference/settlement_reconciliation.csv.gz": {
+      "bytes": 206980,
+      "sha256": "52f0cbedcb9c042b9c400b486a871731f710917bc6bc0087485397a589b9ce0b"
+    }
+  },
+  "databases": {
+    "btc": {
+      "started_ms": 1791399629905,
+      "tables": {
+        "strategy_alerts": 3584,
+        "reversion_signals": 69,
+        "observations": 110709,
+        "predictions": 1588,
+        "allsignal_trades": 851,
+        "trade_proposals": 1726,
+        "executions": 265,
+        "shadow_decisions": 1673,
+        "decision_records": 2786,
+        "decision_details": 1574,
+        "settlements": 1282,
+        "fills": 2281,
+        "daily_ledger": 1282,
+        "realised_events": 1310,
+        "capital_days": 16,
+        "recovery_deficit": 1,
+        "recovery_adds": 194,
+        "recovery_add_budget": 1,
+        "recovery_cycle_wins": 839,
+        "fund_reservations": 2,
+        "intelligence_decisions": 35871,
+        "candidate_evaluations": 580,
+        "input_gaps": 4506,
+        "learning_runs": 62,
+        "policy_activations": 62,
+        "policy_withdrawals": 7,
+        "learning_state": 6,
+        "settings": 13
+      },
+      "finished_ms": 1791399648557
+    },
+    "gold": {
+      "started_ms": 1791399648566,
+      "tables": {
+        "strategy_alerts": 1621,
+        "reversion_signals": 0,
+        "observations": 61973,
+        "predictions": 793,
+        "allsignal_trades": 111,
+        "trade_proposals": 780,
+        "executions": 8,
+        "shadow_decisions": 794,
+        "decision_records": 63,
+        "decision_details": 797,
+        "settlements": 1282,
+        "fills": 2281,
+        "daily_ledger": 1213,
+        "realised_events": 1215,
+        "capital_days": 14,
+        "recovery_deficit": 1,
+        "recovery_adds": 8,
+        "recovery_add_budget": 0,
+        "recovery_cycle_wins": 839,
+        "fund_reservations": 0,
+        "intelligence_decisions": 21561,
+        "candidate_evaluations": 8,
+        "input_gaps": 357,
+        "learning_runs": 53,
+        "policy_activations": 53,
+        "policy_withdrawals": 0,
+        "learning_state": 6,
+        "settings": 10
+      },
+      "finished_ms": 1791399656857
+    },
+    "eth": {
+      "started_ms": 1791399656863,
+      "tables": {
+        "strategy_alerts": 2565,
+        "reversion_signals": 0,
+        "observations": 95273,
+        "predictions": 1240,
+        "allsignal_trades": 0,
+        "trade_proposals": 1312,
+        "executions": 140,
+        "shadow_decisions": 1332,
+        "decision_records": 1108,
+        "decision_details": 1339,
+        "settlements": 1282,
+        "fills": 2281,
+        "daily_ledger": 1236,
+        "realised_events": 1249,
+        "capital_days": 14,
+        "recovery_deficit": 1,
+        "recovery_adds": 125,
+        "recovery_add_budget": 0,
+        "recovery_cycle_wins": 839,
+        "fund_reservations": 0,
+        "intelligence_decisions": 33633,
+        "candidate_evaluations": 626,
+        "input_gaps": 3299,
+        "learning_runs": 54,
+        "policy_activations": 48,
+        "policy_withdrawals": 6,
+        "learning_state": 6,
+        "settings": 10
+      },
+      "finished_ms": 1791399669144
+    },
+    "sol": {
+      "started_ms": 1791399669146,
+      "tables": {
+        "strategy_alerts": 2311,
+        "reversion_signals": 0,
+        "observations": 88332,
+        "predictions": 1149,
+        "allsignal_trades": 0,
+        "trade_proposals": 1180,
+        "executions": 40,
+        "shadow_decisions": 1175,
+        "decision_records": 987,
+        "decision_details": 1183,
+        "settlements": 1282,
+        "fills": 2281,
+        "daily_ledger": 1178,
+        "realised_events": 1179,
+        "capital_days": 13,
+        "recovery_deficit": 1,
+        "recovery_adds": 36,
+        "recovery_add_budget": 0,
+        "recovery_cycle_wins": 839,
+        "fund_reservations": 0,
+        "intelligence_decisions": 31284,
+        "candidate_evaluations": 3141,
+        "input_gaps": 3171,
+        "learning_runs": 51,
+        "policy_activations": 42,
+        "policy_withdrawals": 0,
+        "learning_state": 6,
+        "settings": 10
+      },
+      "finished_ms": 1791399681330
+    },
+    "silver": {
+      "started_ms": 1791399681336,
+      "tables": {
+        "strategy_alerts": 1482,
+        "reversion_signals": 0,
+        "observations": 57923,
+        "predictions": 741,
+        "allsignal_trades": 0,
+        "trade_proposals": 718,
+        "executions": 0,
+        "shadow_decisions": 741,
+        "decision_records": 0,
+        "decision_details": 741,
+        "settlements": 1282,
+        "fills": 2281,
+        "daily_ledger": 1178,
+        "realised_events": 1178,
+        "capital_days": 13,
+        "recovery_deficit": 1,
+        "recovery_adds": 0,
+        "recovery_add_budget": 0,
+        "recovery_cycle_wins": 839,
+        "fund_reservations": 0,
+        "intelligence_decisions": 20226,
+        "candidate_evaluations": 947,
+        "input_gaps": 444,
+        "learning_runs": 51,
+        "policy_activations": 51,
+        "policy_withdrawals": 0,
+        "learning_state": 6,
+        "settings": 10
+      },
+      "finished_ms": 1791399688829
+    },
+    "xrp": {
+      "started_ms": 1791399688835,
+      "tables": {
+        "strategy_alerts": 2138,
+        "reversion_signals": 0,
+        "observations": 82451,
+        "predictions": 1069,
+        "allsignal_trades": 0,
+        "trade_proposals": 1066,
+        "executions": 0,
+        "shadow_decisions": 1061,
+        "decision_records": 0,
+        "decision_details": 1069,
+        "settlements": 1282,
+        "fills": 2281,
+        "daily_ledger": 1135,
+        "realised_events": 1135,
+        "capital_days": 12,
+        "recovery_deficit": 1,
+        "recovery_adds": 0,
+        "recovery_add_budget": 0,
+        "recovery_cycle_wins": 839,
+        "fund_reservations": 0,
+        "intelligence_decisions": 29128,
+        "candidate_evaluations": 1151,
+        "input_gaps": 2681,
+        "learning_runs": 46,
+        "policy_activations": 46,
+        "policy_withdrawals": 0,
+        "learning_state": 6,
+        "settings": 10
+      },
+      "finished_ms": 1791399699235
+    },
+    "near": {
+      "started_ms": 1791399699239,
+      "tables": {
+        "strategy_alerts": 2114,
+        "reversion_signals": 0,
+        "observations": 80482,
+        "predictions": 1057,
+        "allsignal_trades": 0,
+        "trade_proposals": 1056,
+        "executions": 0,
+        "shadow_decisions": 1045,
+        "decision_records": 0,
+        "decision_details": 1057,
+        "settlements": 1282,
+        "fills": 2281,
+        "daily_ledger": 1126,
+        "realised_events": 1126,
+        "capital_days": 12,
+        "recovery_deficit": 1,
+        "recovery_adds": 0,
+        "recovery_add_budget": 0,
+        "recovery_cycle_wins": 839,
+        "fund_reservations": 0,
+        "intelligence_decisions": 28859,
+        "candidate_evaluations": 1703,
+        "input_gaps": 3649,
+        "learning_runs": 45,
+        "policy_activations": 45,
+        "policy_withdrawals": 0,
+        "learning_state": 6,
+        "settings": 10
+      },
+      "finished_ms": 1791399709389
+    },
+    "bnb": {
+      "started_ms": 1791399709395,
+      "tables": {
+        "strategy_alerts": 1162,
+        "reversion_signals": 0,
+        "observations": 44233,
+        "predictions": 581,
+        "allsignal_trades": 0,
+        "trade_proposals": 579,
+        "executions": 0,
+        "shadow_decisions": 581,
+        "decision_records": 0,
+        "decision_details": 581,
+        "settlements": 1282,
+        "fills": 2281,
+        "daily_ledger": 770,
+        "realised_events": 770,
+        "capital_days": 7,
+        "recovery_deficit": 1,
+        "recovery_adds": 0,
+        "recovery_add_budget": 0,
+        "recovery_cycle_wins": 235,
+        "fund_reservations": 0,
+        "intelligence_decisions": 15856,
+        "candidate_evaluations": 0,
+        "input_gaps": 2043,
+        "learning_runs": 0,
+        "policy_activations": 0,
+        "policy_withdrawals": 0,
+        "learning_state": 1,
+        "settings": 8
+      },
+      "finished_ms": 1791399715461
+    },
+    "daily_profit": {
+      "started_ms": 1791399715463,
+      "tables": {
+        "profit_days": 35
+      },
+      "finished_ms": 1791399715467
+    },
+    "hourly": {
+      "started_ms": 1791399715472,
+      "tables": {
+        "hourly_chains": 18240,
+        "hourly_strikes": 883315,
+        "hourly_settlements": 347
+      },
+      "finished_ms": 1791399750211
+    },
+    "settlement_reference": {
+      "started_ms": 1791399784195,
+      "tables": {
+        "reference_observations": 219046,
+        "settlement_reconciliation": 2898,
+        "feed_gaps": 1163,
+        "brti_features": 106811
+      },
+      "finished_ms": 1791399799053
+    },
+    "cache_market_data": {
+      "started_ms": 1791399750227,
+      "tables": {
+        "markets": 6805
+      },
+      "finished_ms": 1791399750466
+    },
+    "cache_market_data_kxbtcd": {
+      "started_ms": 1791399750470,
+      "tables": {
+        "markets": 290686
+      },
+      "finished_ms": 1791399757201
+    },
+    "cache_market_data_kxeth15m": {
+      "started_ms": 1791399757203,
+      "tables": {
+        "markets": 6714
+      },
+      "finished_ms": 1791399757371
+    },
+    "cache_market_data_kxgold15m": {
+      "started_ms": 1791399757372,
+      "tables": {
+        "markets": 3907
+      },
+      "finished_ms": 1791399757479
+    },
+    "cache_market_data_kxnear15m": {
+      "started_ms": 1791399757481,
+      "tables": {
+        "markets": 4262
+      },
+      "finished_ms": 1791399757586
+    },
+    "cache_market_data_kxsilver15m": {
+      "started_ms": 1791399757591,
+      "tables": {
+        "markets": 3923
+      },
+      "finished_ms": 1791399757743
+    },
+    "cache_market_data_kxsol15m": {
+      "started_ms": 1791399757747,
+      "tables": {
+        "markets": 6403
+      },
+      "finished_ms": 1791399757906
+    },
+    "cache_market_data_kxsol15m_new": {
+      "started_ms": 1791399757908,
+      "tables": {
+        "markets": 5684
+      },
+      "finished_ms": 1791399758052
+    },
+    "cache_market_data_kxxrp15m": {
+      "started_ms": 1791399758056,
+      "tables": {
+        "markets": 4262
+      },
+      "finished_ms": 1791399758152
+    }
+  },
+  "disk_source_fingerprint": "100c3efebc28",
+  "running_source_fingerprint": "100c3efebc28",
+  "source_commit": "ec876943f20cdd1888e1580d42a8b8f7baf28d0e",
+  "env_modified_ms": 1791221283265,
+  "process_started_ms": 1791225028119
+}
