@@ -761,6 +761,29 @@ def allsignal_trend_skip(store: Store, settings: Settings, opened: int, side: st
         return ""
 
 
+def allsignal_ohlc_lock_skip(settings: Settings, now_ms: int) -> str:
+    """The note to skip with while a chop range is locked, else "". Never raises:
+    an error or missing data lets the signal through."""
+    try:
+        if not getattr(settings, "allsignal_ohlc_lock_skip", False):
+            return ""
+        if surface.asset(settings.kalshi_series) != "BTC":
+            return ""
+        path = Path(getattr(settings, "reference_database_path", "") or "")
+        if not path.is_file():
+            return ""
+        from .ohlc_regime import range_lock
+
+        lock = range_lock(path, int(now_ms))
+        if not lock["locked"]:
+            return ""
+        return (f"chop range locked ({lock['low']:.0f}-{lock['high']:.0f}): "
+                "no entry until it breaks out")
+    except Exception as exc:  # noqa: BLE001
+        print(f"allsignal: range-lock check failed {exc!r} - not applied", flush=True)
+        return ""
+
+
 def allsignal_on_alert(store: Store, settings: Settings, trader, contract, side: str,
                        ask: float, snapshot, opened: int, now_ms: int,
                        telegram=None) -> None:
@@ -770,7 +793,8 @@ def allsignal_on_alert(store: Store, settings: Settings, trader, contract, side:
     2026-09-29 - the wait may only delay or skip a trade, never add one)."""
     # AFTER TWO LOSSES, NEVER AGAINST THE 15-MIN TREND (FINDINGS 142): skipped
     # here, said by the miss notice, and the streak stands until a trade is taken.
-    skip = allsignal_trend_skip(store, settings, opened, side, now_ms)
+    skip = (allsignal_ohlc_lock_skip(settings, now_ms)
+            or allsignal_trend_skip(store, settings, opened, side, now_ms))
     if skip:
         # Never raises (review 2026-10-02): a locked database loses the record
         # of the skip, never the alert's own prediction row.

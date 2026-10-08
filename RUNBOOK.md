@@ -723,3 +723,16 @@ rebuilt locally. When a message and the ledger disagree, the message is wrong.
 repo. It is not encrypted and not permission-restricted. Anyone with read access
 to that file can trade this account. Rotating it and tightening its ACL is
 outstanding.
+
+
+## Daily target policy (2026-10-07)
+
+Every live account pauses new BTC entries at 3% of its own recorded opening
+capital, net of fees, until midnight America/New_York. Existing exits and all
+shadow recording continue. Mirrors continue independently until their own cap.
+Production enables the target guard, sets primary/mirror rates and primary stop
+rate to 0.03, disables the win-count target cap, and sets all after-target stakes
+to zero. The example configuration keeps activation disabled for safety.
+Opening capital and reached pauses persist across restarts. Existing day targets
+are frozen; changing settings alone does not rewrite them. Do not clear pauses
+when deploying updates. Historical studies retain their original assumptions.

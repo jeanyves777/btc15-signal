@@ -11209,3 +11209,12 @@ On history candles the pair costs < $1 all-in in only ~3.6% of hours (~1.5c); th
 (55-82 of 303 hours, ~5c) is a stale /markets-quote artifact - gone at the next poll 81-91% of the
 time. Executability needs an hourly ORDER-BOOK recording in the last 15 minutes (not built).
 METHOD: day sign-flip / day bootstrap overstate certainty on 0-loss favourites; use a binomial test.
+
+
+## Live target change ? 2026-10-07 18:30 ET
+
+Operator authorized 3% daily profit target for PRIMARY AND ALL MIRRORS; Affoue no longer trades past its target. DAILY_PROFIT_TARGET_RATE=0.03, DAILY_PROFIT_STOP_RATE=0.03, MIRROR_DAILY_PROFIT_TARGET_RATE=0.03, MIRROR_TARGET_MAX_WINS=0, ALLSIGNAL_AFTER_TARGET_STAKE=0 and MIRROR_1/2/3_ALLSIGNAL_AFTER_TARGET_STAKE=0. Stakes and after-loss sizing unchanged. Each account pauses until midnight New York after its own target; shadow recording continues. Mirror-after-primary-done remains enabled only so a mirror below its OWN target may continue until reaching it.
+
+Today opening capital and existing pause/cap timestamps preserved. Today's target fields updated to opening*0.03 (primary $19.6806; Wife $1.0431; George $0.8814; Affoue $1.4595). All four had already crossed their targets today; Affoue's historical pause is retained even though its later all-day trading brought today's result below target.
+
+90 relevant tests passed (daily profit, primary cap, recording never pauses, new setup). Broker flat on all four accounts, no resting orders; restart preflight passed. BTC PID 18388 replaced by watchdog PID 22564; fresh observations verified on BTC/ETH/GOLD/SILVER/SOL/XRP/NEAR/BNB. No shadow service restart, no day-capital reset. Backup .env.bak-20261007-3pct; prior day state runtime/3pct_change_20261007_before.json.

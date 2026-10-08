@@ -593,7 +593,7 @@ def summary(guards):
     for name, pnl, cap, rate in capped_rows:
         out.append(f"\U0001f3c1 <b>{name}</b> \u00b7 daily cap reached "
                    f"(${pnl:+.2f} of ${cap:.2f}, {100 * rate:g}%) \u00b7 done: no new BTC "
-                   "entries until 00:00 ET; open positions still exit")
+                   "entries until 00:00 ET; open positions still exit; shadow tracking continues")
     for name, lower, back in lowered:
         out.append(f"\u2b07\ufe0f <b>{name}</b> \u00b7 at or above the target \u00b7 "
                    f"<b>${lower:g}</b> per signal"
@@ -606,7 +606,7 @@ def summary(guards):
     if paused:
         out.append(f"\u23f8 <b>{' and '.join(paused) if len(paused) < 3 else ', '.join(paused)}"
                    "</b> \u00b7 target hit \u00b7 no new BTC entries until 00:00 ET; "
-                   "open positions still exit")
+                   "open positions still exit; shadow tracking continues")
     if blocked:
         out.append(f"\u26a0\ufe0f <b>{', '.join(blocked)}</b> \u00b7 Kalshi figures unavailable "
                    "\u00b7 new BTC entries blocked until they are read again")
@@ -636,7 +636,7 @@ def footer(guards):
         "<b>BTC daily target: 3% · after fees</b>\n"
         + "\n\n".join(g.line() for g in guards)
         + "\n\n<i>Reset: 00:00 New York. Target pauses entries; exits continue."
-        + " Mirrors follow primary fills.</i>"
+        + " Each account pauses independently; shadow tracking continues.</i>"
     )
 
 
@@ -687,7 +687,9 @@ async def _monitor_one(guard, telegram):
     # A DAY ALREADY DONE AT ITS CAP stays done whatever the read does: the
     # outage pair said "allowed again" on a capped day (review 2026-10-02).
     try:
-        done = capped(guard, guard.state())
+        state = guard.state()
+        done = capped(guard, state) or bool(
+            state and state["paused_ms"] and not guard.after_target_stake)
     except Exception:  # noqa: BLE001 - a local read; the plain wording then
         done = False
     if guard.fail_passes >= 2 and not getattr(guard, "outage_said", False):
@@ -728,7 +730,7 @@ async def _monitor_one(guard, telegram):
                      f"${guard.stop_rate * state['opening']:.2f} cap "
                      f"({100 * guard.stop_rate:g}% of ${state['opening']:.2f}) \u00b7 net of fees\n"
                      "\U0001f6d1 Done for the day: no new BTC entries until 00:00 ET \u00b7 "
-                     "open positions still exit"
+                     "open positions still exit; shadow tracking continues"
                      + (f"\n{escape(_note(guard), quote=False)}" if _note(guard) else ""))
                     if status == "capped" else
                     (f"\U0001f3af <b>TARGET REACHED{' AGAIN' if again else ''} \u00b7 {label}</b>\n"
@@ -749,7 +751,7 @@ async def _monitor_one(guard, telegram):
                     f"\U0001f3af <b>{state['pnl']:+.2f}</b> of ${state['target']:.2f} "
                     f"({pct:+.2f}%) \u00b7 net of fees\n"
                     "\U0001f6d1 New BTC entries paused until 00:00 ET \u00b7 "
-                    "open positions still exit"
+                    "open positions still exit; shadow tracking continues"
                     if status == "paused" else
                     f"\u25b6\ufe0f <b>DAILY TARGET ACTIVE \u00b7 {label}</b>\n"
                     f"\U0001f3e6 Opening capital <b>${state['opening']:.2f}</b>\n"

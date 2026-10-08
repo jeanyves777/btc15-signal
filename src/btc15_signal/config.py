@@ -465,17 +465,11 @@ class Settings(BaseSettings):
     execution_enabled: bool = False
     execution_entry_series: str = ""
     daily_profit_target_enabled: bool = False
-    # THE DAILY TARGETS, per account (operator, 2026-09-29: "let's move to 8%
-    # and 15%"). On the 650 recorded BTC signals to 09-29 a 3% target kept 28%
-    # of the no-target profit on the primary; 8% kept 82% and still stopped the
-    # bad afternoons. A mirror's $2 trade is a far bigger share of a ~$20-25
-    # account, so it hit small targets after one trade; 15% kept all of it.
-    # Re-evaluate at 2,000 recorded signals (scripts/target_study.py).
-    daily_profit_target_rate: float = 0.08            # the primary
-    # THE PRIMARY'S DAILY CAP (operator, 2026-10-02: "I authorize implement the
-    # 20% daily stop on the primary"; FINDINGS 135): once the day's realised P&L
-    # reaches this fraction of the opening, no new entry until 00:00 New York
-    # (latched; exits and recording continue). Primary only. 0 = off.
+    # Live policy (2026-10-07): each account stops new BTC entries at 3%
+    # of its own recorded opening capital, net of fees, until midnight ET.
+    # The guard remains opt-in; exits and shadow recording continue.
+    daily_profit_target_rate: float = 0.03
+    # Optional separate primary cap. Production sets this to 0.03 as well.
     daily_profit_stop_rate: float = 0.0
     # AFTER TWO LOSSES, NEVER AGAINST THE 15-MIN TREND (operator, 2026-10-02:
     # "the 15 minutes after 2 losses is the one I want live"; FINDINGS 139-142):
@@ -493,7 +487,9 @@ class Settings(BaseSettings):
     allsignal_trend_skip_after_losses: int = 0
     allsignal_trend_skip_minutes: int = 15
     allsignal_trend_skip_bps: float = 10.0
-    mirror_daily_profit_target_rate: float = 0.15     # each mirror
+    # Skip BTC signals while a detected chop range is locked (study: reports/oct6_regime_deep).
+    allsignal_ohlc_lock_skip: bool = False
+    mirror_daily_profit_target_rate: float = 0.03     # each mirror
     # THE MIRRORS AFTER A LOSS, PAST A TARGET, AND ONCE THE PRIMARY IS DONE
     # (operator, 2026-10-05: "Mirrors: boost all three by $1 ... Affoue ... $6 base
     # and $8 after 1 loss and the after target hit $3"; FINDINGS 163). Inside the
@@ -514,7 +510,7 @@ class Settings(BaseSettings):
     # stake. Measured on the recorded copies 09-23..10-01: up to ~7 wins the
     # target was reached on 8 of 9 days at both $2 and $3; past ~8-9 the hit rate
     # fell (Wife missed 10-01 by 13c at $2 needing ~9 wins). 0 = off. FINDINGS 123.
-    mirror_target_max_wins: float = 7.0
+    mirror_target_max_wins: float = 0.0
     target_win_price: float = 0.75
     # THE MIRRORS' STAKE SCALES WITH THE ACCOUNT (operator, 2026-10-01: "auto
     # scale for the mirrored account as the account balance changes every day at
