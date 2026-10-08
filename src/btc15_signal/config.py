@@ -487,8 +487,12 @@ class Settings(BaseSettings):
     allsignal_trend_skip_after_losses: int = 0
     allsignal_trend_skip_minutes: int = 15
     allsignal_trend_skip_bps: float = 10.0
-    # Skip BTC signals while a detected chop range is locked (study: reports/oct6_regime_deep).
-    allsignal_ohlc_lock_skip: bool = False
+    # While a chop range is locked a BTC signal waits for either side's ask to reach `min_ask`
+    # and enters that side (the opposite one if it gets there first); neither with
+    # `allsignal_cushion_min_left_s` left: no entry. Every lock is logged to
+    # runtime/lock_shadow.jsonl. 0 min_ask = log only.
+    allsignal_ohlc_lock_wait: bool = False
+    allsignal_ohlc_lock_min_ask: float = 0.85
     mirror_daily_profit_target_rate: float = 0.03     # each mirror
     # THE MIRRORS AFTER A LOSS, PAST A TARGET, AND ONCE THE PRIMARY IS DONE
     # (operator, 2026-10-05: "Mirrors: boost all three by $1 ... Affoue ... $6 base

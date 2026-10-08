@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import bisect
 import csv
+import gzip
 import hashlib
 import json
 import math
@@ -15,6 +16,7 @@ import sys
 from collections import Counter, defaultdict
 from datetime import datetime
 from pathlib import Path
+from types import SimpleNamespace
 from zoneinfo import ZoneInfo
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -180,19 +182,21 @@ def boosted(trades, now):
     return since is not None and since<2
 
 
-def replay(tape, rule, target_rate, delay=60, slippage=0., capital=CAPITAL):
+def replay(tape, rule, target_rate, delay=60, slippage=0., capital=CAPITAL, entry_recheck=False):
     daily=[];ledger=[]
     grouped=defaultdict(list)
     for s in tape.signals:
         grouped[s['day']].append(s)
     for day, signals in sorted(grouped.items()):
         trades=[];pnl=peak=dd=0.;hit=None;reasons=Counter()
+        midnight = int(datetime.fromisoformat(day).replace(tzinfo=NY).timestamp()*1000)
+        next_midnight = midnight + 86400000  # This fixed study contains no DST transition.
         def flush(now):
             nonlocal pnl,peak,dd,hit
             for t in sorted(trades,key=lambda t:t['known']):
                 if t['known']<=now and not t['booked']:
                     t['booked']=True;pnl+=t['net'];peak=max(peak,pnl);dd=max(dd,peak-pnl)
-                    if target_rate and hit is None and pnl+1e-8>=capital*target_rate:
+                    if target_rate and hit is None and t['known']<next_midnight and pnl+1e-8>=capital*target_rate:
                         hit=t['known']
         for s in signals:
             now=s['at'];flush(now)
@@ -221,6 +225,10 @@ def replay(tape, rule, target_rate, delay=60, slippage=0., capital=CAPITAL):
             flush(entry)
             if hit:
                 reasons['target']+=1;continue
+            if entry_recheck and entry>s['at']:
+                checked=entry_features(tape,s,entry)
+                if rule_blocks(checked,rule):
+                    reasons['regime_at_entry']+=1;continue
             stake=30 if rule!='no_loss_boost' and boosted(trades,entry) else 25
             price=min(.99,price+slippage)
             n=contracts_for_budget(stake,price)
@@ -239,6 +247,21 @@ def replay(tape, rule, target_rate, delay=60, slippage=0., capital=CAPITAL):
                           hit=stamp(hit) if hit else None,skips=dict(reasons)))
         ledger.extend(trades)
     return daily,ledger
+
+
+def entry_features(tape, signal, at):
+    """Causal recheck for a delayed cushion entry; never uses the later outcome."""
+    if not hasattr(tape, 'entry_cache'):
+        tape.entry_cache={}
+    key=(signal['wo'],at)
+    if key not in tape.entry_cache:
+        checked=dict(signal,at=at)
+        checked.update(tape.features(checked))
+        checked.update(tape.regime_byminute.get(at//MINUTE*MINUTE,{}))
+        from postshock import add_postshock
+        add_postshock(SimpleNamespace(signals=[checked],value=tape.value))
+        tape.entry_cache[key]=checked
+    return tape.entry_cache[key]
 
 
 def aggregate(days):
@@ -294,6 +317,7 @@ def attach_ohlc(tape):
                          chop=state.get('chop'),regime_chop=state.get('regime_chop'),
                          ohlc_valid=state.get('valid'))
     for s in tape.signals:s.update(byminute.get(s['at']//MINUTE*MINUTE,{}))
+    tape.regime_byminute=byminute
     write_csv(OUT/'ohlc_states.csv',states)
     write_csv(OUT/'lock_events.csv',events)
     return events
@@ -302,7 +326,7 @@ def attach_ohlc(tape):
 def main():
     tape=Tape();events=attach_ohlc(tape)
     from postshock import add_postshock
-    add_postshock(tape)
+    postshock_coverage=add_postshock(tape)
     rules=['baseline','chop_0.25_3','hour_chop','ohlc_chop','ohlc_lock',
            'trend_always','chop_and_trend','ask_floor_70','no_loss_boost','postshock']
     all_days=[];all_ledger=[];summary=[]
@@ -322,11 +346,24 @@ def main():
                 days,_=replay(tape,name,rate)
                 sensitivity.append(dict(rule=name,rate=rate,**aggregate(days)))
     execution_sensitivity=[]
-    for rule in ('baseline','chop_0.25_3','hour_chop','ohlc_lock','ask_floor_70'):
+    for rule in ('baseline','chop_0.25_3','hour_chop','ohlc_lock','ask_floor_70','postshock'):
         for rate in (.03,.05,.08):
             for delay,slip in ((300,0),(60,.01),(60,.02)):
                 days,_=replay(tape,rule,rate,delay,slip)
                 execution_sensitivity.append(dict(rule=rule,rate=rate,delay=delay,slippage=slip,**aggregate(days)))
+    postshock_sensitivity=[]
+    for shock,hours,ratio in ((75,8,.5),(125,8,.5),(100,4,.5),(100,12,.5),
+                               (100,8,.4),(100,8,.6),(100,8,.5)):
+        add_postshock(tape,shock_bps=shock,after_hours=hours,contraction_ratio=ratio)
+        for rate in (.05,.08):
+            days,_=replay(tape,'postshock',rate)
+            postshock_sensitivity.append(dict(shock_bps=shock,hours=hours,ratio=ratio,rate=rate,**aggregate(days)))
+    add_postshock(tape)
+    recheck=[]
+    for rule in ('postshock','ohlc_lock','chop_0.25_3'):
+        for rate in (.03,.05,.08):
+            days,_=replay(tape,rule,rate,entry_recheck=True)
+            recheck.append(dict(rule=rule,rate=rate,**aggregate(days)))
     # Attribution on real trades only; does not claim alternative live execution.
     bywo={s['wo']:s for s in tape.signals};actual=[]
     for r in tape.actual:
@@ -336,6 +373,10 @@ def main():
                            **{f'blocked_{rule}':rule_blocks(s,rule) for rule in rules}))
     write_csv(OUT/'signals.csv',tape.signals);write_csv(OUT/'daily.csv',all_days)
     write_csv(OUT/'modeled_trades.csv',all_ledger);write_csv(OUT/'actual_attribution.csv',actual)
+    # Freeze the exact sampled data used, avoiding later live-DB revisions.
+    with gzip.open(OUT/'inputs.json.gz','wt',encoding='utf-8') as f:
+        json.dump(dict(signals=tape.signals,polls=dict(tape.polls),brti=tape.brti,
+                       actual=tape.actual),f,separators=(',',':'))
     result=dict(window=dict(start=stamp(START),end=stamp(END),signals=len(tape.signals)),
         assumptions=dict(capital_fixed=CAPITAL,base=25,boost=30,boost_trades=2,cushion_bps=5,
                          trend_skip_after_losses=2,trend_bps=10,fees='local fee formula',
@@ -345,7 +386,10 @@ def main():
                       er60_missing=sum(s['er60'] is None for s in tape.signals),
                       ohlc_missing=sum(not s.get('ohlc_valid') for s in tape.signals)),
         summary=summary,sensitivity=sensitivity,execution_sensitivity=execution_sensitivity,
-        source_hash=hashlib.sha256(Path(__file__).read_bytes()).hexdigest())
+        postshock_coverage=postshock_coverage,postshock_sensitivity=postshock_sensitivity,
+        entry_recheck=recheck,
+        source_hashes={p.name:hashlib.sha256(p.read_bytes()).hexdigest()
+                       for p in (Path(__file__),OUT/'postshock.py',OUT/'ohlc_regime.py')})
     (OUT/'results.json').write_text(json.dumps(result,indent=2),encoding='utf-8')
     print(json.dumps({'coverage':result['coverage'],'main':[r for r in summary if r['period']=='all15' and r['rate'] in (.03,.05,.08)]},indent=2))
 

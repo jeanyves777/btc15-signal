@@ -111,9 +111,9 @@ def test_the_after_loss_cushion_is_pinned():
 # Re-pinned 2026-10-05 (FINDINGS 163, same instruction): the cushion and the trend skip
 # read the day's TAKEN sequence - copied signals included once the primary is done -
 # through _taken_rows/_taken_lost, pinned with them. Filled rows read exactly as before.
-# Re-pinned 2026-10-07 (operator: "set the better candidate"): allsignal_on_alert also
-# skips while a chop range is locked (allsignal_ohlc_lock_skip, off unless set).
-CUSHION_CODE = "db93f187e99a5c66"
+# Re-pinned 2026-10-08 (operator: "live should never skip a signal"): allsignal_on_alert
+# holds a signal inside a locked chop range for an 85c ask, never skips it (allsignal_ohlc_lock_wait).
+CUSHION_CODE = "3fec538d6a864be3"
 
 
 def test_the_cushion_rule_code_is_pinned():

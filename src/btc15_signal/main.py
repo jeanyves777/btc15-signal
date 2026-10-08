@@ -761,11 +761,24 @@ def allsignal_trend_skip(store: Store, settings: Settings, opened: int, side: st
         return ""
 
 
-def allsignal_ohlc_lock_skip(settings: Settings, now_ms: int) -> str:
-    """The note to skip with while a chop range is locked, else "". Never raises:
-    an error or missing data lets the signal through."""
+LOCK_WAIT: dict = {}     # the window waiting for its ask to reach the lock floor
+
+
+def _lock_shadow(settings: Settings, event: dict) -> None:
+    """Append one lock event to lock_shadow.jsonl beside the reference db. Never raises."""
     try:
-        if not getattr(settings, "allsignal_ohlc_lock_skip", False):
+        path = Path(settings.reference_database_path).parent / "lock_shadow.jsonl"
+        with path.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(event) + "\n")
+    except Exception as exc:  # noqa: BLE001
+        print(f"allsignal: lock shadow not recorded {exc!r}", flush=True)
+
+
+def allsignal_ohlc_lock_note(settings: Settings, now_ms: int) -> str:
+    """The note for a signal made while a chop range is locked, else "". Never
+    raises: an error or missing data lets the signal through untouched."""
+    try:
+        if not getattr(settings, "allsignal_ohlc_lock_wait", False):
             return ""
         if surface.asset(settings.kalshi_series) != "BTC":
             return ""
@@ -777,24 +790,70 @@ def allsignal_ohlc_lock_skip(settings: Settings, now_ms: int) -> str:
         lock = range_lock(path, int(now_ms))
         if not lock["locked"]:
             return ""
-        return (f"chop range locked ({lock['low']:.0f}-{lock['high']:.0f}): "
-                "no entry until it breaks out")
+        return f"chop range locked ({lock['low']:.0f}-{lock['high']:.0f})"
     except Exception as exc:  # noqa: BLE001
         print(f"allsignal: range-lock check failed {exc!r} - not applied", flush=True)
         return ""
 
 
+def allsignal_lock_poll(store: Store, settings: Settings, trader, contract, snapshot,
+                        opened: int, remaining: int, now_ms: int, telegram=None) -> None:
+    """EVERY POLL: a window held by the range lock enters whichever side's ask first
+    reaches the floor - the signal's, or the opposite (price is the better read of
+    direction). Neither by the cushion deadline: no entry, recorded as skipped."""
+    try:
+        for key in [k for k in LOCK_WAIT if k != opened]:
+            _lock_shadow(settings, dict(event="window_ended", window_open=key, at_ms=now_ms))
+            LOCK_WAIT.pop(key, None)
+        wait = LOCK_WAIT.get(opened)
+        if wait is None:
+            return
+        signal_side = wait["side"]
+        other = "DOWN" if signal_side == "UP" else "UP"
+        floor = float(settings.allsignal_ohlc_lock_min_ask)
+        side = next((s for s in (signal_side, other)
+                     if (contract.ask(s) or 0) >= floor), None)
+        if side is None and remaining >= settings.allsignal_cushion_min_left_s:
+            return
+        LOCK_WAIT.pop(opened, None)
+        waited = (now_ms - wait["since"]) / 1000
+        if side is None:
+            note = (f"{wait['note']}: neither side reached {floor * 100:.0f}\u00a2 in "
+                    f"{waited:.0f}s - no entry")
+            _lock_shadow(settings, dict(event="passed", window_open=opened, side=signal_side,
+                                        alert_ask=wait["ask"], waited_s=waited, at_ms=now_ms))
+            if store.allsignal_claim(opened, contract.ticker, signal_side, wait["ask"], 0,
+                                     0.0, now_ms):
+                store.allsignal_finish(opened, "skipped", note=note)
+            print(f"allsignal: skipped - {note}", flush=True)
+            return
+        ask = contract.ask(side)
+        flipped = side != signal_side
+        _lock_shadow(settings, dict(event="entered", window_open=opened, side=side,
+                                    flipped=flipped, ask=ask, alert_ask=wait["ask"],
+                                    waited_s=waited, at_ms=now_ms))
+        _note_wait(opened, f"{wait['note']}: alert {signal_side} {wait['ask'] * 100:.0f}\u00a2, "
+                           f"waited {waited:.0f}s, "
+                           + (f"FLIPPED to {side} " if flipped else "entered ")
+                           + f"at {float(ask) * 100:.0f}\u00a2")
+        print(f"allsignal: lock wait over after {waited:.0f}s - entering {side} at {ask}"
+              + (" (flipped)" if flipped else ""), flush=True)
+        allsignal_on_alert(store, settings, trader, contract, side, ask, snapshot, opened,
+                           now_ms, telegram, released=True)
+    except Exception as exc:  # noqa: BLE001
+        print(f"allsignal: lock poll failed {exc!r}", flush=True)
+
+
 def allsignal_on_alert(store: Store, settings: Settings, trader, contract, side: str,
                        ask: float, snapshot, opened: int, now_ms: int,
-                       telegram=None) -> None:
+                       telegram=None, released: bool = False) -> None:
     """At the alert: enter now - or, after a loss, once the price is clear of
     the line (`allsignal_cushion_poll` watches every poll). Never raises, and
     FAILS CLOSED: a check that errors waits rather than enters (review
     2026-09-29 - the wait may only delay or skip a trade, never add one)."""
     # AFTER TWO LOSSES, NEVER AGAINST THE 15-MIN TREND (FINDINGS 142): skipped
     # here, said by the miss notice, and the streak stands until a trade is taken.
-    skip = (allsignal_ohlc_lock_skip(settings, now_ms)
-            or allsignal_trend_skip(store, settings, opened, side, now_ms))
+    skip = "" if released else allsignal_trend_skip(store, settings, opened, side, now_ms)
     if skip:
         # Never raises (review 2026-10-02): a locked database loses the record
         # of the skip, never the alert's own prediction row.
@@ -805,6 +864,19 @@ def allsignal_on_alert(store: Store, settings: Settings, trader, contract, side:
             print(f"allsignal: skip not recorded {exc!r}", flush=True)
         print(f"allsignal: skipped - {skip}", flush=True)
         return
+    # CHOP RANGE LOCKED: logged, and held for the floor price - never skipped.
+    lock = "" if released else allsignal_ohlc_lock_note(settings, now_ms)
+    if lock:
+        floor = float(getattr(settings, "allsignal_ohlc_lock_min_ask", 0.0) or 0.0)
+        hold = 0.0 < floor < 1.0 and float(ask) < floor and allsignal_on(store, settings)
+        _lock_shadow(settings, dict(event="locked", window_open=opened, side=side, ask=ask,
+                                    note=lock, floor=floor, held=hold, at_ms=now_ms))
+        if hold:
+            LOCK_WAIT.clear()
+            LOCK_WAIT[opened] = {"side": side, "ask": float(ask), "since": now_ms, "note": lock}
+            print(f"allsignal: {lock} - waiting for {side} ask {floor:g} (now {ask})",
+                  flush=True)
+            return
     need = float(getattr(settings, "allsignal_after_loss_cushion_bps", 0.0) or 0.0)
     if surface.asset(settings.kalshi_series) != "BTC":
         need = 0.0      # measured on BTC's signals only (FINDINGS 112)
@@ -1197,7 +1269,7 @@ def allsignal_urgent(store: Store, settings: Settings, now_ms: int) -> bool:
             return False
         opened = now_ms // 900_000 * 900_000
         remaining = (opened + 900_000 - now_ms) / 1000
-        if opened in ALLSIGNAL_WAIT:
+        if opened in ALLSIGNAL_WAIT or opened in LOCK_WAIT:
             return True
         row = store.db.execute(
             "SELECT status, COALESCE(attempt_ms, created_ms) FROM allsignal_trades "
@@ -6478,6 +6550,8 @@ async def service() -> None:
                     )
                     # After a loss the $ signal may be waiting for its cushion -
                     # checked on EVERY poll, not only in the 11-6 min entry range.
+                    allsignal_lock_poll(store, settings, trader, contract, snapshot,
+                                        opened, remaining, now_ms, telegram)
                     allsignal_cushion_poll(store, settings, trader, contract, snapshot,
                                            opened, remaining, now_ms, telegram)
                     allsignal_retry_poll(store, settings, trader, contract, snapshot,

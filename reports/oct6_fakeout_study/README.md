@@ -43,3 +43,7 @@ Both warnings together are a candidate for further shadow evaluation: they impro
 The current recorded sequence first crosses 3% of opening $908.00 at 2026-10-06T02:45:07.141000-04:00, with $+27.59. That daily pause is separate from detecting choppiness.
 
 The screenshot illustrates another venue and does not prove why every Kalshi trade lost. A faithful combined 3%-cap plus filter replay, with actual outcome availability and account sizing, remains necessary before considering deployment.
+
+## Correction from deeper lifecycle audit
+
+The earlier paragraph describing the loss difference as an unexplained revision was incorrect. -$231.5772 is the saved observed-ask model; -$251.9799 is actual net after $38.57008 in fees. Both cover exactly the same 86 October 6 windows. See ../oct6_regime_deep/README.md for the reconciled analysis and chronological target/filter tests.
