@@ -77,15 +77,15 @@ def boosted(trades, now):
     return since is not None and since < 2
 
 
-def flow_entry(signal, rows):
+def flow_entry(signal, rows, maximum=.99):
     """First observed side at >=85c; original side wins an exact timestamp tie."""
     side = signal["side"]
     candidates = []
     initial = signal["yes_ask"] if side == "UP" else signal["no_ask"]
     opposite = signal["no_ask"] if side == "UP" else signal["yes_ask"]
-    if initial and FLOOR <= initial < 1:
+    if initial and FLOOR <= initial <= maximum:
         return signal["at"], side, initial, False
-    if opposite and FLOOR <= opposite < 1:
+    if opposite and FLOOR <= opposite <= maximum:
         return signal["at"], "DOWN" if side == "UP" else "UP", opposite, True
     for row in rows:
         if row["at"] < signal["at"]:
@@ -96,12 +96,12 @@ def flow_entry(signal, rows):
                    ("DOWN" if side == "UP" else "UP",
                     row["no_ask"] if side == "UP" else row["yes_ask"]))
         for chosen, ask in ordered:
-            if ask and FLOOR <= ask < 1:
+            if ask and FLOOR <= ask <= maximum:
                 return row["at"], chosen, ask, chosen != side
     return None
 
 
-def replay(signals, polls, mode, slippage=0.0, target=True):
+def replay(signals, polls, mode, slippage=0.0, target=True, maximum=.99):
     by_day = defaultdict(list)
     for s in signals:
         by_day[stamp(s["wo"])[:10]].append(s)
@@ -132,7 +132,7 @@ def replay(signals, polls, mode, slippage=0.0, target=True):
             if mode == "all_trades" or (mode == "wait_85_after_loss" and not after_known_loss):
                 entry = (s["at"], s["side"], s["ask"], False)
             else:
-                entry = flow_entry(s, polls[s["wo"]])
+                entry = flow_entry(s, polls[s["wo"]], maximum)
                 if not entry:
                     missed["neither_side_reached_85"] += 1
                     continue

@@ -72,3 +72,27 @@ observed-ask result as achievable live profit.
 
 Reproduce with `python reports/price_flow_15days_20261008/run.py`. Detailed
 outputs are in `results.json`, `daily.csv`, and `trades.csv`.
+
+## Maximum entry-price sweep
+
+A strict maximum rejects quotes above the ceiling and continues waiting for
+either side to return to the allowed 85c-to-ceiling band. This is distinct from
+adding slippage to a hypothetical fill.
+
+| Maximum entry | Trades | Win rate | Net | Worst day | Max DD | Target days |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| 85c | 207 | 84.54% | -$77.43 | -$98.47 | $115.68 | 10/15 |
+| 86c | 354 | 85.31% | -$69.69 | -$91.52 | $117.21 | 8/15 |
+| 87c | 373 | 87.67% | +$113.00 | -$82.23 | $117.39 | 12/15 |
+| 88c | 347 | 88.18% | +$103.71 | -$104.38 | $142.43 | 12/15 |
+| 89c | 390 | 88.97% | +$154.44 | -$88.32 | $131.89 | 12/15 |
+| 90c | 287 | 91.99% | +$343.66 | +$21.32 | $54.44 | 15/15 |
+| 91c | 351 | 91.17% | +$328.00 | +$4.37 | $68.28 | 14/15 |
+| 92c | 391 | 91.05% | +$328.61 | +$7.98 | $63.85 | 14/15 |
+| 93c | 362 | 91.44% | +$325.77 | +$7.56 | $63.85 | 14/15 |
+| 99c | 372 | 91.67% | +$326.03 | +$4.15 | $64.90 | 14/15 |
+
+The strict 85c maximum is harmful in this recorded-quote replay because discrete
+polling often first observes the crossing above 85c. A 90c ceiling is the best
+point in this small, in-sample sweep, but that selection is optimized on the
+same 15 days and needs forward fill evidence before production use.
