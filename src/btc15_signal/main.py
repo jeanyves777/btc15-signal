@@ -471,8 +471,8 @@ def _taken_lost(row: dict) -> bool | None:
     if row["market_result"] in ("yes", "no"):
         return (row["market_result"] == "yes") != (row["side"] == "UP")
     if row["status"] == "copied" and row["p_won"] is not None \
-            and row["p_side"] == row["side"]:
-        return not row["p_won"]
+            and row["p_side"] in ("UP", "DOWN"):
+        return not row["p_won"] if row["p_side"] == row["side"] else bool(row["p_won"])
     return None
 
 
@@ -762,6 +762,61 @@ def allsignal_trend_skip(store: Store, settings: Settings, opened: int, side: st
 
 
 LOCK_WAIT: dict = {}     # the window waiting for its ask to reach the lock floor
+PRICE_WAIT_KEY = "allsignal_price_wait"
+PRICE_CONFIRMED_KEY = "allsignal_price_confirmed"
+
+
+def _price_wait_floor(settings: Settings) -> float:
+    if surface.asset(settings.kalshi_series) != "BTC":
+        return 0.0
+    value = float(getattr(settings, "allsignal_skip_wait_min_ask", 0.0) or 0.0)
+    return value if 0.0 < value < 1.0 else 0.0
+
+
+def _save_price_wait(store: Store, wait: dict | None, now_ms: int) -> None:
+    store.set_setting_text(PRICE_WAIT_KEY, json.dumps(wait) if wait else "", now_ms)
+
+
+def _price_confirmation(store: Store, opened: int) -> dict:
+    return json.loads(store.get_setting_text(PRICE_CONFIRMED_KEY) or "{}").get(str(opened), {})
+
+
+def _remember_price_confirmation(store: Store, opened: int, floor: float,
+                                 note: str, now_ms: int) -> None:
+    saved = json.loads(store.get_setting_text(PRICE_CONFIRMED_KEY) or "{}")
+    saved[str(opened)] = {"floor": floor, "note": note}
+    for key in sorted(saved, key=int)[:-8]:
+        saved.pop(key, None)
+    store.set_setting_text(PRICE_CONFIRMED_KEY, json.dumps(saved), now_ms)
+
+
+def _begin_price_wait(store: Store, settings: Settings, opened: int, ticker: str,
+                      side: str, ask: float, floor: float, note: str, now_ms: int,
+                      telegram=None) -> None:
+    # A live order owns its window. Repeated alerts cannot replace or duplicate it.
+    if store.db.execute("SELECT 1 FROM allsignal_trades WHERE window_open=?", (opened,)).fetchone():
+        return
+    if opened in LOCK_WAIT:
+        return
+    wait = dict(opened=opened, ticker=ticker, side=side, ask=float(ask),
+                floor=floor, since=now_ms, note=note)
+    _save_price_wait(store, wait, now_ms)
+    LOCK_WAIT[opened] = wait
+    if opened in ALLSIGNAL_WAIT:
+        _end_wait(store, opened)
+    _lock_shadow(settings, dict(event="price_wait", window_open=opened, side=side,
+                                ask=ask, floor=floor, note=note, at_ms=now_ms))
+    if telegram is not None:
+        text = (f"\u23f3 <b>BTC PRICE CONFIRMATION</b>\n"
+                f"Signal: {side} {ask * 100:.0f}\u00a2\n"
+                f"Waiting for UP or DOWN at <b>{floor * 100:.0f}\u00a2 or higher</b>.\n"
+                f"Reason: {escape(note)}\n"
+                f"Entry cutoff: {settings.allsignal_cushion_min_left_s // 60} min before expiry. "
+                "Shadow tracking continues.")
+        task = asyncio.get_running_loop().create_task(
+            Notifier(telegram, store, settings).send_once("allsignal_price_wait", str(opened), text, now_ms))
+        ALLSIGNAL_TASKS.add(task)
+        task.add_done_callback(ALLSIGNAL_TASKS.discard)
 
 
 def _lock_shadow(settings: Settings, event: dict) -> None:
@@ -798,50 +853,64 @@ def allsignal_ohlc_lock_note(settings: Settings, now_ms: int) -> str:
 
 def allsignal_lock_poll(store: Store, settings: Settings, trader, contract, snapshot,
                         opened: int, remaining: int, now_ms: int, telegram=None) -> None:
-    """EVERY POLL: a window held by the range lock enters whichever side's ask first
-    reaches the floor - the signal's, or the opposite (price is the better read of
-    direction). Neither by the cushion deadline: no entry, recorded as skipped."""
+    """Restore a price wait and take the first unambiguous 85c side before cutoff."""
     try:
-        for key in [k for k in LOCK_WAIT if k != opened]:
-            _lock_shadow(settings, dict(event="window_ended", window_open=key, at_ms=now_ms))
+        if not LOCK_WAIT:
+            saved = json.loads(store.get_setting_text(PRICE_WAIT_KEY) or "null")
+            if saved:
+                LOCK_WAIT[int(saved["opened"])] = saved
+        for key in list(LOCK_WAIT):
+            wait = LOCK_WAIT[key]
+            expired = key != opened or remaining < settings.allsignal_cushion_min_left_s
+            expired = expired or now_ms >= key + 900_000
+            if not expired:
+                continue
+            floor = float(wait.get("floor") or settings.allsignal_ohlc_lock_min_ask)
+            note = (f"price confirmation expired: neither side reached {floor * 100:.0f} cents "
+                    "before the entry cutoff")
+            if store.allsignal_claim(key, wait.get("ticker", contract.ticker), wait["side"],
+                                     wait["ask"], 0, 0.0, now_ms):
+                store.allsignal_finish(key, "price_expired" if _price_wait_floor(settings)
+                                      else "skipped", note=note)
+            _lock_shadow(settings, dict(event="passed", window_open=key, at_ms=now_ms, note=note))
             LOCK_WAIT.pop(key, None)
+            _save_price_wait(store, LOCK_WAIT.get(opened), now_ms)
         wait = LOCK_WAIT.get(opened)
-        if wait is None:
+        if wait is None or wait.get("ticker", contract.ticker) != contract.ticker:
             return
-        signal_side = wait["side"]
-        other = "DOWN" if signal_side == "UP" else "UP"
-        floor = float(settings.allsignal_ohlc_lock_min_ask)
-        side = next((s for s in (signal_side, other)
-                     if (contract.ask(s) or 0) >= floor), None)
-        if side is None and remaining >= settings.allsignal_cushion_min_left_s:
+        if store.db.execute("SELECT 1 FROM allsignal_trades WHERE window_open=?", (opened,)).fetchone():
+            LOCK_WAIT.pop(opened, None)
+            _save_price_wait(store, None, now_ms)
             return
-        LOCK_WAIT.pop(opened, None)
+        if trader is None or not allsignal_on(store, settings):
+            return
+        floor = float(wait.get("floor") or settings.allsignal_ohlc_lock_min_ask)
+        # Two very expensive asks can mean a wide/incoherent book, not direction.
+        eligible = [side for side in ("UP", "DOWN")
+                    if floor <= float(contract.ask(side) or 0) < 1.0]
+        if len(eligible) != 1:
+            return
+        side = eligible[0]
+        ask = float(contract.ask(side))
         waited = (now_ms - wait["since"]) / 1000
-        if side is None:
-            note = (f"{wait['note']}: neither side reached {floor * 100:.0f}\u00a2 in "
-                    f"{waited:.0f}s - no entry")
-            _lock_shadow(settings, dict(event="passed", window_open=opened, side=signal_side,
-                                        alert_ask=wait["ask"], waited_s=waited, at_ms=now_ms))
-            if store.allsignal_claim(opened, contract.ticker, signal_side, wait["ask"], 0,
-                                     0.0, now_ms):
-                store.allsignal_finish(opened, "skipped", note=note)
-            print(f"allsignal: skipped - {note}", flush=True)
-            return
-        ask = contract.ask(side)
-        flipped = side != signal_side
+        flipped = side != wait["side"]
+        note = (f"{wait['note']}: alert {wait['side']} {wait['ask'] * 100:.0f} cents, "
+                f"waited {waited:.0f}s; " + (f"FLIPPED to {side}" if flipped else f"confirmed {side}")
+                + f" at {ask * 100:.0f} cents")
+        _remember_price_confirmation(store, opened, floor, note, now_ms)
+        _note_wait(opened, note)
         _lock_shadow(settings, dict(event="entered", window_open=opened, side=side,
                                     flipped=flipped, ask=ask, alert_ask=wait["ask"],
                                     waited_s=waited, at_ms=now_ms))
-        _note_wait(opened, f"{wait['note']}: alert {signal_side} {wait['ask'] * 100:.0f}\u00a2, "
-                           f"waited {waited:.0f}s, "
-                           + (f"FLIPPED to {side} " if flipped else "entered ")
-                           + f"at {float(ask) * 100:.0f}\u00a2")
-        print(f"allsignal: lock wait over after {waited:.0f}s - entering {side} at {ask}"
-              + (" (flipped)" if flipped else ""), flush=True)
         allsignal_on_alert(store, settings, trader, contract, side, ask, snapshot, opened,
                            now_ms, telegram, released=True)
+        # A claim (including a broker pause) owns the window. If a local write
+        # failed, retain the wait to retry safely, with claim preventing duplicates.
+        if store.db.execute("SELECT 1 FROM allsignal_trades WHERE window_open=?", (opened,)).fetchone():
+            LOCK_WAIT.pop(opened, None)
+            _save_price_wait(store, None, now_ms)
     except Exception as exc:  # noqa: BLE001
-        print(f"allsignal: lock poll failed {exc!r}", flush=True)
+        print(f"allsignal: price confirmation poll failed {exc!r}", flush=True)
 
 
 def allsignal_on_alert(store: Store, settings: Settings, trader, contract, side: str,
@@ -854,6 +923,23 @@ def allsignal_on_alert(store: Store, settings: Settings, trader, contract, side:
     # AFTER TWO LOSSES, NEVER AGAINST THE 15-MIN TREND (FINDINGS 142): skipped
     # here, said by the miss notice, and the streak stands until a trade is taken.
     skip = "" if released else allsignal_trend_skip(store, settings, opened, side, now_ms)
+    price_floor = _price_wait_floor(settings)
+    if price_floor and allsignal_on(store, settings):
+        if released:
+            # Contract-price confirmation replaces the old after-loss cushion.
+            spawn_allsignal(store, settings, trader, contract.ticker, side, ask, opened,
+                            now_ms, telegram)
+            return
+        loss_wait = allsignal_after_loss(store, opened)
+        if skip or loss_wait:
+            reason = skip or "after a loss or while the previous result is pending"
+            _lock_shadow(settings, dict(event="strategy_skip_shadow", window_open=opened,
+                                        side=side, ask=ask, note=reason, at_ms=now_ms))
+            _begin_price_wait(store, settings, opened, contract.ticker, side, ask,
+                              price_floor, reason, now_ms, telegram)
+            allsignal_lock_poll(store, settings, trader, contract, snapshot, opened,
+                                (opened + 900_000 - now_ms) // 1000, now_ms, telegram)
+            return
     if skip:
         # Never raises (review 2026-10-02): a locked database loses the record
         # of the skip, never the alert's own prediction row.
@@ -868,12 +954,22 @@ def allsignal_on_alert(store: Store, settings: Settings, trader, contract, side:
     lock = "" if released else allsignal_ohlc_lock_note(settings, now_ms)
     if lock:
         floor = float(getattr(settings, "allsignal_ohlc_lock_min_ask", 0.0) or 0.0)
+        if price_floor and floor:
+            _lock_shadow(settings, dict(event="strategy_skip_shadow", window_open=opened,
+                                        side=side, ask=ask, note=lock, at_ms=now_ms))
+            _begin_price_wait(store, settings, opened, contract.ticker, side, ask,
+                              price_floor, lock, now_ms, telegram)
+            allsignal_lock_poll(store, settings, trader, contract, snapshot, opened,
+                                (opened + 900_000 - now_ms) // 1000, now_ms, telegram)
+            return
         hold = 0.0 < floor < 1.0 and float(ask) < floor and allsignal_on(store, settings)
         _lock_shadow(settings, dict(event="locked", window_open=opened, side=side, ask=ask,
                                     note=lock, floor=floor, held=hold, at_ms=now_ms))
         if hold:
             LOCK_WAIT.clear()
-            LOCK_WAIT[opened] = {"side": side, "ask": float(ask), "since": now_ms, "note": lock}
+            LOCK_WAIT[opened] = {"opened": opened, "ticker": contract.ticker, "floor": floor,
+                                 "side": side, "ask": float(ask), "since": now_ms, "note": lock}
+            _save_price_wait(store, LOCK_WAIT[opened], now_ms)
             print(f"allsignal: {lock} - waiting for {side} ask {floor:g} (now {ask})",
                   flush=True)
             return
@@ -924,10 +1020,28 @@ def allsignal_cushion_poll(store: Store, settings: Settings, trader, contract, s
                 else:
                     ALLSIGNAL_WAIT[o] = saved
         for key in [k for k in ALLSIGNAL_WAIT if k != opened]:
+            if _price_wait_floor(settings):
+                old = ALLSIGNAL_WAIT[key]
+                _begin_price_wait(store, settings, key, old["ticker"], old["side"],
+                                  old["ask"], _price_wait_floor(settings),
+                                  "after-loss price confirmation", now_ms)
+                allsignal_lock_poll(store, settings, trader, contract, snapshot, opened,
+                                    remaining, now_ms, telegram)
+                _end_wait(store, key)
+                continue
             _skip_wait(store, ALLSIGNAL_WAIT[key],
                        "after a loss: the wait was interrupted before a verdict", now_ms)
         wait = ALLSIGNAL_WAIT.get(opened)
         if wait is None:
+            return
+        price_floor = _price_wait_floor(settings)
+        if price_floor:
+            # Upgrade an old persisted cushion wait at deployment/restart.
+            _begin_price_wait(store, settings, opened, contract.ticker, wait["side"],
+                              wait["ask"], price_floor, "after-loss price confirmation",
+                              now_ms, telegram)
+            allsignal_lock_poll(store, settings, trader, contract, snapshot, opened,
+                                remaining, now_ms, telegram)
             return
         need = float(settings.allsignal_after_loss_cushion_bps)
         side = wait["side"]
@@ -997,6 +1111,13 @@ def allsignal_retry_poll(store: Store, settings: Settings, trader, contract, sna
         retries = int(row.get("retries") or 0)
         side, cap = row["side"], float(row["limit_price"])
         ask = contract.ask(side)
+        confirmed_floor = float(_price_confirmation(store, opened).get("floor") or 0)
+        if confirmed_floor and not confirmed_floor <= float(ask or 0) < 1:
+            store.db.execute("UPDATE allsignal_trades SET note=? WHERE window_open=? AND status='unfilled'",
+                             (f"price confirmation: the quote no longer qualified at "
+                              f"{confirmed_floor * 100:.0f} cents or higher; waiting to retry", opened))
+            store.db.commit()
+            return  # The retry must not buy below the price that confirmed direction.
         # THE CHASE (operator, 2026-10-05: "it's better to take it than just
         # letting it go"; FINDINGS 153). A miss means the price ran the signal's
         # way past the cap: from `allsignal_chase_after_s` after it, buy at the
@@ -1011,10 +1132,10 @@ def allsignal_retry_poll(store: Store, settings: Settings, trader, contract, sna
         if now_ms - last < wait_ms:
             return
         c = cushion_bps(snapshot, side)
-        if c is None or c <= 0 or not 0 < ask <= (chase_max if chasing else cap):
+        if (not confirmed_floor and (c is None or c <= 0)) or not 0 < ask <= (chase_max if chasing else cap):
             return                           # not aligned yet - look again next poll
         need = float(getattr(settings, "allsignal_after_loss_cushion_bps", 0.0) or 0.0)
-        if need > 0 and surface.asset(settings.kalshi_series) == "BTC" \
+        if not confirmed_floor and need > 0 and surface.asset(settings.kalshi_series) == "BTC" \
                 and allsignal_after_loss(store, opened) and c < need:
             return
         if not allsignal_on(store, settings):
@@ -1030,7 +1151,7 @@ def allsignal_retry_poll(store: Store, settings: Settings, trader, contract, sna
                             "the signal ")
                            + f"(ask {ask * 100:.0f}\u00a2, cap {cap * 100:.0f}\u00a2)")
         print(f"allsignal: retry {retries} {side} ask {ask:.2f} <= cap {cap:.2f}, "
-              f"{c:.1f} bps, {remaining}s left", flush=True)
+              f"{c if c is not None else float('nan'):.1f} bps, {remaining}s left", flush=True)
         # SIZED FOR NOW: a window claimed at $6 whose retry comes after the
         # primary's target goes at the lower stake (review, 2026-09-30).
         stake = allsignal_stake_now(store, settings, opened)
@@ -1496,6 +1617,8 @@ async def _refresh_accounts(store: Store) -> None:
 
 def _miss_reason(row: dict) -> str:
     """Why a $ signal bought nothing, including what the retry did."""
+    if str(row.get("note") or "").startswith("price confirmation:"):
+        return str(row["note"]).replace("; waiting to retry", "; no qualifying retry before cutoff")
     base = _order_failure(row.get("note"))
     if row.get("status") != "unfilled":
         return base
@@ -1513,7 +1636,7 @@ def _order_failure(note) -> str:
     if "no fill" in n or "book moved" in n:
         return "the price moved above the cap before the order landed"
     if "reconciliation unavailable" in n:
-        return "the 3% target check could not read Kalshi, so the entry was blocked for safety"
+        return "the daily target check could not read Kalshi, so the entry was blocked for safety"
     if "authentication" in n or "401" in n:
         return "the account's API key was refused"
     return ""
@@ -1595,7 +1718,8 @@ def _allsignal_text(store: Store, settings: Settings, row: dict, now_ms: int,
         book=_allsignal_book(settings, store, now_ms) if with_book else None,
         exit_price=row.get("exit_price"), exit_count=row.get("exit_count"),
         exited_ms=row.get("exited_ms"), budget=_row_stake(row, settings),
-        cushion_note=ALLSIGNAL_WAIT_NOTE.get(int(row["window_open"]), ""),
+        cushion_note=(ALLSIGNAL_WAIT_NOTE.get(int(row["window_open"]))
+                      or _price_confirmation(store, int(row["window_open"])).get("note", "")),
         target=target, ref=ref)
 
 
@@ -1739,9 +1863,10 @@ async def report_allsignal_results(store: Store, settings: Settings, telegram,
                     budget=(allsignal_stake_now(store, settings)
                             if row["status"] == "skipped" and not row.get("stake")
                             else _row_stake(row, settings)),
-                    reason=(row.get("note") if row["status"] == "skipped"
+                    reason=(row.get("note") if row["status"] in ("skipped", "price_expired")
                             else _miss_reason(row)),
                     skipped=row["status"] == "skipped",
+                    confirmation_expired=row["status"] == "price_expired",
                     target=_window_prices(store, int(row["window_open"]))[0],
                     ref=_window_prices(store, int(row["window_open"]))[1]),
                 now_ms)
@@ -1753,8 +1878,8 @@ async def report_allsignal_results(store: Store, settings: Settings, telegram,
     # money is its own broker balance, shown in the session summary.
     try:
         copied = store._dicts(
-            "SELECT a.window_open, p.won AS p_won FROM allsignal_trades a "
-            "JOIN predictions p ON p.window_open = a.window_open AND p.side = a.side "
+            "SELECT a.window_open, CASE WHEN p.side=a.side THEN p.won ELSE 1-p.won END AS p_won "
+            "FROM allsignal_trades a JOIN predictions p ON p.window_open = a.window_open "
             "WHERE a.status = 'copied' AND a.reported_ms IS NULL AND p.won IS NOT NULL "
             "AND a.created_ms >= ? ORDER BY a.window_open", (now_ms - 3 * 3_600_000,))
     except Exception as exc:  # noqa: BLE001

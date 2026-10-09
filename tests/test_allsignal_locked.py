@@ -113,7 +113,9 @@ def test_the_after_loss_cushion_is_pinned():
 # through _taken_rows/_taken_lost, pinned with them. Filled rows read exactly as before.
 # Re-pinned 2026-10-08 (operator: "live should never skip a signal"): allsignal_on_alert
 # holds a signal inside a locked chop range for an 85c ask, never skips it (allsignal_ohlc_lock_wait).
-CUSHION_CODE = "3fec538d6a864be3"
+# Re-pinned 2026-10-08: operator explicitly replaced live strategy skips and
+# after-loss cushion with >=85c confirmation on either side; skips stay shadow.
+CUSHION_CODE = "b24659d6c5b4d367"
 
 
 def test_the_cushion_rule_code_is_pinned():
@@ -135,7 +137,7 @@ def test_the_cushion_rule_code_is_pinned():
 # it go"; FINDINGS 155): a miss is chased at the moved price, up to 93c.
 # Re-pinned 2026-10-05 (FINDINGS 163): the retry sizes for its own window (the boost).
 # Re-pinned again 2026-10-05 (review): pre-funding covers the after-a-loss stakes.
-RETRY_CODE = "3f63a5e96564e44c"
+RETRY_CODE = "37fcd623c89f8baa"
 
 
 def test_the_retry_code_is_pinned():

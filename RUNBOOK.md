@@ -736,3 +736,22 @@ to zero. The example configuration keeps activation disabled for safety.
 Opening capital and reached pauses persist across restarts. Existing day targets
 are frozen; changing settings alone does not rewrite them. Do not clear pauses
 when deploying updates. Historical studies retain their original assumptions.
+
+
+## BTC price confirmation after strategy warnings (2026-10-08)
+
+With ALLSIGNAL_SKIP_WAIT_MIN_ASK=0.85, a two-loss trend warning, active chop
+lock, or previous taken loss/unknown outcome starts a persistent price wait.
+These strategy warnings are recorded in runtime/lock_shadow.jsonl; they do not
+immediately mark a live trade skipped. Normal unflagged signals still enter normally.
+The first unambiguous UP or DOWN ask at 85 cents or higher may enter, including
+an opposite-side entry. This confirmation replaces the after-loss 5bps cushion
+for that entry and its retries. The 120-second entry cutoff remains in force.
+
+Neither side qualifying in time is recorded as price_expired and announced as
+PRICE CONFIRMATION EXPIRED. Existing positions, per-account profit pauses, the
+execution switch, normal sizing and the shadow signal/outcome archive remain in
+force. All mirror orders follow the side selected for the actual trade. Price
+waits, the retry floor and flipped-entry notes survive restarts. The 85-cent
+condition applies to the observed ask; limit orders can receive price improvement.
+Zero disables this new mode and retains the historical cushion/skip behavior.

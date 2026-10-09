@@ -5425,7 +5425,7 @@ class Store:
         """Signals whose order bought nothing and were never reported."""
         return self._dicts(
             "SELECT * FROM allsignal_trades WHERE status IN "
-            "('unfilled', 'failed', 'paused', 'skipped') "
+            "('unfilled', 'failed', 'paused', 'skipped', 'price_expired') "
             "AND reported_ms IS NULL AND created_ms >= ? ORDER BY window_open",
             (since_ms,))
 

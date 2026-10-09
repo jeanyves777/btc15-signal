@@ -2356,7 +2356,7 @@ def allsignal_missed_message(*, asset: str, window_open: int, side: str,
                              signal_ask: float, limit: float,
                              failed: bool = False, budget: float = 1.0,
                              reason: str = "", skipped: bool = False,
-                             target=None, ref=None) -> str:
+                             target=None, ref=None, confirmation_expired: bool = False) -> str:
     """A signal whose order bought nothing - said, so no window looks skipped,
     with the broker's reason when there is one."""
     import datetime as dt
@@ -2365,12 +2365,13 @@ def allsignal_missed_message(*, asset: str, window_open: int, side: str,
     start = dt.datetime.fromtimestamp(window_open / 1000, ZoneInfo("America/New_York"))
     end = start + dt.timedelta(minutes=15)
     arrow = "\u2b06\ufe0f UP" if side == "UP" else "\u2b07\ufe0f DOWN"
-    what = "SKIPPED" if skipped else ("ORDER FAILED" if failed else "NOT FILLED")
+    what = ("PRICE CONFIRMATION EXPIRED" if confirmation_expired else
+            "SKIPPED" if skipped else ("ORDER FAILED" if failed else "NOT FILLED"))
     lines = [
         f"\u26aa <b>{escape(asset)} ${budget:g} \u00b7 {what}</b>",
         f"<b>{arrow}</b> \u00b7 \U0001f552 {start:%H:%M}\u2013{end:%H:%M} ET",
         f"\U0001f3af Signal {signal_ask * 100:.0f}\u00a2"
-        + ("" if skipped else f" \u00b7 limit {limit * 100:.0f}\u00a2"),
+        + ("" if skipped or confirmation_expired else f" \u00b7 limit {limit * 100:.0f}\u00a2"),
         *target_lines(side, target, ref, asset=asset),
         f"{surface.WARN} <i>No trade this window"
         + (f": {escape(reason, quote=False)}" if reason else "") + "</i>",

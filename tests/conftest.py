@@ -37,6 +37,8 @@ os.environ.setdefault("CASH_OUT_ENABLED", "true")
 # The chase (ON in the live .env since 2026-10-05): OFF for the suite, so the 60 s
 # retry stays tested as it was; tests/test_allsignal_chase.py switches it on itself.
 os.environ.setdefault("ALLSIGNAL_CHASE_MAX", "0")
+# Historical cushion/skip tests opt out; price-confirmation tests opt in explicitly.
+os.environ.setdefault("ALLSIGNAL_SKIP_WAIT_MIN_ASK", "0")
 # The after-a-loss stakes and the mirrors trading on past the primary (ON in the live
 # .env since 2026-10-05, FINDINGS 163): OFF for the suite, so the stake rules stay
 # tested as they were; tests/test_new_setup_1005.py switches them on itself.

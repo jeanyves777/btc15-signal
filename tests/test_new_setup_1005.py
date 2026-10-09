@@ -184,7 +184,7 @@ def test_a_copied_loss_drives_the_cushion_the_streak_and_the_boost(tmp_path):
 
 def test_a_copied_row_with_no_readable_result_is_unknown(tmp_path):
     store, s = Store(str(tmp_path / "btc15.db")), settings(tmp_path)
-    trade(store, W(6), status="copied", pred=("DOWN", 1))   # the other side: not ours
+    trade(store, W(6), status="copied", pred=("DOWN", None))  # no known outcome
     trade(store, W(5), status="copied")                     # no prediction at all
     assert main.allsignal_after_loss(store, W(4)) is True, "the cushion waits when unsure"
     assert main.allsignal_loss_streak(store, W(4), 1) is False, "not a KNOWN loss"
