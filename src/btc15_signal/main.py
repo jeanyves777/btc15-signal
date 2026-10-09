@@ -590,8 +590,8 @@ def allsignal_count_now(store: Store, settings: Settings, limit: float,
             if dynamic is not None:
                 return int(dynamic)
         except Exception as exc:  # noqa: BLE001
-            print(f"allsignal: dynamic size unavailable {exc!r} - no order", flush=True)
-            return 0
+            print(f"allsignal: dynamic size unavailable {exc!r} - using one contract", flush=True)
+            return 1
         break
     return contracts_for_budget(
         allsignal_stake_now(store, settings, opened), float(quote or limit))

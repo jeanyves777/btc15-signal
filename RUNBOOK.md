@@ -176,7 +176,7 @@ When `ALLSIGNAL_STAKE_RATE` or a mirror's
 recalculated from its own opening capital recorded for the New York day. The
 contract count is rounded down so `count × final order limit + entry fee` stays
 inside the configured fraction. A retry or chase is resized at its new limit;
-if even one contract exceeds the cap, no order is sent. Fixed dollar settings
+if the cap is smaller than one contract, one contract is sent. Fixed dollar settings
 remain fallbacks only when the corresponding rate is zero.
 
 `ALLSIGNAL_AFTER_LOSS_STAKE_RATE` supplies the primary's after-loss fraction.

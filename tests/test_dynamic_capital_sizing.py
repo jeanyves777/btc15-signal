@@ -25,12 +25,12 @@ def add_day(guard, opening=100.0):
     guard.error = ""
 
 
-def test_fee_inclusive_risk_cap_rounds_down_and_can_refuse_one_contract():
+def test_fee_inclusive_risk_cap_rounds_down_with_one_contract_floor():
     n = contracts_for_risk_cap(40.75, .05, .85)
     assert n == 2
     assert n * .85 + kalshi_fee_charged(.85, n) <= 40.75 * .05
     assert (n + 1) * .85 + kalshi_fee_charged(.85, n + 1) > 40.75 * .05
-    assert contracts_for_risk_cap(10, .05, .85) == 0
+    assert contracts_for_risk_cap(10, .05, .85) == 1
 
 
 def test_guard_uses_daily_opening_and_distinct_primary_after_loss_rate(tmp_path):
@@ -47,7 +47,7 @@ def test_guard_uses_daily_opening_and_distinct_primary_after_loss_rate(tmp_path)
     assert boosted > base
 
 
-def test_primary_dynamic_count_uses_final_limit_and_fails_closed_when_stale(tmp_path):
+def test_primary_dynamic_count_uses_final_limit_and_keeps_one_when_stale(tmp_path):
     store = Store(str(tmp_path / "btc.db"))
     g = DailyProfitGuard(tmp_path / "p.db", "primary", "Primary", SimpleNamespace(), .03)
     g.entry_risk_rate = .05
@@ -61,7 +61,7 @@ def test_primary_dynamic_count_uses_final_limit_and_fails_closed_when_stale(tmp_
     assert main.allsignal_count_now(store, settings, .85, 1, quote=.75) == 2
     with g.connect() as db:
         db.execute("UPDATE profit_days SET updated_ms=0")
-    assert main.allsignal_count_now(store, settings, .85, 1, quote=.75) == 0
+    assert main.allsignal_count_now(store, settings, .85, 1, quote=.75) == 1
 
 
 def test_mirror_sizes_from_own_opening_and_actual_order_ceiling(tmp_path):

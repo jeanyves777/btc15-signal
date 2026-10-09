@@ -43,7 +43,7 @@ from btc15_signal.mirror import MirrorTarget  # noqa: E402
 # Re-pinned 2026-10-08 on the operator's explicit sizing instruction: every
 # account now sizes from its own daily opening capital, with the primary's
 # separate after-loss percentage. The fee-inclusive count function is pinned.
-LOCKED_CODE = "a6c6f19f3c3f7fa8"
+LOCKED_CODE = "d00f6533b8e6b557"
 
 
 def test_the_locked_settings():

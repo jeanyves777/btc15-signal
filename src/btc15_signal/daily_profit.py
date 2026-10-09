@@ -181,7 +181,8 @@ class DailyProfitGuard:
         """Fee-inclusive contract cap from today's recorded opening capital.
 
         ``None`` means dynamic sizing is disabled and the caller should use its
-        legacy fixed-dollar path. Zero means the cap cannot fund one contract.
+        legacy fixed-dollar path. Dynamic sizing always keeps a one-contract
+        participation floor.
         """
         rate = float(self.entry_risk_rate or 0.0)
         if after_loss and self.after_loss_risk_rate:
@@ -190,7 +191,7 @@ class DailyProfitGuard:
             return None
         state = self.state()
         if not state or self.error or int(time.time() * 1000) - state["updated_ms"] > 60_000:
-            return 0
+            return 1
         from .validation import contracts_for_risk_cap
 
         return contracts_for_risk_cap(float(state["opening"]), rate, float(limit))
