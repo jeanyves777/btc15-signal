@@ -1,6 +1,6 @@
 # Universal 85-cent price-flow replay — September 24 through October 8, 2026
 
-This is a chronological, read-only replay of all 1,395 recorded primary BTC
+This is a chronological, read-only replay of all 1,396 recorded primary BTC
 signals across 15 calendar days. For the candidate rule, each signal waits until
 the original side or the opposite side first shows an ask of at least 85 cents.
 The original side wins an exact-timestamp tie. The trade must qualify with at
@@ -16,6 +16,7 @@ not compound between days.
 | Rule | Trades | W-L | Win rate | Net | Worst day | Max realized DD | Target days |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
 | Enter every signal at its observed ask | 471 | 347-124 | 73.67% | -$151.79 | -$428.41 | $463.38 | 13/15 |
+| Wait >=85c only for two trades after a known loss | 415 | 338-77 | 81.45% | +$201.80 | -$80.21 | $181.03 | 13/15 |
 | Wait for either side >=85c | 372 | 341-31 | 91.67% | +$326.03 | +$4.15 | $64.90 | 14/15 |
 | Wait for either side >=85c, add 1c | 578 | 522-56 | 90.31% | +$111.79 | -$105.17 | $155.02 | 11/15 |
 | Wait for either side >=85c, add 5c | 755 | 678-77 | 89.80% | -$743.86 | -$186.80 | $213.26 | 7/15 |
@@ -30,6 +31,13 @@ Without the daily target, the candidate took 1,215 of 1,395 signals, flipped 174
 won 89.22%, and modeled +$173.10 at observed asks. The immediate-entry baseline
 won 74.34% and modeled -$209.51. Neither side reached 85 cents before cutoff in
 180 windows.
+
+Applying confirmation only for the next two trades after a known loss improved
+the immediate-entry baseline, but it was weaker than universal confirmation.
+With 1-cent worse entries it modeled +$21.26, an $187.37 maximum drawdown, and
+12 target days. Universal confirmation under the same stress modeled +$111.79,
+a $155.02 maximum drawdown, and 11 target days. At 5 cents worse, after-loss-only
+modeled -$1,159.99 versus -$742.12 for universal confirmation.
 
 ## Daily observed-ask result with the 3% target
 
@@ -49,7 +57,7 @@ won 74.34% and modeled -$209.51. Neither side reached 85 cents before cutoff in
 | Oct 5 | 34 | 31 | 5 | +$22.83 | $50.76 | Yes |
 | Oct 6 | 8 | 8 | 2 | +$23.09 | $0.00 | Yes |
 | Oct 7 | 49 | 44 | 9 | +$21.52 | $48.38 | Yes |
-| Oct 8 through 21:00 ET | 48 | 43 | 4 | +$21.43 | $36.71 | Yes |
+| Oct 8 through 21:15 ET | 48 | 43 | 4 | +$21.43 | $36.71 | Yes |
 
 ## Limits
 

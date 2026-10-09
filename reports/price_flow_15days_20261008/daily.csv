@@ -13,4 +13,4 @@ day,signals,trades,wins,flips,net,max_dd,target_hit,misses
 2026-10-05,96,34,31,5,22.825,50.7593,2026-10-05T09:31:00-04:00,"{'neither_side_reached_85': 4, 'daily_target': 58}"
 2026-10-06,96,8,8,2,23.0866,0.0,2026-10-06T02:31:00-04:00,"{'neither_side_reached_85': 2, 'daily_target': 86}"
 2026-10-07,96,49,44,9,21.5199,48.3797,2026-10-07T14:16:00-04:00,"{'neither_side_reached_85': 8, 'daily_target': 39}"
-2026-10-08,76,48,43,4,21.4319,36.7127,2026-10-08T16:16:00-04:00,"{'neither_side_reached_85': 9, 'daily_target': 19}"
+2026-10-08,77,48,43,4,21.4319,36.7127,2026-10-08T16:16:00-04:00,"{'neither_side_reached_85': 9, 'daily_target': 20}"

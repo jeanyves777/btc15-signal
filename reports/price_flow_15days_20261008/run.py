@@ -21,7 +21,7 @@ from btc15_signal.validation import contracts_for_budget, kalshi_fee_charged
 
 NY = ZoneInfo("America/New_York")
 START = int(datetime(2026, 9, 24, tzinfo=NY).timestamp() * 1000)
-END = int(datetime(2026, 10, 9, tzinfo=NY).timestamp() * 1000)
+END = int(datetime(2026, 10, 8, 21, 15, tzinfo=NY).timestamp() * 1000)
 CAPITAL = 708.75
 TARGET = CAPITAL * .03
 FLOOR = .85
@@ -128,7 +128,8 @@ def replay(signals, polls, mode, slippage=0.0, target=True):
             if target_hit:
                 missed["daily_target"] += 1
                 continue
-            if mode == "all_trades":
+            after_known_loss = boosted(trades, s["at"])
+            if mode == "all_trades" or (mode == "wait_85_after_loss" and not after_known_loss):
                 entry = (s["at"], s["side"], s["ask"], False)
             else:
                 entry = flow_entry(s, polls[s["wo"]])
@@ -177,7 +178,7 @@ def main():
     signals, polls = load()
     scenarios = {}
     detailed = {}
-    for mode in ("all_trades", "wait_85_either_side"):
+    for mode in ("all_trades", "wait_85_after_loss", "wait_85_either_side"):
         for target in (False, True):
             for slip in (0.0, 0.01, 0.05):
                 key = f"{mode}|{'3pct' if target else 'uncapped'}|slip{int(slip*100)}c"
