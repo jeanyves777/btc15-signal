@@ -43,7 +43,9 @@ from btc15_signal.mirror import MirrorTarget  # noqa: E402
 # Re-pinned 2026-10-08 on the operator's explicit sizing instruction: every
 # account now sizes from its own daily opening capital, with the primary's
 # separate after-loss percentage. The fee-inclusive count function is pinned.
-LOCKED_CODE = "d00f6533b8e6b557"
+# Re-pinned 2026-10-08 (operator: accept 85-90c only, reject 91c+): the order limit never
+# exceeds allsignal_skip_wait_max_ask.
+LOCKED_CODE = "7a44f81aa25401ec"
 
 
 def test_the_locked_settings():
@@ -144,7 +146,8 @@ def test_the_cushion_rule_code_is_pinned():
 # Re-pinned again 2026-10-05 (review): pre-funding covers the after-a-loss stakes.
 # Re-pinned 2026-10-08: every retry/chase is resized at its final order limit
 # under the same fee-inclusive daily-capital ceiling as the first attempt.
-RETRY_CODE = "6aa87f45731641ab"
+# Re-pinned 2026-10-08 (same instruction): a confirmed retry or chase stays <= the 90c ceiling.
+RETRY_CODE = "337c57a1ba68df89"
 
 
 def test_the_retry_code_is_pinned():

@@ -616,6 +616,11 @@ def spawn_allsignal(store: Store, settings: Settings, trader, ticker: str,
         if not allsignal_on(store, settings):
             return
         limit = round(min(0.99, ask + settings.entry_slippage), 2)
+        ceiling = _price_wait_ceiling(settings)
+        if ceiling:
+            if float(ask) > ceiling + 1e-9:
+                return                    # above the ceiling: nothing is sent, the wait goes on
+            limit = min(limit, ceiling)
         stake = allsignal_stake_now(store, settings, opened)
         count = allsignal_count_now(store, settings, limit, opened, quote=ask)
         if count <= 0:
@@ -803,6 +808,13 @@ def _price_wait_floor(settings: Settings) -> float:
     return value if 0.0 < value < 1.0 else 0.0
 
 
+def _price_wait_ceiling(settings: Settings) -> float:
+    """The highest ask price confirmation accepts, or 0.0 for no ceiling."""
+    floor = _price_wait_floor(settings)
+    value = float(getattr(settings, "allsignal_skip_wait_max_ask", 0.0) or 0.0)
+    return value if floor and floor < value < 1.0 else 0.0
+
+
 def _save_price_wait(store: Store, wait: dict | None, now_ms: int) -> None:
     store.set_setting_text(PRICE_WAIT_KEY, json.dumps(wait) if wait else "", now_ms)
 
@@ -915,9 +927,12 @@ def allsignal_lock_poll(store: Store, settings: Settings, trader, contract, snap
         if trader is None or not allsignal_on(store, settings):
             return
         floor = float(wait.get("floor") or settings.allsignal_ohlc_lock_min_ask)
+        ceiling = _price_wait_ceiling(settings) or 1.0
         # Two very expensive asks can mean a wide/incoherent book, not direction.
+        # An ask above the ceiling is not accepted: that side keeps waiting.
         eligible = [side for side in ("UP", "DOWN")
-                    if floor <= float(contract.ask(side) or 0) < 1.0]
+                    if floor - 1e-9 <= float(contract.ask(side) or 0) <= ceiling + 1e-9
+                    and float(contract.ask(side) or 0) < 1.0]
         if len(eligible) != 1:
             return
         side = eligible[0]
@@ -1148,7 +1163,9 @@ def allsignal_retry_poll(store: Store, settings: Settings, trader, contract, sna
         side, cap = row["side"], float(row["limit_price"])
         ask = contract.ask(side)
         confirmed_floor = float(_price_confirmation(store, opened).get("floor") or 0)
-        if confirmed_floor and not confirmed_floor <= float(ask or 0) < 1:
+        ceiling = _price_wait_ceiling(settings) if confirmed_floor else 0.0
+        if confirmed_floor and not (confirmed_floor <= float(ask or 0) < 1
+                                    and (not ceiling or float(ask) <= ceiling + 1e-9)):
             store.db.execute("UPDATE allsignal_trades SET note=? WHERE window_open=? AND status='unfilled'",
                              (f"price confirmation: the quote no longer qualified at "
                               f"{confirmed_floor * 100:.0f} cents or higher; waiting to retry", opened))
@@ -1161,6 +1178,8 @@ def allsignal_retry_poll(store: Store, settings: Settings, trader, contract, sna
         # `allsignal_chase_attempts` times - instead of waiting 60 s for the old
         # cap. 30 live misses 09-28..10-05: 25 won; at the moved price, +11.13.
         chase_max = float(getattr(settings, "allsignal_chase_max", 0.0) or 0.0)
+        if ceiling:
+            chase_max = min(chase_max, ceiling)
         chasing = (chase_max > 0 and cap < ask <= chase_max
                    and retries < int(getattr(settings, "allsignal_chase_attempts", 3) or 0))
         wait_ms = (int(getattr(settings, "allsignal_chase_after_s", 10) or 0) * 1000

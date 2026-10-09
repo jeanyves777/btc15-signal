@@ -503,6 +503,9 @@ class Settings(BaseSettings):
     # side for EVERY BTC signal. Production uses .85. Zero retains the historical
     # cushion/skip policy.
     allsignal_skip_wait_min_ask: float = 0.0
+    # Price confirmation also rejects an ask ABOVE this (production .90): such a side keeps
+    # waiting until it is back in range. Orders and the chase never go above it. 0 = no ceiling.
+    allsignal_skip_wait_max_ask: float = 0.0
     mirror_daily_profit_target_rate: float = 0.03     # each mirror
     # THE MIRRORS AFTER A LOSS, PAST A TARGET, AND ONCE THE PRIMARY IS DONE
     # (operator, 2026-10-05: "Mirrors: boost all three by $1 ... Affoue ... $6 base
