@@ -114,10 +114,20 @@ def test_ambiguous_or_invalid_asks_do_not_confirm(tmp_path,monkeypatch):
     assert not client.orders and W in main.LOCK_WAIT
 
 
-def test_unflagged_signal_keeps_normal_entry(tmp_path):
+def test_every_signal_waits_for_price_confirmation(tmp_path):
     store,s,client=configured(tmp_path)
     alert(store,s,client,.70)
-    assert len(client.orders)==1 and not main.LOCK_WAIT
+    assert not client.orders and W in main.LOCK_WAIT
+    poll(store,s,client,.85,X+10000,650)
+    assert client.orders[0][0]=='UP'
+
+
+def test_universal_rule_can_flip_without_a_loss_or_skip(tmp_path):
+    store,s,client=configured(tmp_path)
+    alert(store,s,client,.70)
+    poll(store,s,client,.14,X+10000,650,down=.85)
+    assert client.orders[0][0]=='DOWN'
+    assert 'FLIPPED' in main._price_confirmation(store,W)['note']
 
 
 def test_legacy_persisted_cushion_converts_to_price_wait(tmp_path):

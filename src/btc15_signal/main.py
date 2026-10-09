@@ -946,30 +946,36 @@ def allsignal_lock_poll(store: Store, settings: Settings, trader, contract, snap
 def allsignal_on_alert(store: Store, settings: Settings, trader, contract, side: str,
                        ask: float, snapshot, opened: int, now_ms: int,
                        telegram=None, released: bool = False) -> None:
-    """At the alert: enter now - or, after a loss, once the price is clear of
-    the line (`allsignal_cushion_poll` watches every poll). Never raises, and
-    FAILS CLOSED: a check that errors waits rather than enters (review
-    2026-09-29 - the wait may only delay or skip a trade, never add one)."""
+    """Apply BTC's universal price confirmation, then enter the confirmed side.
+
+    With a configured price floor every signal waits for exactly one side to
+    quote at or above the floor. The opposite side may confirm first. Without a
+    floor, retain the historical skip/cushion path.
+    """
     # AFTER TWO LOSSES, NEVER AGAINST THE 15-MIN TREND (FINDINGS 142): skipped
     # here, said by the miss notice, and the streak stands until a trade is taken.
     skip = "" if released else allsignal_trend_skip(store, settings, opened, side, now_ms)
     price_floor = _price_wait_floor(settings)
     if price_floor and allsignal_on(store, settings):
         if released:
-            # Contract-price confirmation replaces the old after-loss cushion.
+            # Contract-price confirmation replaces every old entry-time gate.
             spawn_allsignal(store, settings, trader, contract.ticker, side, ask, opened,
                             now_ms, telegram)
             return
         loss_wait = allsignal_after_loss(store, opened)
-        if skip or loss_wait:
-            reason = skip or "after a loss or while the previous result is pending"
+        lock = allsignal_ohlc_lock_note(settings, now_ms)
+        reasons = [x for x in (skip,
+                   "after a loss or while the previous result is pending" if loss_wait else "",
+                   lock) if x]
+        reason = "; ".join(reasons) if reasons else "universal BTC price confirmation"
+        if reasons:
             _lock_shadow(settings, dict(event="strategy_skip_shadow", window_open=opened,
                                         side=side, ask=ask, note=reason, at_ms=now_ms))
-            _begin_price_wait(store, settings, opened, contract.ticker, side, ask,
-                              price_floor, reason, now_ms, telegram)
-            allsignal_lock_poll(store, settings, trader, contract, snapshot, opened,
-                                (opened + 900_000 - now_ms) // 1000, now_ms, telegram)
-            return
+        _begin_price_wait(store, settings, opened, contract.ticker, side, ask,
+                          price_floor, reason, now_ms, telegram)
+        allsignal_lock_poll(store, settings, trader, contract, snapshot, opened,
+                            (opened + 900_000 - now_ms) // 1000, now_ms, telegram)
+        return
     if skip:
         # Never raises (review 2026-10-02): a locked database loses the record
         # of the skip, never the alert's own prediction row.

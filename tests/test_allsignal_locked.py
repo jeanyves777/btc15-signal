@@ -116,9 +116,11 @@ def test_the_after_loss_cushion_is_pinned():
 # through _taken_rows/_taken_lost, pinned with them. Filled rows read exactly as before.
 # Re-pinned 2026-10-08 (operator: "live should never skip a signal"): allsignal_on_alert
 # holds a signal inside a locked chop range for an 85c ask, never skips it (allsignal_ohlc_lock_wait).
-# Re-pinned 2026-10-08: operator explicitly replaced live strategy skips and
+# Re-pinned 2026-10-08: operator explicitly made >=85c either-side confirmation
+# universal for every live BTC signal, including after losses.
+# The earlier change explicitly replaced live strategy skips and
 # after-loss cushion with >=85c confirmation on either side; skips stay shadow.
-CUSHION_CODE = "b24659d6c5b4d367"
+CUSHION_CODE = "974781c4d18cc5f3"
 
 
 def test_the_cushion_rule_code_is_pinned():

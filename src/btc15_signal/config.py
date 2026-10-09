@@ -500,7 +500,8 @@ class Settings(BaseSettings):
     allsignal_ohlc_lock_wait: bool = False
     allsignal_ohlc_lock_min_ask: float = 0.85
     # BTC strategy skips and after-loss waits become price confirmation on either
-    # side. Production uses .85. Zero retains the historical cushion/skip policy.
+    # side for EVERY BTC signal. Production uses .85. Zero retains the historical
+    # cushion/skip policy.
     allsignal_skip_wait_min_ask: float = 0.0
     mirror_daily_profit_target_rate: float = 0.03     # each mirror
     # THE MIRRORS AFTER A LOSS, PAST A TARGET, AND ONCE THE PRIMARY IS DONE
