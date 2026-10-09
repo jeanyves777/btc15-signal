@@ -11209,3 +11209,37 @@ On history candles the pair costs < $1 all-in in only ~3.6% of hours (~1.5c); th
 (55-82 of 303 hours, ~5c) is a stale /markets-quote artifact - gone at the next poll 81-91% of the
 time. Executability needs an hourly ORDER-BOOK recording in the last 15 minutes (not built).
 METHOD: day sign-flip / day bootstrap overstate certainty on 0-loss favourites; use a binomial test.
+
+
+## Live target change ? 2026-10-07 18:30 ET
+
+Operator authorized 3% daily profit target for PRIMARY AND ALL MIRRORS; Affoue no longer trades past its target. DAILY_PROFIT_TARGET_RATE=0.03, DAILY_PROFIT_STOP_RATE=0.03, MIRROR_DAILY_PROFIT_TARGET_RATE=0.03, MIRROR_TARGET_MAX_WINS=0, ALLSIGNAL_AFTER_TARGET_STAKE=0 and MIRROR_1/2/3_ALLSIGNAL_AFTER_TARGET_STAKE=0. Stakes and after-loss sizing unchanged. Each account pauses until midnight New York after its own target; shadow recording continues. Mirror-after-primary-done remains enabled only so a mirror below its OWN target may continue until reaching it.
+
+Today opening capital and existing pause/cap timestamps preserved. Today's target fields updated to opening*0.03 (primary $19.6806; Wife $1.0431; George $0.8814; Affoue $1.4595). All four had already crossed their targets today; Affoue's historical pause is retained even though its later all-day trading brought today's result below target.
+
+90 relevant tests passed (daily profit, primary cap, recording never pauses, new setup). Broker flat on all four accounts, no resting orders; restart preflight passed. BTC PID 18388 replaced by watchdog PID 22564; fresh observations verified on BTC/ETH/GOLD/SILVER/SOL/XRP/NEAR/BNB. No shadow service restart, no day-capital reset. Backup .env.bak-20261007-3pct; prior day state runtime/3pct_change_20261007_before.json.
+
+
+## 2026-10-08: strategy skips become 85-cent price waits
+
+Operator explicitly requested that live strategy skips remain shadow-only and
+live execution wait for the original or opposite side to reach at least85c,
+including after a loss. The trend gate still terminated a window immediately;
+the after-loss cushion could still enter below85c and prevent a confirmed flip.
+Added opt-in ALLSIGNAL_SKIP_WAIT_MIN_ASK (production85c), persistent either-side
+waiting, cutoff expiry reporting, retry floor, and opposite-side copy grading.
+The daily target and all account sizes are preserved. Strategy code pins updated
+for this explicit operator instruction; historical mode tests remain in place.
+New coverage includes wait/restart, adverse/ambiguous quotes, both directions,
+loss waits, mirror direction, copy result inversion and the daily pause path.
+
+
+Deployment verified 2026-10-08 20:01:52 ET: BTC PID25380, source b502423d4bde.
+All four broker accounts were flat with no resting orders immediately before
+restart, and preflight found nothing unresolved. Existing 5% account targets,
+opening capital and pause latches were preserved. BTC and all seven other
+instrument recorders had fresh observations after restart. The broader check
+passed182 tests; final targeted checks passed50 tests after the retry-message
+follow-up. Fifteen dedicated price-confirmation cases cover the new behavior.
+Only ALLSIGNAL_SKIP_WAIT_MIN_ASK=0.85 changed in .env; its prior values are in an
+ignored local runtime backup. No new capital baseline or pause reset occurred.

@@ -293,8 +293,8 @@ def test_each_account_has_its_own_rate_and_the_table_names_them(tmp_path):
     from btc15_signal.daily_profit import summary
 
     d = Settings.model_fields
-    assert d["daily_profit_target_rate"].default == 0.08
-    assert d["mirror_daily_profit_target_rate"].default == 0.15
+    assert d["daily_profit_target_rate"].default == 0.03
+    assert d["mirror_daily_profit_target_rate"].default == 0.03
     guards = []
     for account, label, rate, opening in (("primary", "You", 0.08, 104.77),
                                           ("m1", "Wife", 0.15, 25.39)):
@@ -333,3 +333,20 @@ def test_the_2000_signal_review_reminder_fires_once(tmp_path):
     asyncio.run(main.remind_target_review(store, settings, Tg(), base))
     asyncio.run(main.remind_target_review(store, settings, Tg(), base + 60_000))
     assert len(sent) == 1 and "2,000 BTC SIGNALS RECORDED" in sent[0]
+
+
+def test_paused_mirror_outage_recovery_keeps_pause(tmp_path):
+    from btc15_signal import daily_profit as dp
+    client = SimpleNamespace(account_value=AsyncMock(return_value=100))
+    g = DailyProfitGuard(tmp_path / "g.db", "m3", "Affoue", client, .03)
+    g.pages = AsyncMock(return_value=[])
+    asyncio.run(g.refresh(force=True))
+    with g.connect() as db:
+        db.execute("UPDATE profit_days SET paused_ms=1, notified='paused' WHERE account='m3'")
+    g.outage_said = True
+    telegram = SimpleNamespace(send=AsyncMock(return_value=1))
+    asyncio.run(dp._monitor_one(g, telegram))
+    messages = [call.args[0] for call in telegram.send.call_args_list]
+    assert any("RESTORED" in text and "no new BTC entries" in text for text in messages)
+    assert all("allowed again" not in text for text in messages)
+    assert "shadow tracking continues" in dp.footer([g])

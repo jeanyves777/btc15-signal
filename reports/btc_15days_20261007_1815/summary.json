@@ -1,0 +1,241 @@
+{
+  "start": "2026-09-23 00:00 ET",
+  "last_close": "2026-10-07 18:15 ET",
+  "capital_fixed_per_day": 995.93,
+  "target": 79.67439999999999,
+  "signal_rows": 1392,
+  "matched_settled_signals": 1392,
+  "unmatched_or_unsettled": 0,
+  "source_wins": 1038,
+  "daily": [
+    {
+      "day": "09-23",
+      "signals": 96,
+      "trades": 13,
+      "wins": 12,
+      "losses": 1,
+      "net": 82.977,
+      "low": -24.7286,
+      "target_hit": "03:15",
+      "skips": {
+        "daily_target": 83
+      }
+    },
+    {
+      "day": "09-24",
+      "signals": 87,
+      "trades": 46,
+      "wins": 36,
+      "losses": 10,
+      "net": 83.2093,
+      "low": -19.2144,
+      "target_hit": "13:30",
+      "skips": {
+        "daily_target": 41
+      }
+    },
+    {
+      "day": "09-25",
+      "signals": 95,
+      "trades": 17,
+      "wins": 15,
+      "losses": 2,
+      "net": 80.0582,
+      "low": 0.0,
+      "target_hit": "04:15",
+      "skips": {
+        "daily_target": 78
+      }
+    },
+    {
+      "day": "09-26",
+      "signals": 96,
+      "trades": 68,
+      "wins": 52,
+      "losses": 16,
+      "net": 6.8476,
+      "low": -90.3892,
+      "target_hit": null,
+      "skips": {
+        "no_cushion": 28
+      }
+    },
+    {
+      "day": "09-27",
+      "signals": 96,
+      "trades": 32,
+      "wins": 27,
+      "losses": 5,
+      "net": 84.8616,
+      "low": -25.0012,
+      "target_hit": "08:15",
+      "skips": {
+        "no_cushion": 1,
+        "daily_target": 63
+      }
+    },
+    {
+      "day": "09-28",
+      "signals": 96,
+      "trades": 70,
+      "wins": 53,
+      "losses": 17,
+      "net": 84.7392,
+      "low": -126.2044,
+      "target_hit": "18:00",
+      "skips": {
+        "no_cushion": 1,
+        "trend_skip": 1,
+        "daily_target": 24
+      }
+    },
+    {
+      "day": "09-29",
+      "signals": 96,
+      "trades": 25,
+      "wins": 21,
+      "losses": 4,
+      "net": 84.431,
+      "low": -28.78,
+      "target_hit": "06:15",
+      "skips": {
+        "daily_target": 71
+      }
+    },
+    {
+      "day": "09-30",
+      "signals": 96,
+      "trades": 13,
+      "wins": 12,
+      "losses": 1,
+      "net": 84.737,
+      "low": -20.6474,
+      "target_hit": "03:15",
+      "skips": {
+        "daily_target": 83
+      }
+    },
+    {
+      "day": "10-01",
+      "signals": 81,
+      "trades": 38,
+      "wins": 32,
+      "losses": 6,
+      "net": 80.8367,
+      "low": -11.776,
+      "target_hit": "13:15",
+      "skips": {
+        "daily_target": 43
+      }
+    },
+    {
+      "day": "10-02",
+      "signals": 96,
+      "trades": 21,
+      "wins": 18,
+      "losses": 3,
+      "net": 82.6418,
+      "low": -25.1832,
+      "target_hit": "05:15",
+      "skips": {
+        "daily_target": 75
+      }
+    },
+    {
+      "day": "10-03",
+      "signals": 96,
+      "trades": 63,
+      "wins": 50,
+      "losses": 13,
+      "net": 55.0309,
+      "low": -47.856,
+      "target_hit": null,
+      "skips": {
+        "no_cushion": 33
+      }
+    },
+    {
+      "day": "10-04",
+      "signals": 96,
+      "trades": 78,
+      "wins": 59,
+      "losses": 19,
+      "net": -28.3965,
+      "low": -109.7022,
+      "target_hit": null,
+      "skips": {
+        "no_cushion": 18
+      }
+    },
+    {
+      "day": "10-05",
+      "signals": 96,
+      "trades": 95,
+      "wins": 72,
+      "losses": 23,
+      "net": -36.3149,
+      "low": -114.0605,
+      "target_hit": null,
+      "skips": {
+        "no_cushion": 1
+      }
+    },
+    {
+      "day": "10-06",
+      "signals": 96,
+      "trades": 86,
+      "wins": 60,
+      "losses": 26,
+      "net": -231.5772,
+      "low": -245.8985,
+      "target_hit": null,
+      "skips": {
+        "no_cushion": 10
+      }
+    },
+    {
+      "day": "10-07",
+      "signals": 73,
+      "trades": 17,
+      "wins": 15,
+      "losses": 2,
+      "net": 84.6338,
+      "low": -18.3913,
+      "target_hit": "04:15",
+      "skips": {
+        "daily_target": 56
+      }
+    }
+  ],
+  "total_net": 598.72,
+  "target_days": 10,
+  "losing_days": 3,
+  "modeled_trades": 682,
+  "modeled_wins": 534,
+  "recorded_lifecycle_statuses": {
+    "filled": 656,
+    "unfilled": 31,
+    "paused": 42,
+    "skipped": 74,
+    "copied": 61
+  },
+  "settings": {
+    "allsignal_stake": 25.0,
+    "allsignal_after_loss_stake": 30.0,
+    "allsignal_after_loss_trades": 2,
+    "daily_profit_stop_rate": 0.08,
+    "allsignal_after_loss_cushion_bps": 5.0,
+    "allsignal_cushion_min_left_s": 120,
+    "allsignal_trend_skip_after_losses": 2,
+    "allsignal_trend_skip_bps": 10.0,
+    "cash_out_enabled": false
+  },
+  "reference_script_sha256": "42d783653056adb7eb7b7a929e5086cdc2b9dc9c57ebf0af15f457590e774858",
+  "limitations": [
+    "Real recorded signals, polls and outcomes; hypothetical fills at observed asks.",
+    "No order-book execution, retry or chase fill simulation.",
+    "Fixed 995.93 daily opening, no compounding or deposit reconstruction.",
+    "Previous outcome assumed known before next signal, as in original Claude study; delayed result availability not reconstructed.",
+    "Current-rule counterfactual, not historical account profit."
+  ]
+}

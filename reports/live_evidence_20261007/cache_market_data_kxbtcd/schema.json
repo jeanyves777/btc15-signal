@@ -1,0 +1,3 @@
+{
+  "markets": "CREATE TABLE markets (\n            ticker TEXT PRIMARY KEY, event_ticker TEXT, open_ms INTEGER,\n            close_ms INTEGER, floor_strike REAL, result TEXT, status TEXT,\n            expiration_value REAL, volume REAL, open_interest REAL\n        )"
+}

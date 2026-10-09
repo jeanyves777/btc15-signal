@@ -169,6 +169,21 @@ memory, so a crash and restart cannot reset one that has already been breached.
 | Price drift before abandoning a retry | $0.08 | `auto_retry_max_drift` |
 | Slippage allowance on an entry | $0.01 | `entry_slippage` |
 
+### Dynamic all-signal size
+
+When `ALLSIGNAL_STAKE_RATE` or a mirror's
+`MIRROR_n_ALLSIGNAL_RISK_RATE` is positive, that account's all-signal size is
+recalculated from its own opening capital recorded for the New York day. The
+contract count is rounded down so `count × final order limit + entry fee` stays
+inside the configured fraction. A retry or chase is resized at its new limit;
+if the cap is smaller than one contract, one contract is sent. Fixed dollar settings
+remain fallbacks only when the corresponding rate is zero.
+
+`ALLSIGNAL_AFTER_LOSS_STAKE_RATE` supplies the primary's after-loss fraction.
+Mirrors remain at their individual base fractions unless a separate rule is
+explicitly configured. Telegram's daily-capital notice and `/status` footer
+show the percentage cap that is actually enforced.
+
 **Alerting fires once per window; trading is evaluated on EVERY poll.** These
 were one gate, and it made 67% of qualifying windows unreachable (see
 FINDINGS.md §3). If you ever merge them again you will lose two thirds of the
@@ -723,3 +738,35 @@ rebuilt locally. When a message and the ledger disagree, the message is wrong.
 repo. It is not encrypted and not permission-restricted. Anyone with read access
 to that file can trade this account. Rotating it and tightening its ACL is
 outstanding.
+
+
+## Daily target policy (2026-10-07)
+
+Every live account pauses new BTC entries at 3% of its own recorded opening
+capital, net of fees, until midnight America/New_York. Existing exits and all
+shadow recording continue. Mirrors continue independently until their own cap.
+Production enables the target guard, sets primary/mirror rates and primary stop
+rate to 0.03, disables the win-count target cap, and sets all after-target stakes
+to zero. The example configuration keeps activation disabled for safety.
+Opening capital and reached pauses persist across restarts. Existing day targets
+are frozen; changing settings alone does not rewrite them. Do not clear pauses
+when deploying updates. Historical studies retain their original assumptions.
+
+
+## BTC price confirmation after strategy warnings (2026-10-08)
+
+With ALLSIGNAL_SKIP_WAIT_MIN_ASK=0.85, a two-loss trend warning, active chop
+lock, or previous taken loss/unknown outcome starts a persistent price wait.
+These strategy warnings are recorded in runtime/lock_shadow.jsonl; they do not
+immediately mark a live trade skipped. Normal unflagged signals still enter normally.
+The first unambiguous UP or DOWN ask at 85 cents or higher may enter, including
+an opposite-side entry. This confirmation replaces the after-loss 5bps cushion
+for that entry and its retries. The 120-second entry cutoff remains in force.
+
+Neither side qualifying in time is recorded as price_expired and announced as
+PRICE CONFIRMATION EXPIRED. Existing positions, per-account profit pauses, the
+execution switch, normal sizing and the shadow signal/outcome archive remain in
+force. All mirror orders follow the side selected for the actual trade. Price
+waits, the retry floor and flipped-entry notes survive restarts. The 85-cent
+condition applies to the observed ask; limit orders can receive price improvement.
+Zero disables this new mode and retains the historical cushion/skip behavior.

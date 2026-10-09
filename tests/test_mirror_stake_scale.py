@@ -229,11 +229,11 @@ def test_the_broker_read_covers_the_whole_previous_day_across_dst():
     assert "since = fetch_since(midnight)" in src and "86_400_000" not in src
 
 
-def test_only_the_mirrors_scale_in_service():
+def test_legacy_whole_dollar_scale_stays_mirror_only_in_service():
     src = " ".join(inspect.getsource(main.service).split())
     assert ("guard.stake_target = next((m for m in getattr(trader, \"_mirrors\", []) "
             "if m.target.name == account), None)") in src
     head, _ = src.split("else: # mirrors: the target scales with growth", 1)
-    assert "stake_rate" not in head.split("if account == \"primary\":")[-1]
+    assert "guard.stake_rate" not in head.split("if account == \"primary\":")[-1]
     assert Settings.model_fields["mirror_stake_scale_rate"].default == 0.0
     assert Settings.model_fields["mirror_stake_scale_max"].default == 6.0

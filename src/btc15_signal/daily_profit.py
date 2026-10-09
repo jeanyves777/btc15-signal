@@ -103,6 +103,11 @@ class DailyProfitGuard:
     stake_rate = 0.0
     stake_max = 0.0
     stake_target = None
+    # Exact dynamic all-signal sizing. Unlike the legacy mirror scale, this is
+    # a fee-inclusive ceiling and is allowed above 5% when explicitly set for
+    # an account. after_loss_risk_rate=0 means use the same ceiling after loss.
+    entry_risk_rate = 0.0
+    after_loss_risk_rate = 0.0
     # > 0: THE DAILY CAP (the primary since 2026-10-02, FINDINGS 135): once the
     # day's realised P&L reaches this fraction of the opening, NO new entry until
     # 00:00 New York - latched in `capped_ms`, so a later loss does not reopen
@@ -145,6 +150,9 @@ class DailyProfitGuard:
         `entry_budget`, raised to `stake_rate` x the opening in whole dollars
         when that is more, never above `stake_max`."""
         floor = float(getattr(self, "entry_budget", 0.0) or 0.0)
+        dynamic = float(getattr(self, "entry_risk_rate", 0.0) or 0.0)
+        if 0 < dynamic <= 1 and opening and opening > 0:
+            return float(opening) * dynamic
         rate, top = float(self.stake_rate or 0.0), float(self.stake_max or 0.0)
         # A MIS-SET SCALE SCALES NOTHING: a rate above 5% ("2" typed for 2%
         # would send every mirror to the ceiling) or no ceiling at all leaves
@@ -168,6 +176,25 @@ class DailyProfitGuard:
         if opening:
             return self.day_stake(float(opening))
         return float(getattr(self, "entry_budget", 0.0) or 0.0)
+
+    def entry_count(self, limit: float, after_loss: bool = False) -> int | None:
+        """Fee-inclusive contract cap from today's recorded opening capital.
+
+        ``None`` means dynamic sizing is disabled and the caller should use its
+        legacy fixed-dollar path. Dynamic sizing always keeps a one-contract
+        participation floor.
+        """
+        rate = float(self.entry_risk_rate or 0.0)
+        if after_loss and self.after_loss_risk_rate:
+            rate = float(self.after_loss_risk_rate)
+        if not 0 < rate <= 1:
+            return None
+        state = self.state()
+        if not state or self.error or int(time.time() * 1000) - state["updated_ms"] > 60_000:
+            return 1
+        from .validation import contracts_for_risk_cap
+
+        return contracts_for_risk_cap(float(state["opening"]), rate, float(limit))
 
     def sync_stake(self, state):
         """Point the mirror's copies at today's stake. Every refresh, so a
@@ -517,7 +544,9 @@ class DailyProfitGuard:
         percent = 100 * state["pnl"] / state["opening"]
         budget = (self.stake_today(state)
                   if getattr(self, "entry_budget", None) is not None else None)
-        size = f" · ${budget:g}/entry" if budget is not None else ""
+        risk = float(getattr(self, "entry_risk_rate", 0.0) or 0.0)
+        size = (f" · max {100 * risk:g}%/entry incl fees" if risk
+                else f" · ${budget:g}/entry" if budget is not None else "")
         return (
             f"<b>{label}</b> · {status}{size}\n"
             f"Starting capital: ${state['opening']:.2f} ({basis})\n"
@@ -593,7 +622,7 @@ def summary(guards):
     for name, pnl, cap, rate in capped_rows:
         out.append(f"\U0001f3c1 <b>{name}</b> \u00b7 daily cap reached "
                    f"(${pnl:+.2f} of ${cap:.2f}, {100 * rate:g}%) \u00b7 done: no new BTC "
-                   "entries until 00:00 ET; open positions still exit")
+                   "entries until 00:00 ET; open positions still exit; shadow tracking continues")
     for name, lower, back in lowered:
         out.append(f"\u2b07\ufe0f <b>{name}</b> \u00b7 at or above the target \u00b7 "
                    f"<b>${lower:g}</b> per signal"
@@ -606,7 +635,7 @@ def summary(guards):
     if paused:
         out.append(f"\u23f8 <b>{' and '.join(paused) if len(paused) < 3 else ', '.join(paused)}"
                    "</b> \u00b7 target hit \u00b7 no new BTC entries until 00:00 ET; "
-                   "open positions still exit")
+                   "open positions still exit; shadow tracking continues")
     if blocked:
         out.append(f"\u26a0\ufe0f <b>{', '.join(blocked)}</b> \u00b7 Kalshi figures unavailable "
                    "\u00b7 new BTC entries blocked until they are read again")
@@ -636,7 +665,7 @@ def footer(guards):
         "<b>BTC daily target: 3% · after fees</b>\n"
         + "\n\n".join(g.line() for g in guards)
         + "\n\n<i>Reset: 00:00 New York. Target pauses entries; exits continue."
-        + " Mirrors follow primary fills.</i>"
+        + " Each account pauses independently; shadow tracking continues.</i>"
     )
 
 
@@ -687,7 +716,9 @@ async def _monitor_one(guard, telegram):
     # A DAY ALREADY DONE AT ITS CAP stays done whatever the read does: the
     # outage pair said "allowed again" on a capped day (review 2026-10-02).
     try:
-        done = capped(guard, guard.state())
+        state = guard.state()
+        done = capped(guard, state) or bool(
+            state and state["paused_ms"] and not guard.after_target_stake)
     except Exception:  # noqa: BLE001 - a local read; the plain wording then
         done = False
     if guard.fail_passes >= 2 and not getattr(guard, "outage_said", False):
@@ -728,7 +759,7 @@ async def _monitor_one(guard, telegram):
                      f"${guard.stop_rate * state['opening']:.2f} cap "
                      f"({100 * guard.stop_rate:g}% of ${state['opening']:.2f}) \u00b7 net of fees\n"
                      "\U0001f6d1 Done for the day: no new BTC entries until 00:00 ET \u00b7 "
-                     "open positions still exit"
+                     "open positions still exit; shadow tracking continues"
                      + (f"\n{escape(_note(guard), quote=False)}" if _note(guard) else ""))
                     if status == "capped" else
                     (f"\U0001f3af <b>TARGET REACHED{' AGAIN' if again else ''} \u00b7 {label}</b>\n"
@@ -749,7 +780,7 @@ async def _monitor_one(guard, telegram):
                     f"\U0001f3af <b>{state['pnl']:+.2f}</b> of ${state['target']:.2f} "
                     f"({pct:+.2f}%) \u00b7 net of fees\n"
                     "\U0001f6d1 New BTC entries paused until 00:00 ET \u00b7 "
-                    "open positions still exit"
+                    "open positions still exit; shadow tracking continues"
                     if status == "paused" else
                     f"\u25b6\ufe0f <b>DAILY TARGET ACTIVE \u00b7 {label}</b>\n"
                     f"\U0001f3e6 Opening capital <b>${state['opening']:.2f}</b>\n"
@@ -765,6 +796,13 @@ async def _monitor_one(guard, telegram):
                        f"${float(guard.entry_budget):g}"
                        + (f" or above ${guard.stake_max:g}" if guard.stake_max else "")
                        if guard.stake_rate else "")
+                    + (f"\n\U0001f4b5 Entry risk cap <b>{100 * guard.entry_risk_rate:g}%</b> "
+                       "of opening capital, including fee"
+                       + (f" · after loss {100 * guard.after_loss_risk_rate:g}%"
+                          if guard.after_loss_risk_rate and
+                          abs(guard.after_loss_risk_rate - guard.entry_risk_rate) > 1e-12
+                          else "")
+                       if guard.entry_risk_rate else "")
                     # THE DAILY CAP, said with the day's target (2026-10-02).
                     + (f"\n\U0001f3c1 Daily cap <b>${guard.stop_rate * state['opening']:.2f}</b> "
                        f"({100 * guard.stop_rate:g}%) \u00b7 done for the day once reached"

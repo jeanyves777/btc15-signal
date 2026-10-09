@@ -1,0 +1,286 @@
+{
+  "start": "2026-09-23",
+  "end": "2026-10-07 18:15 ET",
+  "results": [
+    {
+      "rule": "baseline",
+      "period": "all15",
+      "signals": 1392,
+      "missing": 28,
+      "blocked": 0,
+      "blocked_wins": 0,
+      "blocked_losses": 0,
+      "net": -52.82,
+      "change": 0
+    },
+    {
+      "rule": "baseline",
+      "period": "before_oct6",
+      "signals": 1223,
+      "missing": 23,
+      "blocked": 0,
+      "blocked_wins": 0,
+      "blocked_losses": 0,
+      "net": 366.45,
+      "change": 0
+    },
+    {
+      "rule": "baseline",
+      "period": "oct6",
+      "signals": 96,
+      "missing": 2,
+      "blocked": 0,
+      "blocked_wins": 0,
+      "blocked_losses": 0,
+      "net": -369.5,
+      "change": 0
+    },
+    {
+      "rule": "baseline",
+      "period": "oct6_chart_11_20_30",
+      "signals": 38,
+      "missing": 0,
+      "blocked": 0,
+      "blocked_wins": 0,
+      "blocked_losses": 0,
+      "net": -315.75,
+      "change": 0
+    },
+    {
+      "rule": "low_progress",
+      "period": "all15",
+      "signals": 1392,
+      "missing": 28,
+      "blocked": 647,
+      "blocked_wins": 461,
+      "blocked_losses": 186,
+      "net": 522.29,
+      "change": 575.11
+    },
+    {
+      "rule": "low_progress",
+      "period": "before_oct6",
+      "signals": 1223,
+      "missing": 23,
+      "blocked": 562,
+      "blocked_wins": 410,
+      "blocked_losses": 152,
+      "net": 524.49,
+      "change": 158.05
+    },
+    {
+      "rule": "low_progress",
+      "period": "oct6",
+      "signals": 96,
+      "missing": 2,
+      "blocked": 44,
+      "blocked_wins": 25,
+      "blocked_losses": 19,
+      "net": -99.57,
+      "change": 269.93
+    },
+    {
+      "rule": "low_progress",
+      "period": "oct6_chart_11_20_30",
+      "signals": 38,
+      "missing": 0,
+      "blocked": 18,
+      "blocked_wins": 8,
+      "blocked_losses": 10,
+      "net": -141.43,
+      "change": 174.32
+    },
+    {
+      "rule": "strike_whipsaw",
+      "period": "all15",
+      "signals": 1392,
+      "missing": 28,
+      "blocked": 698,
+      "blocked_wins": 501,
+      "blocked_losses": 197,
+      "net": 371.11,
+      "change": 423.94
+    },
+    {
+      "rule": "strike_whipsaw",
+      "period": "before_oct6",
+      "signals": 1223,
+      "missing": 23,
+      "blocked": 614,
+      "blocked_wins": 448,
+      "blocked_losses": 166,
+      "net": 471.2,
+      "change": 104.75
+    },
+    {
+      "rule": "strike_whipsaw",
+      "period": "oct6",
+      "signals": 96,
+      "missing": 2,
+      "blocked": 43,
+      "blocked_wins": 26,
+      "blocked_losses": 17,
+      "net": -175.81,
+      "change": 193.7
+    },
+    {
+      "rule": "strike_whipsaw",
+      "period": "oct6_chart_11_20_30",
+      "signals": 38,
+      "missing": 0,
+      "blocked": 19,
+      "blocked_wins": 9,
+      "blocked_losses": 10,
+      "net": -139.65,
+      "change": 176.09
+    },
+    {
+      "rule": "both",
+      "period": "all15",
+      "signals": 1392,
+      "missing": 28,
+      "blocked": 334,
+      "blocked_wins": 220,
+      "blocked_losses": 114,
+      "net": 642.75,
+      "change": 695.58
+    },
+    {
+      "rule": "both",
+      "period": "before_oct6",
+      "signals": 1223,
+      "missing": 23,
+      "blocked": 290,
+      "blocked_wins": 198,
+      "blocked_losses": 92,
+      "net": 720.05,
+      "change": 353.6
+    },
+    {
+      "rule": "both",
+      "period": "oct6",
+      "signals": 96,
+      "missing": 2,
+      "blocked": 23,
+      "blocked_wins": 11,
+      "blocked_losses": 12,
+      "net": -173.11,
+      "change": 196.39
+    },
+    {
+      "rule": "both",
+      "period": "oct6_chart_11_20_30",
+      "signals": 38,
+      "missing": 0,
+      "blocked": 11,
+      "blocked_wins": 5,
+      "blocked_losses": 6,
+      "net": -214.57,
+      "change": 101.17
+    },
+    {
+      "rule": "either_with_breakout_release",
+      "period": "all15",
+      "signals": 1392,
+      "missing": 28,
+      "blocked": 947,
+      "blocked_wins": 692,
+      "blocked_losses": 255,
+      "net": 167.71,
+      "change": 220.54
+    },
+    {
+      "rule": "either_with_breakout_release",
+      "period": "before_oct6",
+      "signals": 1223,
+      "missing": 23,
+      "blocked": 827,
+      "blocked_wins": 612,
+      "blocked_losses": 215,
+      "net": 256.25,
+      "change": -110.2
+    },
+    {
+      "rule": "either_with_breakout_release",
+      "period": "oct6",
+      "signals": 96,
+      "missing": 2,
+      "blocked": 63,
+      "blocked_wins": 40,
+      "blocked_losses": 23,
+      "net": -127.45,
+      "change": 242.06
+    },
+    {
+      "rule": "either_with_breakout_release",
+      "period": "oct6_chart_11_20_30",
+      "signals": 38,
+      "missing": 0,
+      "blocked": 25,
+      "blocked_wins": 12,
+      "blocked_losses": 13,
+      "net": -91.69,
+      "change": 224.05
+    }
+  ],
+  "actual_oct6_attribution": [
+    {
+      "rule": "baseline",
+      "matched": 86,
+      "actual_rows": 86,
+      "removed": 0,
+      "removed_losses": 0,
+      "removed_wins": 0,
+      "removed_net": 0,
+      "matched_actual_net": -251.98
+    },
+    {
+      "rule": "low_progress",
+      "matched": 86,
+      "actual_rows": 86,
+      "removed": 36,
+      "removed_losses": 12,
+      "removed_wins": 24,
+      "removed_net": -111.62,
+      "matched_actual_net": -251.98
+    },
+    {
+      "rule": "strike_whipsaw",
+      "matched": 86,
+      "actual_rows": 86,
+      "removed": 39,
+      "removed_losses": 14,
+      "removed_wins": 25,
+      "removed_net": -156.49,
+      "matched_actual_net": -251.98
+    },
+    {
+      "rule": "both",
+      "matched": 86,
+      "actual_rows": 86,
+      "removed": 19,
+      "removed_losses": 9,
+      "removed_wins": 10,
+      "removed_net": -128.81,
+      "matched_actual_net": -251.98
+    },
+    {
+      "rule": "either_with_breakout_release",
+      "matched": 86,
+      "actual_rows": 86,
+      "removed": 55,
+      "removed_losses": 16,
+      "removed_wins": 39,
+      "removed_net": -114.01,
+      "matched_actual_net": -251.98
+    }
+  ],
+  "limitations": [
+    "Fixed $25 stake, observed ask, settlement outcome and estimated fee: not live strategy replay.",
+    "No loss boosts, chase, early cashout, spread/slippage or fill uncertainty simulated.",
+    "Missing BRTI histories pass through, explicitly counted.",
+    "Actual attribution holds later historical sizes/outcomes fixed; not attainable counterfactual account profit.",
+    "Screenshot is another venue; image alone does not establish cause.",
+    "Thresholds chosen for this exploratory study; earlier days are a comparison, not an independent holdout."
+  ]
+}
