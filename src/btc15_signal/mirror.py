@@ -228,7 +228,22 @@ class _Mirror:
                 # THIS COPY'S STAKE, decided at the dispatch (after a loss, past
                 # a target - main.mirror_stake_now, 2026-10-05); else the day's.
                 stake = float(args.get("stake") or self.target.allsignal_budget)
-                count = self.target._cap(contracts_for_budget(stake, proposal.entry_limit))
+                order_limit = float(
+                    args.get("ceiling")
+                    or min(0.99, proposal.entry_limit + max(0.0, args.get("slippage", 0)))
+                )
+                guard = getattr(self.client, "daily_profit_guard", None)
+                dynamic = guard.entry_count(order_limit) if guard is not None else None
+                count = (int(dynamic) if dynamic is not None
+                         else self.target._cap(contracts_for_budget(stake, proposal.entry_limit)))
+                if count <= 0:
+                    self._answer(args, "paused", 0, 0, stake)
+                    self._log(self.target.name, kind, "paused",
+                              {"ticker": proposal.ticker, "side": proposal.side,
+                               "count": 0, "limit": order_limit,
+                               "primary_count": args["filled_count"]},
+                              "daily capital risk cap cannot fund one contract")
+                    return
             elif args.get("recovery") and self.target.recovery_budget > 0:
                 count = self.target.recovery_count(proposal.entry_limit)
             else:

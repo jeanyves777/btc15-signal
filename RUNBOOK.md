@@ -169,6 +169,21 @@ memory, so a crash and restart cannot reset one that has already been breached.
 | Price drift before abandoning a retry | $0.08 | `auto_retry_max_drift` |
 | Slippage allowance on an entry | $0.01 | `entry_slippage` |
 
+### Dynamic all-signal size
+
+When `ALLSIGNAL_STAKE_RATE` or a mirror's
+`MIRROR_n_ALLSIGNAL_RISK_RATE` is positive, that account's all-signal size is
+recalculated from its own opening capital recorded for the New York day. The
+contract count is rounded down so `count × final order limit + entry fee` stays
+inside the configured fraction. A retry or chase is resized at its new limit;
+if even one contract exceeds the cap, no order is sent. Fixed dollar settings
+remain fallbacks only when the corresponding rate is zero.
+
+`ALLSIGNAL_AFTER_LOSS_STAKE_RATE` supplies the primary's after-loss fraction.
+Mirrors remain at their individual base fractions unless a separate rule is
+explicitly configured. Telegram's daily-capital notice and `/status` footer
+show the percentage cap that is actually enforced.
+
 **Alerting fires once per window; trading is evaluated on EVERY poll.** These
 were one gate, and it made 67% of qualifying windows unreachable (see
 FINDINGS.md §3). If you ever merge them again you will lose two thirds of the

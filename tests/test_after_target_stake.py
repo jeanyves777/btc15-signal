@@ -112,8 +112,8 @@ def test_unknown_figures_still_block_the_primary_past_its_target(tmp_path):
 
 def test_only_the_primary_guard_gets_the_lower_stake_in_service():
     src = " ".join(inspect.getsource(main.service).split())
-    assert ('if account == "primary": # only the primary (operator, 2026-09-30) '
-            "guard.after_target_stake = float(") in src
+    primary = src.split('if account == "primary":', 1)[1].split("else: # mirrors", 1)[0]
+    assert "guard.after_target_stake = float(" in primary
     assert DailyProfitGuard.after_target_stake == 0.0, "every other account pauses"
 
 
@@ -286,7 +286,8 @@ def test_a_retry_after_the_target_goes_at_the_lower_stake():
     assert "stake = allsignal_stake_now(store, settings, opened)" in src
     # Sized at the stake NOW - and, since 2026-10-05, at the price now (the chase review:
     # every account sizes its copy by the order's entry price).
-    assert 'count = min(int(row["count"]), contracts_for_budget(stake, ask))' in src
+    assert "dynamic_count = allsignal_count_now(store, settings, cap, opened, quote=ask)" in src
+    assert 'count = min(int(row["count"]), dynamic_count)' in src
     assert "count, cap, opened, telegram))" in src
 
 

@@ -421,6 +421,11 @@ class Settings(BaseSettings):
     # scripts/allsignal_switch.py. The main strategy is untouched.
     allsignal_instruments: str = "BTC,GOLD"
     allsignal_stake: float = 1.00
+    # Dynamic entry-risk ceiling. When set, the day's opening capital replaces
+    # the fixed stake: count * order limit + entry fee may not exceed this
+    # fraction. The order limit (including retries/chases), not a stale quote,
+    # sizes the trade. Zero retains fixed-dollar behavior.
+    allsignal_stake_rate: float = 0.0
     # AFTER THE PRIMARY'S DAILY TARGET, A LOWER STAKE INSTEAD OF A PAUSE
     # (operator, 2026-09-30: "make primary account base size 6 and apply $3
     # after the 8% target hit only to mine the primary; the mirrors stay at the
@@ -436,6 +441,7 @@ class Settings(BaseSettings):
     # `allsignal_after_loss_trades` taken $ trades after a known loss go at this
     # stake. The primary (the mirrors' own below). 0 = off.
     allsignal_after_loss_stake: float = 0.0
+    allsignal_after_loss_stake_rate: float = 0.0
     allsignal_after_loss_trades: int = 2
     # AFTER A LOSS, WAIT FOR A CUSHION (operator, 2026-09-29: "adopt 5 and ship
     # it live"; FINDINGS 112). The signal after a losing trade (today) enters
@@ -569,6 +575,7 @@ class Settings(BaseSettings):
     mirror_1_base_budget: float = 0.0
     mirror_1_base_contracts: int = 1
     mirror_1_allsignal_budget: float = 1.0
+    mirror_1_allsignal_risk_rate: float = 0.0
     mirror_1_allsignal_after_loss_stake: float = 0.0
     mirror_1_allsignal_after_target_stake: float = 0.0
     mirror_1_add_contracts: int = 0
@@ -578,6 +585,7 @@ class Settings(BaseSettings):
     mirror_2_base_budget: float = 0.0
     mirror_2_base_contracts: int = 1
     mirror_2_allsignal_budget: float = 1.0
+    mirror_2_allsignal_risk_rate: float = 0.0
     mirror_2_allsignal_after_loss_stake: float = 0.0
     mirror_2_allsignal_after_target_stake: float = 0.0
     mirror_2_add_contracts: int = 0
@@ -590,6 +598,7 @@ class Settings(BaseSettings):
     mirror_3_base_budget: float = 0.0
     mirror_3_base_contracts: int = 1
     mirror_3_allsignal_budget: float = 1.0
+    mirror_3_allsignal_risk_rate: float = 0.0
     mirror_3_allsignal_after_loss_stake: float = 0.0
     mirror_3_allsignal_after_target_stake: float = 0.0
     mirror_3_add_contracts: int = 0

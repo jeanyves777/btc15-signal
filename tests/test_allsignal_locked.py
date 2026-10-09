@@ -40,7 +40,10 @@ from btc15_signal.mirror import MirrorTarget  # noqa: E402
 # the mirrors' own stakes - the two new sizing functions are pinned with it.
 # Re-pinned again 2026-10-05 (review wf_83445e67-f9f): a copied window is said on
 # Telegram; a copy is booked only when a mirror bought it (FINDINGS 163).
-LOCKED_CODE = "4ebc15e61e95cf07"
+# Re-pinned 2026-10-08 on the operator's explicit sizing instruction: every
+# account now sizes from its own daily opening capital, with the primary's
+# separate after-loss percentage. The fee-inclusive count function is pinned.
+LOCKED_CODE = "a6c6f19f3c3f7fa8"
 
 
 def test_the_locked_settings():
@@ -55,7 +58,7 @@ def test_the_locked_settings():
 def test_the_locked_order_path():
     src = "".join(inspect.getsource(f) for f in (
         main.allsignal_on, main.spawn_allsignal, main._allsignal_order,
-        main.main_strategy_on, main.allsignal_stake_now,
+        main.main_strategy_on, main.allsignal_stake_now, main.allsignal_count_now,
         main.allsignal_after_loss_boost, main.mirror_stake_now))
     assert hashlib.sha256(src.encode()).hexdigest()[:16] == LOCKED_CODE, (
         "the all-signal strategy's code changed - it is LOCKED (FINDINGS 111)")
@@ -137,7 +140,9 @@ def test_the_cushion_rule_code_is_pinned():
 # it go"; FINDINGS 155): a miss is chased at the moved price, up to 93c.
 # Re-pinned 2026-10-05 (FINDINGS 163): the retry sizes for its own window (the boost).
 # Re-pinned again 2026-10-05 (review): pre-funding covers the after-a-loss stakes.
-RETRY_CODE = "37fcd623c89f8baa"
+# Re-pinned 2026-10-08: every retry/chase is resized at its final order limit
+# under the same fee-inclusive daily-capital ceiling as the first attempt.
+RETRY_CODE = "6aa87f45731641ab"
 
 
 def test_the_retry_code_is_pinned():

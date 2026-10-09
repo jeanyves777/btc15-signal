@@ -551,7 +551,9 @@ def allsignal_stake_now(store: Store, settings: Settings, opened: int | None = N
     base = float(settings.allsignal_stake)
     low = float(getattr(settings, "allsignal_after_target_stake", 0.0) or 0.0)
     boost = float(getattr(settings, "allsignal_after_loss_stake", 0.0) or 0.0)
-    if low <= 0 and boost <= 0:
+    base_rate = float(getattr(settings, "allsignal_stake_rate", 0.0) or 0.0)
+    boost_rate = float(getattr(settings, "allsignal_after_loss_stake_rate", 0.0) or 0.0)
+    if low <= 0 and boost <= 0 and base_rate <= 0 and boost_rate <= 0:
         return base
     at_target = False
     for guard in getattr(store, "daily_profit_guards", None) or []:
@@ -561,6 +563,10 @@ def allsignal_stake_now(store: Store, settings: Settings, opened: int | None = N
             state = guard.state()
         except Exception:  # noqa: BLE001
             return min(base, low) if low > 0 else base
+        if state and 0 < base_rate <= 1:
+            base = float(state["opening"]) * base_rate
+        if state and 0 < boost_rate <= 1:
+            boost = float(state["opening"]) * boost_rate
         at_target = bool(state) and state["pnl"] + 1e-8 >= state["target"]
         break
     if at_target and low > 0:
@@ -569,6 +575,26 @@ def allsignal_stake_now(store: Store, settings: Settings, opened: int | None = N
             store, settings, int(opened if opened is not None else time.time() * 1000)):
         return boost
     return base
+
+
+def allsignal_count_now(store: Store, settings: Settings, limit: float,
+                        opened: int | None = None, quote: float | None = None) -> int:
+    """Primary contract count at the final order limit, including entry fees."""
+    after_loss = allsignal_after_loss_boost(
+        store, settings, int(opened if opened is not None else time.time() * 1000))
+    for guard in getattr(store, "daily_profit_guards", None) or []:
+        if getattr(guard, "account", "") != "primary":
+            continue
+        try:
+            dynamic = guard.entry_count(float(limit), after_loss=after_loss)
+            if dynamic is not None:
+                return int(dynamic)
+        except Exception as exc:  # noqa: BLE001
+            print(f"allsignal: dynamic size unavailable {exc!r} - no order", flush=True)
+            return 0
+        break
+    return contracts_for_budget(
+        allsignal_stake_now(store, settings, opened), float(quote or limit))
 
 
 def _row_stake(row: dict, settings: Settings) -> float:
@@ -589,9 +615,13 @@ def spawn_allsignal(store: Store, settings: Settings, trader, ticker: str,
             return
         if not allsignal_on(store, settings):
             return
-        stake = allsignal_stake_now(store, settings, opened)
-        count = contracts_for_budget(stake, ask)
         limit = round(min(0.99, ask + settings.entry_slippage), 2)
+        stake = allsignal_stake_now(store, settings, opened)
+        count = allsignal_count_now(store, settings, limit, opened, quote=ask)
+        if count <= 0:
+            print(f"allsignal: {ticker} not placed; daily capital risk cap cannot fund "
+                  f"one contract at {limit:.0%}", flush=True)
+            return
         if not store.allsignal_claim(opened, ticker, side, ask, count, limit, now_ms,
                                      stake=stake):
             return
@@ -1159,9 +1189,14 @@ def allsignal_retry_poll(store: Store, settings: Settings, trader, contract, sna
         # by the order's entry price - sent at the signal's old ask, a chased order
         # over-spent the mirrors' stakes by up to ~50%. The record and messages
         # keep the signal's own price (the row's ask).
-        count = min(int(row["count"]), contracts_for_budget(stake, ask))
+        dynamic_count = allsignal_count_now(store, settings, cap, opened, quote=ask)
+        count = min(int(row["count"]), dynamic_count)
         if chasing:                          # the same dollars at the moved price
-            count = max(1, contracts_for_budget(stake, ask))
+            count = dynamic_count
+        if count <= 0:
+            store.allsignal_finish(opened, "paused",
+                                   note="daily capital risk cap cannot fund one contract")
+            return
         if count != int(row["count"]) or chasing:
             store.db.execute("UPDATE allsignal_trades SET stake=?, count=?, limit_price=? "
                              "WHERE window_open=?", (stake, count, cap, opened))
@@ -5956,11 +5991,17 @@ async def service() -> None:
                                   next(t.allsignal_budget for t in targets_from_settings(settings)
                                        if t.name == account))
             if account == "primary":       # only the primary (operator, 2026-09-30)
+                guard.entry_risk_rate = float(
+                    getattr(settings, "allsignal_stake_rate", 0.0) or 0.0)
+                guard.after_loss_risk_rate = float(
+                    getattr(settings, "allsignal_after_loss_stake_rate", 0.0) or 0.0)
                 guard.after_target_stake = float(
                     getattr(settings, "allsignal_after_target_stake", 0.0) or 0.0)
                 # ...and its DAILY CAP: done for the day at 20% (2026-10-02).
                 guard.stop_rate = float(getattr(settings, "daily_profit_stop_rate", 0.0) or 0.0)
             else:                          # mirrors: the target scales with growth
+                guard.entry_risk_rate = float(getattr(
+                    settings, f"mirror_{account[1:]}_allsignal_risk_rate", 0.0) or 0.0)
                 guard.max_target_wins = float(
                     getattr(settings, "mirror_target_max_wins", 0.0) or 0.0)
                 guard.target_win_price = float(

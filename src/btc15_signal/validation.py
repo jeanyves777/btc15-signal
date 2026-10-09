@@ -952,3 +952,24 @@ def contracts_for_budget(budget: float, price: float, minimum: int = 1) -> int:
     if price <= 0:
         return minimum
     return max(minimum, int(budget / price))
+
+
+def contracts_for_risk_cap(capital: float, rate: float, limit: float) -> int:
+    """Whole contracts whose worst entry debit stays inside a capital fraction.
+
+    The order limit is the worst price the IOC may pay.  Fees are part of the
+    debit, so sizing from ``capital * rate / quote`` can exceed the intended
+    risk when the book moves or when the fee is charged.  Zero is deliberate:
+    if one contract does not fit the cap, the safe order size is no order.
+    """
+    try:
+        budget = float(capital) * float(rate)
+        price = float(limit)
+    except (TypeError, ValueError):
+        return 0
+    if budget <= 0 or not 0 < rate <= 1 or not 0 < price < 1:
+        return 0
+    count = max(0, int(budget / price))
+    while count and count * price + kalshi_fee_charged(price, count) > budget + 1e-9:
+        count -= 1
+    return count
